@@ -714,6 +714,7 @@ fn build_engine_config(app: &App, config: &Config) -> EngineConfig {
         runtime_services: app.runtime_services.clone(),
         subagent_model_overrides: config.subagent_model_overrides(),
         subagent_api_timeout: Duration::from_secs(config.subagent_api_timeout_secs()),
+        prefer_bwrap: config.prefer_bwrap.unwrap_or(false),
         memory_enabled: config.memory_enabled(),
         memory_path: config.memory_path(),
         vision_config: config.vision_model_config(),
@@ -721,12 +722,9 @@ fn build_engine_config(app: &App, config: &Config) -> EngineConfig {
         goal_objective: app.goal.goal_objective.clone(),
         locale_tag: app.ui_locale.tag().to_string(),
         workshop: config.workshop.clone(),
-        search_provider: config
-            .search
-            .as_ref()
-            .and_then(|s| s.provider)
-            .unwrap_or_default(),
+        search_provider: config.search_provider(),
         search_api_key: config.search.as_ref().and_then(|s| s.api_key.clone()),
+        tools_always_load: config.tools_always_load(),
     }
 }
 
@@ -893,7 +891,59 @@ async fn run_event_loop(
         .checked_sub(Duration::from_secs(60))
         .unwrap_or_else(Instant::now);
 
+    // Fire-and-forget version check — runs once per session in the
+    // background. On success, `app.version_hint` is set and the footer
+    // renders the update recommendation on the next frame.
+    let mut version_check: Option<tokio::task::JoinHandle<Option<String>>> = Some({
+        let current = env!("CARGO_PKG_VERSION").to_string();
+        tokio::spawn(async move {
+            let client = match reqwest::Client::builder()
+                .user_agent("codewhale-version-check")
+                .timeout(std::time::Duration::from_secs(5))
+                .build()
+            {
+                Ok(c) => c,
+                Err(_) => return None,
+            };
+            let resp = client
+                .get("https://api.github.com/repos/Hmbown/CodeWhale/releases/latest")
+                .header("Accept", "application/vnd.github+json")
+                .send()
+                .await
+                .ok()?;
+            let json: serde_json::Value = resp.json().await.ok()?;
+            let tag = json["tag_name"].as_str()?;
+            let latest = tag.trim_start_matches('v');
+            // Compare semver so dev builds (e.g. "0.8.46-pre") don't
+            // trigger false hints. Falls back to string compare on
+            // unparseable versions.
+            let newer = match (parse_semver(latest), parse_semver(&current)) {
+                (Some(l), Some(c)) => l > c,
+                _ => latest != current,
+            };
+            if newer {
+                Some(format!(
+                    "v{latest} available — run `codewhale update` and restart"
+                ))
+            } else {
+                None
+            }
+        })
+    });
+
     loop {
+        // Drain the version-check handle once; re-assign None so we
+        // don't poll it again.
+        let mut done = false;
+        if let Some(ref handle) = version_check {
+            done = handle.is_finished();
+        }
+        if done
+            && let Ok(Some(hint)) = version_check.take().unwrap().await
+        {
+            app.version_hint = Some(hint);
+        }
+
         if !drain_web_config_events(&mut web_config_session, app, config, &engine_handle).await {
             web_config_session = None;
         }
@@ -1429,6 +1479,28 @@ async fn run_event_loop(
                             .session
                             .total_conversation_tokens
                             .saturating_add(turn_tokens);
+                        app.session.total_input_tokens = app
+                            .session
+                            .total_input_tokens
+                            .saturating_add(usage.input_tokens);
+                        app.session.total_output_tokens = app
+                            .session
+                            .total_output_tokens
+                            .saturating_add(usage.output_tokens);
+                        // Only accumulate cache telemetry when reported.
+                        if let Some(hit_tokens) = usage.prompt_cache_hit_tokens {
+                            app.session.total_cache_hit_tokens = app
+                                .session
+                                .total_cache_hit_tokens
+                                .saturating_add(hit_tokens);
+                            let cache_miss = usage
+                                .prompt_cache_miss_tokens
+                                .unwrap_or_else(|| usage.input_tokens.saturating_sub(hit_tokens));
+                            app.session.total_cache_miss_tokens = app
+                                .session
+                                .total_cache_miss_tokens
+                                .saturating_add(cache_miss);
+                        }
                         app.session.last_prompt_tokens = Some(usage.input_tokens);
                         app.session.last_completion_tokens = Some(usage.output_tokens);
                         app.session.last_prompt_cache_hit_tokens = usage.prompt_cache_hit_tokens;
@@ -1487,9 +1559,15 @@ async fn run_event_loop(
                                 threshold,
                                 turn_elapsed,
                             );
+                            crate::tui::notifications::clear_taskbar_progress();
+                            crate::tui::notifications::stop_title_animation();
                         }
 
                         // Generate post-turn receipt for completed turns.
+                        // Also push a persistent status toast so users always
+                        // see the outcome in the footer (not just the 8-second
+                        // composer receipt), regardless of notification method
+                        // or platform.
                         if status == crate::core::events::TurnOutcomeStatus::Completed {
                             let tool_count = app.tool_evidence.len();
                             let mut receipt = "✓ turn completed".to_string();
@@ -1505,6 +1583,15 @@ async fn run_event_loop(
                                 }
                             }
                             app.set_receipt_text(receipt);
+                            // Mirror as a persistent status toast (10s TTL).
+                            // The footer bar visibly shows status toasts,
+                            // which is more glanceable than the composer
+                            // border receipt alone.
+                            app.push_status_toast(
+                                receipt,
+                                crate::tui::app::StatusToastLevel::Info,
+                                Some(10_000),
+                            );
                         }
 
                         // Auto-save completed turn and clear crash checkpoint.
@@ -2279,6 +2366,8 @@ async fn run_event_loop(
             if app.use_mouse_capture
                 && let Event::Mouse(mouse) = evt
             {
+                // Mouse interaction clears the ✅ completion marker.
+                crate::tui::notifications::reset_title_on_interaction();
                 if should_drop_loading_mouse_motion(app, mouse) {
                     continue;
                 }
@@ -2298,6 +2387,9 @@ async fn run_event_loop(
                 }
                 continue;
             }
+
+            // User interaction — clear the ✅ completion marker from the title.
+            crate::tui::notifications::reset_title_on_interaction();
 
             let Event::Key(key) = evt else {
                 continue;
@@ -3633,7 +3725,7 @@ async fn run_event_loop(
             }
 
             if !is_plain_char && !is_enter {
-                app.paste_burst.clear_window_after_non_char();
+                app.paste_burst.deactivate_keep_window();
             }
         }
     }
@@ -6635,6 +6727,8 @@ fn apply_loaded_session(app: &mut App, config: &Config, session: &SavedSession) 
     app.session.last_prompt_cache_hit_tokens = None;
     app.session.last_prompt_cache_miss_tokens = None;
     app.session.last_reasoning_replay_tokens = None;
+    // Accumulated token breakdown is per-runtime-session; reset on load.
+    app.session.reset_token_breakdown();
     app.session.turn_cache_history.clear();
     // Restore cumulative turn duration so the footer "worked" chip
     // persists across session restarts (#2038).
@@ -7937,6 +8031,16 @@ fn extract_reasoning_header(text: &str) -> Option<String> {
     } else {
         Some(header.to_string())
     }
+}
+
+/// Parse a `major.minor.patch` version string into a comparable tuple.
+/// Returns `None` on any parse failure (non-semver, dev suffixes, etc.).
+fn parse_semver(v: &str) -> Option<(u32, u32, u32)> {
+    let mut parts = v.splitn(3, '.');
+    let major = parts.next()?.parse::<u32>().ok()?;
+    let minor = parts.next()?.parse::<u32>().ok()?;
+    let patch = parts.next().unwrap_or("0").parse::<u32>().ok()?;
+    Some((major, minor, patch))
 }
 
 #[cfg(test)]

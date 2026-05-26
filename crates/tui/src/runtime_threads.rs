@@ -1434,7 +1434,7 @@ impl RuntimeThreadManager {
 
             if let Some(assistant_text) = assistant_text {
                 let asst_summary = if assistant_text.len() > SUMMARY_LIMIT {
-                    format!("{}...", &assistant_text[..SUMMARY_LIMIT.saturating_sub(3)])
+                    crate::utils::truncate_with_ellipsis(&assistant_text, SUMMARY_LIMIT, "...")
                 } else {
                     assistant_text.clone()
                 };
@@ -1976,6 +1976,7 @@ impl RuntimeThreadManager {
             subagent_api_timeout: std::time::Duration::from_secs(
                 self.config.subagent_api_timeout_secs(),
             ),
+            prefer_bwrap: self.config.prefer_bwrap.unwrap_or(false),
             memory_enabled: self.config.memory_enabled(),
             memory_path: self.config.memory_path(),
             vision_config: self.config.vision_model_config(),
@@ -1987,13 +1988,9 @@ impl RuntimeThreadManager {
             .tag()
             .to_string(),
             workshop: self.config.workshop.clone(),
-            search_provider: self
-                .config
-                .search
-                .as_ref()
-                .and_then(|s| s.provider)
-                .unwrap_or_default(),
+            search_provider: self.config.search_provider(),
             search_api_key: self.config.search.as_ref().and_then(|s| s.api_key.clone()),
+            tools_always_load: self.config.tools_always_load(),
         };
 
         let engine = spawn_engine(engine_cfg, &self.config);

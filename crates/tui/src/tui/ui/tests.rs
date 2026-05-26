@@ -5972,16 +5972,15 @@ fn composer_arrows_scroll_defaults_true_without_mouse_capture() {
 }
 
 #[test]
-fn composer_arrows_scroll_defaults_follow_platform_with_mouse_capture() {
+fn composer_arrows_scroll_defaults_false_with_mouse_capture() {
     let options = TuiOptions {
         use_mouse_capture: true,
         ..create_test_options()
     };
     let app = App::new(options, &Config::default());
-    assert_eq!(
-        app.composer_arrows_scroll,
-        cfg!(windows),
-        "arrows-scroll should default to true on Windows and false on other platforms when mouse capture is on"
+    assert!(
+        !app.composer_arrows_scroll,
+        "arrows-scroll must default to false when mouse capture is on"
     );
 }
 
@@ -6090,6 +6089,7 @@ fn notification_settings_tui_always_keeps_configured_method_no_threshold() {
         notifications: Some(crate::config::NotificationsConfig {
             method: crate::config::NotificationMethod::Bel,
             threshold_secs: 120,
+            completion_sound: crate::config::CompletionSound::Beep,
             include_summary: true,
         }),
         ..Config::default()
@@ -6121,6 +6121,7 @@ fn notification_settings_no_tui_override_uses_notifications_block() {
         notifications: Some(crate::config::NotificationsConfig {
             method: crate::config::NotificationMethod::Osc9,
             threshold_secs: 45,
+            completion_sound: crate::config::CompletionSound::Beep,
             include_summary: false,
         }),
         ..Config::default()
