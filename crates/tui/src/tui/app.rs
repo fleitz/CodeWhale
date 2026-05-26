@@ -728,7 +728,7 @@ fn match_kitty_csi_fragment(chars: &[char], start: usize) -> Option<usize> {
     None
 }
 
-const MAX_SUBMITTED_INPUT_CHARS: usize = 32_000;
+const MAX_SUBMITTED_INPUT_CHARS: usize = 16_000;
 const MAX_DRAFT_HISTORY: usize = 50;
 
 impl AppMode {
@@ -3121,14 +3121,10 @@ impl App {
             self.insert_str(&normalized);
         }
         self.paste_burst.clear_after_explicit_paste();
-        // Visible-before-submit consolidation: when the post-paste input
-        // is over the cap, swap it for an @paste-…md mention immediately
-        // (instead of waiting until the user presses Enter and getting
-        // surprised by an auto-sent @mention). The same logic runs as a
-        // safety-net at submit time so any other code path that fills
-        // self.input above the cap still consolidates rather than
-        // silently truncating.
-        self.consolidate_large_input_if_oversized();
+        // Consolidation is deferred to submit time only (#2159).
+        // Pasting large text should not silently replace the composer
+        // content — the user pasted it to see and edit it. The submit
+        // path still enforces the cap as a safety net.
     }
 
     pub fn insert_media_attachment(&mut self, kind: &str, path: &Path, description: Option<&str>) {
@@ -5298,12 +5294,10 @@ mod tests {
     }
 
     #[test]
-    fn paste_consolidates_oversized_text_into_paste_file_visibly() {
-        // Visible-before-submit consolidation (paste UX): when a single
-        // bracketed paste exceeds the safety cap, the @mention must
-        // replace the input *immediately*, so the user sees what's
-        // about to be sent before pressing Enter — not as a side effect
-        // of submit.
+    fn paste_oversized_text_is_preserved_in_composer_not_consolidated() {
+        // #2159: large pastes must NOT silently replace the composer
+        // content. Consolidation is deferred to submit time so the user
+        // can see and edit what they pasted.
         let tmp = tempfile::TempDir::new().expect("tempdir");
         let mut opts = test_options(false);
         opts.workspace = tmp.path().to_path_buf();
@@ -5312,27 +5306,12 @@ mod tests {
 
         app.insert_paste_text(&full_content);
 
-        // Composer should now contain the @mention, not the full text.
-        assert!(
-            app.input.starts_with("@.deepseek/pastes/paste-") && app.input.ends_with(".md"),
-            "expected @mention in composer after large paste, got: {}",
-            app.input
+        // Composer should contain the full pasted text, not an @mention.
+        assert_eq!(
+            app.input, full_content,
+            "large paste should stay visible in composer, got @mention"
         );
-        // The cursor moves to the end of the @mention.
         assert_eq!(app.cursor_position, app.input.chars().count());
-        // The paste file must exist with the full content.
-        let rel_path = &app.input[1..];
-        let abs = tmp.path().join(rel_path);
-        assert!(abs.is_file(), "paste file must exist at {abs:?}");
-        let written = std::fs::read_to_string(&abs).expect("read");
-        assert_eq!(written, full_content);
-        // A toast confirms what happened so the user isn't surprised.
-        assert!(
-            app.status_toasts
-                .iter()
-                .any(|t| t.text.contains("consolidated")),
-            "expected consolidation toast"
-        );
     }
 
     #[test]
