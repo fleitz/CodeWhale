@@ -5,6 +5,37 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.8.48] - 2026-05-27
+
+This release bundles the work that was prepared on the v0.8.47 integration branch but didn't make the v0.8.47 cut, plus a small set of net-new fixes. The features listed in the [0.8.47] section below all actually land here in 0.8.48.
+
+### Added
+
+- **Xiaomi MiMo provider.** First-class support for Xiaomi's MiMo models via `MIMO_API_KEY` / `MIMO_BASE_URL`, with per-provider model picker entries and reasoning-effort translation across off/high/max tiers (#2240, contributed by HUQIANTAO).
+- **`~/.agents/AGENTS.md` vendor-neutral global fallback.** Global agent instructions can now live at this vendor-neutral path between `~/.codewhale/` and `~/.deepseek/` (#2236, contributed by mvanhorn).
+- **WHALE.md as project-context file.** Adopted as the CodeWhale-native convention alongside `AGENTS.md` and `CLAUDE.md`.
+
+### Changed
+
+- **Closed-loop verification gate is active by default.** After every side-effect tool call (write, edit, apply_patch, exec_shell), the engine re-checks the claim before the result enters the session stream. Now ships with auto-retry on failure (up to 2 attempts), fuzzy-search correction for `edit_file`, and a Fin Flash inner-loop correction pass when the fuzzy match also misses.
+- **Permanent V4 Pro 75% discount.** Removed the time-gated 2026-05-31 cutoff; the lower rate is now permanent (#1937, contributed by Colorful-glassblock).
+- **Model picker per-provider slices.** Replaced the boolean `hide_deepseek_models` flag with per-provider model/effort slices; resolves model-picker drift when running on non-DeepSeek providers.
+
+### Fixed
+
+- **DEEPSEEK.md removed from project-context files** to align with the rename to CodeWhale.
+- **Two clippy regressions on `main`** (`useless_format` in `commands/config.rs`, `redundant_closure` in `runtime_log.rs`) folded in from PR #2237.
+- **PDF/image reads moved to `spawn_blocking`** to stop blocking the async runtime on slow disk or large PDFs.
+
+### Deprecated
+
+- **Moonshot / Kimi provider.** Removed from the `/provider` picker and from `provider = "…"` example docs. CodeWhale is focusing on 1M-context models with prefix-cache economics, which Moonshot's pricing/context surface doesn't compose with cleanly. Existing configs with `provider = "moonshot"` still parse and load — the variant is preserved in `ApiProvider` for backward compatibility — but no new picker entry surfaces it. Full removal is scheduled for v0.9 alongside Whale Pod Mode.
+
+### Known limitations
+
+- `/new` may report "Started new session" yet subsequent interactions fail to engage the model when state from a prior session in the same workspace lingers on disk. The root cause is in the session-lifecycle product design rather than a one-line bug; Whale Pod Mode (planned for v0.9) reworks the session/workspace model and is expected to dissolve this class of issue. Until then, the reliable workaround is to launch with `--fresh`.
+- See open issue #1786 (Work Queue Sync Lag / Shell PID Hang) for the related symptom where an orphaned long-running shell sub-process from a prior session can cause the next session to appear stuck.
+
 ## [0.8.47] - 2026-05-26
 
 ### Added
@@ -5084,6 +5115,7 @@ Welcome — and thank you.
 - Example skills and launch assets
 
 [Unreleased]: https://github.com/Hmbown/CodeWhale/compare/v0.8.47...HEAD
+[0.8.48]: https://github.com/Hmbown/CodeWhale/compare/v0.8.47...v0.8.48
 [0.8.47]: https://github.com/Hmbown/CodeWhale/compare/v0.8.46...v0.8.47
 [0.8.46]: https://github.com/Hmbown/CodeWhale/compare/v0.8.45...v0.8.46
 [0.8.45]: https://github.com/Hmbown/CodeWhale/compare/v0.8.44...v0.8.45

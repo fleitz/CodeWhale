@@ -17,7 +17,8 @@
 # toggle without having to re-enter keys. Top-level `api_key` / `base_url` are
 # still read as DeepSeek defaults when `[providers.deepseek]` is absent
 # (backward compatibility).
-provider = "deepseek" # deepseek | deepseek-cn | nvidia-nim | openai | atlascloud | wanjie-ark | openrouter | novita | fireworks | moonshot | sglang | vllm | ollama | xiaomi
+provider = "deepseek" # deepseek | deepseek-cn | nvidia-nim | openai | atlascloud | wanjie-ark | openrouter | novita | fireworks | sglang | vllm | ollama | xiaomi
+                      # (`moonshot` / `kimi` is deprecated in v0.8.48 and scheduled for removal in v0.9; existing configs still load.)
 api_key = "YOUR_DEEPSEEK_API_KEY" # must be non-empty
 base_url = "https://api.deepseek.com/beta"
 # provider = "deepseek-cn"                       # legacy alias (official host is still https://api.deepseek.com)

@@ -169,6 +169,14 @@ impl ApiProvider {
     }
 
     /// All providers, in the order shown in the picker.
+    ///
+    /// `Moonshot` is intentionally omitted as of v0.8.48 — CodeWhale's
+    /// cache-economics bet (1M-context shared prefixes that cache hot)
+    /// doesn't compose well with Moonshot's pricing/context surface, and
+    /// the planned Whale Pod Mode in v0.9 leans further into that bet.
+    /// The variant is preserved so existing `provider = "moonshot"`
+    /// configs still parse, but it's no longer offered in the picker.
+    /// Full removal is targeted for v0.9.
     #[must_use]
     pub fn all() -> &'static [Self] {
         &[
@@ -180,7 +188,6 @@ impl ApiProvider {
             Self::Openrouter,
             Self::Novita,
             Self::Fireworks,
-            Self::Moonshot,
             Self::Sglang,
             Self::Vllm,
             Self::Ollama,
