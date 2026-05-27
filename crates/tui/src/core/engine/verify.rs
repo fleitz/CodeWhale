@@ -8,7 +8,6 @@
 
 use serde::{Deserialize, Serialize};
 use std::path::Path;
-use std::time::Instant;
 
 // ---------------------------------------------------------------------------
 // Verdict types
@@ -78,8 +77,6 @@ pub fn run_verification(
     tool_input: &serde_json::Value,
     workspace: &Path,
 ) -> (VerifyVerdict, String) {
-    let started = Instant::now();
-
     let verdict = match tool_name {
         // Read-only tools — skip
         "read_file"
@@ -124,10 +121,9 @@ pub fn run_verification(
         | "rlm_session_objects"
         | "run_tests" => VerifyVerdict::Skipped,
 
-        // Core file-mutating tools — inline verification: re-read the file
-        // to confirm the write/edit/patch actually landed. If the file is
-        // missing or empty, it's a verification failure. The caller should
-        // retry.
+        // Core file-mutating tools — inline verification: confirm the target
+        // exists after the write/edit/patch landed. Missing targets are a
+        // verification failure; empty files are valid tool output.
         "write_file" | "edit_file" | "apply_patch" => {
             inline_verify_file_tool(tool_input, workspace)
         }
@@ -182,9 +178,6 @@ pub fn run_verification(
         },
     };
 
-    let elapsed_ms = started.elapsed().as_millis() as u64;
-    let _ = elapsed_ms;
-
     // Build the annotated content.
     let annotation = match &verdict {
         VerifyVerdict::Pass => String::new(),
@@ -207,9 +200,8 @@ pub fn is_auto_retryable(tool_name: &str) -> bool {
     matches!(tool_name, "write_file" | "edit_file" | "apply_patch")
 }
 
-/// Inline file verification: read the file back and check it exists with
-/// content. Returns Pass if the file is present and non-empty, Fail if
-/// missing/empty, Unverifiable if we can't read it.
+/// Inline file verification: confirm the file exists after a claimed write.
+/// Empty files are valid output for truncation or marker-file workflows.
 fn inline_verify_file_tool(tool_input: &serde_json::Value, workspace: &Path) -> VerifyVerdict {
     let path_str = match tool_input.get("path").and_then(|v| v.as_str()) {
         Some(p) => p,
@@ -226,12 +218,8 @@ fn inline_verify_file_tool(tool_input: &serde_json::Value, workspace: &Path) -> 
         workspace.join(path_str)
     };
 
-    match std::fs::read_to_string(&resolved) {
-        Ok(content) if !content.is_empty() => VerifyVerdict::Pass,
-        Ok(_) => VerifyVerdict::Fail {
-            expected: format!("non-empty file at {}", resolved.display()),
-            observed: "file is empty".to_string(),
-        },
+    match std::fs::metadata(&resolved) {
+        Ok(_) => VerifyVerdict::Pass,
         Err(_) => VerifyVerdict::Fail {
             expected: format!("file exists at {}", resolved.display()),
             observed: "file missing after write".to_string(),
@@ -694,6 +682,21 @@ mod tests {
             &serde_json::json!({"command": "echo ok"}),
             tmp.path(),
         );
+        assert!(matches!(verdict, VerifyVerdict::Pass));
+    }
+
+    #[test]
+    fn side_effect_tools_pass_for_empty_files() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let test_file = tmp.path().join("empty.txt");
+        std::fs::write(&test_file, "").expect("write empty file");
+
+        let (verdict, _) = run_verification(
+            "write_file",
+            &serde_json::json!({"path": "empty.txt"}),
+            tmp.path(),
+        );
+
         assert!(matches!(verdict, VerifyVerdict::Pass));
     }
 
