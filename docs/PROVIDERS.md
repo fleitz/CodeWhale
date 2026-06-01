@@ -232,7 +232,7 @@ The check fails when:
 
 ## Planned, Not Shipped Yet
 
-These items belong to the v0.8.47 provider-abstraction milestone or related
+These items belong to the v0.8.48+ provider-abstraction milestone or related
 provider docs work, but they are not native shipped behavior in this checkout:
 
 - A unified `Provider` trait in `codewhale-agent` that owns env precedence,

@@ -41,6 +41,7 @@ base_url = "https://api.deepseek.com/beta"
 #   qwen/qwen3.7-max              — OpenRouter Qwen 3.7 Max
 #   xiaomi/mimo-v2.5-pro          — OpenRouter Xiaomi MiMo 2.5 Pro
 #   xiaomi/mimo-v2.5              — OpenRouter Xiaomi MiMo 2.5
+#   kimi-k2.6                       — default Moonshot/Kimi model ID
 #   gpt-4.1                         — default generic OpenAI-compatible model ID
 #   deepseek-ai/deepseek-v4-flash   — default AtlasCloud model ID
 #   deepseek-reasoner               — default Wanjie Ark model ID
@@ -552,10 +553,12 @@ default_text_model = "deepseek-ai/deepseek-v4-pro"
 #                 off:  disable entirely
 # threshold_secs = 30      # only notify when the turn took >= this many seconds
 # include_summary = false  # include elapsed time + cost in the notification body
+# completion_sound = "beep" # off | beep | bell — sound on turn completion (✅ marker)
 [notifications]
 # method = "auto"
 # threshold_secs = 30
 # include_summary = false
+# completion_sound = "beep"
 
 # ─────────────────────────────────────────────────────────────────────────────────
 # Workspace Snapshots (#137)
