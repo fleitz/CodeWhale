@@ -470,8 +470,9 @@ fn core_native_tools_stay_loaded_in_yolo_mode() {
         AppMode::Yolo,
         &always_load
     ));
+    // git_blame remains deferred (read-only git history beyond log/show/diff).
     assert!(should_default_defer_tool(
-        "git_show",
+        "git_blame",
         AppMode::Yolo,
         &always_load
     ));
@@ -502,6 +503,17 @@ fn non_yolo_mode_retains_default_defer_policy() {
     ));
     assert!(!should_default_defer_tool(
         "git_diff",
+        AppMode::Agent,
+        &always_load
+    ));
+    // #2654: read-only git history joins the active set.
+    assert!(!should_default_defer_tool(
+        "git_log",
+        AppMode::Agent,
+        &always_load
+    ));
+    assert!(!should_default_defer_tool(
+        "git_show",
         AppMode::Agent,
         &always_load
     ));
@@ -546,7 +558,7 @@ fn non_yolo_mode_retains_default_defer_policy() {
         &always_load
     ));
     assert!(should_default_defer_tool(
-        "git_show",
+        "git_blame",
         AppMode::Agent,
         &always_load
     ));
@@ -749,9 +761,9 @@ fn agent_catalog_keeps_edit_file_loaded_when_fuzz_is_omitted() {
 
 #[test]
 fn tools_always_load_overrides_default_native_deferral() {
-    let always_load = HashSet::from(["git_show".to_string()]);
+    let always_load = HashSet::from(["git_blame".to_string()]);
     assert!(!should_default_defer_tool(
-        "git_show",
+        "git_blame",
         AppMode::Agent,
         &always_load
     ));
