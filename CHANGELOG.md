@@ -61,6 +61,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   TUI sidebar from the command line instead of relying on copy-hostile sidebar
   state during long transcript work (#2766, #2788). Thanks @mo-vic for the
   detailed report and @aboimpinto for the fix.
+- Added Sofya (`provider = "sofya"`) as a search-tool backend with
+  `SOFYA_API_KEY` fallback, while keeping Sofya scoped to web search rather
+  than model-provider routing (#2790). Thanks @yusufgurdogan for the
+  implementation.
 
 ### Changed
 

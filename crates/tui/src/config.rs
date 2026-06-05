@@ -1068,6 +1068,11 @@ pub enum SearchProvider {
         alias = "volc-ark"
     )]
     Volcengine,
+    /// Sofya web search API (<https://sofya.co>). Requires api_key
+    /// (`ay_live_...`). Returns full extracted page content rather than
+    /// snippets; falls back to the `SOFYA_API_KEY` env var when
+    /// `[search] api_key` is not set.
+    Sofya,
 }
 
 impl SearchProvider {
@@ -1083,6 +1088,7 @@ impl SearchProvider {
                 Some(Self::Baidu)
             }
             "volcengine" | "ark" | "volc" | "volcengine-ark" => Some(Self::Volcengine),
+            "sofya" => Some(Self::Sofya),
             _ => None,
         }
     }
@@ -1097,6 +1103,7 @@ impl SearchProvider {
             Self::Metaso => "metaso",
             Self::Baidu => "baidu",
             Self::Volcengine => "volcengine",
+            Self::Sofya => "sofya",
         }
     }
 }
@@ -5645,6 +5652,29 @@ mod tests {
             config.search.and_then(|search| search.provider),
             Some(SearchProvider::Volcengine)
         );
+    }
+
+    #[test]
+    fn explicit_sofya_search_provider_is_preserved() {
+        let config: Config = toml::from_str(
+            r#"
+            [search]
+            provider = "sofya"
+            "#,
+        )
+        .expect("sofya search config");
+
+        assert_eq!(
+            config.search.and_then(|search| search.provider),
+            Some(SearchProvider::Sofya)
+        );
+    }
+
+    #[test]
+    fn sofya_search_provider_parses_and_round_trips() {
+        assert_eq!(SearchProvider::parse("sofya"), Some(SearchProvider::Sofya));
+        assert_eq!(SearchProvider::parse("Sofya"), Some(SearchProvider::Sofya));
+        assert_eq!(SearchProvider::Sofya.as_str(), "sofya");
     }
 
     #[test]
