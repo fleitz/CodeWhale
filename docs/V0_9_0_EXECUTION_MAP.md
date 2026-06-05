@@ -1,6 +1,6 @@
 # v0.9.0 Execution Map
 
-Snapshot date: 2026-06-04
+Snapshot date: 2026-06-05
 
 This map tracks the v0.9.0 integration branch and keeps the open-PR harvest
 separate from release publishing. It is a working document: update it whenever a
@@ -8,11 +8,12 @@ PR is harvested, superseded, deferred, or closed.
 
 ## Live Counts
 
-- Actual open issues: 446
-- Open PRs: 59
-- Repo API open issue count: 505, because GitHub includes PRs in that total
+- Actual open issues: 452
+- Open PRs: 71
+- Repo API open issue count: 523, because GitHub includes PRs in that total
 - Open issues labeled `v0.9.0`: 119
-- Open issues without a milestone: 102
+- Open `v0.9.0` milestone items: 135 open, 8 closed
+- Open issues without a milestone: 108
 
 ## Execution Order
 
@@ -155,6 +156,7 @@ v0.9 branch so the remaining Windows/manual checks are explicit.
 | #2755 roll back provider after auth failure | Draft / forwarded | Snapshot+rollback of provider/model on auth failure (#2754). Design is sound and tested, but author opened it as draft noting they could not reproduce the live Moonshot auth failure end-to-end. Help-forward: needs maintainer validation against a real provider auth failure (engine respawn + model restore). Credit @cyq1017. |
 | #2756 Xiaomi MiMo Token Plan region docs | Mergeable / locally harvested | Docs-only; verified accurate against branch `resolve_xiaomi_mimo_base_url` (tp- keys default to `token-plan-sgp`, pay-as-you-go to `api.xiaomimimo.com`, CN requires explicit `base_url`). Conflict on the CONFIGURATION.md provider bullet resolved by keeping the branch `path_suffix` bullet and adopting the PR's accurate base_url wording. Credit @xyuai; comment/close after branch is public. Fixes #2735. |
 | #2757 hydrated deferred-tool render | Mergeable / locally harvested | Harvested in full (6 files): deferred-tool first-use schema hydration now renders as "tool loaded — retry required" via `ToolStatus::Hydrated` instead of "run done". Local correction: hydrated rows rank with active work (rank 1) not completed successes; kept the contributor's hydration detection (sole emitter always sets `executed=false`, consistent with the engine's own check, so the missing-field default was not changed). `cargo test -p codewhale-tui --bin codewhale-tui --locked hydrat` (6 pass), clippy clean. Credit @mvanhorn; comment/close after branch is public. Fixes #2648. |
+| #2760 sessions footer resume command | Harvested on review branch `codex/harvest-2760-session-resume-footer`. | Corrects the `codewhale sessions` footer from `codewhale --resume <session-id>` to `codewhale resume <session-id>`, matching the actual CLI subcommand and fixing the repro from #2758. Added a parser/footer regression test. Credit @sximelon as both reporter and PR author; close/comment after the integration PR is merged. Fixes #2758. |
 | Local verification sweep stabilizer | Added after the full workspace verification sweep found test-only no-provider TLS panics and prompt byte instability. | Shared TUI Rustls provider helpers now wrap `reqwest` client construction across engine, runtime API, tool, MCP, config, and skill paths; the skill-installer integration include keeps its own local helper. Prompt byte-stability tests pin home and skills env under the shared test-env lock. Evidence: `cargo fmt --all -- --check`, `git diff --check`, `./scripts/release/check-versions.sh`, `cargo clippy --workspace --all-features --locked -- -D warnings`, focused skill/finance/goal/MCP reruns, and `cargo test --workspace --all-features --locked` all passed locally. |
 
 ## Issue Reduction Strategy

@@ -140,6 +140,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   dedicated hydrated status, so it is no longer indistinguishable from a real
   successful execution. A hydrated row also ranks with active work rather than
   completed successes (#2648).
+- `codewhale sessions` now shows `codewhale resume <session-id>` in the footer
+  instead of the invalid dispatcher command `codewhale --resume <session-id>`
+  (#2758, #2760).
 - TUI HTTP clients now install the Rustls ring crypto provider before building
   `reqwest` clients, covering engine, runtime API, tool, MCP, config, and skill
   download paths. This keeps the no-provider TLS build from panicking during
@@ -150,8 +153,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Community
 
-Thanks to **@cyq1017** for the restore-listing implementation (#2513) and
-pending-input delivery-mode label work (#2532, #2054),
+Thanks to **@sximelon** for reporting and fixing the saved-session resume
+footer hint (#2758, #2760), **@cyq1017** for the restore-listing implementation
+(#2513) and pending-input delivery-mode label work (#2532, #2054),
 **@wywsoor** for the broader macOS/iTerm rollback UX report (#2494),
 **@HUQIANTAO** for the `web_run` lock-splitting work (#2502), turn-metadata
 prefix-cache stability work (#2517), and project-context cache direction

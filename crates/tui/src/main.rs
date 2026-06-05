@@ -3827,6 +3827,10 @@ fn rustc_version() -> String {
 }
 
 /// List saved sessions
+fn sessions_resume_command() -> &'static str {
+    "codewhale resume"
+}
+
 fn list_sessions(limit: usize, search: Option<String>) -> Result<()> {
     use crate::palette;
     use colored::Colorize;
@@ -3881,7 +3885,7 @@ fn list_sessions(limit: usize, search: Option<String>) -> Result<()> {
     println!();
     println!(
         "Resume with: {} {}",
-        "codewhale --resume".truecolor(blue_r, blue_g, blue_b),
+        sessions_resume_command().truecolor(blue_r, blue_g, blue_b),
         "<session-id>".dimmed()
     );
     println!(
@@ -6511,6 +6515,19 @@ mod terminal_mode_tests {
         };
 
         assert!(args.continue_session);
+    }
+
+    #[test]
+    fn sessions_footer_points_to_resume_subcommand() {
+        let cli = parse_cli(&["codewhale", "resume", "abc123"]);
+        let Some(Commands::Resume { session_id, last }) = cli.command else {
+            panic!("expected resume command");
+        };
+
+        assert_eq!(session_id.as_deref(), Some("abc123"));
+        assert!(!last);
+        assert_eq!(sessions_resume_command(), "codewhale resume");
+        assert!(!sessions_resume_command().contains("--resume"));
     }
 
     #[test]
