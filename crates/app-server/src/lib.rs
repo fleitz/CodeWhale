@@ -284,7 +284,7 @@ async fn tool_handler(
             .as_deref()
             .and_then(|p| match p.trim().to_ascii_lowercase().as_str() {
                 "auto" | "yolo" => Some(codewhale_execpolicy::AskForApproval::UnlessTrusted),
-                "never" | "deny" => Some(codewhale_execpolicy::AskForApproval::OnRequest),
+                "never" | "deny" => Some(codewhale_execpolicy::AskForApproval::Never),
                 _ => None,
             })
             .unwrap_or(codewhale_execpolicy::AskForApproval::OnRequest)

@@ -352,7 +352,9 @@ impl ExecPolicyEngine {
         // blocks "rm -rf /" but NOT "rmdir" or "rmview".
         if let Some(rule) = denied_prefixes.iter().find(|rule| {
             let norm_rule = normalize_command(rule);
-            normalized == norm_rule || normalized.starts_with(&format!("{norm_rule} "))
+            normalized == norm_rule
+                || (normalized.starts_with(&norm_rule)
+                    && normalized.as_bytes().get(norm_rule.len()) == Some(&b' '))
         }) {
             return Ok(ExecPolicyDecision {
                 allow: false,
@@ -444,7 +446,12 @@ impl ExecPolicyEngine {
 }
 
 fn normalize_command(value: &str) -> String {
-    value.trim().to_ascii_lowercase()
+    // Normalize: lowercase, collapse internal whitespace to single spaces.
+    // This prevents bypass via "git  status" (double space) vs "git status".
+    value.split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .to_ascii_lowercase()
 }
 
 fn first_token(command: &str) -> String {

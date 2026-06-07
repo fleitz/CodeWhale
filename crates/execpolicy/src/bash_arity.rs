@@ -373,7 +373,8 @@ impl BashArityDict {
             .collect::<Vec<_>>()
             .join(" ");
         command_norm == pattern_norm
-            || command_norm.starts_with(&format!("{pattern_norm} "))
+            || (command_norm.starts_with(&pattern_norm)
+                && command_norm.as_bytes().get(pattern_norm.len()) == Some(&b' '))
     }
 
     /// Iterate over all entries in the dictionary.
