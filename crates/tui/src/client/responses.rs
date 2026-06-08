@@ -32,10 +32,13 @@ impl DeepSeekClient {
             "store": false,
         });
 
-        // Instructions (system prompt).
-        if let Some(instructions) = system_to_instructions(request.system.clone()) {
-            body["instructions"] = json!(instructions);
-        }
+        // Instructions (system prompt). The Codex Responses backend rejects
+        // requests without instructions, so fall back to a minimal system
+        // prompt when the caller did not supply one.
+        let instructions = system_to_instructions(request.system.clone())
+            .filter(|text| !text.trim().is_empty())
+            .unwrap_or_else(|| "You are a helpful assistant.".to_string());
+        body["instructions"] = json!(instructions);
 
         // Convert messages to Responses input items.
         let input = convert_messages_to_responses_input(request);
@@ -52,16 +55,24 @@ impl DeepSeekClient {
             }
         }
 
-        // Reasoning configuration.
-        if let Some(effort) = request.reasoning_effort.as_deref() {
-            let summary = match effort {
-                "off" | "disabled" | "none" | "false" => "off",
-                _ => "auto",
+        // Reasoning configuration. The Codex Responses backend only accepts a
+        // fixed set of effort levels (none/minimal/low/medium/high/xhigh), so
+        // map CodeWhale's effort string onto those and omit reasoning entirely
+        // when it is disabled. CodeWhale's "auto" has no Codex equivalent and
+        // falls back to "medium".
+        if let Some(raw) = request.reasoning_effort.as_deref() {
+            let effort = match raw.trim().to_ascii_lowercase().as_str() {
+                "off" | "disabled" | "none" | "false" => None,
+                "minimal" => Some("minimal"),
+                "low" => Some("low"),
+                "high" => Some("high"),
+                "xhigh" | "max" => Some("xhigh"),
+                _ => Some("medium"),
             };
-            if summary != "off" {
+            if let Some(effort) = effort {
                 body["reasoning"] = json!({
                     "effort": effort,
-                    "summary": summary,
+                    "summary": "auto",
                 });
             }
         }
@@ -89,6 +100,7 @@ impl DeepSeekClient {
             .http_client
             .post(&url)
             .header("Content-Type", "application/json")
+            .header("Accept", "text/event-stream")
             .header("OpenAI-Beta", "responses=experimental")
             .header("originator", "codex_cli_rs");
         if let Some(account_id) = crate::oauth::codex_account_id() {
@@ -128,12 +140,8 @@ impl DeepSeekClient {
                 },
             });
 
-            let mut _response_id = String::new();
-            let mut _current_item_type: Option<String> = None;
             let mut current_block_index: Option<u32> = None;
             let mut saw_tool_call = false;
-            let mut _output_text = String::new();
-            let mut _thinking_text = String::new();
             let mut usage_data: Option<Usage> = None;
             let mut buffer = String::new();
             let mut done = false;
@@ -186,22 +194,12 @@ impl DeepSeekClient {
                             event.get("type").and_then(|t| t.as_str()).unwrap_or("");
 
                         match event_type {
-                            "response.created" => {
-                                if let Some(resp) = event.get("response") {
-                                    _response_id = resp
-                                        .get("id")
-                                        .and_then(|v| v.as_str())
-                                        .unwrap_or("")
-                                        .to_string();
-                                }
-                            }
                             "response.output_item.added" => {
                                 if let Some(item) = event.get("item") {
                                     let item_type = item
                                         .get("type")
                                         .and_then(|v| v.as_str())
                                         .unwrap_or("");
-                                    _current_item_type = Some(item_type.to_string());
 
                                     match item_type {
                                         "message" => {
@@ -272,7 +270,6 @@ impl DeepSeekClient {
                                 if let Some(delta_text) =
                                     event.get("delta").and_then(|d| d.as_str())
                                 {
-                                    _output_text.push_str(delta_text);
                                     if let Some(idx) = current_block_index {
                                         yield Ok(StreamEvent::ContentBlockDelta {
                                             index: idx,
@@ -302,7 +299,6 @@ impl DeepSeekClient {
                                 if let Some(delta_text) =
                                     event.get("delta").and_then(|d| d.as_str())
                                 {
-                                    _thinking_text.push_str(delta_text);
                                     if let Some(idx) = current_block_index {
                                         yield Ok(StreamEvent::ContentBlockDelta {
                                             index: idx,
@@ -317,7 +313,6 @@ impl DeepSeekClient {
                                 if let Some(idx) = current_block_index {
                                     yield Ok(StreamEvent::ContentBlockStop { index: idx });
                                     current_block_index = None;
-                                    _current_item_type = None;
                                 }
                             }
                             "response.completed" => {
@@ -377,6 +372,120 @@ impl DeepSeekClient {
         };
 
         Ok(Box::pin(stream))
+    }
+
+    /// Non-streaming Responses request: drive the streaming handler and fold
+    /// its events into a single `MessageResponse`.
+    ///
+    /// The ChatGPT Codex backend only serves streaming responses, so the
+    /// non-streaming entry point (`create_message`, used by `exec`) reuses the
+    /// same wire path as the interactive stream rather than a second request
+    /// shape.
+    pub(super) async fn handle_responses_message(
+        &self,
+        request: MessageRequest,
+    ) -> Result<MessageResponse> {
+        use futures_util::StreamExt;
+
+        let model = request.model.clone();
+        let mut stream = self.handle_responses_stream(request).await?;
+
+        let mut response = MessageResponse {
+            id: String::new(),
+            r#type: "message".to_string(),
+            role: "assistant".to_string(),
+            content: Vec::new(),
+            model,
+            stop_reason: None,
+            stop_sequence: None,
+            container: None,
+            usage: Usage::default(),
+        };
+        // Accumulated tool-call argument JSON, parallel to `response.content`.
+        let mut tool_args: Vec<String> = Vec::new();
+
+        while let Some(event) = stream.next().await {
+            match event? {
+                StreamEvent::MessageStart { message } => {
+                    response.id = message.id;
+                    response.usage = message.usage;
+                }
+                StreamEvent::ContentBlockStart { content_block, .. } => {
+                    let block = match content_block {
+                        ContentBlockStart::Text { text } => ContentBlock::Text {
+                            text,
+                            cache_control: None,
+                        },
+                        ContentBlockStart::Thinking { thinking } => {
+                            ContentBlock::Thinking { thinking }
+                        }
+                        ContentBlockStart::ToolUse {
+                            id,
+                            name,
+                            input,
+                            caller,
+                        } => ContentBlock::ToolUse {
+                            id,
+                            name,
+                            input,
+                            caller,
+                        },
+                        ContentBlockStart::ServerToolUse { id, name, input } => {
+                            ContentBlock::ServerToolUse { id, name, input }
+                        }
+                    };
+                    response.content.push(block);
+                    tool_args.push(String::new());
+                }
+                StreamEvent::ContentBlockDelta { index, delta } => {
+                    let i = index as usize;
+                    match delta {
+                        Delta::TextDelta { text } => {
+                            if let Some(ContentBlock::Text { text: existing, .. }) =
+                                response.content.get_mut(i)
+                            {
+                                existing.push_str(&text);
+                            }
+                        }
+                        Delta::ThinkingDelta { thinking } => {
+                            if let Some(ContentBlock::Thinking { thinking: existing }) =
+                                response.content.get_mut(i)
+                            {
+                                existing.push_str(&thinking);
+                            }
+                        }
+                        Delta::InputJsonDelta { partial_json } => {
+                            if let Some(buf) = tool_args.get_mut(i) {
+                                buf.push_str(&partial_json);
+                            }
+                        }
+                    }
+                }
+                StreamEvent::ContentBlockStop { index } => {
+                    let i = index as usize;
+                    if let Some(buf) = tool_args.get(i)
+                        && !buf.trim().is_empty()
+                        && let Ok(parsed) = serde_json::from_str::<Value>(buf)
+                        && let Some(ContentBlock::ToolUse { input, .. }) =
+                            response.content.get_mut(i)
+                    {
+                        *input = parsed;
+                    }
+                }
+                StreamEvent::MessageDelta { delta, usage } => {
+                    if let Some(stop_reason) = delta.stop_reason {
+                        response.stop_reason = Some(stop_reason);
+                    }
+                    if let Some(usage) = usage {
+                        response.usage = usage;
+                    }
+                }
+                StreamEvent::MessageStop => break,
+                _ => {}
+            }
+        }
+
+        Ok(response)
     }
 }
 

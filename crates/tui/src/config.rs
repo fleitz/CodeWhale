@@ -2582,9 +2582,9 @@ impl Config {
         // The access token lives in ~/.codex/auth.json (refreshed on demand)
         // rather than a stored API key, so resolve it before the config-file
         // and env slots. Explicit env overrides are handled inside
-        // `codex_access_token`.
+        // `get_credentials`.
         if provider == ApiProvider::OpenaiCodex {
-            return crate::oauth::codex_access_token();
+            return Ok(crate::oauth::get_credentials()?.access_token);
         }
 
         // 1. Config file (provider-scoped slot). This intentionally wins
@@ -5256,9 +5256,12 @@ pub fn has_api_key_for(config: &Config, provider: ApiProvider) -> bool {
         return kimi_cli_credentials_present();
     }
     if provider == ApiProvider::OpenaiCodex {
-        // Any usable Codex credential: either token env override or the Codex
-        // CLI OAuth login on disk.
-        return crate::oauth::credentials_present();
+        // OPENAI_CODEX_ACCESS_TOKEN is already checked above; also honor the
+        // alternate token env var and the Codex CLI OAuth login on disk.
+        if std::env::var("CODEX_ACCESS_TOKEN").is_ok_and(|k| !k.trim().is_empty()) {
+            return true;
+        }
+        return crate::oauth::auth_file_path().exists();
     }
     if matches!(provider, ApiProvider::Huggingface)
         && std::env::var("HF_TOKEN").is_ok_and(|k| !k.trim().is_empty())

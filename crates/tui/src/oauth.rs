@@ -72,23 +72,6 @@ pub fn auth_file_path() -> PathBuf {
     codex_home.join("auth.json")
 }
 
-/// Whether any usable Codex credential is present without performing a refresh
-/// or network call.
-///
-/// Mirrors `kimi_cli_credentials_present`: returns true if an access-token env
-/// override is set or the Codex auth file exists on disk. Used by the provider
-/// picker / auth surfaces so a `codex login` user is not treated as
-/// unauthenticated.
-#[must_use]
-pub fn credentials_present() -> bool {
-    for var in ["OPENAI_CODEX_ACCESS_TOKEN", "CODEX_ACCESS_TOKEN"] {
-        if std::env::var(var).is_ok_and(|v| !v.trim().is_empty()) {
-            return true;
-        }
-    }
-    auth_file_path().exists()
-}
-
 /// Try to extract `exp` (epoch seconds) from a JWT without verifying
 /// the signature. Returns `None` on any parse failure.
 fn jwt_expiry_seconds(token: &str) -> Option<u64> {
@@ -316,14 +299,6 @@ pub fn get_credentials() -> Result<CodexCredentials> {
              Run `codex login` to re-authenticate."
         ),
     }
-}
-
-/// Resolve a Codex access token for use as a bearer credential.
-///
-/// Thin wrapper over [`get_credentials`] that returns just the token string,
-/// matching the shape the config credential-resolution path expects.
-pub fn codex_access_token() -> Result<String> {
-    Ok(get_credentials()?.access_token)
 }
 
 /// Best-effort ChatGPT account id for the `chatgpt-account-id` request header.

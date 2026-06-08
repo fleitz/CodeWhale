@@ -645,13 +645,21 @@ impl DeepSeekClient {
         insecure_skip_tls_verify: bool,
     ) -> Result<reqwest::Client> {
         let headers = build_default_headers(api_key, extra_headers, api_provider, base_url)?;
-        let mut builder = crate::tls::reqwest_client_builder()
-            .default_headers(headers)
-            .user_agent(concat!(
+        // The ChatGPT Codex backend sits behind Cloudflare bot protection that
+        // only admits the Codex CLI's user agent; present a codex_cli_rs UA on
+        // that path so the request is handled like the official client.
+        let user_agent: &str = if api_provider == ApiProvider::OpenaiCodex {
+            concat!("codex_cli_rs/0.137.0 (CodeWhale ", env!("CARGO_PKG_VERSION"), ")")
+        } else {
+            concat!(
                 "Mozilla/5.0 (compatible; codewhale/",
                 env!("CARGO_PKG_VERSION"),
                 "; +https://github.com/Hmbown/CodeWhale)"
-            ))
+            )
+        };
+        let mut builder = crate::tls::reqwest_client_builder()
+            .default_headers(headers)
+            .user_agent(user_agent)
             .connect_timeout(Duration::from_secs(30))
             .tcp_keepalive(Some(Duration::from_secs(30)))
             .http2_keep_alive_interval(Some(Duration::from_secs(15)))
@@ -1123,6 +1131,9 @@ impl LlmClient for DeepSeekClient {
     }
 
     async fn create_message(&self, request: MessageRequest) -> Result<MessageResponse> {
+        if self.api_provider == ApiProvider::OpenaiCodex {
+            return self.handle_responses_message(request).await;
+        }
         self.create_message_chat(&request).await
     }
 
