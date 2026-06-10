@@ -32,7 +32,7 @@ pub(super) const STREAM_MAX_CONTENT_BYTES: usize = 10 * 1024 * 1024; // 10 MB
 /// History: this used to be 300s (5 min) which was too aggressive — V4
 /// thinking turns on hard prompts legitimately exceed 5 minutes wall-clock
 /// while still emitting reasoning_content chunks the whole way. Bumped to
-/// 30 min in v0.6.6 to address `TODO_FIXES.md` #1. Codex defaults to a
+/// 30 min in v0.6.6 after long-reasoning turns hit the old cap. Codex defaults to a
 /// per-chunk idle of 300s with no wall-clock cap; we keep both layers but
 /// give the wall-clock a generous window so it never fires in practice.
 pub(super) const STREAM_MAX_DURATION_SECS: u64 = 1800; // 30 minutes (was 300s; #103/#1)
