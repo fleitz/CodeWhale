@@ -1226,7 +1226,8 @@ pub(super) fn apply_reasoning_effort(
             | ApiProvider::SiliconflowCn
             | ApiProvider::Sglang
             | ApiProvider::Volcengine
-            | ApiProvider::Together => {
+            | ApiProvider::Together
+            | ApiProvider::Atlascloud => {
                 body["thinking"] = json!({ "type": "disabled" });
             }
             ApiProvider::OpenaiCodex => {
@@ -1251,11 +1252,6 @@ pub(super) fn apply_reasoning_effort(
             | ApiProvider::WanjieArk
             | ApiProvider::Arcee
             | ApiProvider::Huggingface => {}
-            ApiProvider::Atlascloud => {
-                // #3024: Atlascloud serves DeepSeek models — speak the
-                // DeepSeek dialect instead of silently dropping the effort.
-                body["thinking"] = json!({ "type": "disabled" });
-            }
             ApiProvider::Moonshot => {
                 // #3024: Kimi models accept thinking enable/disable.
                 body["thinking"] = json!({ "type": "disabled" });
@@ -1277,7 +1273,8 @@ pub(super) fn apply_reasoning_effort(
             | ApiProvider::Siliconflow
             | ApiProvider::SiliconflowCn
             | ApiProvider::Sglang
-            | ApiProvider::Volcengine => {
+            | ApiProvider::Volcengine
+            | ApiProvider::Atlascloud => {
                 body["reasoning_effort"] = json!("high");
                 body["thinking"] = json!({ "type": "enabled" });
             }
@@ -1322,11 +1319,6 @@ pub(super) fn apply_reasoning_effort(
                 body["reasoning_effort"] = json!(value);
             }
             ApiProvider::Openai | ApiProvider::WanjieArk | ApiProvider::OpenaiCodex => {}
-            ApiProvider::Atlascloud => {
-                // #3024: Atlascloud serves DeepSeek models.
-                body["reasoning_effort"] = json!("high");
-                body["thinking"] = json!({ "type": "enabled" });
-            }
             ApiProvider::Moonshot => {
                 // #3024: Kimi models accept thinking enable.
                 body["thinking"] = json!({ "type": "enabled" });
@@ -1348,7 +1340,8 @@ pub(super) fn apply_reasoning_effort(
             | ApiProvider::Siliconflow
             | ApiProvider::SiliconflowCn
             | ApiProvider::Sglang
-            | ApiProvider::Volcengine => {
+            | ApiProvider::Volcengine
+            | ApiProvider::Atlascloud => {
                 body["reasoning_effort"] = json!("max");
                 body["thinking"] = json!({ "type": "enabled" });
             }
@@ -1374,11 +1367,6 @@ pub(super) fn apply_reasoning_effort(
                 body["reasoning_effort"] = json!("high");
             }
             ApiProvider::Openai | ApiProvider::WanjieArk | ApiProvider::OpenaiCodex => {}
-            ApiProvider::Atlascloud => {
-                // #3024: Atlascloud serves DeepSeek models.
-                body["reasoning_effort"] = json!("high");
-                body["thinking"] = json!({ "type": "enabled" });
-            }
             ApiProvider::Moonshot => {
                 // #3024: Kimi models accept thinking enable.
                 body["thinking"] = json!({ "type": "enabled" });
@@ -2569,12 +2557,9 @@ mod tests {
     fn reasoning_effort_off_is_omitted_for_strict_openai_like_providers() {
         for provider in [
             ApiProvider::Openai,
-            ApiProvider::Atlascloud,
             ApiProvider::WanjieArk,
             ApiProvider::Arcee,
             ApiProvider::Huggingface,
-            ApiProvider::Moonshot,
-            ApiProvider::Ollama,
             ApiProvider::Fireworks,
         ] {
             let mut body = json!({});
@@ -2586,6 +2571,49 @@ mod tests {
                 "provider {provider:?} should not receive unsupported reasoning-off fields"
             );
         }
+    }
+
+    #[test]
+    fn reasoning_effort_atlascloud_speaks_deepseek_dialect() {
+        let mut body = json!({});
+        apply_reasoning_effort(&mut body, Some("high"), ApiProvider::Atlascloud);
+        assert_eq!(
+            body,
+            json!({ "reasoning_effort": "high", "thinking": { "type": "enabled" } })
+        );
+
+        let mut body = json!({});
+        apply_reasoning_effort(&mut body, Some("max"), ApiProvider::Atlascloud);
+        assert_eq!(
+            body,
+            json!({ "reasoning_effort": "max", "thinking": { "type": "enabled" } })
+        );
+
+        let mut body = json!({});
+        apply_reasoning_effort(&mut body, Some("off"), ApiProvider::Atlascloud);
+        assert_eq!(body, json!({ "thinking": { "type": "disabled" } }));
+    }
+
+    #[test]
+    fn reasoning_effort_moonshot_toggles_thinking() {
+        let mut body = json!({});
+        apply_reasoning_effort(&mut body, Some("high"), ApiProvider::Moonshot);
+        assert_eq!(body, json!({ "thinking": { "type": "enabled" } }));
+
+        let mut body = json!({});
+        apply_reasoning_effort(&mut body, Some("off"), ApiProvider::Moonshot);
+        assert_eq!(body, json!({ "thinking": { "type": "disabled" } }));
+    }
+
+    #[test]
+    fn reasoning_effort_ollama_toggles_think_flag() {
+        let mut body = json!({});
+        apply_reasoning_effort(&mut body, Some("high"), ApiProvider::Ollama);
+        assert_eq!(body, json!({ "think": true }));
+
+        let mut body = json!({});
+        apply_reasoning_effort(&mut body, Some("off"), ApiProvider::Ollama);
+        assert_eq!(body, json!({ "think": false }));
     }
 
     #[test]

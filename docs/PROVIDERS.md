@@ -283,6 +283,30 @@ DeepSeek compatibility aliases `deepseek-chat` and `deepseek-reasoner` map to
 `deepseek-v4-flash` capability metadata and are scheduled to retire on
 2026-07-24 at 2026-07-24T15:59:00Z.
 
+## Reasoning Effort
+
+`/reasoning <effort>` (and the `reasoning_effort` config key) is translated to
+each provider's wire dialect by the client before the request is sent. `off`
+disables thinking where the dialect supports it; providers marked "omitted"
+receive no reasoning fields at all for that tier.
+
+| Provider | `off` | `low`/`medium`/`high` | `max`/`xhigh` |
+| --- | --- | --- | --- |
+| `deepseek`, `deepseek-cn`, `siliconflow`, `siliconflow-CN`, `sglang`, `volcengine`, `atlascloud` | `thinking: {type: disabled}` | `reasoning_effort: "high"` + `thinking: {type: enabled}` | `reasoning_effort: "max"` + `thinking: {type: enabled}` |
+| `openrouter`, `novita`, `together` | `thinking: {type: disabled}` | `reasoning_effort` pass-through + `thinking: {type: enabled}` | `reasoning_effort: "xhigh"` + `thinking: {type: enabled}` |
+| `moonshot` | `thinking: {type: disabled}` | `thinking: {type: enabled}` | `thinking: {type: enabled}` |
+| `ollama` | `think: false` | `think: true` | `think: true` |
+| `xiaomi-mimo` | `thinking: {type: disabled}` | `thinking: {type: enabled}` | `thinking: {type: enabled}` |
+| `nvidia-nim` | `chat_template_kwargs.thinking: false` | `chat_template_kwargs`: `thinking: true` + `reasoning_effort: "high"` | `chat_template_kwargs`: `thinking: true` + `reasoning_effort: "max"` |
+| `vllm` | `chat_template_kwargs.enable_thinking: false` | `chat_template_kwargs.enable_thinking: true` + `reasoning_effort` low/medium/high | `chat_template_kwargs.enable_thinking: true` + `reasoning_effort: "high"` (vLLM has no max tier) |
+| `arcee`, `huggingface` | omitted | `reasoning_effort` pass-through | `reasoning_effort: "high"` |
+| `fireworks` | omitted | `reasoning_effort: "high"` | `reasoning_effort: "max"` |
+| `openai`, `wanjie-ark` | omitted | omitted | omitted |
+| `openai-codex` | Responses API `reasoning` field (handled by the Responses bridge) | Responses API `reasoning` field | Responses API `reasoning` field |
+
+AtlasCloud serves DeepSeek models, so it speaks the DeepSeek reasoning dialect,
+including the `max` tier (#3024).
+
 ## Drift Check
 
 Run this before changing provider IDs, provider TOML tables, static model
