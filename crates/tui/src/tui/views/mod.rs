@@ -1622,6 +1622,9 @@ fn lifecycle_to_subagent_status(status: AgentLifecycle) -> SubAgentStatus {
         AgentLifecycle::Completed => SubAgentStatus::Completed,
         AgentLifecycle::Failed => SubAgentStatus::Failed("failed in transcript".to_string()),
         AgentLifecycle::Cancelled => SubAgentStatus::Cancelled,
+        AgentLifecycle::Interrupted => {
+            SubAgentStatus::Interrupted("interrupted in transcript".to_string())
+        }
     }
 }
 

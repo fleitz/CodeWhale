@@ -3528,6 +3528,83 @@ fn fanout_started_sibling_bumps_existing_card_revision() {
 }
 
 #[test]
+fn fanout_interrupted_mailbox_drops_running_count() {
+    let mut app = create_test_app();
+    app.pending_subagent_dispatch = Some("rlm".to_string());
+
+    for (seq, id) in ["fanout-a", "fanout-b"].iter().enumerate() {
+        handle_subagent_mailbox(
+            &mut app,
+            seq as u64 + 1,
+            &crate::tools::subagent::MailboxMessage::Started {
+                agent_id: (*id).to_string(),
+                agent_type: "default".to_string(),
+            },
+        );
+    }
+    assert_eq!(
+        crate::tui::subagent_routing::active_fanout_counts(&app),
+        Some((2, 2))
+    );
+
+    handle_subagent_mailbox(
+        &mut app,
+        3,
+        &crate::tools::subagent::MailboxMessage::Interrupted {
+            agent_id: "fanout-a".to_string(),
+            reason: "API call timed out after 120000ms".to_string(),
+        },
+    );
+
+    assert_eq!(
+        crate::tui::subagent_routing::active_fanout_counts(&app),
+        Some((1, 2)),
+        "interrupted worker must no longer count as running"
+    );
+}
+
+#[test]
+fn reconcile_syncs_stale_running_cards_with_interrupted_snapshots() {
+    let mut app = create_test_app();
+    app.pending_subagent_dispatch = Some("rlm".to_string());
+
+    for (seq, id) in ["fanout-a", "fanout-b"].iter().enumerate() {
+        handle_subagent_mailbox(
+            &mut app,
+            seq as u64 + 1,
+            &crate::tools::subagent::MailboxMessage::Started {
+                agent_id: (*id).to_string(),
+                agent_type: "default".to_string(),
+            },
+        );
+    }
+    let fanout_idx = app.last_fanout_card_index.expect("fanout card index");
+    let initial_revision = app.history_revisions[fanout_idx];
+
+    // The card missed its lifecycle envelope; only the manager snapshot
+    // (delivered via AgentList) knows the agents were interrupted.
+    app.subagent_cache = vec![
+        make_subagent(
+            "fanout-a",
+            crate::tools::subagent::SubAgentStatus::Interrupted("API call timed out".to_string()),
+        ),
+        make_subagent("fanout-b", crate::tools::subagent::SubAgentStatus::Running),
+    ];
+    reconcile_subagent_activity_state(&mut app);
+
+    assert_eq!(
+        crate::tui::subagent_routing::active_fanout_counts(&app),
+        Some((1, 2)),
+        "snapshot reconciliation must clear the stale running slot"
+    );
+    assert_ne!(
+        app.history_revisions[fanout_idx], initial_revision,
+        "reconciled card must invalidate cached transcript rows"
+    );
+    assert_eq!(running_agent_count(&app), 1);
+}
+
+#[test]
 fn format_token_count_compact_formats_units() {
     assert_eq!(format_token_count_compact(999), "999");
     assert_eq!(format_token_count_compact(1_200), "1.2k");

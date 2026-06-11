@@ -1317,6 +1317,9 @@ async fn api_timeout_preserves_checkpoint_and_agent_eval_continues_from_it() {
     runtime.client = client;
     runtime.manager = Arc::clone(&manager);
     runtime.context = ToolContext::new(tmp.path());
+    let (mailbox, mut mailbox_rx) =
+        crate::tools::subagent::mailbox::Mailbox::new(tokio_util::sync::CancellationToken::new());
+    runtime.mailbox = Some(mailbox);
 
     let task = SubAgentTask {
         manager_handle: Arc::clone(&manager),
@@ -1374,6 +1377,29 @@ async fn api_timeout_preserves_checkpoint_and_agent_eval_continues_from_it() {
     })
     .await
     .expect("first timed-out API attempt should reach the test server");
+
+    let interrupted_envelope = tokio::time::timeout(Duration::from_secs(2), async {
+        loop {
+            for env in mailbox_rx.drain() {
+                if let MailboxMessage::Interrupted {
+                    agent_id: id,
+                    reason,
+                } = env.message
+                {
+                    return (id, reason);
+                }
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("API timeout should publish an Interrupted mailbox lifecycle event");
+    assert_eq!(interrupted_envelope.0, agent_id);
+    assert!(
+        interrupted_envelope.1.contains("API call timed out"),
+        "reason should carry the timeout context: {}",
+        interrupted_envelope.1
+    );
 
     let ctx = runtime.context.clone();
     let tool = AgentEvalTool::new(Arc::clone(&manager));

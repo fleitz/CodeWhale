@@ -4390,6 +4390,12 @@ async fn run_subagent(
                                 checkpoint.clone(),
                             )?
                         };
+                        if let Some(mb) = runtime.mailbox.as_ref() {
+                            let _ = mb.send(MailboxMessage::Interrupted {
+                                agent_id: agent_id.clone(),
+                                reason: reason.clone(),
+                            });
+                        }
 
                         let next_input = tokio::select! {
                             biased;
