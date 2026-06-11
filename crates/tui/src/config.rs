@@ -188,6 +188,7 @@ pub enum ApiProvider {
     Huggingface,
     Together,
     OpenaiCodex,
+    Anthropic,
 }
 
 impl ApiProvider {
@@ -237,6 +238,7 @@ impl ApiProvider {
             "ollama" | "ollama-local" => Some(Self::Ollama),
             "huggingface" | "hugging-face" | "hugging_face" | "hf" => Some(Self::Huggingface),
             "together" | "together-ai" | "together_ai" => Some(Self::Together),
+            "anthropic" | "claude" => Some(Self::Anthropic),
             "openai-codex" | "openai_codex" | "openaicodex" | "codex" | "chatgpt"
             | "chatgpt-codex" | "chatgpt_codex" | "chatgptcodex" => Some(Self::OpenaiCodex),
             _ => None,
@@ -267,6 +269,7 @@ impl ApiProvider {
             Self::Huggingface => "huggingface",
             Self::Together => "together",
             Self::OpenaiCodex => "openai-codex",
+            Self::Anthropic => "anthropic",
         }
     }
 
@@ -295,6 +298,7 @@ impl ApiProvider {
             Self::Huggingface => "Hugging Face",
             Self::Together => "Together AI",
             Self::OpenaiCodex => "OpenAI Codex (ChatGPT)",
+            Self::Anthropic => "Anthropic",
         }
     }
 
@@ -322,6 +326,7 @@ impl ApiProvider {
             Self::Huggingface,
             Self::Together,
             Self::OpenaiCodex,
+            Self::Anthropic,
         ]
     }
 }
