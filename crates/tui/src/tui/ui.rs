@@ -2302,14 +2302,10 @@ async fn run_event_loop(
                         if app.agent_activity_started_at.is_none() {
                             app.agent_activity_started_at = Some(Instant::now());
                         }
-                        // #3030: Assign a stable user-facing label for this agent.
-                        if !app.agent_label_map.contains_key(&id) {
-                            app.agent_counter = app.agent_counter.saturating_add(1);
-                            app.agent_label_map
-                                .insert(id.clone(), format!("Agent {}", app.agent_counter));
-                        }
-                        app.status_message =
-                            Some(format!("Sub-agent {id} starting: {prompt_summary}"));
+                        // #3030: Assign a stable user-facing label for this
+                        // agent and keep the raw id out of the status bar.
+                        let label = app.ensure_agent_label(&id);
+                        app.status_message = Some(format!("{label} starting: {prompt_summary}"));
                         let _ = engine_handle.send(Op::ListSubAgents).await;
                     }
                     EngineEvent::AgentProgress { id, status } => {
@@ -2324,7 +2320,10 @@ async fn run_event_loop(
                         if app.agent_activity_started_at.is_none() {
                             app.agent_activity_started_at = Some(Instant::now());
                         }
-                        app.status_message = Some(format!("Sub-agent {id}: {display}"));
+                        // #3030: progress can arrive before AgentSpawned is
+                        // observed — assign the stable label on first sight.
+                        let label = app.ensure_agent_label(&id);
+                        app.status_message = Some(format!("{label}: {display}"));
                     }
                     EngineEvent::AgentComplete { id, result } => {
                         execute_subagent_observer_hook(
@@ -2346,8 +2345,10 @@ async fn run_event_loop(
                                         && matches!(agent.status, SubAgentStatus::Running)
                                 });
                         app.agent_progress.remove(&id);
+                        // #3030: stable label with raw-id fallback.
+                        let label = app.agent_display_label(&id);
                         app.status_message = Some(format!(
-                            "Sub-agent {id} completed: {}",
+                            "{label} completed: {}",
                             summarize_tool_output(&result)
                         ));
                         let should_recapture_terminal =

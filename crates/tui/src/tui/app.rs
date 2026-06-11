@@ -2740,6 +2740,28 @@ impl App {
         self.collapsed_cell_map.clear();
     }
 
+    /// #3030: return the stable user-facing label for an agent id
+    /// ("Agent 3"), assigning the next sequential label on first sight.
+    pub(crate) fn ensure_agent_label(&mut self, agent_id: &str) -> String {
+        if let Some(label) = self.agent_label_map.get(agent_id) {
+            return label.clone();
+        }
+        self.agent_counter = self.agent_counter.saturating_add(1);
+        let label = format!("Agent {}", self.agent_counter);
+        self.agent_label_map
+            .insert(agent_id.to_string(), label.clone());
+        label
+    }
+
+    /// #3030: read-only label lookup with raw-id fallback for agents the
+    /// label map has never seen.
+    pub(crate) fn agent_display_label(&self, agent_id: &str) -> String {
+        self.agent_label_map
+            .get(agent_id)
+            .cloned()
+            .unwrap_or_else(|| agent_id.to_string())
+    }
+
     pub fn mark_history_updated(&mut self) {
         self.history_version = self.history_version.wrapping_add(1);
         // Resync per-cell revisions to history.len(). This is the

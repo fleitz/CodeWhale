@@ -3173,3 +3173,18 @@ fn model_catalog_only_advertises_canonical_subagent_tools() {
         );
     }
 }
+
+// ── #3030: step-counter formatting ──────────────────────────────────────────
+
+#[test]
+fn format_step_counter_hides_unbounded_sentinel() {
+    // DEFAULT_MAX_STEPS is u32::MAX, meaning "unbounded" — rendering the
+    // sentinel as a denominator produced "step 16/4294967295".
+    assert_eq!(format_step_counter(16, u32::MAX), "step 16");
+}
+
+#[test]
+fn format_step_counter_keeps_concrete_budgets() {
+    assert_eq!(format_step_counter(3, 25), "step 3/25");
+    assert_eq!(format_step_counter(0, 1), "step 0/1");
+}

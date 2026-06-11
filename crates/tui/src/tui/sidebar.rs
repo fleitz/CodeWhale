@@ -1835,12 +1835,13 @@ fn sidebar_agent_rows(app: &App) -> Vec<SidebarAgentRow> {
                         .map(summarize_tool_output)
                         .filter(|summary| !summary.trim().is_empty())
                 });
-            // #3030: Prefer stable label ("Agent 1") > nickname > raw name.
-            let display_name = app
-                .agent_label_map
-                .get(&agent.agent_id)
-                .cloned()
-                .or_else(|| agent.nickname.clone())
+            // #3030: Prefer the user-assigned nickname > stable label
+            // ("Agent 1") > raw name. Every spawned agent gets a label-map
+            // entry, so the generated label must not shadow nicknames.
+            let display_name = agent
+                .nickname
+                .clone()
+                .or_else(|| app.agent_label_map.get(&agent.agent_id).cloned())
                 .unwrap_or_else(|| agent.name.clone());
             SidebarAgentRow {
                 id: agent.agent_id.clone(),
@@ -1981,8 +1982,9 @@ pub fn subagent_panel_lines(
         if lines.len() >= max_rows {
             break;
         }
+        // #3030: keep raw agent ids out of the compact detail line — the
+        // full id remains available in the hover text.
         let mut detail_parts = Vec::new();
-        detail_parts.push(truncate_line_to_width(&row.id, 10));
         if row.steps_taken > 0 {
             detail_parts.push(format!("{} step(s)", row.steps_taken));
         }
@@ -1996,6 +1998,9 @@ pub fn subagent_panel_lines(
         }
         if let Some(duration) = row.duration_ms {
             detail_parts.push(format_duration_ms(duration));
+        }
+        if detail_parts.is_empty() {
+            detail_parts.push(row.status.clone());
         }
         lines.push(Line::from(Span::styled(
             format!(
@@ -2371,8 +2376,8 @@ mod tests {
         SidebarSubagentSummary, SidebarToolRow, SidebarWorkChecklistItem, SidebarWorkStrategyStep,
         SidebarWorkSummary, ToolRowOrder, auto_sidebar_panels, editorial_tool_rows,
         normalize_activity_text, sidebar_hover_rows, sidebar_work_summary,
-        subagent_panel_hover_texts, subagent_panel_lines, task_panel_lines, work_panel_empty_hint,
-        work_panel_hover_texts, work_panel_lines,
+        subagent_panel_hover_texts, subagent_panel_lines, task_panel_hover_texts, task_panel_lines,
+        work_panel_empty_hint, work_panel_hover_texts, work_panel_lines,
     };
     use crate::config::Config;
     use crate::palette;
@@ -3529,5 +3534,105 @@ mod tests {
             hover.iter().any(|line| line.contains(long_progress)),
             "hover text should include the full progress before popover wrapping: {hover:?}"
         );
+    }
+
+    // ── #3030: stable labels instead of raw internal ids ───────────────────
+
+    #[test]
+    fn tasks_panel_shows_stable_turn_label_not_uuid() {
+        let mut app = create_test_app();
+        app.runtime_turn_id = Some("0196f0a3-1111-2222-3333-444455556666".to_string());
+        app.runtime_turn_status = Some("in_progress".to_string());
+        app.turn_counter = 3;
+
+        let text = lines_to_text(&task_panel_lines(&app, 64, 8));
+        assert!(
+            text[0].contains("Turn 3 (in_progress)"),
+            "compact row must show the stable turn label: {text:?}"
+        );
+        assert!(
+            !text[0].contains("0196f0a3"),
+            "raw turn UUID must stay out of the compact row: {text:?}"
+        );
+
+        let hover = task_panel_hover_texts(&app, 8);
+        assert!(
+            hover[0].contains("0196f0a3-1111-2222-3333-444455556666"),
+            "full turn UUID must remain available in hover text: {hover:?}"
+        );
+    }
+
+    #[test]
+    fn tasks_panel_turn_label_falls_back_before_first_counted_turn() {
+        let mut app = create_test_app();
+        app.runtime_turn_id = Some("0196f0a3-1111-2222-3333-444455556666".to_string());
+        app.runtime_turn_status = Some("in_progress".to_string());
+        app.turn_counter = 0;
+
+        let text = lines_to_text(&task_panel_lines(&app, 64, 8));
+        assert!(
+            text[0].contains("Current turn (in_progress)"),
+            "zero counter falls back to a generic label: {text:?}"
+        );
+    }
+
+    #[test]
+    fn ensure_agent_label_assigns_stable_sequential_labels() {
+        let mut app = create_test_app();
+        assert_eq!(app.ensure_agent_label("agent_aaa111"), "Agent 1");
+        assert_eq!(app.ensure_agent_label("agent_bbb222"), "Agent 2");
+        // Re-seeing a known agent keeps its original label.
+        assert_eq!(app.ensure_agent_label("agent_aaa111"), "Agent 1");
+        assert_eq!(app.agent_counter, 2);
+        // Read-only lookup falls back to the raw id for unknown agents.
+        assert_eq!(app.agent_display_label("agent_bbb222"), "Agent 2");
+        assert_eq!(app.agent_display_label("agent_zzz999"), "agent_zzz999");
+    }
+
+    fn cached_agent(
+        agent_id: &str,
+        nickname: Option<&str>,
+    ) -> crate::tools::subagent::SubAgentResult {
+        crate::tools::subagent::SubAgentResult {
+            name: "implementation-worker".to_string(),
+            agent_id: agent_id.to_string(),
+            context_mode: "fresh".to_string(),
+            fork_context: false,
+            workspace: None,
+            git_branch: None,
+            agent_type: crate::tools::subagent::SubAgentType::General,
+            assignment: crate::tools::subagent::SubAgentAssignment {
+                objective: "task".to_string(),
+                role: Some("worker".to_string()),
+            },
+            model: String::new(),
+            nickname: nickname.map(str::to_string),
+            status: crate::tools::subagent::SubAgentStatus::Running,
+            result: None,
+            steps_taken: 1,
+            checkpoint: None,
+            duration_ms: 100,
+            from_prior_session: false,
+        }
+    }
+
+    #[test]
+    fn sidebar_agent_rows_prefer_nickname_over_generated_label() {
+        let mut app = create_test_app();
+        let agent_id = "agent_cafe0123";
+        app.ensure_agent_label(agent_id);
+        app.subagent_cache
+            .push(cached_agent(agent_id, Some("doc-fixer")));
+
+        let rows = super::sidebar_agent_rows(&app);
+        assert_eq!(
+            rows[0].name, "doc-fixer",
+            "user nickname must beat the generated Agent-N label"
+        );
+
+        // Without a nickname the generated label is used.
+        app.subagent_cache[0].nickname = None;
+        let rows = super::sidebar_agent_rows(&app);
+        assert_eq!(rows[0].name, "Agent 1");
     }
 }
