@@ -10,6 +10,7 @@ use super::spec::{
 };
 use async_trait::async_trait;
 use serde_json::{Value, json};
+use std::fmt::Display;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
@@ -356,7 +357,7 @@ fn read_pdf_via_pdf_extract(
         // pdf-extract returns pages in document order; `start`/`end` are
         // 1-indexed inclusive (validated above), so we convert to a
         // 0-indexed half-open slice with bounds clamping.
-        let pages = pdf_extract::extract_text_by_pages(path).map_err(|e| {
+        let pages = guard_pdf_extract(|| pdf_extract::extract_text_by_pages(path)).map_err(|e| {
             ToolError::execution_failed(format!(
                 "pdf-extract failed on {}: {e} (set `prefer_external_pdftotext = true` in settings.toml to retry via pdftotext)",
                 path.display()
@@ -379,7 +380,7 @@ fn read_pdf_via_pdf_extract(
         // extract_text uses an internal codepath that can hang on certain PDF
         // cross-reference tables or font encodings (#2641). The per-page path
         // avoids that hang and produces identical output when joined.
-        pdf_extract::extract_text_by_pages(path)
+        guard_pdf_extract(|| pdf_extract::extract_text_by_pages(path))
             .map(|pages| pages.join("\n"))
             .map_err(|e| {
                 ToolError::execution_failed(format!(
@@ -389,6 +390,31 @@ fn read_pdf_via_pdf_extract(
             })?
     };
     Ok(ToolResult::success(clean_pdf_text(&text)))
+}
+
+fn guard_pdf_extract<T, E, F>(extract: F) -> Result<T, String>
+where
+    E: Display,
+    F: FnOnce() -> Result<T, E>,
+{
+    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(extract)) {
+        Ok(Ok(value)) => Ok(value),
+        Ok(Err(err)) => Err(err.to_string()),
+        Err(payload) => Err(format!(
+            "extractor panicked: {}",
+            panic_payload_message(payload.as_ref())
+        )),
+    }
+}
+
+fn panic_payload_message(payload: &(dyn std::any::Any + Send)) -> String {
+    if let Some(message) = payload.downcast_ref::<&str>() {
+        (*message).to_string()
+    } else if let Some(message) = payload.downcast_ref::<String>() {
+        message.clone()
+    } else {
+        "unknown panic".to_string()
+    }
 }
 
 fn read_pdf_via_pdftotext(
@@ -1378,6 +1404,17 @@ mod tests {
         );
         // Title text lives on page 1 — must survive the window crop.
         assert!(single.content.contains("Recursive Language Models"));
+    }
+
+    #[test]
+    fn pdf_extract_panic_is_returned_as_tool_error_text() {
+        let err = guard_pdf_extract(|| -> Result<String, &'static str> {
+            panic!("assertion failed: name == \"Identity-H\"");
+        })
+        .expect_err("panic should become an error");
+
+        assert!(err.contains("extractor panicked"));
+        assert!(err.contains("Identity-H"));
     }
 
     #[tokio::test]
