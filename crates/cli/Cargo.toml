@@ -36,7 +36,7 @@ rustls.workspace = true
 semver.workspace = true
 tokio.workspace = true
 sha2.workspace = true
-tempfile = "3.16"
+tempfile = "3.27"
 tracing.workspace = true
 
 [dev-dependencies]
