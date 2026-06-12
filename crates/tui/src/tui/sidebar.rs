@@ -427,11 +427,24 @@ fn work_panel_hover_texts(
         let later = summary.checklist_items.len().saturating_sub(end);
         let remaining = earlier.saturating_add(later);
         if remaining > 0 && texts.len() < max_rows {
-            let label = match (earlier, later) {
+            let mut label = match (earlier, later) {
                 (0, later) => format!("+{later} more checklist items"),
                 (earlier, 0) => format!("+{earlier} earlier checklist items"),
                 (earlier, later) => format!("+{earlier} earlier, +{later} later"),
             };
+            // Hovering the overflow row reveals the omitted items, since
+            // the compact panel gives no other way to inspect them (#3063).
+            let omitted = summary.checklist_items[..start]
+                .iter()
+                .chain(summary.checklist_items[end..].iter());
+            for item in omitted {
+                let prefix = match item.status {
+                    TodoStatus::Pending => "[ ]",
+                    TodoStatus::InProgress => "[~]",
+                    TodoStatus::Completed => "[✓]",
+                };
+                let _ = write!(label, "\n{prefix} #{} {}", item.id, item.content);
+            }
             texts.push(label);
         }
     }
@@ -1934,6 +1947,7 @@ pub struct SidebarAgentRow {
     pub name: String,
     pub role: String,
     pub status: String,
+    pub objective: Option<String>,
     pub git_branch: Option<String>,
     pub progress: Option<String>,
     pub steps_taken: u32,
@@ -1984,6 +1998,8 @@ fn sidebar_agent_rows(app: &App) -> Vec<SidebarAgentRow> {
                 name: display_name,
                 role: agent.agent_type.as_str().to_string(),
                 status: subagent_status_text(&agent.status).to_string(),
+                objective: Some(agent.assignment.objective.clone())
+                    .filter(|objective| !objective.trim().is_empty()),
                 git_branch: agent.git_branch.clone(),
                 progress,
                 steps_taken: agent.steps_taken,
@@ -2013,6 +2029,7 @@ fn sidebar_agent_rows(app: &App) -> Vec<SidebarAgentRow> {
                     name: display_name,
                     role: "agent".to_string(),
                     status: "running".to_string(),
+                    objective: None,
                     git_branch: None,
                     progress: Some(progress.clone()),
                     steps_taken: 0,
@@ -2230,8 +2247,10 @@ fn subagent_panel_hover_texts(
         if texts.len() >= max_rows {
             break;
         }
-        let (marker, _) = agent_status_marker(row.status.as_str(), &palette::UI_THEME);
-        texts.push(format!("{marker} {} {}", row.role, row.name));
+        // The compact label row truncates aggressively, so its hover text
+        // carries the full agent dossier: id, role, status, elapsed,
+        // objective, branch, and untruncated progress (#3063).
+        texts.push(agent_row_hover_text(row));
 
         if row.status == "done" {
             continue;
@@ -2248,7 +2267,7 @@ fn subagent_panel_hover_texts(
         if let Some(progress) = row.progress.as_deref()
             && !progress.trim().is_empty()
         {
-            detail_parts.push(summarize_tool_output(progress));
+            detail_parts.push(progress.trim().to_string());
         }
         if let Some(branch) = row.git_branch.as_deref() {
             detail_parts.push(format!("branch {branch}"));
@@ -2264,6 +2283,35 @@ fn subagent_panel_hover_texts(
     }
 
     texts
+}
+
+/// Full hover dossier for one Agents-panel label row (#3063). The compact
+/// row only shows `marker role name`, so hovering reveals everything else
+/// without spamming raw ids into the normal view.
+fn agent_row_hover_text(row: &SidebarAgentRow) -> String {
+    let (marker, _) = agent_status_marker(row.status.as_str(), &palette::UI_THEME);
+    let mut text = format!("{marker} {} {}", row.role, row.name);
+    let _ = write!(text, "\nid: {}", row.id);
+    let mut status_line = format!("status: {}", row.status);
+    if let Some(duration) = row.duration_ms {
+        let _ = write!(status_line, " · elapsed {}", format_duration_ms(duration));
+    }
+    if row.steps_taken > 0 {
+        let _ = write!(status_line, " · {} step(s)", row.steps_taken);
+    }
+    let _ = write!(text, "\n{status_line}");
+    if let Some(objective) = row.objective.as_deref() {
+        let _ = write!(text, "\nobjective: {}", objective.trim());
+    }
+    if let Some(branch) = row.git_branch.as_deref() {
+        let _ = write!(text, "\nbranch: {branch}");
+    }
+    if let Some(progress) = row.progress.as_deref()
+        && !progress.trim().is_empty()
+    {
+        let _ = write!(text, "\nprogress: {}", progress.trim());
+    }
+    text
 }
 
 fn agent_status_marker(
@@ -2799,6 +2847,47 @@ mod tests {
             text.iter().any(|line| line.contains("earlier"))
                 || text.iter().any(|line| line.contains("later")),
             "truncation should explain omitted checklist rows: {text:?}"
+        );
+    }
+
+    #[test]
+    fn work_panel_overflow_hover_lists_omitted_checklist_items() {
+        let summary = SidebarWorkSummary {
+            checklist_completion_pct: 38,
+            checklist_items: (1..=8)
+                .map(|id| SidebarWorkChecklistItem {
+                    id,
+                    content: format!("Release task {id}"),
+                    status: if id <= 3 {
+                        TodoStatus::Completed
+                    } else if id == 5 {
+                        TodoStatus::InProgress
+                    } else {
+                        TodoStatus::Pending
+                    },
+                })
+                .collect(),
+            ..SidebarWorkSummary::default()
+        };
+
+        let hover = work_panel_hover_texts(&summary, 80, 6);
+        let overflow = hover
+            .iter()
+            .find(|text| text.starts_with('+'))
+            .expect("overflow hover row should exist");
+
+        // Every checklist item is reachable: either as its own hover row or
+        // listed inside the overflow row's hover text (#3063).
+        for id in 1..=8 {
+            let needle = format!("#{id} Release task {id}");
+            assert!(
+                hover.iter().any(|text| text.contains(&needle)),
+                "item {id} should be inspectable via hover: {hover:?}"
+            );
+        }
+        assert!(
+            overflow.lines().count() > 1,
+            "overflow hover should enumerate omitted items: {overflow:?}"
         );
     }
 
@@ -3372,6 +3461,7 @@ mod tests {
             name: "investigator".to_string(),
             role: "worker".to_string(),
             status: "running".to_string(),
+            objective: None,
             git_branch: None,
             progress: Some("scanning".to_string()),
             steps_taken: 2,
@@ -3409,6 +3499,7 @@ mod tests {
             name: "scout".to_string(),
             role: "explorer".to_string(),
             status: "running".to_string(),
+            objective: None,
             git_branch: None,
             progress: Some("reading".to_string()),
             steps_taken: 1,
@@ -3697,6 +3788,7 @@ mod tests {
                 name: "check-docs-mcp".to_string(),
                 role: "explore".to_string(),
                 status: "running".to_string(),
+                objective: None,
                 git_branch: Some("feature/docs".to_string()),
                 progress: Some("step 2/3: running tool 'read_file'".to_string()),
                 steps_taken: 2,
@@ -3707,6 +3799,7 @@ mod tests {
                 name: "check-install-docs".to_string(),
                 role: "general".to_string(),
                 status: "done".to_string(),
+                objective: None,
                 git_branch: None,
                 progress: Some("SUMMARY: docs checked".to_string()),
                 steps_taken: 5,
@@ -3961,6 +4054,7 @@ mod tests {
             name: "sidebar-detail-worker-with-long-name".to_string(),
             role: "worker".to_string(),
             status: "running".to_string(),
+            objective: None,
             git_branch: Some("codex/sidebar-hover".to_string()),
             progress: Some(long_progress.to_string()),
             steps_taken: 9,
@@ -3975,6 +4069,56 @@ mod tests {
         assert!(
             hover.iter().any(|line| line.contains(long_progress)),
             "hover text should include the full progress before popover wrapping: {hover:?}"
+        );
+    }
+
+    #[test]
+    fn subagent_label_hover_carries_full_agent_dossier() {
+        let mut role_counts = std::collections::BTreeMap::new();
+        role_counts.insert("worker".to_string(), 1);
+        let summary = SidebarSubagentSummary {
+            cached_total: 1,
+            cached_running: 1,
+            role_counts,
+            ..SidebarSubagentSummary::default()
+        };
+        let rows = vec![SidebarAgentRow {
+            id: "019e9142-83f6-7713-87f1-28902e74bf05".to_string(),
+            name: "doc-checker".to_string(),
+            role: "worker".to_string(),
+            status: "running".to_string(),
+            objective: Some("Verify install docs against the release notes".to_string()),
+            git_branch: Some("codex/doc-check".to_string()),
+            progress: Some("step 2/3: running tool 'read_file'".to_string()),
+            steps_taken: 2,
+            duration_ms: Some(22_000),
+        }];
+
+        let hover = subagent_panel_hover_texts(&summary, &rows, 6);
+        let label = hover
+            .iter()
+            .find(|text| text.contains("doc-checker"))
+            .expect("label hover row should exist");
+
+        assert!(
+            label.contains("id: 019e9142-83f6-7713-87f1-28902e74bf05"),
+            "label hover should carry the full id: {label:?}"
+        );
+        assert!(
+            label.contains("status: running") && label.contains("elapsed"),
+            "label hover should carry status and elapsed time: {label:?}"
+        );
+        assert!(
+            label.contains("objective: Verify install docs against the release notes"),
+            "label hover should carry the objective: {label:?}"
+        );
+        assert!(
+            label.contains("branch: codex/doc-check"),
+            "label hover should carry the branch: {label:?}"
+        );
+        assert!(
+            label.contains("progress: step 2/3: running tool 'read_file'"),
+            "label hover should carry untruncated progress: {label:?}"
         );
     }
 
