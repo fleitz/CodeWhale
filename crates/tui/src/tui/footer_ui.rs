@@ -6,6 +6,7 @@ use unicode_width::UnicodeWidthStr;
 use crate::core::coherence::CoherenceState;
 use crate::localization::{Locale, MessageId};
 use crate::palette;
+use crate::resource_telemetry::TokenThroughput;
 use crate::tools::subagent::SubAgentStatus;
 use crate::tui::app::App;
 use crate::tui::format_helpers;
@@ -105,7 +106,7 @@ pub(crate) fn render_footer(f: &mut Frame, area: Rect, app: &mut App) {
         if app.fancy_animations {
             props.working_strip_frame = Some(now_ms);
         }
-    } else if props.state_label == "ready"
+    } else if matches!(props.state_label.as_str(), "idle" | "ready")
         && let Some(label) = selected_detail_footer_label(app)
     {
         props.state_label = label;
@@ -409,7 +410,7 @@ pub(crate) fn active_tool_status_label(app: &App) -> Option<String> {
     if active_foreground_shell_running(app) {
         parts.push("Ctrl+B shell".to_string());
     }
-    parts.push(key_shortcuts::tool_details_shortcut_label().to_string());
+    parts.push(key_shortcuts::tool_details_shortcut_hint_label().to_string());
     Some(parts.join(" \u{00B7} "))
 }
 
@@ -732,13 +733,36 @@ pub(crate) fn should_show_footer_cost(displayed_cost: f64) -> bool {
 /// Detailed cache stats live in the separate `cache` chip.
 pub(crate) fn footer_session_tokens_spans(app: &App) -> Vec<Span<'static>> {
     let session = &app.session;
-    if session.total_input_tokens == 0 && session.total_output_tokens == 0 {
+    let throughput = footer_output_throughput_label(app);
+    if session.total_input_tokens == 0 && session.total_output_tokens == 0 && throughput.is_none() {
         return Vec::new();
     }
     let total = u64::from(session.total_input_tokens)
         .saturating_add(u64::from(session.total_output_tokens));
-    let text = format!("tok {}", format_token_count_compact(total));
+    let mut text = if total == 0 {
+        "tok live".to_string()
+    } else {
+        format!("tok {}", format_token_count_compact(total))
+    };
+    if let Some(label) = throughput {
+        text.push_str(" \u{00B7} ");
+        text.push_str(&label);
+    }
     vec![Span::styled(text, Style::default().fg(palette::TEXT_MUTED))]
+}
+
+fn footer_output_throughput_label(app: &App) -> Option<String> {
+    if app.is_loading
+        && let Some(started_at) = app.turn_started_at
+        && let Some(throughput) =
+            TokenThroughput::new(app.streaming_output_token_estimate, started_at.elapsed())
+    {
+        return Some(format!("out ~{}/s live", throughput.compact_rate()));
+    }
+
+    app.session
+        .last_output_throughput
+        .map(|throughput| format!("out {}/s last", throughput.compact_rate()))
 }
 
 /// Test-only helper retained as a parity reference for `FooterWidget`'s
@@ -950,12 +974,14 @@ pub(crate) fn footer_state_label(app: &App) -> (&'static str, ratatui::style::Co
     if app.is_purging {
         return ("purging \u{238B}", app.ui_theme.status_warning);
     }
-    // Note: we deliberately do NOT show a "thinking" label for `is_loading`.
-    // The animated water-spout strip in the footer's spacer is the visual
-    // signal that the model is live; "thinking" was misleading because it
-    // fired for every kind of in-flight work (tool calls, streaming, etc.),
-    // not strictly reasoning. Sub-agents still surface "working" because
-    // that's a distinct lifecycle the user can act on (open `/agents`).
+    if app.is_loading || matches!(app.runtime_turn_status.as_deref(), Some("in_progress")) {
+        return ("busy", app.ui_theme.status_working);
+    }
+    // Note: we deliberately do NOT show a "thinking" label for live turns.
+    // Busy can mean model bytes, tool calls, approval waits, or sub-agents;
+    // the label should be a state indicator, not an invented activity.
+    // Sub-agents still surface "working" because that's a distinct lifecycle
+    // the user can act on (open `/agents`).
     if running_agent_count(app) > 0 {
         return ("working", app.ui_theme.status_working);
     }
@@ -971,7 +997,7 @@ pub(crate) fn footer_state_label(app: &App) -> (&'static str, ratatui::style::Co
         return ("draft", app.ui_theme.text_muted);
     }
 
-    ("ready", app.ui_theme.status_ready)
+    ("idle", app.ui_theme.status_ready)
 }
 
 #[cfg(test)]

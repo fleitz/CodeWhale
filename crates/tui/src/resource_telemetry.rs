@@ -14,7 +14,10 @@
 //! `tools::goal` here to avoid coupling a presentation-layer helper to the tool
 //! domain model (whose budgets are `u32` and carry unrelated bookkeeping).
 
-use std::fmt::{self, Write as _};
+use std::{
+    fmt::{self, Write as _},
+    time::Duration,
+};
 
 /// A coarse, three-level read on how close a task is to exhausting its budget.
 ///
@@ -172,6 +175,57 @@ impl fmt::Display for ResourceTelemetry {
     }
 }
 
+/// Output-token throughput for a live or completed turn.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct TokenThroughput {
+    pub output_tokens: u64,
+    pub elapsed_seconds: f64,
+}
+
+impl TokenThroughput {
+    pub fn new(output_tokens: u64, elapsed: Duration) -> Option<Self> {
+        let elapsed_seconds = elapsed.as_secs_f64();
+        if output_tokens == 0 || !elapsed_seconds.is_finite() || elapsed_seconds <= 0.0 {
+            return None;
+        }
+        Some(Self {
+            output_tokens,
+            elapsed_seconds,
+        })
+    }
+
+    pub fn from_estimated_text(text: &str, elapsed: Duration) -> Option<Self> {
+        Self::new(estimate_output_tokens_from_text(text), elapsed)
+    }
+
+    pub fn tokens_per_second(self) -> f64 {
+        self.output_tokens as f64 / self.elapsed_seconds
+    }
+
+    pub fn compact_rate(self) -> String {
+        let rate = self.tokens_per_second();
+        if rate < 10.0 {
+            format!("{rate:.1}")
+        } else {
+            format!("{rate:.0}")
+        }
+    }
+}
+
+/// Estimate output tokens from streamed text before provider usage arrives.
+///
+/// Provider-reported usage remains canonical at turn completion. During a live
+/// stream, this gives the footer a stable approximation without inspecting
+/// provider-specific tokenizer internals.
+pub fn estimate_output_tokens_from_text(text: &str) -> u64 {
+    let chars = text.chars().count() as u64;
+    if chars == 0 {
+        0
+    } else {
+        chars.saturating_add(3) / 4
+    }
+}
+
 /// Divide `used` by an optional budget, guarding against an absent or zero
 /// budget. Returns `None` when the budget is `None` or `0`.
 fn fraction(used: u64, budget: Option<u64>) -> Option<f64> {
@@ -319,6 +373,38 @@ mod tests {
     fn format_duration_large() {
         // 100 hours, 1 minute, 1 second.
         assert_eq!(format_duration(360_061), "100h01m01s");
+    }
+
+    // ---- throughput -------------------------------------------------------
+
+    #[test]
+    fn token_throughput_formats_compact_rates() {
+        let throughput = TokenThroughput::new(120, Duration::from_secs(6)).expect("throughput");
+        assert_eq!(throughput.tokens_per_second(), 20.0);
+        assert_eq!(throughput.compact_rate(), "20");
+
+        let slow = TokenThroughput::new(15, Duration::from_secs(4)).expect("throughput");
+        assert_eq!(slow.compact_rate(), "3.8");
+    }
+
+    #[test]
+    fn token_throughput_rejects_empty_or_zero_elapsed_samples() {
+        assert!(TokenThroughput::new(0, Duration::from_secs(5)).is_none());
+        assert!(TokenThroughput::new(5, Duration::ZERO).is_none());
+    }
+
+    #[test]
+    fn estimated_streaming_tokens_round_up_from_text_chars() {
+        assert_eq!(estimate_output_tokens_from_text(""), 0);
+        assert_eq!(estimate_output_tokens_from_text("abc"), 1);
+        assert_eq!(estimate_output_tokens_from_text("abcd"), 1);
+        assert_eq!(estimate_output_tokens_from_text("abcde"), 2);
+
+        let throughput =
+            TokenThroughput::from_estimated_text(&"x".repeat(400), Duration::from_secs(10))
+                .expect("estimated throughput");
+        assert_eq!(throughput.output_tokens, 100);
+        assert_eq!(throughput.compact_rate(), "10");
     }
 
     // ---- fraction / percent ----------------------------------------------

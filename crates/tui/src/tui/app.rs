@@ -27,6 +27,7 @@ use crate::models::{
 };
 use crate::palette::{self, UiTheme};
 use crate::pricing::{CostCurrency, CostEstimate};
+use crate::resource_telemetry::TokenThroughput;
 use crate::session_manager::SessionContextReference;
 use crate::settings::Settings;
 use crate::tools::plan::{SharedPlanState, new_shared_plan_state};
@@ -1205,6 +1206,7 @@ pub struct SessionState {
     pub displayed_cost_high_water_cny: f64,
     pub last_prompt_tokens: Option<u32>,
     pub last_completion_tokens: Option<u32>,
+    pub last_output_throughput: Option<TokenThroughput>,
     pub last_prompt_cache_hit_tokens: Option<u32>,
     pub last_prompt_cache_miss_tokens: Option<u32>,
     pub last_reasoning_replay_tokens: Option<u32>,
@@ -1252,6 +1254,10 @@ pub struct SidebarHoverRow {
     /// shell_abc123`); task-manager ids route through `/task` (e.g.
     /// `/task show task_abc123`).
     pub click_action: Option<String>,
+    /// Optional narrower stop target for rows that show an inline `[x]`.
+    pub stop_action: Option<String>,
+    pub stop_zone_start_col: Option<u16>,
+    pub stop_zone_end_col: Option<u16>,
 }
 
 /// Per-section metadata for sidebar hover detection.
@@ -1277,6 +1283,7 @@ impl Default for SessionState {
             displayed_cost_high_water_cny: 0.0,
             last_prompt_tokens: None,
             last_completion_tokens: None,
+            last_output_throughput: None,
             last_prompt_cache_hit_tokens: None,
             last_prompt_cache_miss_tokens: None,
             last_reasoning_replay_tokens: None,
@@ -1302,6 +1309,7 @@ impl SessionState {
         self.total_cache_hit_tokens = 0;
         self.total_cache_miss_tokens = 0;
         self.total_output_tokens = 0;
+        self.last_output_throughput = None;
     }
 }
 
@@ -1703,6 +1711,8 @@ pub struct App {
     pub streaming_thinking_active_entry: Option<usize>,
     /// Newline-gated streaming collector state.
     pub streaming_state: StreamingState,
+    /// Live approximate output tokens for the current assistant stream.
+    pub streaming_output_token_estimate: u64,
     /// Accumulated reasoning text
     pub reasoning_buffer: String,
     /// Live reasoning header extracted from bold text
@@ -1984,6 +1994,7 @@ impl App {
     pub(crate) fn clear_model_scoped_telemetry(&mut self) {
         self.session.last_prompt_tokens = None;
         self.session.last_completion_tokens = None;
+        self.session.last_output_throughput = None;
         self.session.last_prompt_cache_hit_tokens = None;
         self.session.last_prompt_cache_miss_tokens = None;
         self.session.last_reasoning_replay_tokens = None;
@@ -2399,6 +2410,7 @@ impl App {
             suppress_stream_events_until_turn_complete: false,
             streaming_thinking_active_entry: None,
             streaming_state: StreamingState::new(),
+            streaming_output_token_estimate: 0,
             reasoning_buffer: String::new(),
             reasoning_header: None,
             last_reasoning: None,

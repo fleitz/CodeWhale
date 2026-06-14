@@ -98,6 +98,7 @@ pub(crate) fn reset_conversation_state(app: &mut App) -> bool {
     app.last_exec_wait_command = None;
     app.session.last_prompt_tokens = None;
     app.session.last_completion_tokens = None;
+    app.session.last_output_throughput = None;
     app.session.last_prompt_cache_hit_tokens = None;
     app.session.last_prompt_cache_miss_tokens = None;
     app.session.last_reasoning_replay_tokens = None;
@@ -133,6 +134,7 @@ pub fn model(app: &mut App, model_name: Option<&str>) -> CommandResult {
             } else {
                 app.session.last_prompt_tokens = None;
                 app.session.last_completion_tokens = None;
+                app.session.last_output_throughput = None;
             }
             app.provider_models
                 .insert(app.api_provider.as_str().to_string(), "auto".to_string());
@@ -197,6 +199,7 @@ pub fn model(app: &mut App, model_name: Option<&str>) -> CommandResult {
         } else {
             app.session.last_prompt_tokens = None;
             app.session.last_completion_tokens = None;
+            app.session.last_output_throughput = None;
         }
         app.provider_models
             .insert(app.api_provider.as_str().to_string(), model_id.clone());

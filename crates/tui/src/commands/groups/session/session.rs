@@ -252,6 +252,7 @@ pub fn load(app: &mut App, path: Option<&str>) -> CommandResult {
     app.session.displayed_cost_high_water_cny = 0.0;
     app.session.last_prompt_tokens = None;
     app.session.last_completion_tokens = None;
+    app.session.last_output_throughput = None;
     app.session.last_prompt_cache_hit_tokens = None;
     app.session.last_prompt_cache_miss_tokens = None;
     app.session.last_reasoning_replay_tokens = None;

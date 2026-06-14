@@ -1800,6 +1800,27 @@ mod tests {
     }
 
     #[test]
+    fn paragraph_wrap_breaks_no_whitespace_cjk_at_width_40() {
+        // #963: long CJK runs without whitespace must wrap by display width
+        // instead of overflowing or truncating. Each Han character is 2 cols.
+        let long = "界".repeat(300);
+        let rendered = render_paragraph_for_test(&long, 40);
+        for w in rendered_widths(&rendered) {
+            assert!(w <= 40, "rendered width {w} exceeds 40-col window");
+        }
+        let combined: String = rendered
+            .iter()
+            .flat_map(|l| l.spans.iter().map(|s| s.content.to_string()))
+            .collect();
+        assert_eq!(combined.chars().filter(|&ch| ch == '界').count(), 300);
+        assert!(
+            rendered.len() >= 15,
+            "300 double-width chars should wrap into many rows, got {}",
+            rendered.len()
+        );
+    }
+
+    #[test]
     fn paragraph_wrap_breaks_overlong_word_at_widths_60_80_120() {
         let long = format!("https://example.com/{}", "p".repeat(180));
         for &width in &[60usize, 80, 120] {

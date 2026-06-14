@@ -1413,11 +1413,11 @@ fn english(id: MessageId) -> &'static str {
         MessageId::CmdThemeDescription => "Switch theme or open the theme picker",
         MessageId::CmdProviderDescription => "Switch the active provider and/or model",
         MessageId::CmdQueueDescription => "View or edit queued messages",
-        MessageId::CmdQueueUsage => "Usage: /queue [list|edit <n>|drop <n>|clear]",
+        MessageId::CmdQueueUsage => "Usage: /queue [list|send <n>|edit <n>|drop <n>|clear]",
         MessageId::CmdQueueDraftHeader => "Editing queued message:",
         MessageId::CmdQueueNoMessages => "No queued messages",
         MessageId::CmdQueueListHeader => "Queued messages ({count}):",
-        MessageId::CmdQueueTip => "Tip: /queue edit <n> to edit, /queue drop <n> to remove",
+        MessageId::CmdQueueTip => "Tip: /queue send <n> to send now, /queue drop <n> to remove",
         MessageId::CmdQueueAlreadyEditing => {
             "Already editing a queued message. Send it or /queue clear to discard."
         }
@@ -1801,7 +1801,9 @@ fn english(id: MessageId) -> &'static str {
         MessageId::CtxInspNoSystemPrompt => "No system prompt set.",
         MessageId::CtxInspNoReferences => "No file, directory, or media references recorded yet.",
         MessageId::CtxInspNoToolActivity => "No tool activity recorded yet.",
-        MessageId::CtxInspAltVHint => "Open the matching card and press Alt+V for full details.",
+        MessageId::CtxInspAltVHint => {
+            "Open the matching card and press Alt+V (or v) for full details."
+        }
         MessageId::CtxInspCells => "cells",
         MessageId::CtxInspApiMessages => "API messages",
         MessageId::CtxInspActive => "active",
@@ -2024,11 +2026,11 @@ fn vietnamese(id: MessageId) -> Option<&'static str> {
             "Chuyển đổi hoặc xem backend LLM đang hoạt động (deepseek | nvidia-nim | ollama)"
         }
         MessageId::CmdQueueDescription => "Xem hoặc chỉnh sửa các tin nhắn đang chờ xử lý",
-        MessageId::CmdQueueUsage => "Cách dùng: /queue [list|edit <n>|drop <n>|clear]",
+        MessageId::CmdQueueUsage => "Cách dùng: /queue [list|send <n>|edit <n>|drop <n>|clear]",
         MessageId::CmdQueueDraftHeader => "Đang chỉnh sửa tin nhắn đang chờ:",
         MessageId::CmdQueueNoMessages => "Không có tin nhắn đang chờ",
         MessageId::CmdQueueListHeader => "Tin nhắn đang chờ ({count}):",
-        MessageId::CmdQueueTip => "Mẹo: /queue edit <n> để sửa, /queue drop <n> để xóa",
+        MessageId::CmdQueueTip => "Mẹo: /queue send <n> để gửi ngay, /queue drop <n> để xóa",
         MessageId::CmdQueueAlreadyEditing => {
             "Đã đang chỉnh sửa một tin nhắn đang chờ. Hãy gửi nó hoặc dùng /queue clear để hủy."
         }
@@ -2438,7 +2440,7 @@ fn vietnamese(id: MessageId) -> Option<&'static str> {
         MessageId::CtxInspNoSystemPrompt => "Chưa có lời nhắc hệ thống.",
         MessageId::CtxInspNoReferences => "Chưa có tham chiếu tệp, thư mục hoặc phương tiện nào.",
         MessageId::CtxInspNoToolActivity => "Chưa có hoạt động công cụ nào.",
-        MessageId::CtxInspAltVHint => "Mở thẻ phù hợp và nhấn Alt+V để biết chi tiết.",
+        MessageId::CtxInspAltVHint => "Mở thẻ phù hợp và nhấn Alt+V (hoặc v) để biết chi tiết.",
         MessageId::CtxInspCells => "ô",
         MessageId::CtxInspApiMessages => "tin nhắn API",
         MessageId::CtxInspActive => "đang hoạt động",
@@ -2595,7 +2597,7 @@ fn traditional_chinese(id: MessageId) -> Option<&'static str> {
         MessageId::CtxInspNoSystemPrompt => "未設定系統提示。",
         MessageId::CtxInspNoReferences => "尚未記錄任何檔案、目錄或媒體引用。",
         MessageId::CtxInspNoToolActivity => "尚未記錄任何工具活動。",
-        MessageId::CtxInspAltVHint => "開啟對應的卡片並按 Alt+V 檢視詳細資訊。",
+        MessageId::CtxInspAltVHint => "開啟對應的卡片並按 Alt+V（或 v）檢視詳細資訊。",
         MessageId::CtxInspCells => "儲存格",
         MessageId::CtxInspApiMessages => "API 訊息",
         MessageId::CtxInspActive => "作用中",
@@ -2831,11 +2833,11 @@ fn japanese(id: MessageId) -> Option<&'static str> {
             "現在の LLM バックエンドを切り替え・確認（deepseek | nvidia-nim | ollama）"
         }
         MessageId::CmdQueueDescription => "キューされたメッセージを確認・編集",
-        MessageId::CmdQueueUsage => "使用方法: /queue [list|edit <n>|drop <n>|clear]",
+        MessageId::CmdQueueUsage => "使用方法: /queue [list|send <n>|edit <n>|drop <n>|clear]",
         MessageId::CmdQueueDraftHeader => "キューされたメッセージを編集中:",
         MessageId::CmdQueueNoMessages => "キューされたメッセージはありません",
         MessageId::CmdQueueListHeader => "キューされたメッセージ ({count}):",
-        MessageId::CmdQueueTip => "ヒント: /queue edit <n> で編集、/queue drop <n> で削除",
+        MessageId::CmdQueueTip => "ヒント: /queue send <n> で今すぐ送信、/queue drop <n> で削除",
         MessageId::CmdQueueAlreadyEditing => {
             "すでにキューされたメッセージを編集中です。送信するか /queue clear で破棄してください。"
         }
@@ -3219,7 +3221,9 @@ fn japanese(id: MessageId) -> Option<&'static str> {
             "ファイル、ディレクトリ、メディアの参照はまだ記録されていません。"
         }
         MessageId::CtxInspNoToolActivity => "ツールアクティビティはまだ記録されていません。",
-        MessageId::CtxInspAltVHint => "該当するカードを開き、Alt+V を押すと詳細が表示されます。",
+        MessageId::CtxInspAltVHint => {
+            "該当するカードを開き、Alt+V（または v）を押すと詳細が表示されます。"
+        }
         MessageId::CtxInspCells => "セル",
         MessageId::CtxInspApiMessages => "API メッセージ",
         MessageId::CtxInspActive => "アクティブ",
@@ -3407,11 +3411,11 @@ fn chinese_simplified(id: MessageId) -> Option<&'static str> {
             "切换或查看当前 LLM 后端（deepseek | nvidia-nim | ollama）"
         }
         MessageId::CmdQueueDescription => "查看或编辑已排队的消息",
-        MessageId::CmdQueueUsage => "用法: /queue [list|edit <n>|drop <n>|clear]",
+        MessageId::CmdQueueUsage => "用法: /queue [list|send <n>|edit <n>|drop <n>|clear]",
         MessageId::CmdQueueDraftHeader => "正在编辑已排队的消息:",
         MessageId::CmdQueueNoMessages => "没有已排队的消息",
         MessageId::CmdQueueListHeader => "已排队的消息 ({count}):",
-        MessageId::CmdQueueTip => "提示: /queue edit <n> 编辑, /queue drop <n> 删除",
+        MessageId::CmdQueueTip => "提示: /queue send <n> 立即发送, /queue drop <n> 删除",
         MessageId::CmdQueueAlreadyEditing => {
             "已在编辑一条已排队的消息。请先发送或使用 /queue clear 放弃。"
         }
@@ -3749,7 +3753,7 @@ fn chinese_simplified(id: MessageId) -> Option<&'static str> {
         MessageId::CtxInspNoSystemPrompt => "未设置系统提示。",
         MessageId::CtxInspNoReferences => "尚未记录任何文件、目录或媒体引用。",
         MessageId::CtxInspNoToolActivity => "尚未记录任何工具活动。",
-        MessageId::CtxInspAltVHint => "打开对应的卡片并按 Alt+V 查看详细信息。",
+        MessageId::CtxInspAltVHint => "打开对应的卡片并按 Alt+V（或 v）查看详细信息。",
         MessageId::CtxInspCells => "单元格",
         MessageId::CtxInspApiMessages => "API 消息",
         MessageId::CtxInspActive => "活动中",
@@ -3953,11 +3957,13 @@ fn portuguese_brazil(id: MessageId) -> Option<&'static str> {
             "Trocar ou exibir o backend LLM ativo (deepseek | nvidia-nim | ollama)"
         }
         MessageId::CmdQueueDescription => "Ver ou editar mensagens enfileiradas",
-        MessageId::CmdQueueUsage => "Uso: /queue [list|edit <n>|drop <n>|clear]",
+        MessageId::CmdQueueUsage => "Uso: /queue [list|send <n>|edit <n>|drop <n>|clear]",
         MessageId::CmdQueueDraftHeader => "Editando mensagem enfileirada:",
         MessageId::CmdQueueNoMessages => "Nenhuma mensagem enfileirada",
         MessageId::CmdQueueListHeader => "Mensagens enfileiradas ({count}):",
-        MessageId::CmdQueueTip => "Dica: /queue edit <n> para editar, /queue drop <n> para remover",
+        MessageId::CmdQueueTip => {
+            "Dica: /queue send <n> para enviar agora, /queue drop <n> para remover"
+        }
         MessageId::CmdQueueAlreadyEditing => {
             "Já está editando uma mensagem enfileirada. Envie-a ou use /queue clear para descartar."
         }
@@ -4364,7 +4370,7 @@ fn portuguese_brazil(id: MessageId) -> Option<&'static str> {
         }
         MessageId::CtxInspNoToolActivity => "Nenhuma atividade de ferramenta registrada ainda.",
         MessageId::CtxInspAltVHint => {
-            "Abra o cartão correspondente e pressione Alt+V para detalhes completos."
+            "Abra o cartão correspondente e pressione Alt+V (ou v) para detalhes completos."
         }
         MessageId::CtxInspCells => "células",
         MessageId::CtxInspApiMessages => "mensagens da API",
@@ -4579,12 +4585,12 @@ fn spanish_latin_america(id: MessageId) -> Option<&'static str> {
             "Cambiar o mostrar el backend LLM activo (deepseek | nvidia-nim | ollama)"
         }
         MessageId::CmdQueueDescription => "Ver o editar mensajes en cola",
-        MessageId::CmdQueueUsage => "Uso: /queue [list|edit <n>|drop <n>|clear]",
+        MessageId::CmdQueueUsage => "Uso: /queue [list|send <n>|edit <n>|drop <n>|clear]",
         MessageId::CmdQueueDraftHeader => "Editando mensaje en cola:",
         MessageId::CmdQueueNoMessages => "No hay mensajes en cola",
         MessageId::CmdQueueListHeader => "Mensajes en cola ({count}):",
         MessageId::CmdQueueTip => {
-            "Consejo: /queue edit <n> para editar, /queue drop <n> para eliminar"
+            "Consejo: /queue send <n> para enviar ahora, /queue drop <n> para eliminar"
         }
         MessageId::CmdQueueAlreadyEditing => {
             "Ya estás editando un mensaje en cola. Envíalo o usa /queue clear para descartarlo."
@@ -4994,7 +5000,7 @@ fn spanish_latin_america(id: MessageId) -> Option<&'static str> {
         }
         MessageId::CtxInspNoToolActivity => "Aún no se ha registrado actividad de herramientas.",
         MessageId::CtxInspAltVHint => {
-            "Abra la tarjeta correspondiente y presione Alt+V para ver los detalles completos."
+            "Abra la tarjeta correspondiente y presione Alt+V (o v) para ver los detalles completos."
         }
         MessageId::CtxInspCells => "celdas",
         MessageId::CtxInspApiMessages => "mensajes de API",

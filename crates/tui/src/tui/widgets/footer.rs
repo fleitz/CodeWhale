@@ -41,8 +41,8 @@ pub struct FooterProps {
     pub text_muted_color: Color,
     /// Background color for the full footer/status bar row.
     pub footer_bg: Color,
-    /// Status label like `"ready"`, `"thinking ⌫"`, `"working"`. When the
-    /// label equals `"ready"` the footer hides the status segment entirely.
+    /// Status label like `"idle"`, `"busy"`, `"working"`. When the label
+    /// equals `"ready"` the footer hides the status segment entirely.
     pub state_label: String,
     /// Color used for the status label.
     pub state_color: Color,
@@ -860,13 +860,13 @@ mod tests {
     }
 
     #[test]
-    fn from_app_loading_state_uses_thinking_label_and_warning_color() {
+    fn from_app_loading_state_uses_busy_label_and_working_color() {
         let app = make_app();
         let props = FooterProps::from_app(
             &app,
             None,
-            "thinking \u{238B}",
-            palette::STATUS_WARNING,
+            "busy",
+            palette::DEEPSEEK_SKY,
             Vec::<Span<'static>>::new(),
             Vec::<Span<'static>>::new(),
             Vec::<Span<'static>>::new(),
@@ -875,8 +875,8 @@ mod tests {
             Vec::<Span<'static>>::new(),
         );
 
-        assert!(props.state_label.starts_with("thinking"));
-        assert_eq!(props.state_color, palette::STATUS_WARNING);
+        assert_eq!(props.state_label, "busy");
+        assert_eq!(props.state_color, palette::DEEPSEEK_SKY);
     }
 
     #[test]

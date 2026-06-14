@@ -64,6 +64,13 @@ pub(super) fn tool_details_shortcut_label() -> &'static str {
     }
 }
 
+pub(super) fn tool_details_shortcut_hint_label() -> &'static str {
+    match tool_details_shortcut_label() {
+        "\u{2325}+V" => "\u{2325}+V/v",
+        _ => "Alt+V/v",
+    }
+}
+
 pub(super) fn activity_shortcut_label() -> &'static str {
     "Ctrl+O"
 }

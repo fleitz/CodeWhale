@@ -97,7 +97,7 @@ static PROVIDER_INFO: CommandInfo = CommandInfo {
 static QUEUE_INFO: CommandInfo = CommandInfo {
     name: "queue",
     aliases: &["queued"],
-    usage: "/queue [list|edit <n>|drop <n>|clear]",
+    usage: "/queue [list|send <n>|edit <n>|drop <n>|clear]",
     description_id: MessageId::CmdQueueDescription,
 };
 static STASH_INFO: CommandInfo = CommandInfo {

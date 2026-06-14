@@ -1462,7 +1462,7 @@ pub enum StatusItem {
     Model,
     /// Session cost in the configured display currency.
     Cost,
-    /// Activity label: "ready" / "draft" / "working".
+    /// Activity label: "idle" / "busy" / "draft" / "working".
     Status,
     /// Coherence intervention label: "refreshing context" / "verifying" / "resetting plan".
     Coherence,
@@ -1563,7 +1563,7 @@ impl StatusItem {
             StatusItem::Mode => "Mode",
             StatusItem::Model => "Model",
             StatusItem::Cost => "Session cost",
-            StatusItem::Status => "Activity (ready/draft/working)",
+            StatusItem::Status => "Activity (idle/busy/draft/working)",
             StatusItem::Coherence => "Coherence interventions",
             StatusItem::Agents => "Sub-agents in flight",
             StatusItem::ReasoningReplay => "Reasoning replay tokens",

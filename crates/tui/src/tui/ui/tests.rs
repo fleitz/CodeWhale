@@ -288,6 +288,19 @@ fn composer_newline_shortcuts_do_not_steal_ctrl_enter() {
     )));
 }
 
+#[cfg(target_os = "macos")]
+#[test]
+fn cmd_enter_normalizes_to_control_enter_not_newline() {
+    use crate::tui::composer_ui::normalize_macos_modifiers;
+
+    let normalized = normalize_macos_modifiers(KeyModifiers::SUPER);
+    assert!(normalized.contains(KeyModifiers::CONTROL));
+    assert!(!is_composer_newline_key(KeyEvent::new(
+        KeyCode::Enter,
+        normalized,
+    )));
+}
+
 #[test]
 fn word_cursor_modifier_accepts_control_and_alt() {
     assert!(is_word_cursor_modifier(KeyModifiers::CONTROL));
@@ -791,6 +804,9 @@ fn loading_mouse_filter_allows_sidebar_hover_popovers() {
             detail: Some("Detailed context".to_string()),
             is_truncated: true,
             click_action: None,
+            stop_action: None,
+            stop_zone_start_col: None,
+            stop_zone_end_col: None,
         }],
     });
     let moved = MouseEvent {
@@ -2057,6 +2073,7 @@ fn active_tool_status_label_summarizes_live_tool_group() {
     assert!(label.contains("1 active"));
     assert!(label.contains("1 done"));
     assert!(label.contains(crate::tui::key_shortcuts::tool_details_shortcut_label()));
+    assert!(label.contains("/v"));
 }
 
 #[test]
@@ -4298,26 +4315,47 @@ fn footer_session_tokens_chip_uses_single_compact_total() {
 }
 
 #[test]
+fn footer_session_tokens_chip_shows_live_output_throughput() {
+    let mut app = create_test_app();
+    app.is_loading = true;
+    app.turn_started_at = Some(Instant::now() - Duration::from_secs(10));
+    app.streaming_output_token_estimate = 125;
+
+    let text = spans_text(&footer_session_tokens_spans(&app));
+
+    assert_eq!(text, "tok live \u{00B7} out ~12/s live");
+}
+
+#[test]
+fn footer_session_tokens_chip_shows_last_reported_output_throughput() {
+    let mut app = create_test_app();
+    app.session.total_input_tokens = 1_000;
+    app.session.total_output_tokens = 240;
+    app.session.last_output_throughput =
+        crate::resource_telemetry::TokenThroughput::new(240, Duration::from_secs(12));
+
+    let text = spans_text(&footer_session_tokens_spans(&app));
+
+    assert_eq!(text, "tok 1.2k \u{00B7} out 20/s last");
+}
+
+#[test]
 fn format_context_budget_caps_overflow_display() {
     assert_eq!(format_context_budget(5_000, 128_000), "5.0k/128.0k");
     assert_eq!(format_context_budget(250_000, 128_000), ">128.0k/128.0k");
 }
 
 #[test]
-fn footer_state_label_drops_thinking_and_prefers_compacting() {
-    // We deliberately do not surface a "thinking" label for `is_loading` —
-    // the animated water-spout strip in the footer's spacer is the visual
-    // signal. `is_loading` alone falls through to "ready"; `is_compacting`
-    // still wins because compacting is a less-common, distinct state.
+fn footer_state_label_shows_idle_busy_and_prefers_compacting() {
+    // The footer should expose a steady idle/busy state chip without reviving
+    // the old misleading "thinking" label. Compacting still wins because it
+    // is a less-common, distinct state.
     let mut app = create_test_app();
-    assert_eq!(footer_state_label(&app).0, "ready");
+    assert_eq!(footer_state_label(&app).0, "idle");
 
     app.is_loading = true;
-    assert_eq!(
-        footer_state_label(&app).0,
-        "ready",
-        "is_loading must NOT produce a `thinking` text label — the animation handles it"
-    );
+    assert_eq!(footer_state_label(&app).0, "busy");
+    assert_ne!(footer_state_label(&app).0, "thinking");
 
     app.is_compacting = true;
     assert!(footer_state_label(&app).0.starts_with("compacting"));
@@ -4568,15 +4606,15 @@ fn footer_status_line_spans_show_mode_and_model_idle_and_active() {
     assert!(idle.contains("agent"));
     assert!(idle.contains("deepseek-v4-flash"));
     assert!(idle.contains("\u{00B7}"));
-    assert!(!idle.contains("ready"));
+    assert!(idle.contains("idle"));
 
-    // is_loading no longer adds a "thinking" text label — the live-work
-    // signal is the animated water-spout strip the renderer paints into
-    // the footer's spacer. The mode + model still render unchanged.
+    // is_loading uses the state chip, not a misleading "thinking" text label.
+    // The mode + model still render unchanged.
     app.is_loading = true;
     let active = spans_text(&footer_status_line_spans(&app, 60));
     assert!(active.contains("agent"));
     assert!(active.contains("deepseek-v4-flash"));
+    assert!(active.contains("busy"));
     assert!(
         !active.contains("thinking"),
         "footer must not show a `thinking` text label while loading"
@@ -5770,7 +5808,7 @@ async fn dismissed_plan_prompt_leaves_non_numeric_input_for_normal_send_path() {
     );
     assert_eq!(
         app.status_message.as_deref(),
-        Some("Offline: 1 queued — ↑ to edit, /queue list")
+        Some("Offline: 1 queued follow-up(s) — ↑ edit last, /queue send <n>")
     );
 }
 
@@ -5919,6 +5957,70 @@ async fn ctrl_s_sends_edited_queued_draft_into_running_turn() {
     let content = engine.rx_steer.recv().await.expect("steer content");
     assert!(content.contains("edited queued follow-up"));
     assert!(content.contains("skill body"));
+}
+
+#[test]
+fn parse_queue_send_command_accepts_queue_alias_and_positive_index() {
+    assert_eq!(parse_queue_send_command("/queue send 2"), Some(Ok(1)));
+    assert_eq!(parse_queue_send_command("/queued now 1"), Some(Ok(0)));
+    assert!(parse_queue_send_command("/queue drop 1").is_none());
+    assert!(
+        parse_queue_send_command("/queue send 0")
+            .expect("send command should parse")
+            .is_err()
+    );
+}
+
+#[tokio::test]
+async fn queue_send_index_sends_selected_message_into_running_turn() {
+    let mut app = create_test_app();
+    app.is_loading = true;
+    app.queue_message(crate::tui::app::QueuedMessage::new(
+        "first stays queued".to_string(),
+        None,
+    ));
+    app.queue_message(crate::tui::app::QueuedMessage::new(
+        "second sends now".to_string(),
+        None,
+    ));
+    let config = Config::default();
+    let mut engine = crate::core::engine::mock_engine_handle();
+
+    assert!(
+        send_queued_message_at_index_now(&mut app, &config, &engine.handle, 1)
+            .await
+            .expect("indexed send succeeds")
+    );
+
+    assert_eq!(app.queued_message_count(), 1);
+    assert_eq!(
+        app.queued_messages.front().map(|msg| msg.display.as_str()),
+        Some("first stays queued")
+    );
+    assert_eq!(
+        engine.rx_steer.recv().await.as_deref(),
+        Some("second sends now")
+    );
+}
+
+#[tokio::test]
+async fn enter_while_model_waiting_steers_instead_of_queueing() {
+    let mut app = create_test_app();
+    app.is_loading = true;
+    app.streaming_message_index = None;
+    let config = Config::default();
+    let mut engine = crate::core::engine::mock_engine_handle();
+    let queued = build_queued_message(&mut app, "adjust current turn".to_string());
+
+    submit_or_steer_message(&mut app, &config, &engine.handle, queued)
+        .await
+        .expect("busy waiting submit steers");
+
+    assert_eq!(app.queued_message_count(), 0);
+    assert_eq!(
+        engine.rx_steer.recv().await.as_deref(),
+        Some("adjust current turn")
+    );
 }
 
 #[tokio::test]
@@ -6161,7 +6263,7 @@ fn detail_target_prefers_visible_tool_card() {
     let expected = format!(
         "{} Activity: find · {} raw",
         crate::tui::key_shortcuts::activity_shortcut_label(),
-        crate::tui::key_shortcuts::tool_details_shortcut_label()
+        crate::tui::key_shortcuts::tool_details_shortcut_hint_label()
     );
     assert_eq!(
         selected_detail_footer_label(&app).as_deref(),
@@ -6216,7 +6318,7 @@ fn activity_footer_hint_uses_details_for_subagent_cards() {
     let expected = format!(
         "{} Activity: sub-agent · {} details",
         crate::tui::key_shortcuts::activity_shortcut_label(),
-        crate::tui::key_shortcuts::tool_details_shortcut_label()
+        crate::tui::key_shortcuts::tool_details_shortcut_hint_label()
     );
     assert_eq!(
         selected_detail_footer_label(&app).as_deref(),
@@ -8723,7 +8825,7 @@ fn tab_queues_running_turn_draft_for_next_turn() {
     assert!(
         app.status_message
             .as_deref()
-            .is_some_and(|msg| msg.contains("queued — ↑"))
+            .is_some_and(|msg| msg.contains("queued follow-up(s)"))
     );
 }
 
