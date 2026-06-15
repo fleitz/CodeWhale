@@ -83,6 +83,11 @@ pub struct SettingsSection {
     pub max_history: usize,
     pub cost_currency: CostCurrencyValue,
     pub prefer_external_pdftotext: bool,
+    #[schemars(
+        title = "Follow symlinks",
+        description = "Follow symbolic links during workspace file discovery walks. Enable for symlink-based multi-project workspaces."
+    )]
+    pub workspace_follow_symlinks: bool,
     pub default_model: Option<String>,
 }
 
@@ -352,6 +357,7 @@ pub fn build_document(app: &App, config: &Config) -> Result<ConfigUiDocument> {
             max_history: settings.max_input_history,
             cost_currency: CostCurrencyValue::from_setting(&settings.cost_currency)?,
             prefer_external_pdftotext: settings.prefer_external_pdftotext,
+            workspace_follow_symlinks: settings.workspace_follow_symlinks,
             default_model,
         },
         config: ConfigSection {
@@ -551,6 +557,10 @@ pub fn apply_document(
         (
             "prefer_external_pdftotext",
             bool_str(doc.settings.prefer_external_pdftotext),
+        ),
+        (
+            "workspace_follow_symlinks",
+            bool_str(doc.settings.workspace_follow_symlinks),
         ),
         ("mcp_config_path", doc.config.mcp_config_path.as_str()),
     ] {

@@ -319,6 +319,19 @@ pub struct Settings {
     /// `binary_unavailable` response with an install hint, matching the
     /// pre-v0.8.32 behavior.
     pub prefer_external_pdftotext: bool,
+    /// Follow symbolic links during workspace file discovery walks (`@`-mention
+    /// completion, fuzzy resolve, and the file-index builder). When `false`
+    /// (default) symlinked directories are skipped, which keeps walks fast and
+    /// avoids accidentally traversing into system paths. Set to `true` to
+    /// support symlink-based multi-project workspaces where several project
+    /// directories are symlinked into a single hub directory.
+    ///
+    /// **Note**: The walker has built-in cycle detection that skips already-
+    /// visited real paths, so symlink loops (A→B→A) will not cause infinite
+    /// recursion. However, enabling this on workspaces with symlinks that
+    /// point to large directory trees (e.g. `/usr`, home directories) can
+    /// significantly increase first-turn latency and memory usage.
+    pub workspace_follow_symlinks: bool,
 }
 
 impl Default for Settings {
@@ -362,6 +375,7 @@ impl Default for Settings {
             status_indicator: "whale".to_string(),
             synchronized_output: "auto".to_string(),
             prefer_external_pdftotext: false,
+            workspace_follow_symlinks: false,
         }
     }
 }
@@ -688,6 +702,9 @@ impl Settings {
             "prefer_external_pdftotext" | "external_pdftotext" | "pdftotext" => {
                 self.prefer_external_pdftotext = parse_bool(value)?;
             }
+            "workspace_follow_symlinks" | "follow_symlinks" => {
+                self.workspace_follow_symlinks = parse_bool(value)?;
+            }
             "default_mode" | "mode" => {
                 let normalized = normalize_mode(value);
                 if !["agent", "plan", "yolo"].contains(&normalized) {
@@ -827,6 +844,10 @@ impl Settings {
             "  prefer_external_pdftotext: {}",
             self.prefer_external_pdftotext
         ));
+        lines.push(format!(
+            "  workspace_follow_symlinks: {}",
+            self.workspace_follow_symlinks
+        ));
         lines.push(format!("  default_mode:       {}", self.default_mode));
         lines.push(format!(
             "  sidebar_width:      {}%",
@@ -942,6 +963,10 @@ impl Settings {
             (
                 "prefer_external_pdftotext",
                 "Route PDF reads through Poppler's pdftotext instead of the bundled pure-Rust extractor: on/off (default off)",
+            ),
+            (
+                "workspace_follow_symlinks",
+                "Follow symbolic links during workspace file discovery walks: on/off (default off). Enable for symlink-based multi-project workspaces. Has built-in cycle detection but may increase latency on large symlinked trees.",
             ),
             ("default_mode", "Default mode: agent, plan, yolo"),
             ("sidebar_width", "Sidebar width percentage: 10-50"),

@@ -255,6 +255,12 @@ fn show_single_setting(app: &App, key: &str) -> CommandResult {
         "prefer_external_pdftotext" | "external_pdftotext" | "pdftotext" => Settings::load()
             .ok()
             .map(|settings| settings.prefer_external_pdftotext.to_string()),
+        "workspace_follow_symlinks" | "follow_symlinks" => Settings::load().ok().map(|settings| {
+            format!(
+                "{} (restart required for engine tools)",
+                settings.workspace_follow_symlinks
+            )
+        }),
         _ => {
             let known = Settings::available_settings()
                 .iter()
@@ -759,6 +765,26 @@ pub fn set_config_value(app: &mut App, key: &str, value: &str, persist: bool) ->
             app.mention_walk_depth = settings.mention_walk_depth;
             app.composer.mention_completion_cache = None;
             app.needs_redraw = true;
+        }
+        "workspace_follow_symlinks" | "follow_symlinks" => {
+            app.workspace_follow_symlinks = settings.workspace_follow_symlinks;
+            app.composer.mention_completion_cache = None;
+            app.needs_redraw = true;
+            // Engine tools use EngineConfig which is fixed at startup
+            return CommandResult::message(if persist {
+                if let Err(e) = settings.save() {
+                    return CommandResult::error(format!("Failed to save: {e}"));
+                }
+                format!(
+                    "workspace_follow_symlinks = {} (saved; restart required for engine tools)",
+                    settings.workspace_follow_symlinks
+                )
+            } else {
+                format!(
+                    "workspace_follow_symlinks = {} (session only for UI; restart required for engine tools)",
+                    settings.workspace_follow_symlinks
+                )
+            });
         }
         "transcript_spacing" | "spacing" => {
             app.transcript_spacing =

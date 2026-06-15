@@ -380,6 +380,12 @@ pub struct EngineConfig {
     /// Applied to the per-turn tool registry after built-in tools are registered.
     /// When `None`, no overrides or plugin loading occurs.
     pub tools: Option<crate::config::ToolsConfig>,
+    /// Whether tools should follow symbolic links. When `true`, symlinked
+    /// directories are traversed by walk-based tools and symlinked paths
+    /// that resolve outside the workspace are still allowed (the symlink
+    /// itself must be inside the workspace). Mirrors the
+    /// `workspace_follow_symlinks` setting.
+    pub workspace_follow_symlinks: bool,
 }
 
 impl Default for EngineConfig {
@@ -442,6 +448,7 @@ impl Default for EngineConfig {
             prefer_bwrap: false,
             verbosity: None,
             tools: None,
+            workspace_follow_symlinks: false,
         }
     }
 }
@@ -2397,7 +2404,8 @@ impl Engine {
         ))
         .with_cancel_token(self.cancel_token.clone())
         .with_shell_policy(shell_policy_for_mode(mode, self.session.allow_shell))
-        .with_trusted_external_paths(trusted_external_paths);
+        .with_trusted_external_paths(trusted_external_paths)
+        .with_follow_symlinks(self.config.workspace_follow_symlinks);
 
         // Hand the user-memory path to tools so the model-callable
         // `remember` tool can append entries (#489). `None` when the

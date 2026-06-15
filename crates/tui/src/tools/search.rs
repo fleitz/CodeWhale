@@ -169,6 +169,7 @@ impl ToolSpec for GrepFilesTool {
 
         let workspace = context.workspace.clone();
         let cancel_token = context.cancel_token.clone();
+        let follow_symlinks = context.follow_symlinks;
 
         // The directory walk and per-file regex are synchronous blocking work.
         // Run them on a blocking worker bounded by a hard timeout so a huge tree
@@ -182,6 +183,7 @@ impl ToolSpec for GrepFilesTool {
                 &include_patterns,
                 &exclude_patterns,
                 cancel_token,
+                follow_symlinks,
             )?;
 
             // Search files
@@ -336,6 +338,7 @@ fn collect_files(
     include_patterns: &[String],
     exclude_patterns: &[String],
     cancel_token: Option<&CancellationToken>,
+    follow_symlinks: bool,
 ) -> Result<Vec<PathBuf>, ToolError> {
     let mut files = Vec::new();
     check_cancelled(cancel_token)?;
@@ -352,6 +355,7 @@ fn collect_files(
         exclude_patterns,
         cancel_token,
         &mut files,
+        follow_symlinks,
     )?;
     Ok(files)
 }
@@ -363,6 +367,7 @@ fn collect_files_recursive(
     exclude_patterns: &[String],
     cancel_token: Option<&CancellationToken>,
     files: &mut Vec<PathBuf>,
+    follow_symlinks: bool,
 ) -> Result<(), ToolError> {
     check_cancelled(cancel_token)?;
 
@@ -386,7 +391,7 @@ fn collect_files_recursive(
                 e
             ))
         })?;
-        if file_type.is_symlink() {
+        if file_type.is_symlink() && !follow_symlinks {
             continue;
         }
 
@@ -399,7 +404,19 @@ fn collect_files_recursive(
             continue;
         }
 
-        if file_type.is_dir() {
+        // When following symlinks, resolve the target type for directories
+        // and files so symlinked dirs are traversed and symlinked files are
+        // included.
+        let effective_type = if file_type.is_symlink() && follow_symlinks {
+            match fs::metadata(&path) {
+                Ok(meta) => meta.file_type(),
+                Err(_) => continue,
+            }
+        } else {
+            file_type
+        };
+
+        if effective_type.is_dir() {
             collect_files_recursive(
                 root,
                 &path,
@@ -407,8 +424,9 @@ fn collect_files_recursive(
                 exclude_patterns,
                 cancel_token,
                 files,
+                follow_symlinks,
             )?;
-        } else if file_type.is_file() {
+        } else if effective_type.is_file() {
             // Check inclusions (if any specified)
             if include_patterns.is_empty() || should_include(&relative_str, include_patterns) {
                 files.push(path);

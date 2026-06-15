@@ -111,17 +111,17 @@ pub fn summarize_project(root: &Path) -> String {
 /// directory still precedes its children because `"src" < "src/lib.rs"`)
 /// while making the rendered output byte-stable across runs.
 #[must_use]
-pub fn project_tree(root: &Path, max_depth: usize) -> String {
+pub fn project_tree(root: &Path, max_depth: usize, follow_symlinks: bool) -> String {
     let mut entries: Vec<(PathBuf, bool)> = Vec::new();
 
     let mut builder = WalkBuilder::new(root);
     builder
         .hidden(false)
-        .follow_links(false)
+        .follow_links(follow_symlinks)
         .max_depth(Some(max_depth + 1));
 
     for entry in builder.build().flatten() {
-        if entry.file_type().is_some_and(|ft| ft.is_symlink()) {
+        if entry.file_type().is_some_and(|ft| ft.is_symlink()) && !follow_symlinks {
             continue;
         }
         let depth = entry.depth();
@@ -756,7 +756,7 @@ mod project_mapping_tests {
         fs::write(root.join("apple.txt"), "a").expect("write apple");
         fs::write(root.join("mango.txt"), "m").expect("write mango");
 
-        let tree = project_tree(root, 1);
+        let tree = project_tree(root, 1, false);
         let lines: Vec<&str> = tree.lines().collect();
         let apple_pos = lines
             .iter()
@@ -786,7 +786,7 @@ mod project_mapping_tests {
         fs::write(src.join("lib.rs"), "lib").expect("write lib");
         fs::write(src.join("main.rs"), "main").expect("write main");
 
-        let tree = project_tree(root, 2);
+        let tree = project_tree(root, 2, false);
         let src_pos = tree.find("DIR: src").expect("src dir line");
         let lib_pos = tree.find("FILE: lib.rs").expect("lib file line");
         let main_pos = tree.find("FILE: main.rs").expect("main file line");
@@ -802,7 +802,7 @@ mod project_mapping_tests {
         fs::write(root.join("z.txt"), "z").expect("write");
         fs::write(root.join("a.txt"), "a").expect("write");
 
-        assert_eq!(project_tree(root, 1), project_tree(root, 1));
+        assert_eq!(project_tree(root, 1, false), project_tree(root, 1, false));
     }
 
     #[test]
@@ -818,7 +818,7 @@ mod project_mapping_tests {
         std::os::unix::fs::symlink(&outside_file, root.join("Cargo.toml")).expect("symlink");
 
         assert_eq!(summarize_project(&root), "Unknown project type");
-        assert!(!project_tree(&root, 1).contains("Cargo.toml"));
+        assert!(!project_tree(&root, 1, false).contains("Cargo.toml"));
     }
 
     #[test]

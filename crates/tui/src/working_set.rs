@@ -33,6 +33,10 @@ pub struct Workspace {
     cwd: Option<PathBuf>,
     file_index: OnceLock<HashMap<String, Vec<PathBuf>>>,
     completion_walk_depth: Option<usize>,
+    /// Follow symbolic links during file discovery walks. When `true`,
+    /// symlinked directories are traversed, enabling multi-project workspaces
+    /// where project directories are symlinked into a hub directory.
+    follow_links: bool,
 }
 
 struct SearchContext<'a> {
@@ -82,11 +86,23 @@ impl Workspace {
     /// Construct with an explicit completion walk depth. A depth of `0`
     /// disables the depth limit for users with deeply nested workspaces.
     pub fn with_cwd_and_depth(root: PathBuf, cwd: Option<PathBuf>, walk_depth: usize) -> Self {
+        Self::with_cwd_depth_and_follow_links(root, cwd, walk_depth, false)
+    }
+
+    /// Construct with an explicit completion walk depth and symlink-following
+    /// preference. See [`Workspace::follow_links`].
+    pub fn with_cwd_depth_and_follow_links(
+        root: PathBuf,
+        cwd: Option<PathBuf>,
+        walk_depth: usize,
+        follow_links: bool,
+    ) -> Self {
         Self {
             root,
             cwd,
             file_index: OnceLock::new(),
             completion_walk_depth: normalize_completion_walk_depth(walk_depth),
+            follow_links,
         }
     }
 
@@ -132,7 +148,8 @@ impl Workspace {
     fn build_file_index(&self) -> HashMap<String, Vec<PathBuf>> {
         let mut index: HashMap<String, Vec<PathBuf>> = HashMap::new();
         let mut total: usize = 0;
-        let builder = discovery_walk_builder(&self.root, self.completion_walk_depth);
+        let builder =
+            discovery_walk_builder(&self.root, self.completion_walk_depth, self.follow_links);
 
         for entry in builder.build().flatten() {
             if total >= FILE_INDEX_MAX_ENTRIES {
@@ -168,7 +185,7 @@ impl Workspace {
             let mut dot_builder = WalkBuilder::new(&dot_dir);
             dot_builder
                 .hidden(true)
-                .follow_links(false)
+                .follow_links(self.follow_links)
                 .git_ignore(false)
                 .ignore(false);
             if let Some(depth) = child_completion_walk_depth(self.completion_walk_depth) {
@@ -204,6 +221,7 @@ impl Workspace {
             &self.root,
             LOCAL_REFERENCE_SCAN_LIMIT,
             self.completion_walk_depth,
+            self.follow_links,
         ) {
             if total >= FILE_INDEX_MAX_ENTRIES {
                 break;
@@ -262,15 +280,34 @@ impl Workspace {
                 .map(|c| c != self.root.as_path())
                 .unwrap_or(false);
             if cwd_diverges && let Some(cwd) = self.cwd.as_deref() {
-                walk_for_completions(cwd, cwd, &mut ctx, self.completion_walk_depth);
-                add_local_reference_completions(cwd, cwd, &mut ctx, self.completion_walk_depth);
+                walk_for_completions(
+                    cwd,
+                    cwd,
+                    &mut ctx,
+                    self.completion_walk_depth,
+                    self.follow_links,
+                );
+                add_local_reference_completions(
+                    cwd,
+                    cwd,
+                    &mut ctx,
+                    self.completion_walk_depth,
+                    self.follow_links,
+                );
             }
-            walk_for_completions(&self.root, &self.root, &mut ctx, self.completion_walk_depth);
+            walk_for_completions(
+                &self.root,
+                &self.root,
+                &mut ctx,
+                self.completion_walk_depth,
+                self.follow_links,
+            );
             add_local_reference_completions(
                 &self.root,
                 &self.root,
                 &mut ctx,
                 self.completion_walk_depth,
+                self.follow_links,
             );
         }
 
@@ -319,7 +356,7 @@ impl Workspace {
         let mut builder = WalkBuilder::new(&dir);
         builder
             .hidden(!show_hidden)
-            .follow_links(false)
+            .follow_links(self.follow_links)
             .max_depth(Some(1));
         let _ = builder.add_custom_ignore_filename(".deepseekignore");
 
@@ -391,13 +428,17 @@ fn child_completion_walk_depth(depth: Option<usize>) -> Option<usize> {
 /// above the actual entry count and the cap is a no-op.
 const FILE_INDEX_MAX_ENTRIES: usize = 50_000;
 
-/// Configure a `WalkBuilder` for workspace discovery: hidden files, no
-/// symlink following, depth-limited, custom `.deepseekignore` honored,
-/// and gitignore overrides for AI-tool dot-directories so `@`-completion
-/// finds them even when they're gitignored.
-fn discovery_walk_builder(root: &Path, max_depth: Option<usize>) -> WalkBuilder {
+/// Configure a `WalkBuilder` for workspace discovery: hidden files,
+/// depth-limited, custom `.deepseekignore` honored, and gitignore overrides
+/// for AI-tool dot-directories so `@`-completion finds them even when
+/// they're gitignored. Symlink following is controlled by `follow_links`.
+fn discovery_walk_builder(
+    root: &Path,
+    max_depth: Option<usize>,
+    follow_links: bool,
+) -> WalkBuilder {
     let mut builder = WalkBuilder::new(root);
-    builder.hidden(true).follow_links(false);
+    builder.hidden(true).follow_links(follow_links);
     if let Some(depth) = max_depth {
         builder.max_depth(Some(depth));
     }
@@ -413,6 +454,7 @@ fn walk_always_discoverable_dirs(
     display_root: &Path,
     ctx: &mut SearchContext<'_>,
     max_depth: Option<usize>,
+    follow_links: bool,
 ) {
     for dir_name in DISCOVERY_ALWAYS_DIRS {
         let dot_dir = walk_root.join(dir_name);
@@ -422,7 +464,7 @@ fn walk_always_discoverable_dirs(
         let mut builder = WalkBuilder::new(&dot_dir);
         builder
             .hidden(true)
-            .follow_links(false)
+            .follow_links(follow_links)
             .git_ignore(false)
             .ignore(false);
         if let Some(depth) = max_depth {
@@ -465,8 +507,9 @@ fn walk_for_completions(
     display_root: &Path,
     ctx: &mut SearchContext<'_>,
     max_depth: Option<usize>,
+    follow_links: bool,
 ) {
-    let builder = discovery_walk_builder(walk_root, max_depth);
+    let builder = discovery_walk_builder(walk_root, max_depth, follow_links);
 
     for entry in builder.build().flatten() {
         if ctx.is_full() {
@@ -497,7 +540,7 @@ fn walk_for_completions(
 
     // Also walk the AI-tool dot-directories with gitignore disabled so
     // `.deepseek/`, `.cursor/`, etc. are always discoverable.
-    walk_always_discoverable_dirs(walk_root, display_root, ctx, max_depth);
+    walk_always_discoverable_dirs(walk_root, display_root, ctx, max_depth, follow_links);
 }
 
 const LOCAL_REFERENCE_SCAN_LIMIT: usize = 4096;
@@ -507,12 +550,13 @@ fn add_local_reference_completions(
     display_root: &Path,
     ctx: &mut SearchContext<'_>,
     max_depth: Option<usize>,
+    follow_links: bool,
 ) {
     if !should_try_local_reference_completion(ctx.needle) {
         return;
     }
 
-    for path in local_reference_paths(root, LOCAL_REFERENCE_SCAN_LIMIT, max_depth) {
+    for path in local_reference_paths(root, LOCAL_REFERENCE_SCAN_LIMIT, max_depth, follow_links) {
         if ctx.is_full() {
             break;
         }
@@ -542,12 +586,17 @@ fn should_try_local_reference_completion(needle: &str) -> bool {
     needle.starts_with('.') || needle.contains('/') || needle.contains('\\')
 }
 
-fn local_reference_paths(root: &Path, limit: usize, max_depth: Option<usize>) -> Vec<PathBuf> {
+fn local_reference_paths(
+    root: &Path,
+    limit: usize,
+    max_depth: Option<usize>,
+    follow_links: bool,
+) -> Vec<PathBuf> {
     let mut out = Vec::new();
     let mut builder = WalkBuilder::new(root);
     builder
         .hidden(false)
-        .follow_links(false)
+        .follow_links(follow_links)
         .git_ignore(false)
         .git_global(false)
         .git_exclude(false);
@@ -587,6 +636,7 @@ impl Clone for Workspace {
             cwd: self.cwd.clone(),
             file_index: OnceLock::new(),
             completion_walk_depth: self.completion_walk_depth,
+            follow_links: self.follow_links,
         }
     }
 }

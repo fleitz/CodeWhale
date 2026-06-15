@@ -182,7 +182,7 @@ fn gather_project_context(workspace: &Path) -> String {
     }
 
     // Directory tree (from existing utility).
-    let tree = crate::utils::project_tree(workspace, 3);
+    let tree = crate::utils::project_tree(workspace, 3, false);
     ctx.push_str("## Directory Structure (depth 3)\n\n```\n");
     ctx.push_str(&tree);
     ctx.push_str("\n```\n\n");
