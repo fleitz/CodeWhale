@@ -2637,6 +2637,30 @@ impl App {
         self.mode = mode;
         self.status_message = Some(format!("Switched to {} mode", mode.label()));
 
+        // Restore outgoing mode state before capturing incoming mode state. This
+        // keeps cross-mode hops such as Plan -> YOLO and YOLO -> Plan from
+        // saving transient policy values as the next mode's baseline.
+        if leaving_yolo && let Some(restore) = self.yolo_restore.take() {
+            self.allow_shell = restore.allow_shell;
+            self.trust_mode = restore.trust_mode;
+            self.approval_mode = restore.approval_mode;
+        }
+
+        // Plan save/restore (#3279): Plan mode derives its write-blocking from
+        // the mode itself (turn_loop), but the TUI approval surface reads
+        // `app.approval_mode` without consulting `app.mode`.  Save the Agent-era
+        // approval mode when entering Plan so it is restored when the user
+        // switches back to Agent.
+        if leaving_plan && let Some(restore) = self.plan_restore.take() {
+            self.approval_mode = restore.approval_mode;
+        }
+
+        if entering_plan {
+            self.plan_restore = Some(PlanRestoreState {
+                approval_mode: self.approval_mode,
+            });
+        }
+
         // YOLO save/restore: captures the full pre-YOLO permission surface so
         // exiting YOLO puts the user back exactly where they were.
         if entering_yolo {
@@ -2648,23 +2672,6 @@ impl App {
             self.allow_shell = true;
             self.trust_mode = true;
             self.approval_mode = ApprovalMode::Auto;
-        } else if leaving_yolo && let Some(restore) = self.yolo_restore.take() {
-            self.allow_shell = restore.allow_shell;
-            self.trust_mode = restore.trust_mode;
-            self.approval_mode = restore.approval_mode;
-        }
-
-        // Plan save/restore (#3279): Plan mode derives its write-blocking from
-        // the mode itself (turn_loop), but the TUI approval surface reads
-        // `app.approval_mode` without consulting `app.mode`.  Save the Agent-era
-        // approval mode when entering Plan so it is restored when the user
-        // switches back to Agent.
-        if entering_plan {
-            self.plan_restore = Some(PlanRestoreState {
-                approval_mode: self.approval_mode,
-            });
-        } else if leaving_plan && let Some(restore) = self.plan_restore.take() {
-            self.approval_mode = restore.approval_mode;
         }
 
         self.yolo = mode == AppMode::Yolo;
@@ -6972,6 +6979,52 @@ mod tests {
         assert_eq!(app.approval_mode, ApprovalMode::Auto);
 
         app.set_mode(AppMode::Agent);
+        assert!(!app.allow_shell);
+        assert!(!app.trust_mode);
+        assert_eq!(app.approval_mode, ApprovalMode::Never);
+    }
+
+    #[test]
+    fn set_mode_plan_restores_previous_approval_on_agent_exit() {
+        let config = Config {
+            approval_policy: Some("never".to_string()),
+            ..Default::default()
+        };
+        let mut options = test_options(false);
+        options.start_in_agent_mode = true; // avoid coupling to settings.default_mode
+        let mut app = App::new(options, &config);
+        assert_eq!(app.mode, AppMode::Agent);
+        assert_eq!(app.approval_mode, ApprovalMode::Never);
+
+        app.set_mode(AppMode::Plan);
+        app.approval_mode = ApprovalMode::Suggest;
+
+        app.set_mode(AppMode::Agent);
+        assert_eq!(app.mode, AppMode::Agent);
+        assert_eq!(app.approval_mode, ApprovalMode::Never);
+    }
+
+    #[test]
+    fn set_mode_plan_to_yolo_keeps_yolo_permissions_and_restores_agent_baseline() {
+        let mut options = test_options(false);
+        options.allow_shell = false;
+        options.start_in_agent_mode = true; // avoid coupling to settings.default_mode
+        let mut app = App::new(options, &Config::default());
+        app.allow_shell = false;
+        app.trust_mode = false;
+        app.approval_mode = ApprovalMode::Never;
+
+        app.set_mode(AppMode::Plan);
+        app.approval_mode = ApprovalMode::Suggest;
+
+        app.set_mode(AppMode::Yolo);
+        assert_eq!(app.mode, AppMode::Yolo);
+        assert!(app.allow_shell);
+        assert!(app.trust_mode);
+        assert_eq!(app.approval_mode, ApprovalMode::Auto);
+
+        app.set_mode(AppMode::Agent);
+        assert_eq!(app.mode, AppMode::Agent);
         assert!(!app.allow_shell);
         assert!(!app.trust_mode);
         assert_eq!(app.approval_mode, ApprovalMode::Never);
