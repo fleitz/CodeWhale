@@ -1,5 +1,10 @@
 # The CodeWhale Agent Runtime — one durable substrate, familiar launchers
 
+> Public naming: CodeWhale exposes **Agents** for delegated work and
+> **Workflows** for durable multi-agent plans. `sub-agent`, `Fleet`, and
+> `WhaleFlow` remain implementation names. See
+> [Orchestration Terminology](ORCHESTRATION_TERMINOLOGY.md).
+
 This document explains how sub-agents, the headless `exec` path, and Agent Fleet
 relate. It exists because these had drifted into *two* parallel "worker"
 systems, and the fix is to make the **fleet-backed worker run** the durable

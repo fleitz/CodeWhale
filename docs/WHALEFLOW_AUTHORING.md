@@ -1,4 +1,8 @@
-# WhaleFlow Authoring
+# Workflow Authoring
+
+> Public naming: **Workflows** are the user-facing concept. `WhaleFlow` is the
+> internal Workflow engine and crate name. See
+> [Orchestration Terminology](ORCHESTRATION_TERMINOLOGY.md).
 
 WhaleFlow has one runtime boundary: authored workflow source lowers to typed
 Rust `WorkflowSpec`, Rust validates the IR, and the scheduler/headless worker

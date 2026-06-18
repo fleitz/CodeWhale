@@ -1,4 +1,8 @@
-# Agent Fleet
+# Agent Control Plane
+
+> Public naming: this is the **Agent control plane**. `Fleet` is the internal
+> scheduler/ledger/host-transport name and the current CLI namespace. See
+> [Orchestration Terminology](ORCHESTRATION_TERMINOLOGY.md).
 
 Agent Fleet is the local-first control plane for durable multi-worker runs. It
 is **not** a separate execution engine: a fleet worker is a headless
@@ -28,25 +32,27 @@ Fleet state is stored under the workspace in `.codewhale/fleet.jsonl`. Worker
 logs and adapter logs are stored under `.codewhale/fleet/` and
 `.codewhale/fleet-host/`.
 
-## Naming: Modes, WhaleFlow, Fleet, and Swarm
+## Naming: Agents, Workflows, Fleet, and Swarm
 
-These names describe different layers, not competing systems. Agent, Plan, and
-YOLO stay the permission/work modes. WhaleFlow is an orchestration overlay that
-can run on top of those modes when the task needs a continuous workflow.
+These names describe different layers, not competing product concepts. Agent,
+Plan, and YOLO stay the permission/work modes. Publicly, CodeWhale has
+**Agents** for delegated work and **Workflows** for durable multi-agent plans.
 
-- **WhaleFlow** is the repeatable workflow plan and user-facing orchestration
-  overlay: a script/IR that decides which phases and agents run next, keeps
-  intermediate results out of the main conversation, and can be inspected or
-  rerun. A WhaleFlow run should have a visible progress view and a clear active
-  header state instead of feeling like a hidden background task.
-- **Fleet** is the execution substrate: headless workers, local/SSH hosts,
+- **Agents** are delegated workers with roles, model routes, permissions,
+  transcripts, and status.
+- **Workflows** are repeatable orchestration plans that decide which phases and
+  Agents run next, keep intermediate results out of the main conversation, and
+  can be inspected or rerun.
+- **Fleet** is the Agent control plane: headless workers, local/SSH hosts,
   trust policy, leases, heartbeats, logs, receipts, and status APIs.
-- **Swarm** is the high-fanout behavior inside WhaleFlow. It is gated in
+- **WhaleFlow** is the Workflow engine: typed IR, authoring, validation, and
+  replay.
+- **Swarm** is high-fanout Workflow behavior. It is gated in
   v0.8.61: `/swarm` must not revive prompt-only sub-agent fanout. It should
-  compile into a WhaleFlow-backed fleet run once the durable worker and goal
+  compile into a Workflow-backed Agent run once the durable worker and goal
   re-dispatch substrate is available.
 
-UI guidance: keep the main transcript calm. A WhaleFlow run should appear as a
+UI guidance: keep the main transcript calm. A Workflow run should appear as a
 compact progress card plus Work/Agents sidebar rows with phase names, worker
 counts, receipts, and nested indentation for child workers. Use the whale mark
 sparingly as an active header/status signal; avoid repeating emoji-heavy rows

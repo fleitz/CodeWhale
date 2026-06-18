@@ -1,5 +1,10 @@
 # Workroom Architecture
 
+> Public naming: Workrooms are collaboration contexts. They organize threads,
+> links, events, and shared visibility; they are not a third orchestration
+> concept beside **Agents** and **Workflows**. See
+> [Orchestration Terminology](ORCHESTRATION_TERMINOLOGY.md).
+
 ## Purpose
 
 Workrooms are CodeWhale's chat-native abstraction for durable, addressable

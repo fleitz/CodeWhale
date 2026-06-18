@@ -9,6 +9,7 @@ import { MobileMenu } from "./mobile-menu";
 const EN_LINKS = [
   { href: "/en/install", label: "Install", cn: "安装" },
   { href: "/en/docs", label: "Docs", cn: "文档" },
+  { href: "/en/wiki", label: "Wiki", cn: "源码" },
   { href: "/en/feed", label: "Activity", cn: "动态" },
   { href: "/en/roadmap", label: "Roadmap", cn: "路线" },
   { href: "/en/faq", label: "FAQ", cn: "问答" },
@@ -18,6 +19,7 @@ const EN_LINKS = [
 const ZH_LINKS = [
   { href: "/zh/install", label: "安装", cn: "" },
   { href: "/zh/docs", label: "文档", cn: "" },
+  { href: "/zh/wiki", label: "Wiki", cn: "" },
   { href: "/zh/feed", label: "动态", cn: "" },
   { href: "/zh/roadmap", label: "路线图", cn: "" },
   { href: "/zh/faq", label: "常见问题", cn: "" },
@@ -59,7 +61,7 @@ export function Nav({ locale = "en" }: { locale?: Locale }) {
           </div>
         </Link>
 
-        <nav className="hidden md:flex items-center gap-7">
+        <nav className="hidden md:flex items-center gap-5 lg:gap-7">
           {links.map((l) => (
             <Link key={l.href} href={l.href} className="nav-link group">
               <span>{l.label}</span>

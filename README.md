@@ -131,8 +131,8 @@ one you want isn't here, that's a good issue to open.
   ChatGPT/Codex CLI login (working).
 
 Routing is more than a base URL swap: `/reasoning` effort is translated into
-each provider's wire dialect, sub-agent tiers resolve per provider, and the
-system prompt's model facts are templated per-model instead of hardcoded.
+each provider's wire dialect, delegated Agent tiers resolve per provider, and
+the system prompt's model facts are templated per-model instead of hardcoded.
 Switch mid-session with `/provider` and `/model`. The full registry —
 credentials, base URLs, capability boundaries — lives in
 [docs/PROVIDERS.md](docs/PROVIDERS.md).
@@ -231,11 +231,13 @@ The README is the short version. The rest is in docs and on
 - [User guide](docs/GUIDE.md) · [Install guide](docs/INSTALL.md) ·
   [Configuration](docs/CONFIGURATION.md) · [Provider registry](docs/PROVIDERS.md)
 - [Modes](docs/MODES.md) — Agent, Plan, and YOLO.
-- [Sub-agents](docs/SUBAGENTS.md) — roles, lifecycle, output contract, and
-  recovery behavior.
+- [Agents and Workflows terminology](docs/ORCHESTRATION_TERMINOLOGY.md) —
+  the public naming model for delegated work and durable orchestration.
+- [Agents](docs/SUBAGENTS.md) — delegated roles, lifecycle, output contract,
+  and recovery behavior.
 - [Architecture](docs/ARCHITECTURE.md) — crate layout, runtime flow, tool system,
   extension points, and security model.
-- [Fleet](docs/FLEET.md) · [WhaleFlow authoring](docs/WHALEFLOW_AUTHORING.md) ·
+- [Agent control plane](docs/FLEET.md) · [Workflow authoring](docs/WHALEFLOW_AUTHORING.md) ·
   [MCP](docs/MCP.md) · [Runtime API](docs/RUNTIME_API.md) ·
   [Model Lab](docs/MODEL_LAB.md)
 - [Keybindings](docs/KEYBINDINGS.md) · [Sandbox & approvals](docs/SANDBOX.md)

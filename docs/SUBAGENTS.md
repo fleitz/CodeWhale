@@ -1,4 +1,8 @@
-# Sub-Agents
+# Agents
+
+> Public naming: **Agents** are delegated workers. The codebase and some
+> compatibility surfaces still use `sub-agent` / `subagent` for the current
+> implementation. See [Orchestration Terminology](ORCHESTRATION_TERMINOLOGY.md).
 
 Sub-agents are the user-facing vocabulary for nested worker assignments: a
 parent launches a focused role (`explore`, `review`, `implementer`, `verifier`,
@@ -18,7 +22,7 @@ cutover completes. It can still be useful for short in-session delegation, but
 if a child fails once on a transient provider timeout while an equivalent fleet
 worker would retry from the ledger, that is a runtime unification gap. For work
 that must survive provider hiccups, process restarts, sleep, or remote
-execution, prefer Fleet or a WhaleFlow-backed fleet run.
+execution, prefer the Agent control plane or a Workflow-backed Agent run.
 
 Sub-agents inherit the parent's tool registry by default, but child agents are
 leaf workers: they do not receive `agent` or nested lifecycle tools. `agent`
