@@ -1071,14 +1071,20 @@ fn messages_from_thread_detail(detail: &ThreadDetail) -> Vec<Message> {
     let mut messages = Vec::new();
 
     for turn in &detail.turns {
-        // Collect content blocks for the current assistant message.
-        // Multiple items (AgentMessage, AgentReasoning, ToolCall) may
-        // belong to the same assistant message, so we batch them.
         let mut assistant_blocks: Vec<ContentBlock> = Vec::new();
+        let mut user_blocks: Vec<ContentBlock> = Vec::new();
         let flush_assistant = |blocks: &mut Vec<ContentBlock>, msgs: &mut Vec<Message>| {
             if !blocks.is_empty() {
                 msgs.push(Message {
                     role: "assistant".to_string(),
+                    content: std::mem::take(blocks),
+                });
+            }
+        };
+        let flush_user = |blocks: &mut Vec<ContentBlock>, msgs: &mut Vec<Message>| {
+            if !blocks.is_empty() {
+                msgs.push(Message {
+                    role: "user".to_string(),
                     content: std::mem::take(blocks),
                 });
             }
@@ -1090,22 +1096,18 @@ fn messages_from_thread_detail(detail: &ThreadDetail) -> Vec<Message> {
             };
             match item.kind {
                 TurnItemKind::UserMessage => {
-                    // Flush any pending assistant blocks before starting a
-                    // new user message.
                     flush_assistant(&mut assistant_blocks, &mut messages);
 
                     let text = item.detail.as_deref().map(str::trim).unwrap_or("");
                     if !text.is_empty() {
-                        messages.push(Message {
-                            role: "user".to_string(),
-                            content: vec![ContentBlock::Text {
-                                text: text.to_string(),
-                                cache_control: None,
-                            }],
+                        user_blocks.push(ContentBlock::Text {
+                            text: text.to_string(),
+                            cache_control: None,
                         });
                     }
                 }
                 TurnItemKind::AgentMessage => {
+                    flush_user(&mut user_blocks, &mut messages);
                     let text = item.detail.as_deref().map(str::trim).unwrap_or("");
                     if !text.is_empty() {
                         assistant_blocks.push(ContentBlock::Text {
@@ -1115,6 +1117,7 @@ fn messages_from_thread_detail(detail: &ThreadDetail) -> Vec<Message> {
                     }
                 }
                 TurnItemKind::AgentReasoning => {
+                    flush_user(&mut user_blocks, &mut messages);
                     let thinking = item.detail.as_deref().map(str::trim).unwrap_or("");
                     if !thinking.is_empty() {
                         assistant_blocks.push(ContentBlock::Thinking {
@@ -1128,8 +1131,6 @@ fn messages_from_thread_detail(detail: &ThreadDetail) -> Vec<Message> {
                     let meta = item.metadata.as_ref();
                     let is_tool_result = meta.and_then(|m| m.get("tool_result_for")).is_some();
                     if is_tool_result {
-                        // tool_result blocks go in a user message.
-                        // Flush any pending assistant blocks first.
                         flush_assistant(&mut assistant_blocks, &mut messages);
 
                         let tool_use_id = meta
@@ -1142,17 +1143,18 @@ fn messages_from_thread_detail(detail: &ThreadDetail) -> Vec<Message> {
                             .and_then(|m| m.get("is_error"))
                             .and_then(|v| v.as_bool())
                             .unwrap_or(false);
-                        messages.push(Message {
-                            role: "user".to_string(),
-                            content: vec![ContentBlock::ToolResult {
-                                tool_use_id,
-                                content,
-                                is_error: if is_error { Some(true) } else { None },
-                                content_blocks: None,
-                            }],
+                        let content_blocks = meta
+                            .and_then(|m| m.get("content_blocks"))
+                            .and_then(|v| v.as_array())
+                            .cloned();
+                        user_blocks.push(ContentBlock::ToolResult {
+                            tool_use_id,
+                            content,
+                            is_error: if is_error { Some(true) } else { None },
+                            content_blocks,
                         });
                     } else {
-                        // tool_use block — part of assistant message.
+                        flush_user(&mut user_blocks, &mut messages);
                         let tool_use_id = meta
                             .and_then(|m| m.get("tool_use_id"))
                             .and_then(|v| v.as_str())
@@ -1178,8 +1180,8 @@ fn messages_from_thread_detail(detail: &ThreadDetail) -> Vec<Message> {
                 _ => {}
             }
         }
-        // Flush any remaining assistant blocks.
         flush_assistant(&mut assistant_blocks, &mut messages);
+        flush_user(&mut user_blocks, &mut messages);
     }
 
     messages
@@ -3573,6 +3575,175 @@ mod tests {
             Some("structured text")
         );
         assert_eq!(block["is_error"].as_bool(), Some(false));
+    }
+
+    #[test]
+    fn messages_from_thread_detail_batches_tool_results() {
+        let now = Utc::now();
+        let turn_id = "turn_detail".to_string();
+        let thread = ThreadRecord {
+            schema_version: 2,
+            id: "thr_detail".to_string(),
+            created_at: now,
+            updated_at: now,
+            model: DEFAULT_TEXT_MODEL.to_string(),
+            workspace: PathBuf::from("."),
+            mode: "agent".to_string(),
+            allow_shell: false,
+            trust_mode: false,
+            auto_approve: false,
+            latest_turn_id: Some(turn_id.clone()),
+            latest_response_bookmark: None,
+            archived: false,
+            system_prompt: None,
+            task_id: None,
+            title: None,
+            session_id: None,
+        };
+        let turn = TurnRecord {
+            schema_version: 2,
+            id: turn_id.clone(),
+            thread_id: thread.id.clone(),
+            status: RuntimeTurnStatus::Completed,
+            input_summary: "check".to_string(),
+            created_at: now,
+            started_at: Some(now),
+            ended_at: Some(now),
+            duration_ms: Some(0),
+            usage: None,
+            error: None,
+            item_ids: vec![
+                "item_user".to_string(),
+                "item_reasoning".to_string(),
+                "item_tool_use".to_string(),
+                "item_result_one".to_string(),
+                "item_result_two".to_string(),
+                "item_answer".to_string(),
+            ],
+            steer_count: 0,
+        };
+        let item = |id: &str,
+                    kind: TurnItemKind,
+                    summary: &str,
+                    detail: Option<&str>,
+                    metadata: Option<Value>| {
+            crate::runtime_threads::TurnItemRecord {
+                schema_version: 2,
+                id: id.to_string(),
+                turn_id: turn_id.clone(),
+                kind,
+                status: TurnItemLifecycleStatus::Completed,
+                summary: summary.to_string(),
+                detail: detail.map(str::to_string),
+                metadata,
+                artifact_refs: Vec::new(),
+                started_at: Some(now),
+                ended_at: Some(now),
+            }
+        };
+        let detail = ThreadDetail {
+            thread,
+            turns: vec![turn],
+            items: vec![
+                item(
+                    "item_user",
+                    TurnItemKind::UserMessage,
+                    "check",
+                    Some("check"),
+                    None,
+                ),
+                item(
+                    "item_reasoning",
+                    TurnItemKind::AgentReasoning,
+                    "thinking",
+                    Some("thinking"),
+                    None,
+                ),
+                item(
+                    "item_tool_use",
+                    TurnItemKind::ToolCall,
+                    "shell",
+                    Some(r#"{"cmd":"pwd"}"#),
+                    Some(json!({
+                        "tool_use_id": "tool-1",
+                        "tool_name": "shell"
+                    })),
+                ),
+                item(
+                    "item_result_one",
+                    TurnItemKind::ToolCall,
+                    "one",
+                    Some("one"),
+                    Some(json!({
+                        "tool_result_for": "tool-1",
+                        "is_error": false,
+                        "content_blocks": [{
+                            "type": "text",
+                            "text": "structured one"
+                        }]
+                    })),
+                ),
+                item(
+                    "item_result_two",
+                    TurnItemKind::ToolCall,
+                    "two",
+                    Some("two"),
+                    Some(json!({
+                        "tool_result_for": "tool-2",
+                        "is_error": true
+                    })),
+                ),
+                item(
+                    "item_answer",
+                    TurnItemKind::AgentMessage,
+                    "done",
+                    Some("done"),
+                    None,
+                ),
+            ],
+            latest_seq: 0,
+        };
+
+        let messages = messages_from_thread_detail(&detail);
+        let roles = messages
+            .iter()
+            .map(|message| message.role.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(roles, vec!["user", "assistant", "user", "assistant"]);
+        assert_eq!(messages[2].content.len(), 2);
+        match &messages[2].content[0] {
+            ContentBlock::ToolResult {
+                tool_use_id,
+                content,
+                is_error,
+                content_blocks,
+            } => {
+                assert_eq!(tool_use_id, "tool-1");
+                assert_eq!(content, "one");
+                assert_eq!(*is_error, None);
+                assert_eq!(
+                    content_blocks
+                        .as_ref()
+                        .and_then(|blocks| blocks[0].get("text")),
+                    Some(&json!("structured one"))
+                );
+            }
+            other => panic!("expected first tool result, got {other:?}"),
+        }
+        match &messages[2].content[1] {
+            ContentBlock::ToolResult {
+                tool_use_id,
+                content,
+                is_error,
+                content_blocks,
+            } => {
+                assert_eq!(tool_use_id, "tool-2");
+                assert_eq!(content, "two");
+                assert_eq!(*is_error, Some(true));
+                assert!(content_blocks.is_none());
+            }
+            other => panic!("expected second tool result, got {other:?}"),
+        }
     }
 
     #[test]

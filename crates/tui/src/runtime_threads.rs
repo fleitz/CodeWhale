@@ -815,6 +815,7 @@ enum SeedItem {
         tool_use_id: String,
         content: String,
         is_error: bool,
+        content_blocks: Option<Vec<serde_json::Value>>,
     },
 }
 
@@ -1634,35 +1635,28 @@ impl RuntimeThreadManager {
         for msg in messages {
             match msg.role.as_str() {
                 "user" => {
-                    // Flush any pending turn before starting a new one.
-                    if let Some(t) = current_turn.take() {
-                        turns.push(t);
-                    }
-                    let mut turn = TurnSeed {
-                        user_text: String::new(),
-                        items: Vec::new(),
-                    };
-                    // Extract text from user message content blocks.
-                    // Tool result blocks in user messages are part of the
-                    // tool loop and should be stored as tool_call items.
+                    let mut user_text = String::new();
+                    let mut tool_results = Vec::new();
+
                     for block in &msg.content {
                         match block {
                             ContentBlock::Text { text, .. } if !text.trim().is_empty() => {
-                                if !turn.user_text.is_empty() {
-                                    turn.user_text.push('\n');
+                                if !user_text.is_empty() {
+                                    user_text.push('\n');
                                 }
-                                turn.user_text.push_str(text);
+                                user_text.push_str(text);
                             }
                             ContentBlock::ToolResult {
                                 tool_use_id,
                                 content,
                                 is_error,
-                                ..
+                                content_blocks,
                             } => {
-                                turn.items.push(SeedItem::ToolResult {
+                                tool_results.push(SeedItem::ToolResult {
                                     tool_use_id: tool_use_id.clone(),
                                     content: content.clone(),
                                     is_error: is_error.unwrap_or(false),
+                                    content_blocks: content_blocks.clone(),
                                 });
                             }
                             // Other block types in user messages are rare;
@@ -1670,7 +1664,32 @@ impl RuntimeThreadManager {
                             _ => {}
                         }
                     }
-                    current_turn = Some(turn);
+
+                    if !user_text.is_empty() {
+                        // A real user prompt begins a new turn. Tool results
+                        // without text belong to the preceding assistant turn.
+                        if let Some(t) = current_turn.take() {
+                            turns.push(t);
+                        }
+                        current_turn = Some(TurnSeed {
+                            user_text,
+                            items: tool_results,
+                        });
+                    } else if !tool_results.is_empty() {
+                        let turn = current_turn.get_or_insert_with(|| TurnSeed {
+                            user_text: String::new(),
+                            items: Vec::new(),
+                        });
+                        turn.items.extend(tool_results);
+                    } else {
+                        if let Some(t) = current_turn.take() {
+                            turns.push(t);
+                        }
+                        current_turn = Some(TurnSeed {
+                            user_text: String::new(),
+                            items: Vec::new(),
+                        });
+                    }
                 }
                 "assistant" => {
                     // If no current turn exists (e.g. session starts with
@@ -1831,12 +1850,20 @@ impl RuntimeThreadManager {
                         tool_use_id,
                         content,
                         is_error,
+                        content_blocks,
                     } => {
                         let result_summary = if content.len() > SUMMARY_LIMIT {
                             crate::utils::truncate_with_ellipsis(content, SUMMARY_LIMIT, "...")
                         } else {
                             content.clone()
                         };
+                        let mut metadata = serde_json::Map::new();
+                        metadata.insert("tool_result_for".to_string(), json!(tool_use_id));
+                        metadata.insert("is_error".to_string(), json!(is_error));
+                        if let Some(blocks) = content_blocks {
+                            metadata
+                                .insert("content_blocks".to_string(), Value::Array(blocks.clone()));
+                        }
                         self.store.save_item(&TurnItemRecord {
                             schema_version: CURRENT_RUNTIME_SCHEMA_VERSION,
                             id: item_id.clone(),
@@ -1849,15 +1876,7 @@ impl RuntimeThreadManager {
                             },
                             summary: result_summary,
                             detail: Some(content.clone()),
-                            metadata: Some(serde_json::Value::Object(
-                                serde_json::json!({
-                                    "tool_result_for": tool_use_id,
-                                    "is_error": is_error,
-                                })
-                                .as_object()
-                                .unwrap()
-                                .clone(),
-                            )),
+                            metadata: Some(Value::Object(metadata)),
                             artifact_refs: Vec::new(),
                             started_at: Some(now),
                             ended_at: Some(now),
@@ -2536,13 +2555,43 @@ impl RuntimeThreadManager {
     fn reconstruct_messages_from_turns(&self, turns: &[TurnRecord]) -> Result<Vec<Message>> {
         let mut messages = Vec::new();
         for turn in turns {
-            let items = self.store.list_items_for_turn(&turn.id)?;
-            // Collect content blocks for the current assistant message.
+            let stored_items = self.store.list_items_for_turn(&turn.id)?;
+            let items = if turn.item_ids.is_empty() {
+                stored_items
+            } else {
+                let mut by_id: HashMap<String, TurnItemRecord> = stored_items
+                    .iter()
+                    .cloned()
+                    .map(|item| (item.id.clone(), item))
+                    .collect();
+                let mut ordered = Vec::new();
+                for item_id in &turn.item_ids {
+                    if let Some(item) = by_id.remove(item_id) {
+                        ordered.push(item);
+                    }
+                }
+                for item in stored_items {
+                    if by_id.contains_key(&item.id) {
+                        ordered.push(item);
+                    }
+                }
+                ordered
+            };
+
             let mut assistant_blocks: Vec<ContentBlock> = Vec::new();
+            let mut user_blocks: Vec<ContentBlock> = Vec::new();
             let flush_assistant = |blocks: &mut Vec<ContentBlock>, msgs: &mut Vec<Message>| {
                 if !blocks.is_empty() {
                     msgs.push(Message {
                         role: "assistant".to_string(),
+                        content: std::mem::take(blocks),
+                    });
+                }
+            };
+            let flush_user = |blocks: &mut Vec<ContentBlock>, msgs: &mut Vec<Message>| {
+                if !blocks.is_empty() {
+                    msgs.push(Message {
+                        role: "user".to_string(),
                         content: std::mem::take(blocks),
                     });
                 }
@@ -2553,16 +2602,14 @@ impl RuntimeThreadManager {
                         flush_assistant(&mut assistant_blocks, &mut messages);
                         let text = item.detail.unwrap_or(item.summary);
                         if !text.trim().is_empty() {
-                            messages.push(Message {
-                                role: "user".to_string(),
-                                content: vec![ContentBlock::Text {
-                                    text,
-                                    cache_control: None,
-                                }],
+                            user_blocks.push(ContentBlock::Text {
+                                text,
+                                cache_control: None,
                             });
                         }
                     }
                     TurnItemKind::AgentMessage => {
+                        flush_user(&mut user_blocks, &mut messages);
                         let text = item.detail.unwrap_or(item.summary);
                         if !text.trim().is_empty() {
                             assistant_blocks.push(ContentBlock::Text {
@@ -2572,6 +2619,7 @@ impl RuntimeThreadManager {
                         }
                     }
                     TurnItemKind::AgentReasoning => {
+                        flush_user(&mut user_blocks, &mut messages);
                         let thinking = item.detail.unwrap_or(item.summary);
                         if !thinking.trim().is_empty() {
                             assistant_blocks.push(ContentBlock::Thinking {
@@ -2595,16 +2643,18 @@ impl RuntimeThreadManager {
                                 .and_then(|m| m.get("is_error"))
                                 .and_then(|v| v.as_bool())
                                 .unwrap_or(false);
-                            messages.push(Message {
-                                role: "user".to_string(),
-                                content: vec![ContentBlock::ToolResult {
-                                    tool_use_id,
-                                    content,
-                                    is_error: if is_error { Some(true) } else { None },
-                                    content_blocks: None,
-                                }],
+                            let content_blocks = meta
+                                .and_then(|m| m.get("content_blocks"))
+                                .and_then(|v| v.as_array())
+                                .cloned();
+                            user_blocks.push(ContentBlock::ToolResult {
+                                tool_use_id,
+                                content,
+                                is_error: if is_error { Some(true) } else { None },
+                                content_blocks,
                             });
                         } else {
+                            flush_user(&mut user_blocks, &mut messages);
                             let tool_use_id = meta
                                 .and_then(|m| m.get("tool_use_id"))
                                 .and_then(|v| v.as_str())
@@ -2630,6 +2680,7 @@ impl RuntimeThreadManager {
                 }
             }
             flush_assistant(&mut assistant_blocks, &mut messages);
+            flush_user(&mut user_blocks, &mut messages);
         }
         Ok(messages)
     }
@@ -3942,6 +3993,149 @@ mod tests {
 
         // Cleanup so we don't leak across tests.
         let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn store_load_thread_defaults_missing_session_id() {
+        let dir = test_runtime_dir();
+        let store = RuntimeThreadStore::open(dir.clone()).expect("open store");
+        let thread = sample_thread("thr_legacy_session");
+        let path = store.threads_dir.join(format!("{}.json", thread.id));
+        std::fs::create_dir_all(path.parent().unwrap()).expect("mkdirs");
+        let mut payload = serde_json::to_value(&thread).expect("serialize thread");
+        payload
+            .as_object_mut()
+            .expect("thread object")
+            .remove("session_id");
+        std::fs::write(
+            &path,
+            serde_json::to_string(&payload).expect("encode thread"),
+        )
+        .expect("write thread");
+
+        let loaded = store
+            .load_thread(&thread.id)
+            .expect("legacy thread should load");
+        assert_eq!(loaded.session_id, None);
+
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test]
+    async fn seed_thread_keeps_tool_results_on_preceding_turn() -> Result<()> {
+        let dir = test_runtime_dir();
+        let manager = test_manager(dir.clone())?;
+        let thread = sample_thread("thr_seed_blocks");
+        manager.store.save_thread(&thread)?;
+        let messages = vec![
+            Message {
+                role: "user".to_string(),
+                content: vec![ContentBlock::Text {
+                    text: "check the files".to_string(),
+                    cache_control: None,
+                }],
+            },
+            Message {
+                role: "assistant".to_string(),
+                content: vec![
+                    ContentBlock::Thinking {
+                        thinking: "need a tool".to_string(),
+                        signature: Some("sig-1".to_string()),
+                    },
+                    ContentBlock::ToolUse {
+                        id: "tool-1".to_string(),
+                        name: "shell".to_string(),
+                        input: json!({ "cmd": "one" }),
+                        caller: None,
+                    },
+                    ContentBlock::ToolUse {
+                        id: "tool-2".to_string(),
+                        name: "shell".to_string(),
+                        input: json!({ "cmd": "two" }),
+                        caller: None,
+                    },
+                ],
+            },
+            Message {
+                role: "user".to_string(),
+                content: vec![ContentBlock::ToolResult {
+                    tool_use_id: "tool-1".to_string(),
+                    content: "one".to_string(),
+                    is_error: None,
+                    content_blocks: Some(vec![json!({
+                        "type": "text",
+                        "text": "structured one"
+                    })]),
+                }],
+            },
+            Message {
+                role: "user".to_string(),
+                content: vec![ContentBlock::ToolResult {
+                    tool_use_id: "tool-2".to_string(),
+                    content: "two".to_string(),
+                    is_error: Some(true),
+                    content_blocks: None,
+                }],
+            },
+            Message {
+                role: "assistant".to_string(),
+                content: vec![ContentBlock::Text {
+                    text: "done".to_string(),
+                    cache_control: None,
+                }],
+            },
+        ];
+
+        manager
+            .seed_thread_from_messages(&thread.id, &messages)
+            .await?;
+        let turns = manager.store.list_turns_for_thread(&thread.id)?;
+        assert_eq!(turns.len(), 1);
+
+        let restored = manager.reconstruct_messages_from_turns(&turns)?;
+        let roles = restored
+            .iter()
+            .map(|message| message.role.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(roles, vec!["user", "assistant", "user", "assistant"]);
+        assert_eq!(restored[2].content.len(), 2);
+
+        match &restored[2].content[0] {
+            ContentBlock::ToolResult {
+                tool_use_id,
+                content,
+                is_error,
+                content_blocks,
+            } => {
+                assert_eq!(tool_use_id, "tool-1");
+                assert_eq!(content, "one");
+                assert_eq!(*is_error, None);
+                assert_eq!(
+                    content_blocks
+                        .as_ref()
+                        .and_then(|blocks| blocks[0].get("text")),
+                    Some(&json!("structured one"))
+                );
+            }
+            other => panic!("expected first tool result, got {other:?}"),
+        }
+        match &restored[2].content[1] {
+            ContentBlock::ToolResult {
+                tool_use_id,
+                content,
+                is_error,
+                content_blocks,
+            } => {
+                assert_eq!(tool_use_id, "tool-2");
+                assert_eq!(content, "two");
+                assert_eq!(*is_error, Some(true));
+                assert!(content_blocks.is_none());
+            }
+            other => panic!("expected second tool result, got {other:?}"),
+        }
+
+        let _ = std::fs::remove_dir_all(dir);
+        Ok(())
     }
 
     #[test]
