@@ -205,17 +205,6 @@ non-interactive filesystem/shell tool use, matching the supported automation
 path used by stream-json wrappers.
 ")]
     Exec(TuiPassthroughArgs),
-    /// Generate SWE-bench prediction rows from CodeWhale runs.
-    #[command(after_help = "\
-Examples:
-  codewhale swebench run --instance-id django__django-12345 --issue-file issue.md
-  codewhale swebench export --instance-id django__django-12345 --predictions-path all_preds.jsonl
-
-This command forwards to the TUI runtime. `run` invokes tool-backed agent mode
-and writes a SWE-bench-compatible JSONL prediction row from the resulting
-working-tree diff. `export` only writes the current diff.
-")]
-    Swebench(TuiPassthroughArgs),
     /// Manage durable Agent Fleet runs via the TUI runtime.
     Fleet(TuiPassthroughArgs),
     /// Run a CodeWhale-powered code review over a git diff.
@@ -277,7 +266,7 @@ Transports:
 --http`/`--mobile`, which remain as compatibility aliases. The runtime API token
 is read from --auth-token, CODEWHALE_RUNTIME_TOKEN, or DEEPSEEK_RUNTIME_TOKEN.
 
-See docs/RUNTIME_API.md and scripts/release/app-server-smoke.sh.")]
+See docs/RUNTIME_API.md.")]
     AppServer(AppServerArgs),
     /// Generate shell completions.
     #[command(after_help = r#"Examples:
@@ -595,7 +584,7 @@ struct AppServerArgs {
     #[arg(long, conflicts_with = "stdio")]
     mobile: bool,
     /// Run the app-server JSON-RPC control transport over stdio (no listener).
-    /// Used by local SDKs and the release benchmark smoke probe.
+    /// Used by local SDKs and JSON-RPC integrations.
     #[arg(long, default_value_t = false)]
     stdio: bool,
     /// Show a QR code for the mobile URL in the terminal (requires --mobile).
@@ -714,10 +703,6 @@ fn run() -> Result<()> {
         Some(Commands::Exec(args)) => {
             let resolved_runtime = resolve_runtime_for_dispatch(&mut store, &runtime_overrides);
             delegate_to_tui(&cli, &resolved_runtime, tui_args("exec", args))
-        }
-        Some(Commands::Swebench(args)) => {
-            let resolved_runtime = resolve_runtime_for_dispatch(&mut store, &runtime_overrides);
-            delegate_to_tui(&cli, &resolved_runtime, tui_args("swebench", args))
         }
         Some(Commands::Fleet(args)) => {
             let resolved_runtime = resolve_runtime_for_dispatch(&mut store, &runtime_overrides);
@@ -1978,7 +1963,7 @@ fn build_tui_command(
     if verbosity.is_none()
         && passthrough
             .iter()
-            .any(|arg| matches!(arg.as_str(), "exec" | "swebench" | "eval"))
+            .any(|arg| matches!(arg.as_str(), "exec" | "eval"))
     {
         verbosity = Some("concise".to_string());
     }

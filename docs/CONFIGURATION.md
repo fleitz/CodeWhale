@@ -977,8 +977,8 @@ If you are upgrading from older releases:
 - `reasoning_effort` (string, optional): `off`, `low`, `medium`, `high`, `max`, `xhigh`, or `ultracode`; defaults to the configured UI tier. DeepSeek Platform receives top-level `thinking` / `reasoning_effort` fields. OpenAI Codex normalizes stale `off` to `low` and sends `max` / `ultracode` as Responses `xhigh`. Z.ai receives documented `thinking` controls and treats enabled thinking as the GLM coding high/max lane. NVIDIA NIM receives equivalent settings through `chat_template_kwargs`.
 - `verbosity` (string, optional): `normal` or `concise`. `normal` keeps the
   default conversational prompt. `concise` appends a prompt discipline block
-  for direct, low-chatter output; CLI noninteractive commands (`exec`, `eval`,
-  and `swebench`) default to `concise` unless config/env/CLI overrides it.
+  for direct, low-chatter output; CLI noninteractive commands (`exec` and
+  `eval`) default to `concise` unless config/env/CLI overrides it.
   Override per process with `CODEWHALE_VERBOSITY` or the legacy
   `DEEPSEEK_VERBOSITY` alias.
 - `allow_shell` (bool, optional): defaults to `false`; shell tools must be explicitly enabled.
@@ -1278,7 +1278,7 @@ for experimental feature flags. It shows each flag's effective enabled/disabled
 state and whether that state comes from the default or a configured override.
 Change feature flags in `[features]` or with `--enable` / `--disable`; the
 `/config` section is an audit surface, not a stability promise. Goal and
-WhaleFlow preview rows may appear there as placeholders until those workflows
+WhaleFlow preview rows may appear there as reserved entries until those workflows
 graduate behind real gated flags.
 
 ## Web Search Provider
@@ -1325,7 +1325,7 @@ Completions API currently accepts text message content, so media attachments are
 sent as explicit local path references instead of native image/video payloads.
 Attachment rows appear above the composer before submit; move to the start of
 the composer, press `↑` to select an attachment row, then press `Backspace` or
-`Delete` to remove it without editing the placeholder text by hand.
+`Delete` to remove it without editing the sample text by hand.
 
 ## Managed Configuration and Requirements
 
@@ -1395,7 +1395,7 @@ configure reasoning effort.
   intentionally not auto-loaded; wire individual scripts into the agent via
   MCP, hooks, or skills.
 - `--plugins` — scaffold `~/.codewhale/plugins/` with a `README.md` and an
-  `example/PLUGIN.md` placeholder using the same frontmatter shape as
+  `example/PLUGIN.md` sample using the same frontmatter shape as
   `SKILL.md`. Plugins are not loaded automatically either; reference them
   from a skill, hook, or MCP wrapper when you want them active.
 - `--all` now scaffolds MCP + skills + tools + plugins together.

@@ -55,7 +55,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   while Ctrl-X is scoped to Tasks-sidebar background shell cancellation. Shell
   jobs launched by sub-agents now render with their child-agent owner in the
   Tasks sidebar and transcript.
-- **Benchmark-turn recovery and context economy.** Repeated read-only search
+- **Long-turn recovery and context economy.** Repeated read-only search
   loop blocks now return guidance instead of fatal tool failures, Python build
   failures that are missing `setuptools` include an install/retry hint, long
   foreground shell timeouts steer models toward background execution, and noisy
@@ -123,7 +123,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   unchanged.
 - **Base prompt / delegate skill guidance** updated to encourage parallel
   read-only exploration (2-4 `type: "explore"` sub-agents) for broad repo,
-  version, branch, benchmark, and API-surface investigations, while keeping
+  version, branch, release, and API-surface investigations, while keeping
   architecture, integration, and final verification in the parent. The
   delegate skill examples now use provider-neutral `model_strength` instead of
   hardcoded DeepSeek model ids.
@@ -297,7 +297,7 @@ folds in several community contributions.
 - Work sidebar no longer shows stale `phase now:` / `phase next:` strategy rows once the checklist
   is 100% complete.
 - Plan mode no longer shortcuts investigation for requests that name a repository, URL, version,
-  release, build state, benchmark, bug, PR, issue, API surface, or local code path.
+  release, build state, bug, PR, issue, API surface, or local code path.
 - Oversized pasted text stays editable in the composer, with a file backup appended at submit
   time for model access; thanks @idling11 (#3267, closes #3263).
 - Bare digit keys `1`-`8` now insert text instead of firing hotbar slots; use `Alt+digit` for
@@ -796,8 +796,6 @@ folds in several community contributions.
 
 ### Added
 
-- **Benchmark harness runners.** Added CodeWhale-native benchmark entry points for SWE-bench, Terminal-Bench, and PinchBench, plus a local PinchBench runner that can grade tool-use traces with an LLM judge.
-- **Direct MiMo benchmark routing.** The benchmark runner now defaults to direct Xiaomi MiMo v2.5 Pro routing when configured, while keeping provider/model selection explicit.
 - Added `/restore list [N]` so users can inspect more side-git rollback
   snapshots with UTC timestamps before choosing a restore point. Plain
   `/restore` now shows the 20 most recent snapshots, numeric restore targets can
@@ -1138,7 +1136,6 @@ folds in several community contributions.
 
 ### Fixed
 
-- **Benchmark workspace copying.** Fixed benchmark workspace file copying so local benchmark tasks can preserve their intended file layout during agent runs.
 - **MiMo default tests.** Guarded Xiaomi MiMo default-model tests against ambient CI provider environment variables.
 - Stream/body decode failures such as `Stream read error: error decoding
   response body` are now classified as recoverable network interruptions

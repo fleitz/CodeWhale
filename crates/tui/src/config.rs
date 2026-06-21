@@ -1731,8 +1731,8 @@ impl StatusItem {
             StatusItem::Cache => "% of prompt served from cache",
             StatusItem::ContextPercent => "tokens used / model context window",
             StatusItem::GitBranch => "current workspace branch",
-            StatusItem::LastToolElapsed => "ms of the most recent tool call (placeholder)",
-            StatusItem::RateLimit => "remaining requests in the budget (placeholder)",
+            StatusItem::LastToolElapsed => "ms of the most recent tool call (reserved)",
+            StatusItem::RateLimit => "remaining requests in the budget (reserved)",
             StatusItem::Tokens => "input / cache-hit / output token totals",
             StatusItem::Balance => "topped-up + granted balance from DeepSeek",
         }

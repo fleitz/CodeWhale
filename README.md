@@ -11,8 +11,8 @@ when something fails.
 It's open source (MIT, Rust), it runs on your machine, and it works with the
 models people actually use. DeepSeek and open-weight models are first-class,
 but Claude, GPT, Kimi, and a local vLLM/Ollama box on your LAN are all full
-peers. The goal is simple: stay current with the best research and features in
-commercial coding agents, and surpass them.
+peers. The goal is simple: keep the local terminal workflow current with the
+best research and practical features in coding agents.
 
 Developers from all over the world have shaped CodeWhale into what it is. If
 there's a model, endpoint, or feature you don't see that you want, open an issue
@@ -113,7 +113,7 @@ codewhale exec --allowed-tools read_file,exec_shell --max-turns 10 "fix the fail
 
 ## The models
 
-Twenty-five providers route through the same harness and the same tools. If the
+Supported providers route through the same runtime and the same tools. If the
 one you want isn't here, that's a good issue to open.
 
 - **Open models, hosted:** `deepseek` (first among equals), `openrouter`,
@@ -189,8 +189,8 @@ structure intact.
 - **Sub-agents.** Independent investigations and implementation slices run in
   parallel with provider-specific fanout caps, clean context, and
   provider-aware model tiers (big vs. cheap).
-- **25 providers.** DeepSeek, GLM, Claude, GPT, Kimi, MiniMax, OpenRouter, and
-  local vLLM/SGLang/Ollama, all behind the same harness and tools. Switch
+- **Broad provider support.** DeepSeek, GLM, Claude, GPT, Kimi, MiniMax,
+  OpenRouter, and local vLLM/SGLang/Ollama, all behind the same runtime and tools. Switch
   mid-session with `/provider` and `/model`.
 - **Rollback.** Side-git snapshots and `/restore`, kept outside your repo's
   `.git` — undoing a turn never touches your history.
