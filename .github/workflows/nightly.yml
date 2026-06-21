@@ -77,11 +77,12 @@ jobs:
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v7
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@master
         with:
+          toolchain: '1.88'
           targets: ${{ matrix.target }}
       - name: Install Rust target
-        run: rustup target add ${{ matrix.target }}
+        run: rustup target add --toolchain 1.88 ${{ matrix.target }}
       - uses: Swatinem/rust-cache@v2
         with:
           cache-bin: false
