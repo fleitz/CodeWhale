@@ -5392,16 +5392,30 @@ fn merge_project_config(config: &mut Config, workspace: &Path) {
     let path = workspace
         .join(codewhale_config::CODEWHALE_APP_DIR)
         .join("config.toml");
-    let raw = match std::fs::read_to_string(&path) {
-        Ok(r) => r,
-        Err(_) => {
+    let raw = match read_project_config_file(&path) {
+        Ok(Some(r)) => r,
+        Ok(None) => {
             let legacy = workspace
                 .join(codewhale_config::LEGACY_APP_DIR)
                 .join("config.toml");
-            match std::fs::read_to_string(&legacy) {
-                Ok(r) => r,
-                Err(_) => return,
+            match read_project_config_file(&legacy) {
+                Ok(Some(r)) => r,
+                Ok(None) => return,
+                Err(err) => {
+                    eprintln!(
+                        "warning: failed to read project-scope config {}: {err}",
+                        legacy.display()
+                    );
+                    return;
+                }
             }
+        }
+        Err(err) => {
+            eprintln!(
+                "warning: failed to read project-scope config {}: {err}",
+                path.display()
+            );
+            return;
         }
     };
     let project: toml::Value = match toml::from_str(&raw) {
@@ -5507,6 +5521,44 @@ fn merge_project_config(config: &mut Config, workspace: &Path) {
              (See #417.)"
         );
     }
+}
+
+fn read_project_config_file(path: &Path) -> io::Result<Option<String>> {
+    let metadata = match std::fs::symlink_metadata(path) {
+        Ok(metadata) => metadata,
+        Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(err) => return Err(err),
+    };
+    let file_type = metadata.file_type();
+    if file_type.is_symlink() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "project-scope config must not be a symlink",
+        ));
+    }
+    if !file_type.is_file() {
+        return Ok(None);
+    }
+
+    let mut file = open_project_config_file(path)?;
+    let mut raw = String::new();
+    file.read_to_string(&mut raw)?;
+    Ok(Some(raw))
+}
+
+#[cfg(unix)]
+fn open_project_config_file(path: &Path) -> io::Result<std::fs::File> {
+    use std::os::unix::fs::OpenOptionsExt;
+
+    std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(path)
+}
+
+#[cfg(not(unix))]
+fn open_project_config_file(path: &Path) -> io::Result<std::fs::File> {
+    std::fs::File::open(path)
 }
 
 fn merge_user_workspace_config(
@@ -7482,6 +7534,35 @@ mod project_config_tests {
         fs::create_dir_all(&project_dir).expect("mkdir .deepseek");
         fs::write(project_dir.join("config.toml"), body).expect("write project config");
         tmp
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn project_overlay_rejects_symlinked_primary_config() {
+        let workspace = tempdir().expect("workspace tempdir");
+        let outside = tempdir().expect("outside tempdir");
+        let primary_dir = workspace.path().join(codewhale_config::CODEWHALE_APP_DIR);
+        let legacy_dir = workspace.path().join(codewhale_config::LEGACY_APP_DIR);
+        fs::create_dir_all(&primary_dir).expect("mkdir primary");
+        fs::create_dir_all(&legacy_dir).expect("mkdir legacy");
+        let outside_config = outside.path().join("config.toml");
+        fs::write(&outside_config, "model = \"outside-model\"\n").expect("write outside config");
+        fs::write(legacy_dir.join("config.toml"), "model = \"legacy-model\"\n")
+            .expect("write legacy config");
+        std::os::unix::fs::symlink(&outside_config, primary_dir.join("config.toml"))
+            .expect("symlink project config");
+        let mut config = Config {
+            default_text_model: Some("base-model".to_string()),
+            ..Config::default()
+        };
+
+        merge_project_config(&mut config, workspace.path());
+
+        assert_eq!(
+            config.default_text_model.as_deref(),
+            Some("base-model"),
+            "symlinked primary project config should stop the project overlay"
+        );
     }
 
     fn with_home_dir<T>(home: &Path, f: impl FnOnce() -> T) -> T {

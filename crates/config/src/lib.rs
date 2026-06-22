@@ -2158,19 +2158,32 @@ fn sandbox_mode_rank(value: &str) -> Option<u8> {
 pub fn load_project_config(workspace: &Path) -> Option<ConfigToml> {
     for dir in [CODEWHALE_APP_DIR, LEGACY_APP_DIR] {
         let path = workspace.join(dir).join(CONFIG_FILE_NAME);
-        if path.exists()
-            && let Ok(raw) = fs::read_to_string(&path)
-        {
-            match toml::from_str(&raw) {
-                Ok(config) => return Some(config),
-                Err(e) => {
-                    tracing::warn!("Failed to parse project config {}: {e}", path.display());
-                    return None;
-                }
+        if !project_config_candidate_exists(&path) {
+            continue;
+        }
+        let raw = match read_checked_config_file(&path) {
+            Ok(raw) => raw,
+            Err(e) => {
+                tracing::warn!("Failed to read project config {}: {e:#}", path.display());
+                return None;
+            }
+        };
+        match toml::from_str(&raw) {
+            Ok(config) => return Some(config),
+            Err(e) => {
+                tracing::warn!("Failed to parse project config {}: {e}", path.display());
+                return None;
             }
         }
     }
     None
+}
+
+fn project_config_candidate_exists(path: &Path) -> bool {
+    fs::symlink_metadata(path).is_ok_and(|metadata| {
+        let file_type = metadata.file_type();
+        file_type.is_file() || file_type.is_symlink()
+    })
 }
 
 fn normalize_model_for_provider(provider: ProviderKind, model: &str) -> String {

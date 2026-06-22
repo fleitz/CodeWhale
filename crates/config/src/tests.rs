@@ -2227,6 +2227,33 @@ fn normalize_config_file_path_rejects_symlink_file() {
 
 #[cfg(unix)]
 #[test]
+fn load_project_config_rejects_symlinked_primary_config() {
+    let workspace = tempfile::tempdir().expect("workspace tempdir");
+    let outside = tempfile::tempdir().expect("outside tempdir");
+    let primary_dir = workspace.path().join(CODEWHALE_APP_DIR);
+    let legacy_dir = workspace.path().join(LEGACY_APP_DIR);
+    fs::create_dir_all(&primary_dir).expect("mkdir primary");
+    fs::create_dir_all(&legacy_dir).expect("mkdir legacy");
+    let outside_config = outside.path().join(CONFIG_FILE_NAME);
+    fs::write(&outside_config, "model = \"outside-model\"\n").expect("write outside config");
+    fs::write(
+        legacy_dir.join(CONFIG_FILE_NAME),
+        "model = \"legacy-model\"\n",
+    )
+    .expect("write legacy config");
+    std::os::unix::fs::symlink(&outside_config, primary_dir.join(CONFIG_FILE_NAME))
+        .expect("symlink project config");
+
+    let loaded = load_project_config(workspace.path());
+
+    assert!(
+        loaded.is_none(),
+        "symlinked primary project config should stop the project overlay"
+    );
+}
+
+#[cfg(unix)]
+#[test]
 fn load_sibling_permissions_rejects_symlink_file() {
     let dir = tempfile::tempdir().expect("tempdir");
     let config_path = dir.path().join(CONFIG_FILE_NAME);
