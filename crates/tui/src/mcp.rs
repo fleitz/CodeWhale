@@ -1925,8 +1925,12 @@ impl McpPool {
         workspace: &Path,
     ) -> Result<Self> {
         let config = load_config_with_workspace(path, workspace)?;
+        let workspace = checked_workspace_path(workspace)?;
         let mut pool = Self::new(config);
-        pool.config_sources = vec![path.to_path_buf(), workspace_mcp_config_path(workspace)];
+        pool.config_sources = vec![
+            path.to_path_buf(),
+            checked_workspace_mcp_config_path(&workspace)?,
+        ];
         pool.config_sources
             .extend(crate::config::workspace_trust_config_candidate_paths());
         pool.last_mtimes = pool
@@ -1934,7 +1938,7 @@ impl McpPool {
             .iter()
             .map(|source| mcp_config_mtime(source))
             .collect();
-        pool.workspace = Some(workspace.to_path_buf());
+        pool.workspace = Some(workspace);
         Ok(pool)
     }
 
@@ -2652,8 +2656,8 @@ pub fn workspace_mcp_config_path(workspace: &Path) -> PathBuf {
 
 pub fn load_config_with_workspace(global_path: &Path, workspace: &Path) -> Result<McpConfig> {
     let mut merged = load_config(global_path)?;
-    let workspace = normalize_workspace_path(workspace);
-    let project_path = workspace_mcp_config_path(&workspace);
+    let workspace = checked_workspace_path(workspace)?;
+    let project_path = checked_workspace_mcp_config_path(&workspace)?;
     if !project_path.exists() || paths_refer_to_same_config(global_path, &project_path) {
         return Ok(merged);
     }
@@ -2678,6 +2682,40 @@ pub fn load_config_with_workspace(global_path: &Path, workspace: &Path) -> Resul
 
 fn workspace_allows_project_mcp_config(workspace: &Path) -> bool {
     crate::config::is_workspace_trusted(workspace)
+}
+
+fn checked_workspace_mcp_config_path(workspace: &Path) -> Result<PathBuf> {
+    Ok(checked_workspace_path(workspace)?
+        .join(".codewhale")
+        .join("mcp.json"))
+}
+
+fn checked_workspace_path(workspace: &Path) -> Result<PathBuf> {
+    if workspace.as_os_str().is_empty() {
+        anyhow::bail!("workspace path cannot be empty");
+    }
+    if workspace
+        .components()
+        .any(|component| matches!(component, Component::ParentDir))
+    {
+        anyhow::bail!("workspace path cannot contain '..' components");
+    }
+    let absolute = if workspace.is_absolute() {
+        workspace.to_path_buf()
+    } else {
+        std::env::current_dir()
+            .context("failed to resolve current directory for workspace")?
+            .join(workspace)
+    };
+    match absolute.canonicalize() {
+        Ok(path) => Ok(path),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+            Ok(normalize_path_components(&absolute))
+        }
+        Err(err) => {
+            Err(err).with_context(|| format!("failed to resolve workspace {}", workspace.display()))
+        }
+    }
 }
 
 fn normalize_workspace_path(workspace: &Path) -> PathBuf {

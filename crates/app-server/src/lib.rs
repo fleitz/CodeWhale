@@ -338,7 +338,9 @@ async fn app_handler(
 }
 
 fn build_state(config_path: Option<PathBuf>, auth_token: Option<String>) -> Result<AppState> {
-    let store = ConfigStore::load(config_path.clone())?;
+    let has_explicit_config_path = config_path.is_some();
+    let store = ConfigStore::load(config_path)?;
+    let config_path = has_explicit_config_path.then(|| store.path().to_path_buf());
     let config = store.config.clone();
     let exec_policy = store.exec_policy_engine();
     let registry = ModelRegistry::default();
@@ -1077,6 +1079,27 @@ mod tests {
         )
         .expect("state");
         (app_router(state, &[]), tmp)
+    }
+
+    #[test]
+    fn build_state_keeps_resolved_explicit_config_path() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let config_dir = tmp.path().join("config-dir");
+        fs::create_dir_all(&config_dir).expect("config dir");
+        let config_path = config_dir.join("config.toml");
+        fs::write(&config_path, "api_key = \"sk-deepseek-secret\"\n").expect("write config");
+
+        let state = build_state(Some(config_path.clone()), None).expect("state");
+
+        assert_eq!(
+            state.config_path.as_deref(),
+            Some(
+                config_path
+                    .canonicalize()
+                    .expect("canonical config")
+                    .as_path()
+            )
+        );
     }
 
     async fn response_body_json(response: Response) -> Value {

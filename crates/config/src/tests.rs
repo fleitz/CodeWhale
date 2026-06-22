@@ -2131,13 +2131,33 @@ fn project_state_resolvers_reject_path_traversal_subdirs() {
         );
     }
 
+    let canonical_workspace = workspace.canonicalize().expect("canonical workspace");
     let safe = resolve_project_state_dir(&workspace, "notes.md")
         .expect("safe project state subdir should resolve")
         .1;
-    assert_eq!(safe, workspace.join(LEGACY_APP_DIR).join("notes.md"));
+    assert_eq!(
+        safe,
+        canonical_workspace.join(LEGACY_APP_DIR).join("notes.md")
+    );
     let created =
         ensure_project_state_dir(&workspace, "a/b").expect("safe nested project state dir");
-    assert_eq!(created, workspace.join(CODEWHALE_APP_DIR).join("a/b"));
+    assert_eq!(
+        created,
+        canonical_workspace.join(CODEWHALE_APP_DIR).join("a/b")
+    );
+}
+
+#[test]
+fn project_state_resolvers_reject_workspace_traversal() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let workspace = dir.path().join("workspace");
+    fs::create_dir_all(&workspace).expect("workspace");
+    let bad_workspace = workspace.join("..").join("outside");
+
+    let err = resolve_project_state_dir(&bad_workspace, "notes.md")
+        .expect_err("workspace traversal should fail");
+    assert!(format!("{err:#}").contains("project workspace path"));
+    assert!(ensure_project_state_dir(&bad_workspace, "state").is_err());
 }
 
 #[test]

@@ -171,6 +171,17 @@ fn store_open_rejects_symlinked_state_file() {
     let _ = std::fs::remove_dir_all(dir);
 }
 
+#[test]
+fn store_open_rejects_root_traversal() {
+    let dir = test_runtime_dir();
+    let bad_root = dir.join("runtime").join("..").join("outside");
+
+    let err = RuntimeThreadStore::open(bad_root).expect_err("traversal root should fail");
+    assert!(format!("{err:#}").contains("cannot contain '..'"));
+
+    let _ = std::fs::remove_dir_all(dir);
+}
+
 #[cfg(unix)]
 #[test]
 fn store_open_rejects_symlinked_store_directory() {

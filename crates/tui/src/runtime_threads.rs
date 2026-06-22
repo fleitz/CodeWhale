@@ -13,7 +13,7 @@
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::fs::{self, File, OpenOptions};
 use std::io::{BufRead, BufReader, Write};
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 use std::sync::{Arc, Mutex as StdMutex};
 use std::time::Duration;
 
@@ -247,6 +247,7 @@ pub struct RuntimeThreadStore {
 
 impl RuntimeThreadStore {
     pub fn open(root: PathBuf) -> Result<Self> {
+        let root = checked_runtime_store_root(root)?;
         let threads_dir = root.join("threads");
         let turns_dir = root.join("turns");
         let items_dir = root.join("items");
@@ -363,9 +364,9 @@ impl RuntimeThreadStore {
 
     pub fn list_threads(&self) -> Result<Vec<ThreadRecord>> {
         let mut out = Vec::new();
-        reject_symlinked_store_dir(&self.threads_dir)?;
-        for entry in fs::read_dir(&self.threads_dir)
-            .with_context(|| format!("Failed to read {}", self.threads_dir.display()))?
+        let threads_dir = checked_existing_runtime_store_dir(&self.threads_dir)?;
+        for entry in fs::read_dir(&threads_dir)
+            .with_context(|| format!("Failed to read {}", threads_dir.display()))?
         {
             let entry = entry?;
             let path = entry.path();
@@ -392,9 +393,9 @@ impl RuntimeThreadStore {
     pub fn list_turns_for_thread(&self, thread_id: &str) -> Result<Vec<TurnRecord>> {
         validated_record_id(thread_id, "thread id")?;
         let mut out = Vec::new();
-        reject_symlinked_store_dir(&self.turns_dir)?;
-        for entry in fs::read_dir(&self.turns_dir)
-            .with_context(|| format!("Failed to read {}", self.turns_dir.display()))?
+        let turns_dir = checked_existing_runtime_store_dir(&self.turns_dir)?;
+        for entry in fs::read_dir(&turns_dir)
+            .with_context(|| format!("Failed to read {}", turns_dir.display()))?
         {
             let entry = entry?;
             let path = entry.path();
@@ -423,9 +424,9 @@ impl RuntimeThreadStore {
     pub fn list_items_for_turn(&self, turn_id: &str) -> Result<Vec<TurnItemRecord>> {
         validated_record_id(turn_id, "turn id")?;
         let mut out = Vec::new();
-        reject_symlinked_store_dir(&self.items_dir)?;
-        for entry in fs::read_dir(&self.items_dir)
-            .with_context(|| format!("Failed to read {}", self.items_dir.display()))?
+        let items_dir = checked_existing_runtime_store_dir(&self.items_dir)?;
+        for entry in fs::read_dir(&items_dir)
+            .with_context(|| format!("Failed to read {}", items_dir.display()))?
         {
             let entry = entry?;
             let path = entry.path();
@@ -465,9 +466,9 @@ impl RuntimeThreadStore {
 
         let wanted: HashSet<&str> = turn_ids.iter().map(String::as_str).collect();
         let mut out: HashMap<String, Vec<TurnItemRecord>> = HashMap::new();
-        reject_symlinked_store_dir(&self.items_dir)?;
-        for entry in fs::read_dir(&self.items_dir)
-            .with_context(|| format!("Failed to read {}", self.items_dir.display()))?
+        let items_dir = checked_existing_runtime_store_dir(&self.items_dir)?;
+        for entry in fs::read_dir(&items_dir)
+            .with_context(|| format!("Failed to read {}", items_dir.display()))?
         {
             let entry = entry?;
             let path = entry.path();
@@ -3842,6 +3843,62 @@ fn duration_ms(start: DateTime<Utc>, end: DateTime<Utc>) -> u64 {
         0
     } else {
         u64::try_from(millis).unwrap_or(u64::MAX)
+    }
+}
+
+fn checked_runtime_store_root(root: PathBuf) -> Result<PathBuf> {
+    if root.as_os_str().is_empty() {
+        bail!("Runtime store root cannot be empty");
+    }
+    if root
+        .components()
+        .any(|component| matches!(component, Component::ParentDir))
+    {
+        bail!("Runtime store root cannot contain '..' components");
+    }
+    let absolute = if root.is_absolute() {
+        root
+    } else {
+        std::env::current_dir()
+            .context("failed to resolve current directory for runtime store")?
+            .join(root)
+    };
+    match absolute.canonicalize() {
+        Ok(path) => Ok(path),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+            Ok(normalize_path_components(&absolute))
+        }
+        Err(err) => Err(err).with_context(|| {
+            format!(
+                "Failed to resolve runtime store root {}",
+                absolute.display()
+            )
+        }),
+    }
+}
+
+fn checked_existing_runtime_store_dir(path: &Path) -> Result<PathBuf> {
+    reject_symlinked_store_dir(path)?;
+    path.canonicalize()
+        .with_context(|| format!("Failed to resolve {}", path.display()))
+}
+
+fn normalize_path_components(path: &Path) -> PathBuf {
+    let mut normalized = PathBuf::new();
+    for component in path.components() {
+        match component {
+            Component::Prefix(_) | Component::RootDir => normalized.push(component.as_os_str()),
+            Component::CurDir => {}
+            Component::ParentDir => {
+                normalized.pop();
+            }
+            Component::Normal(part) => normalized.push(part),
+        }
+    }
+    if normalized.as_os_str().is_empty() {
+        PathBuf::from(".")
+    } else {
+        normalized
     }
 }
 

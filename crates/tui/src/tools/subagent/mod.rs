@@ -3108,7 +3108,7 @@ pub type SharedSubAgentManager = Arc<RwLock<SubAgentManager>>;
 
 pub fn load_persisted_agent_worker_records(workspace: &Path) -> Result<Vec<AgentWorkerRecord>> {
     let mut manager = SubAgentManager::new(workspace.to_path_buf(), 1)
-        .with_state_path(default_state_path(workspace));
+        .with_state_path(default_state_path(workspace)?);
     manager.load_state()?;
     Ok(manager.list_worker_records())
 }
@@ -3308,17 +3308,24 @@ async fn subagent_session_projection(
     }
 }
 
-fn default_state_path(workspace: &Path) -> PathBuf {
+fn default_state_path(workspace: &Path) -> Result<PathBuf> {
     let workspace = normalize_subagent_workspace(workspace);
     // Prefer .codewhale, fall back to .deepseek for project-local state
-    let primary = workspace.join(".codewhale").join("state");
+    let primary = checked_subagent_state_path(
+        &workspace,
+        &Path::new(".codewhale")
+            .join("state")
+            .join(SUBAGENT_STATE_FILE),
+    )?;
     if primary.exists() {
-        return primary.join(SUBAGENT_STATE_FILE);
+        return Ok(primary);
     }
-    workspace
-        .join(".deepseek")
-        .join("state")
-        .join(SUBAGENT_STATE_FILE)
+    checked_subagent_state_path(
+        &workspace,
+        &Path::new(".deepseek")
+            .join("state")
+            .join(SUBAGENT_STATE_FILE),
+    )
 }
 
 fn checked_subagent_state_path(workspace: &Path, path: &Path) -> Result<PathBuf> {
@@ -3492,13 +3499,21 @@ pub fn new_shared_subagent_manager_with_timeout(
     default_token_budget: Option<u64>,
 ) -> SharedSubAgentManager {
     let max_agents = max_agents.clamp(1, MAX_SUBAGENTS);
-    let state_path = default_state_path(&workspace);
+    let state_path = match default_state_path(&workspace) {
+        Ok(path) => Some(path),
+        Err(err) => {
+            tracing::warn!(target: "subagent", ?err, "failed to resolve sub-agent state path");
+            None
+        }
+    };
     let mut manager = SubAgentManager::new(workspace, max_agents)
         .with_admission_limit(max_admitted_agents)
         .with_running_heartbeat_timeout(running_heartbeat_timeout)
         .with_launch_concurrency(launch_concurrency)
-        .with_default_token_budget(default_token_budget)
-        .with_state_path(state_path);
+        .with_default_token_budget(default_token_budget);
+    if let Some(state_path) = state_path {
+        manager = manager.with_state_path(state_path);
+    }
     if let Err(err) = manager.load_state() {
         // Routed through tracing instead of stderr — see comment in
         // `persist_state_best_effort` above.

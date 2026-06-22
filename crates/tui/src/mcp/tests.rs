@@ -442,7 +442,7 @@ fn workspace_mcp_config_ignores_invalid_untrusted_project_file() {
 }
 
 #[test]
-fn workspace_mcp_config_normalizes_parent_components() {
+fn workspace_mcp_config_rejects_parent_components() {
     let dir = tempfile::tempdir().unwrap();
     let global_path = dir.path().join("global-mcp.json");
     let workspace = dir.path().join("workspace");
@@ -457,12 +457,13 @@ fn workspace_mcp_config_normalizes_parent_components() {
     .unwrap();
 
     let workspace_with_parent = workspace.join("..").join("workspace");
-    let cfg = load_config_with_workspace(&global_path, &workspace_with_parent).unwrap();
-    let workspace = workspace.canonicalize().unwrap();
+    let err = load_config_with_workspace(&global_path, &workspace_with_parent)
+        .expect_err("parent components in workspace should fail closed");
 
-    assert!(cfg.servers.contains_key("project"));
-    let project = cfg.servers.get("project").unwrap();
-    assert_eq!(project.cwd.as_deref(), Some(workspace.as_path()));
+    assert!(
+        format!("{err:#}").contains("workspace path cannot contain '..'"),
+        "unexpected error: {err:#}"
+    );
 }
 
 #[test]
@@ -541,6 +542,23 @@ fn workspace_mcp_config_rejects_symlinked_project_cwd_escape() {
         err.to_string()
             .contains("Project MCP server cwd must stay within workspace"),
         "unexpected error: {err}"
+    );
+}
+
+#[test]
+fn workspace_mcp_config_rejects_workspace_traversal() {
+    let dir = tempfile::tempdir().unwrap();
+    let global_path = dir.path().join("global-mcp.json");
+    let workspace = dir.path().join("workspace");
+    let bad_workspace = workspace.join("..").join("outside");
+    fs::create_dir_all(&workspace).unwrap();
+    fs::write(&global_path, r#"{"servers": {}}"#).unwrap();
+
+    let err = load_config_with_workspace(&global_path, &bad_workspace)
+        .expect_err("workspace traversal should fail");
+    assert!(
+        format!("{err:#}").contains("workspace path cannot contain '..'"),
+        "unexpected error: {err:#}"
     );
 }
 

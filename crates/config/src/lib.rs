@@ -3431,6 +3431,7 @@ fn copy_dir_recursive(src: &Path, dst: &Path) -> Result<()> {
 /// emit a deprecation notice on legacy paths.
 pub fn resolve_project_state_dir(workspace: &Path, subdir: &str) -> Result<(bool, PathBuf)> {
     ensure_safe_state_subdir(subdir)?;
+    let workspace = normalize_project_workspace(workspace)?;
     let primary = workspace.join(CODEWHALE_APP_DIR).join(subdir);
     if primary.exists() {
         return Ok((true, primary));
@@ -3443,6 +3444,7 @@ pub fn resolve_project_state_dir(workspace: &Path, subdir: &str) -> Result<(bool
 /// creating it if necessary. Returns the directory path.
 pub fn ensure_project_state_dir(workspace: &Path, subdir: &str) -> Result<PathBuf> {
     ensure_safe_state_subdir(subdir)?;
+    let workspace = normalize_project_workspace(workspace)?;
     let dir = workspace.join(CODEWHALE_APP_DIR).join(subdir);
     std::fs::create_dir_all(&dir)
         .with_context(|| format!("failed to create {}/", dir.display()))?;
@@ -3847,6 +3849,56 @@ fn normalize_config_file_path(path: PathBuf) -> Result<PathBuf> {
     let normalized = parent.join(file_name);
     reject_path_symlink(&normalized)?;
     Ok(normalized)
+}
+
+fn normalize_project_workspace(workspace: &Path) -> Result<PathBuf> {
+    if workspace.as_os_str().is_empty() {
+        bail!("project workspace path cannot be empty");
+    }
+    if workspace
+        .components()
+        .any(|component| matches!(component, Component::ParentDir))
+    {
+        bail!("project workspace path cannot contain '..' components");
+    }
+    let absolute = if workspace.is_absolute() {
+        workspace.to_path_buf()
+    } else {
+        std::env::current_dir()
+            .context("failed to resolve current directory for project workspace")?
+            .join(workspace)
+    };
+    match absolute.canonicalize() {
+        Ok(path) => Ok(path),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+            Ok(normalize_path_components(&absolute))
+        }
+        Err(err) => Err(err).with_context(|| {
+            format!(
+                "failed to resolve project workspace {}",
+                workspace.display()
+            )
+        }),
+    }
+}
+
+fn normalize_path_components(path: &Path) -> PathBuf {
+    let mut normalized = PathBuf::new();
+    for component in path.components() {
+        match component {
+            Component::Prefix(_) | Component::RootDir => normalized.push(component.as_os_str()),
+            Component::CurDir => {}
+            Component::ParentDir => {
+                normalized.pop();
+            }
+            Component::Normal(part) => normalized.push(part),
+        }
+    }
+    if normalized.as_os_str().is_empty() {
+        PathBuf::from(".")
+    } else {
+        normalized
+    }
 }
 
 fn checked_path_exists(path: &Path) -> Result<bool> {
