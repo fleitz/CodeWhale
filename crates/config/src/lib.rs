@@ -1338,6 +1338,11 @@ pub struct FleetConfigToml {
     /// available; user-defined roles in config override or extend them.
     #[serde(default)]
     pub roles: BTreeMap<String, FleetRolePreset>,
+    /// Fleet profile vocabulary (#3167). Profiles group role semantics,
+    /// loadout hints, permission defaults, and delegation bounds. They are
+    /// config-only in this slice; executor/model routing wiring lands later.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub profiles: BTreeMap<String, FleetProfile>,
     /// Headless worker execution hardening (#3027).
     #[serde(default)]
     pub exec: FleetExecConfig,
@@ -1424,6 +1429,269 @@ impl Default for FleetExecConfig {
     }
 }
 
+/// Fleet org-chart profile.
+///
+/// A profile is an additive config record for future fleet scheduling policy.
+/// Loading one must not grant runtime permissions by itself: shell and trust
+/// escalation default off, and approvals default on.
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
+pub struct FleetProfile {
+    /// Org-chart slot this profile describes.
+    #[serde(default)]
+    pub slot: FleetSlot,
+    /// Semantic role name and optional instruction overlay.
+    #[serde(default)]
+    pub role: FleetRole,
+    /// Model class / route-role hint. This is data only in this slice.
+    #[serde(default)]
+    pub loadout: FleetLoadout,
+    /// Permission defaults requested by the profile.
+    #[serde(default)]
+    pub permissions: FleetProfilePermissions,
+    /// Delegation hints for future manager policy.
+    #[serde(default)]
+    pub delegation: FleetDelegationHints,
+}
+
+/// Semantic role declaration for a fleet profile.
+///
+/// TOML may use either `role = "reviewer"` or a role table with `name` and
+/// `instructions`.
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct FleetRole {
+    /// Stable role name, e.g. `scout`, `implementer`, or `verifier`.
+    pub name: String,
+    /// Optional short description for config UIs and docs.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+    /// Optional instruction overlay to apply when the role is later consumed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub instructions: Option<String>,
+}
+
+impl Default for FleetRole {
+    fn default() -> Self {
+        Self {
+            name: "general".to_string(),
+            description: None,
+            instructions: None,
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for FleetRole {
+    fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        #[derive(Deserialize)]
+        #[serde(untagged)]
+        enum FleetRoleWire {
+            Name(String),
+            Full {
+                #[serde(default)]
+                name: Option<String>,
+                #[serde(default)]
+                description: Option<String>,
+                #[serde(default)]
+                instructions: Option<String>,
+            },
+        }
+
+        match FleetRoleWire::deserialize(deserializer)? {
+            FleetRoleWire::Name(name) => Ok(Self {
+                name,
+                ..Self::default()
+            }),
+            FleetRoleWire::Full {
+                name,
+                description,
+                instructions,
+            } => Ok(Self {
+                name: name.unwrap_or_else(|| Self::default().name),
+                description,
+                instructions,
+            }),
+        }
+    }
+}
+
+/// Org-chart slot for grouping fleet profiles.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub enum FleetSlot {
+    Manager,
+    Scout,
+    Implementer,
+    Reviewer,
+    Verifier,
+    ToolHeavy,
+    Operator,
+    Summarizer,
+    #[default]
+    General,
+    Custom(String),
+}
+
+impl FleetSlot {
+    #[must_use]
+    pub fn as_str(&self) -> &str {
+        match self {
+            Self::Manager => "manager",
+            Self::Scout => "scout",
+            Self::Implementer => "implementer",
+            Self::Reviewer => "reviewer",
+            Self::Verifier => "verifier",
+            Self::ToolHeavy => "tool-heavy",
+            Self::Operator => "operator",
+            Self::Summarizer => "summarizer",
+            Self::General => "general",
+            Self::Custom(value) => value.as_str(),
+        }
+    }
+
+    #[must_use]
+    pub fn from_name(value: &str) -> Self {
+        match value.trim() {
+            "manager" | "coordinator" => Self::Manager,
+            "scout" | "research" | "research-worker" => Self::Scout,
+            "implementer" | "builder" => Self::Implementer,
+            "reviewer" => Self::Reviewer,
+            "verifier" | "tester" => Self::Verifier,
+            "tool-heavy" | "tool_heavy" => Self::ToolHeavy,
+            "operator" | "incident" | "incident-worker" => Self::Operator,
+            "summarizer" | "reducer" => Self::Summarizer,
+            "general" | "" => Self::General,
+            other => Self::Custom(other.to_string()),
+        }
+    }
+}
+
+impl Serialize for FleetSlot {
+    fn serialize<S>(&self, serializer: S) -> std::result::Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        serializer.serialize_str(self.as_str())
+    }
+}
+
+impl<'de> Deserialize<'de> for FleetSlot {
+    fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let value = String::deserialize(deserializer)?;
+        Ok(Self::from_name(&value))
+    }
+}
+
+/// Model class or route-role hint for a profile.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub enum FleetLoadout {
+    #[default]
+    Inherit,
+    Fast,
+    Balanced,
+    DeepReasoning,
+    Code,
+    Review,
+    ToolHeavy,
+    Custom(String),
+}
+
+impl FleetLoadout {
+    #[must_use]
+    pub fn as_str(&self) -> &str {
+        match self {
+            Self::Inherit => "inherit",
+            Self::Fast => "fast",
+            Self::Balanced => "balanced",
+            Self::DeepReasoning => "deep-reasoning",
+            Self::Code => "code",
+            Self::Review => "review",
+            Self::ToolHeavy => "tool-heavy",
+            Self::Custom(value) => value.as_str(),
+        }
+    }
+
+    #[must_use]
+    pub fn from_name(value: &str) -> Self {
+        match value.trim() {
+            "inherit" | "default" | "auto" | "" => Self::Inherit,
+            "fast" => Self::Fast,
+            "balanced" => Self::Balanced,
+            "deep-reasoning" | "deep_reasoning" | "reasoning" => Self::DeepReasoning,
+            "code" | "coding" => Self::Code,
+            "review" | "reviewer" => Self::Review,
+            "tool-heavy" | "tool_heavy" => Self::ToolHeavy,
+            other => Self::Custom(other.to_string()),
+        }
+    }
+}
+
+impl Serialize for FleetLoadout {
+    fn serialize<S>(&self, serializer: S) -> std::result::Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        serializer.serialize_str(self.as_str())
+    }
+}
+
+impl<'de> Deserialize<'de> for FleetLoadout {
+    fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let value = String::deserialize(deserializer)?;
+        Ok(Self::from_name(&value))
+    }
+}
+
+/// Safe permission defaults attached to a fleet profile.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct FleetProfilePermissions {
+    /// Permit shell-capable tools for this profile when later consumed.
+    #[serde(default)]
+    pub allow_shell: bool,
+    /// Permit trusted/elevated execution for this profile when later consumed.
+    #[serde(default)]
+    pub trust: bool,
+    /// Require approval by default. This intentionally defaults on.
+    #[serde(default = "default_fleet_profile_approval_required")]
+    pub approval_required: bool,
+}
+
+fn default_fleet_profile_approval_required() -> bool {
+    true
+}
+
+impl Default for FleetProfilePermissions {
+    fn default() -> Self {
+        Self {
+            allow_shell: false,
+            trust: false,
+            approval_required: true,
+        }
+    }
+}
+
+/// Delegation hints for future fleet manager scheduling.
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
+pub struct FleetDelegationHints {
+    /// Optional profile-level child spawn depth. `None` means inherit existing
+    /// fleet/sub-agent config.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_spawn_depth: Option<u32>,
+    /// Optional profile-level worker concurrency hint.
+    #[serde(
+        default,
+        alias = "concurrency",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub max_concurrency: Option<usize>,
+}
+
 /// A named role preset that bundles common worker settings.
 ///
 /// Task specs reference a role name (e.g. `"role": "reviewer"`), and the
@@ -1473,6 +1741,7 @@ impl Default for FleetConfigToml {
             require_identity_verification: default_fleet_require_identity(),
             max_trust_level: default_fleet_max_trust_level_str(),
             roles: BTreeMap::new(),
+            profiles: BTreeMap::new(),
             exec: FleetExecConfig::default(),
         }
     }

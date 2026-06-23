@@ -4501,6 +4501,85 @@ max_spawn_depth = 2
 }
 
 #[test]
+fn fleet_profile_defaults_round_trip_through_config() {
+    let config: ConfigToml = toml::from_str(
+        r#"
+[fleet.profiles.default]
+"#,
+    )
+    .expect("fleet profile config should parse");
+
+    let profile = config
+        .fleet
+        .expect("fleet config")
+        .profiles
+        .get("default")
+        .expect("default profile")
+        .clone();
+
+    assert_eq!(profile, FleetProfile::default());
+    assert!(!profile.permissions.allow_shell);
+    assert!(!profile.permissions.trust);
+    assert!(profile.permissions.approval_required);
+
+    let serialized = toml::to_string_pretty(&profile).expect("profile serializes");
+    let round_tripped: FleetProfile =
+        toml::from_str(&serialized).expect("serialized profile parses");
+    assert_eq!(round_tripped, profile);
+}
+
+#[test]
+fn fleet_profile_explicit_config_parses_role_loadout_permissions() {
+    let config: ConfigToml = toml::from_str(
+        r#"
+[fleet.profiles.verifier]
+slot = "verifier"
+loadout = "review"
+
+[fleet.profiles.verifier.role]
+name = "verifier"
+description = "Read-only verification worker"
+instructions = "Check the patch and report evidence."
+
+[fleet.profiles.verifier.permissions]
+allow_shell = false
+trust = false
+approval_required = true
+
+[fleet.profiles.verifier.delegation]
+max_spawn_depth = 0
+concurrency = 3
+"#,
+    )
+    .expect("fleet profile config should parse");
+
+    let profile = config
+        .fleet
+        .expect("fleet config")
+        .profiles
+        .get("verifier")
+        .expect("verifier profile")
+        .clone();
+
+    assert_eq!(profile.slot, FleetSlot::Verifier);
+    assert_eq!(profile.role.name, "verifier");
+    assert_eq!(
+        profile.role.description.as_deref(),
+        Some("Read-only verification worker")
+    );
+    assert_eq!(
+        profile.role.instructions.as_deref(),
+        Some("Check the patch and report evidence.")
+    );
+    assert_eq!(profile.loadout, FleetLoadout::Review);
+    assert!(!profile.permissions.allow_shell);
+    assert!(!profile.permissions.trust);
+    assert!(profile.permissions.approval_required);
+    assert_eq!(profile.delegation.max_spawn_depth, Some(0));
+    assert_eq!(profile.delegation.max_concurrency, Some(3));
+}
+
+#[test]
 fn fallback_providers_do_not_change_runtime_resolution() {
     let _lock = env_lock();
     let _env = EnvGuard::without_deepseek_runtime_overrides();
