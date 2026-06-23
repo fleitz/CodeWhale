@@ -80,13 +80,9 @@ impl ModelsDevCatalog {
         wire_model_id: &str,
     ) -> Option<ProviderModelOffering> {
         let provider_key = provider_id.trim();
-        let provider = self.provider(provider_id)?;
+        let provider = self.provider(provider_key)?;
         let model = provider.models.get(wire_model_id.trim())?;
-        let provider_id = if provider.id.trim().is_empty() {
-            provider_key.to_string()
-        } else {
-            provider.id.trim().to_string()
-        };
+        let provider_id = provider.effective_id(provider_key);
         Some(ProviderModelOffering {
             provider: ProviderId::from(provider_id),
             canonical_model: model.base_model.clone().map(ModelId::from),
@@ -105,11 +101,7 @@ impl ModelsDevCatalog {
     pub fn provider_offerings(&self, provider_id: &str) -> Option<Vec<ProviderModelOffering>> {
         let provider_key = provider_id.trim();
         let provider = self.provider(provider_key)?;
-        let provider_id = if provider.id.trim().is_empty() {
-            provider_key.to_string()
-        } else {
-            provider.id.trim().to_string()
-        };
+        let provider_id = provider.effective_id(provider_key);
         Some(
             provider
                 .models
@@ -260,6 +252,22 @@ pub struct ModelsDevProvider {
     pub models: BTreeMap<String, ModelsDevProviderModel>,
 }
 
+impl ModelsDevProvider {
+    /// Resolve the effective provider id for this row.
+    ///
+    /// Models.dev snapshots usually repeat the catalog key in the `id` field,
+    /// but generated JSON can omit it. Fall back to the catalog key so callers
+    /// never emit an empty [`ProviderId`].
+    #[must_use]
+    fn effective_id(&self, provider_key: &str) -> String {
+        if self.id.trim().is_empty() {
+            provider_key.to_string()
+        } else {
+            self.id.trim().to_string()
+        }
+    }
+}
+
 /// Token limits.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub struct ModelsDevLimit {
@@ -306,14 +314,23 @@ fn supports_text_chat(modalities: Option<&ModelsDevModalities>) -> bool {
     let Some(modalities) = modalities else {
         return true;
     };
-    modalities
-        .input
-        .iter()
-        .any(|modality| modality.eq_ignore_ascii_case("text"))
-        && modalities
+    // Treat an empty modality list the same as absent metadata. An incomplete
+    // catalog snapshot can deserialize to `Some({ input: [], output: [] })`,
+    // and `Iterator::any` over an empty slice is `false` — without this guard
+    // such rows would be silently dropped from chat offerings even though the
+    // `None` branch above defaults them to chat-capable. Only an explicitly
+    // populated, non-text list excludes the row.
+    let input_ok = modalities.input.is_empty()
+        || modalities
+            .input
+            .iter()
+            .any(|modality| modality.eq_ignore_ascii_case("text"));
+    let output_ok = modalities.output.is_empty()
+        || modalities
             .output
             .iter()
-            .any(|modality| modality.eq_ignore_ascii_case("text"))
+            .any(|modality| modality.eq_ignore_ascii_case("text"));
+    input_ok && output_ok
 }
 
 #[cfg(test)]
@@ -499,5 +516,58 @@ mod tests {
         };
 
         assert!(!model.supports_text_chat());
+    }
+
+    #[test]
+    fn empty_modalities_struct_is_chat_capable() {
+        // `"modalities": {}` deserializes to Some(empty); it must default to
+        // chat-capable just like absent modality metadata (the None branch),
+        // otherwise rows from incomplete snapshots are silently dropped.
+        let provider_model = ModelsDevProviderModel {
+            modalities: Some(ModelsDevModalities::default()),
+            ..Default::default()
+        };
+        assert!(provider_model.supports_text_chat());
+
+        let canonical = ModelsDevModel {
+            modalities: Some(ModelsDevModalities::default()),
+            ..Default::default()
+        };
+        assert!(canonical.supports_text_chat());
+
+        // A list populated with only non-text entries still excludes the row.
+        let audio_only = ModelsDevProviderModel {
+            modalities: Some(ModelsDevModalities {
+                input: vec!["text".to_string()],
+                output: vec!["audio".to_string()],
+            }),
+            ..Default::default()
+        };
+        assert!(!audio_only.supports_text_chat());
+    }
+
+    #[test]
+    fn provider_offerings_keep_rows_with_empty_modalities_object() {
+        // End-to-end guard for the empty-modalities case at the offering layer:
+        // a custom/local provider row with `"modalities": {}` must still emit a
+        // chat offering rather than being filtered out of route resolution.
+        let raw = r#"{
+          "providers": {
+            "custom": {
+              "models": {
+                "house-model": { "id": "house-model", "modalities": {} }
+              }
+            }
+          }
+        }"#;
+        let catalog = ModelsDevCatalog::parse_json(raw).expect("fixture parses");
+        let offerings = catalog
+            .provider_offerings("custom")
+            .expect("provider offerings");
+
+        assert_eq!(offerings.len(), 1);
+        assert_eq!(offerings[0].wire_model_id.as_str(), "house-model");
+        // `id` was omitted on the provider row → effective id is the catalog key.
+        assert_eq!(offerings[0].provider.as_str(), "custom");
     }
 }

@@ -293,6 +293,45 @@ fn resolver_auto_uses_models_dev_default_offering_when_available() {
 }
 
 #[test]
+fn resolver_auto_falls_back_to_descriptor_default_without_catalog_default() {
+    // Z.ai offerings exist in the catalog snapshot but none is marked
+    // `default: true`. `auto` must then fall back to the provider descriptor's
+    // built-in default wire model rather than picking an arbitrary catalog row.
+    let raw = r#"{
+      "providers": {
+        "zai": {
+          "models": {
+            "glm-5-turbo": {
+              "id": "glm-5-turbo",
+              "modalities": { "input": ["text"], "output": ["text"] }
+            }
+          }
+        }
+      }
+    }"#;
+    let catalog = ModelsDevCatalog::parse_json(raw).expect("Models.dev fixture parses");
+    let offerings = catalog
+        .provider_offerings("zai")
+        .expect("zai provider offerings");
+    let r = RouteResolver::from_offerings(offerings);
+
+    let out = r
+        .resolve(&req(Some(ProviderKind::Zai), Some("auto")))
+        .expect("auto should resolve to the descriptor default");
+
+    assert!(out.logical_model.is_auto());
+    assert_eq!(
+        out.wire_model_id.as_str(),
+        "GLM-5.2",
+        "no catalog default → descriptor built-in default wins"
+    );
+    assert_eq!(
+        out.canonical_model, None,
+        "descriptor fallback carries no catalog canonical link"
+    );
+}
+
+#[test]
 fn resolver_models_dev_prefixed_wire_id_stays_inside_provider_scope() {
     let r = models_dev_route_resolver();
     let out = r
