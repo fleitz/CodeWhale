@@ -1506,6 +1506,9 @@ async fn run_fleet_command(workspace: &Path, config: &Config, args: FleetArgs) -
                 );
             }
         }
+        if let Some(receipt) = &inspection.receipt_summary {
+            println!("receipt: {receipt}");
+        }
         if let Some(error) = &inspection.last_error {
             println!("last_error: {error}");
         }

@@ -109,6 +109,7 @@ pub struct FleetWorkerInspection {
     pub latest_heartbeat_at: Option<String>,
     pub latest_event: Option<FleetWorkerEvent>,
     pub artifacts: Vec<FleetArtifactRef>,
+    pub receipt_summary: Option<String>,
     pub last_error: Option<String>,
     pub alert_state: Option<String>,
     /// Lightweight projection from the sub-agent worker runtime.
@@ -421,6 +422,7 @@ impl FleetManager {
                     .flat_map(|receipt| receipt.artifacts.clone()),
             )
             .collect();
+        let receipt_summary = latest_receipt_for_worker(&state, worker_id).map(receipt_summary);
         let last_error = latest_error_for_worker(&state, worker_id);
         let status = state
             .workers
@@ -464,6 +466,7 @@ impl FleetManager {
             latest_heartbeat_at,
             latest_event,
             artifacts,
+            receipt_summary,
             last_error,
             alert_state,
             runtime_state,
@@ -802,6 +805,8 @@ impl FleetManager {
 
         let (receipt_result, failure_kind, exit_code) =
             task_receipt_outcome(&terminal.payload, terminal.exit_code);
+        let terminal_completed =
+            matches!(&terminal.payload, FleetWorkerEventPayload::Completed { .. });
         self.append_worker_event(
             &task.entry.run_id,
             &task.worker_id,
@@ -842,6 +847,17 @@ impl FleetManager {
                     FleetTaskLedgerStatus::Failed,
                 )?;
             }
+            return Ok(true);
+        }
+        if terminal_completed {
+            let verification =
+                verify_task_result(&self.workspace, &task.task_spec, &verification_input);
+            record_verification_receipt(
+                &self.ledger,
+                &self.workspace,
+                &verification_input,
+                verification,
+            )?;
             return Ok(true);
         }
         self.ledger.record_receipt(FleetReceipt {
@@ -1230,6 +1246,45 @@ fn latest_alert_for_worker(state: &FleetLedgerState, worker_id: &str) -> Option<
         .map(|(_, message)| message)
 }
 
+fn latest_receipt_for_worker<'a>(
+    state: &'a FleetLedgerState,
+    worker_id: &str,
+) -> Option<&'a FleetReceipt> {
+    state
+        .receipts
+        .values()
+        .filter(|receipt| receipt.worker_id == worker_id)
+        .max_by_key(|receipt| &receipt.completed_at)
+}
+
+fn receipt_summary(receipt: &FleetReceipt) -> String {
+    let result = match receipt.result {
+        FleetTaskResult::Pass => "pass",
+        FleetTaskResult::Partial => "partial",
+        FleetTaskResult::Fail => "fail",
+        FleetTaskResult::Skip => "skip",
+        FleetTaskResult::Timeout => "timeout",
+    };
+    let mut summary = format!("result={result}");
+    if let Some(kind) = &receipt.failure_kind {
+        let kind = match kind {
+            FleetTaskFailureKind::Transport => "transport",
+            FleetTaskFailureKind::Task => "task",
+            FleetTaskFailureKind::Verifier => "verifier",
+        };
+        summary.push_str(&format!(" failure_kind={kind}"));
+    }
+    if let Some(notes) = receipt
+        .score
+        .as_ref()
+        .and_then(|score| score.notes.as_deref())
+        .filter(|notes| !notes.trim().is_empty())
+    {
+        summary.push_str(&format!(" notes={notes}"));
+    }
+    summary
+}
+
 fn latest_error_for_worker(state: &FleetLedgerState, worker_id: &str) -> Option<String> {
     state
         .latest_events
@@ -1585,6 +1640,78 @@ exit 0
                 .iter()
                 .any(|artifact| matches!(artifact.kind, FleetArtifactKind::Receipt))
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn fleet_task_spec_unscored_zero_exit_records_partial_receipt() {
+        let tmp = TempDir::new().unwrap();
+        let manager = FleetManager::open(tmp.path()).unwrap();
+        let path = task_spec_file(&tmp, vec![task("task-a")]);
+        let fake = fake_codewhale(
+            &tmp,
+            r#"#!/bin/sh
+printf '{"type":"done"}\n'
+exit 0
+"#,
+        );
+
+        let report = manager.create_run_from_task_spec_path(&path, 1).unwrap();
+        let worker_id = report.worker_ids[0].clone();
+        let status = complete_with_fake_codewhale(&manager, &report.run_id, 1, &fake);
+
+        assert_eq!(status.completed, 1);
+        assert_eq!(status.partial, 1);
+        assert_eq!(status.failed, 0);
+        let state = manager.ledger.rebuild_state().unwrap();
+        let receipt = &state.receipts[&format!("{}:task-a", report.run_id.0)];
+        assert_eq!(receipt.result, FleetTaskResult::Partial);
+        assert_eq!(receipt.failure_kind, None);
+        assert!(
+            receipt
+                .score
+                .as_ref()
+                .and_then(|score| score.notes.as_deref())
+                .unwrap_or_default()
+                .contains("no verifiable output")
+        );
+        assert!(
+            receipt
+                .artifacts
+                .iter()
+                .any(|artifact| matches!(artifact.kind, FleetArtifactKind::Receipt))
+        );
+        let inspection = manager.inspect_worker(&worker_id).unwrap();
+        let summary = inspection.receipt_summary.as_deref().unwrap_or_default();
+        assert!(summary.contains("result=partial"));
+        assert!(summary.contains("no verifiable output"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn fleet_task_spec_unscored_worker_error_records_failed_receipt() {
+        let tmp = TempDir::new().unwrap();
+        let manager = FleetManager::open(tmp.path()).unwrap();
+        let path = task_spec_file(&tmp, vec![task("task-a")]);
+        let fake = fake_codewhale(
+            &tmp,
+            r#"#!/bin/sh
+printf '{"type":"error","error":"tool failed"}\n'
+exit 7
+"#,
+        );
+
+        let report = manager.create_run_from_task_spec_path(&path, 1).unwrap();
+        let status = complete_with_fake_codewhale(&manager, &report.run_id, 1, &fake);
+
+        assert_eq!(status.completed, 0);
+        assert_eq!(status.partial, 0);
+        assert_eq!(status.failed, 1);
+        assert_eq!(status.task_failed, 1);
+        let state = manager.ledger.rebuild_state().unwrap();
+        let receipt = &state.receipts[&format!("{}:task-a", report.run_id.0)];
+        assert_eq!(receipt.result, FleetTaskResult::Fail);
+        assert_eq!(receipt.failure_kind, Some(FleetTaskFailureKind::Task));
     }
 
     #[cfg(unix)]

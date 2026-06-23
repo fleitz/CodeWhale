@@ -193,6 +193,10 @@ pub fn verify_task_result(
             "manual scorer configured",
             "manual verification is required to finalize this receipt",
         ),
+        None if !has_verifiable_artifact(input) => partial(
+            "no scorer configured and no verifiable artifacts recorded",
+            "worker exited successfully but produced no verifiable output",
+        ),
         None => partial(
             "no scorer configured",
             "task has artifacts but no deterministic scorer",
@@ -439,6 +443,15 @@ fn fail(
     }
 }
 
+fn has_verifiable_artifact(input: &FleetTaskVerificationInput) -> bool {
+    input.artifacts.iter().any(|artifact| {
+        !matches!(
+            artifact.kind,
+            FleetArtifactKind::Log | FleetArtifactKind::Receipt
+        )
+    })
+}
+
 #[derive(Debug)]
 struct EvidenceReadError {
     failure_kind: FleetTaskFailureKind,
@@ -676,6 +689,17 @@ mod tests {
             &input,
         );
         assert_eq!(manual.result, FleetTaskResult::Partial);
+
+        let no_scorer_empty = verify_task_result(tmp.path(), &task("unscored", None), &input);
+        assert_eq!(no_scorer_empty.result, FleetTaskResult::Partial);
+        assert!(
+            no_scorer_empty
+                .score
+                .notes
+                .as_deref()
+                .unwrap_or_default()
+                .contains("no verifiable output")
+        );
 
         let failed = verify_task_result(
             tmp.path(),
