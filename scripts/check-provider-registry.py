@@ -21,6 +21,8 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 CONFIG_RS = ROOT / "crates" / "config" / "src" / "lib.rs"
+# ProviderKind's enum + identity impl were split out of lib.rs into this module.
+PROVIDER_KIND_RS = ROOT / "crates" / "config" / "src" / "provider_kind.rs"
 PROVIDER_RS = ROOT / "crates" / "config" / "src" / "provider.rs"
 TUI_CONFIG_RS = ROOT / "crates" / "tui" / "src" / "config.rs"
 AGENT_RS = ROOT / "crates" / "agent" / "src" / "lib.rs"
@@ -91,6 +93,12 @@ def extract_match_block(
 
 
 def parse_aliases_for_variant(source: str, enum_name: str, variant: str, context: str) -> set[str]:
+    # `ProviderKind`'s enum + identity impl (incl. `parse`) live in
+    # provider_kind.rs after the config module split; read the impl from there
+    # regardless of the file the caller passed for other lookups.
+    if enum_name == "ProviderKind":
+        source = read(PROVIDER_KIND_RS)
+        context = "crates/config/src/provider_kind.rs"
     impl_start = require_index(source, f"impl {enum_name}", context)
     block = extract_match_block(
         source,

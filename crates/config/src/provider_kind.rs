@@ -160,7 +160,7 @@ impl ProviderKind {
     /// Return the built-in metadata entry for this provider.
     ///
     /// This is a metadata foundation only; runtime routing still resolves
-    /// through [`ConfigToml::resolve_runtime_options`].
+    /// through [`crate::ConfigToml::resolve_runtime_options`].
     #[must_use]
     pub fn provider(self) -> &'static dyn provider::Provider {
         provider::provider_for_kind(self)
