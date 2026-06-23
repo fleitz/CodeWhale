@@ -3945,6 +3945,20 @@ mod tests {
             height: 5,
         };
 
+        let mut normal_app = create_test_app();
+        normal_app.composer_density = ComposerDensity::Comfortable;
+        let normal_widget =
+            ComposerWidget::new(&normal_app, 5, &slash_menu_entries, &mention_menu_entries);
+        let mut normal_buf = Buffer::empty(area);
+        normal_widget.render(area, &mut normal_buf);
+        let normal_rendered = buffer_text(&normal_buf, area);
+        assert!(!normal_rendered.contains("Composer"));
+        assert!(!normal_rendered.contains("Draft"));
+        assert!(
+            !normal_rendered
+                .contains(&normal_app.tr(crate::localization::MessageId::HistorySearchTitle))
+        );
+
         let mut draft_app = create_test_app();
         draft_app.composer_density = ComposerDensity::Comfortable;
         draft_app.insert_str("first line\nsecond line");
