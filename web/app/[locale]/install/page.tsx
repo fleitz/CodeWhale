@@ -13,11 +13,13 @@ export async function generateMetadata({ params }: { params: Promise<{ locale: s
     locale,
     title: isZh ? "安装 · CodeWhale" : "Install · CodeWhale",
     description: isZh
-      ? "一行 npm install -g codewhale 安装 CodeWhale，也支持 Cargo、GitHub Releases、CNB 镜像、Homebrew、预编译二进制、Docker 和源码编译。"
-      : "Install CodeWhale with npm install -g codewhale — or via cargo, GitHub Releases, the CNB mirror, Homebrew, prebuilt binaries, Docker, or from source.",
+      ? "一行 curl -fsSL https://codewhale.net/install.sh | sh 安装或更新 CodeWhale，也支持 npm、Cargo、GitHub Releases、CNB 镜像、Homebrew、预编译二进制、Docker 和源码编译。"
+      : "Install or update CodeWhale with curl -fsSL https://codewhale.net/install.sh | sh, or via npm, cargo, GitHub Releases, the CNB mirror, Homebrew, prebuilt binaries, Docker, or from source.",
   });
 }
 
+const SHELL_INSTALL = `curl -fsSL https://codewhale.net/install.sh | sh`;
+const SHELL_INSPECT = `curl -fsSL https://codewhale.net/install.sh`;
 const NPM_INSTALL = `npm install -g codewhale`;
 const CARGO_INSTALL = `cargo install codewhale-cli --locked
 cargo install codewhale-tui --locked`;
@@ -52,7 +54,7 @@ docker run --rm -it \\
   ghcr.io/hmbown/codewhale:latest`;
 
 const FROM_SOURCE = `git clone https://github.com/Hmbown/CodeWhale
-cd codewhale
+cd CodeWhale
 cargo build --release --locked
 
 # Install both binaries from the local checkout
@@ -107,27 +109,30 @@ codewhale doctor`;
         </h1>
 
         <div className="space-y-3">
-          <InstallCodeBlock cmd={NPM_INSTALL} copyLabel={copyLabel} copiedLabel={copiedLabel} />
+          <InstallCodeBlock cmd={SHELL_INSTALL} copyLabel={copyLabel} copiedLabel={copiedLabel} />
           <InstallCodeBlock cmd={FIRST_RUN} copyLabel={copyLabel} copiedLabel={copiedLabel} />
         </div>
 
         <p className="mt-4 text-sm text-ink-soft leading-relaxed max-w-2xl">
           {isZh ? (
             <>
-              npm wrapper（Node 18+）会从 GitHub Releases 下载经 SHA-256 校验的二进制，并安装{" "}
+              macOS / Linux 安装脚本会从 GitHub Releases 下载经 SHA-256 校验的二进制，
+              默认安装到 <code className="inline">~/.local/bin</code>，并安装{" "}
               <code className="inline">codewhale</code>、<code className="inline">codew</code> 和{" "}
-              <code className="inline">codewhale-tui</code> 三个命令。
-              下方「其他安装方式」列出 Cargo、GitHub Releases、CNB、国内镜像、Homebrew、预编译二进制和 Docker。
+              <code className="inline">codewhale-tui</code>。先审阅脚本可运行{" "}
+              <code className="inline">{SHELL_INSPECT}</code>。下方「其他安装方式」列出 npm、Cargo、GitHub Releases、
+              CNB、国内镜像、Homebrew、预编译二进制和 Docker。
             </>
           ) : (
             <>
-              The npm wrapper (Node 18+) downloads SHA-256-verified binaries from GitHub Releases
-              and installs <code className="inline">codewhale</code>,{" "}
-              <code className="inline">codew</code>, and{" "}
-              <code className="inline">codewhale-tui</code>. See{" "}
+              The macOS / Linux installer downloads SHA-256-verified binaries from GitHub Releases,
+              installs to <code className="inline">~/.local/bin</code> by default, and exposes{" "}
+              <code className="inline">codewhale</code>, <code className="inline">codew</code>, and{" "}
+              <code className="inline">codewhale-tui</code>. To inspect it first, run{" "}
+              <code className="inline">{SHELL_INSPECT}</code>. See{" "}
               <a href="#other-ways" className="body-link">Other ways to install</a> below for
-              cargo, GitHub Releases, CNB, Homebrew, prebuilt binaries, Docker, or mainland China
-              mirrors.
+              npm, cargo, GitHub Releases, CNB, Homebrew, prebuilt binaries, Docker, or mainland
+              China mirrors.
             </>
           )}
         </p>
@@ -146,14 +151,14 @@ codewhale doctor`;
           {isZh ? (
             <>
               <code className="inline">codewhale doctor</code> 检查 API 密钥、网络、沙箱可用性、
-              MCP 服务器，并将完整报告写入{" "}
-              <code className="inline">~/.codewhale/doctor.log</code>。
+              MCP 服务器，并在终端输出修复建议；需要结构化输出时可加{" "}
+              <code className="inline">--json</code>。
             </>
           ) : (
             <>
               <code className="inline">codewhale doctor</code> checks your API key, network,
-              sandbox availability, and MCP servers. Full report is written to{" "}
-              <code className="inline">~/.codewhale/doctor.log</code>.
+              sandbox availability, and MCP servers, then prints remediation guidance. Add{" "}
+              <code className="inline">--json</code> when you need structured output.
             </>
           )}
         </p>
@@ -167,11 +172,16 @@ codewhale doctor`;
         </div>
 
         <InstallCodeBlock cmd={UPDATE} copyLabel={copyLabel} copiedLabel={copiedLabel} />
+        <div className="mt-3">
+          <InstallCodeBlock cmd={SHELL_INSTALL} copyLabel={copyLabel} copiedLabel={copiedLabel} />
+        </div>
 
         <p className="mt-4 text-sm text-ink-soft leading-relaxed max-w-2xl">
           {isZh ? (
             <>
               检查 GitHub Releases 是否有新版本并就地替换二进制。
+              通过 <code className="inline">install.sh</code> 安装的用户也可以重跑同一条{" "}
+              <code className="inline">curl</code> 命令覆盖更新。
               通过包管理器安装的话，用包管理器升级更稳：npm 安装的运行{" "}
               <code className="inline">npm update -g codewhale</code>；
               Cargo 安装的重跑两个 <code className="inline">cargo install</code> 命令并加{" "}
@@ -181,7 +191,9 @@ codewhale doctor`;
           ) : (
             <>
               Checks GitHub Releases for a newer version and replaces the binary in place. If you
-              installed via a package manager, prefer it instead: npm users run{" "}
+              installed with <code className="inline">install.sh</code>, re-run the same{" "}
+              <code className="inline">curl</code> command to overwrite the binaries.
+              If you installed via a package manager, prefer it instead: npm users run{" "}
               <code className="inline">npm update -g codewhale</code>; cargo users re-run both{" "}
               <code className="inline">cargo install</code> commands with{" "}
               <code className="inline">--force</code>; the legacy Homebrew tap updates with{" "}
@@ -274,11 +286,38 @@ codewhale doctor`;
           </h2>
           <p className="text-sm text-ink-soft max-w-2xl mb-10">
             {isZh
-              ? "如果上面的 npm 路径不适合你，从下面找到匹配你情况的一条。每条都安装同一组 codewhale / codewhale-tui 二进制。"
-              : "If the npm path above doesn't fit your setup, pick the row that matches your situation. Every path installs the same codewhale / codewhale-tui binary pair."}
+              ? "如果上面的脚本路径不适合你，从下面找到匹配你情况的一条。每条都安装同一组 codewhale / codewhale-tui 二进制。"
+              : "If the script above doesn't fit your setup, pick the row that matches your situation. Every path installs the same codewhale / codewhale-tui binary pair."}
           </p>
 
           <div className="space-y-10">
+            {/* npm */}
+            <div>
+              <div className="eyebrow mb-2 text-indigo">
+                npm{" "}
+                <span className="text-ink-mute font-mono normal-case tracking-normal">
+                  {isZh ? "· Node 18+" : "· Node 18+"}
+                </span>
+              </div>
+              <InstallCodeBlock cmd={NPM_INSTALL} copyLabel={copyLabel} copiedLabel={copiedLabel} />
+              <p className="mt-3 text-sm text-ink-soft leading-relaxed max-w-2xl">
+                {isZh ? (
+                  <>
+                    npm wrapper 会从 GitHub Releases 下载经 SHA-256 校验的二进制，并安装{" "}
+                    <code className="inline">codewhale</code>、<code className="inline">codew</code> 和{" "}
+                    <code className="inline">codewhale-tui</code> 三个命令。
+                  </>
+                ) : (
+                  <>
+                    The npm wrapper downloads SHA-256-verified binaries from GitHub Releases and
+                    installs <code className="inline">codewhale</code>,{" "}
+                    <code className="inline">codew</code>, and{" "}
+                    <code className="inline">codewhale-tui</code>.
+                  </>
+                )}
+              </p>
+            </div>
+
             {/* Cargo */}
             <div>
               <div className="eyebrow mb-2 text-indigo">
@@ -289,7 +328,9 @@ codewhale doctor`;
                 {isZh ? (
                   <>
                     编译并安装 <code className="inline">codewhale</code> 和 <code className="inline">codewhale-tui</code> 到 <code className="inline">~/.cargo/bin</code>。
-                    需要 Rust 1.88+；如未安装可访问 <a href="https://rustup.rs" className="body-link">rustup.rs</a>。
+                    需要 Rust 1.88+；Linux 用户先安装 <code className="inline">pkg-config</code> 和{" "}
+                    <code className="inline">libdbus-1-dev</code> 等构建依赖。如未安装 Rust，可访问{" "}
+                    <a href="https://rustup.rs" className="body-link">rustup.rs</a>。
                   </>
                 ) : (
                   <>
@@ -297,6 +338,9 @@ codewhale doctor`;
                     <code className="inline">codewhale-tui</code> to{" "}
                     <code className="inline">~/.cargo/bin</code>. Requires Rust 1.88+; install via{" "}
                     <a href="https://rustup.rs" className="body-link">rustup.rs</a> if you don&apos;t have it.
+                    On Linux, install build dependencies such as{" "}
+                    <code className="inline">pkg-config</code> and{" "}
+                    <code className="inline">libdbus-1-dev</code> first.
                   </>
                 )}
               </p>
@@ -485,13 +529,13 @@ codewhale doctor`;
                 {isZh ? (
                   <>
                     面向无法稳定访问 GitHub 的用户，提供 CNB 镜像（
-                    <Link href="/docs#cnb-mirror" className="body-link">docs/CNB_MIRROR.md</Link>
+                    <a href="https://github.com/Hmbown/CodeWhale/blob/main/docs/CNB_MIRROR.md" className="body-link">docs/CNB_MIRROR.md</a>
                     ）。镜像仓库由社区成员维护，发布延迟可能为几小时。
                   </>
                 ) : (
                   <>
                     A CNB mirror is available for users who cannot reliably reach GitHub (
-                    <Link href="/docs#cnb-mirror" className="body-link">docs/CNB_MIRROR.md</Link>
+                    <a href="https://github.com/Hmbown/CodeWhale/blob/main/docs/CNB_MIRROR.md" className="body-link">docs/CNB_MIRROR.md</a>
                     ). The mirror is maintained by community members; release latency may be a few hours.
                   </>
                 )}
@@ -526,7 +570,7 @@ codewhale doctor`;
           </div>
           <div className="grid md:grid-cols-3 gap-0 col-rule hairline-t hairline-b">
             <Link
-              href={isZh ? "/zh/docs" : "/docs"}
+              href={isZh ? "/zh/docs" : "/en/docs"}
               className="p-6 hover:bg-paper-deep transition-colors"
             >
               <div className="font-display text-xl mb-2">Docs</div>

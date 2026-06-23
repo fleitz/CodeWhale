@@ -8,6 +8,16 @@ If you just want the short version, see the
 [main README](../README.md#install) or
 [简体中文 README](../README.zh-CN.md#安装).
 
+On macOS and Linux, the website installer is the shortest install/update path:
+
+```bash
+curl -fsSL https://codewhale.net/install.sh | sh
+```
+
+It downloads the matching `codewhale` and `codewhale-tui` release binaries,
+verifies them against `codewhale-artifacts-sha256.txt`, installs to
+`~/.local/bin` by default, and creates the `codew` convenience alias.
+
 ---
 
 ## 1. Supported platforms
@@ -117,11 +127,11 @@ a download sourced from an impersonating repository or mirror.
 ## 3. Install via npm
 
 npm is the recommended install path. The `codewhale` wrapper is published at
-v0.8.63 (Node 18+; wrapper available for v0.8.56 and later).
+v0.8.64 (Node 18+; wrapper available for v0.8.56 and later).
 
 ```bash
 npm install -g codewhale
-codewhale --version   # 0.8.63
+codewhale --version   # 0.8.64
 ```
 
 `postinstall` downloads the right pair of binaries from the matching GitHub
