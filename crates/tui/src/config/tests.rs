@@ -2891,6 +2891,14 @@ fn wire_model_for_provider_matches_active_provider_shape() {
         wire_model_for_provider(ApiProvider::Openrouter, OPENROUTER_MINIMAX_M3_MODEL),
         OPENROUTER_MINIMAX_M3_MODEL
     );
+    assert_eq!(
+        wire_model_for_provider(ApiProvider::SiliconflowCn, DEFAULT_SILICONFLOW_MODEL),
+        DEFAULT_SILICONFLOW_MODEL
+    );
+    assert_eq!(
+        wire_model_for_provider(ApiProvider::SiliconflowCn, "deepseek-v4-pro"),
+        DEFAULT_SILICONFLOW_MODEL
+    );
 }
 
 #[test]
@@ -4985,6 +4993,47 @@ model = "deepseek-reasoner"
     assert_eq!(config.deepseek_base_url(), DEFAULT_SILICONFLOW_CN_BASE_URL);
     assert_eq!(config.default_model(), DEFAULT_SILICONFLOW_MODEL);
     assert!(has_api_key_for(&config, ApiProvider::SiliconflowCn));
+    Ok(())
+}
+
+#[test]
+fn siliconflow_cn_preserves_reported_deepseek_prefixed_v4_route() -> Result<()> {
+    let _lock = lock_test_env();
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let temp_root = env::temp_dir().join(format!(
+        "codewhale-tui-siliconflow-cn-v4-report-{}-{}",
+        std::process::id(),
+        nanos
+    ));
+    fs::create_dir_all(&temp_root)?;
+    let _guard = EnvGuard::new(&temp_root);
+
+    let config_path = temp_root.join(".deepseek").join("config.toml");
+    ensure_parent_dir(&config_path)?;
+    fs::write(
+        &config_path,
+        r#"provider = "siliconflow-CN"
+
+[providers.siliconflow-CN]
+api_key = "sf-cn-table-key"
+base_url = "https://api.siliconflow.cn/v1"
+model = "deepseek-ai/DeepSeek-V4-Pro"
+"#,
+    )?;
+
+    let config = Config::load(None, None)?;
+    assert_eq!(config.api_provider(), ApiProvider::SiliconflowCn);
+    assert_ne!(config.api_provider(), ApiProvider::Deepseek);
+    assert_eq!(config.deepseek_api_key()?, "sf-cn-table-key");
+    assert_eq!(config.deepseek_base_url(), DEFAULT_SILICONFLOW_CN_BASE_URL);
+    assert_eq!(config.default_model(), DEFAULT_SILICONFLOW_MODEL);
+    assert_eq!(
+        wire_model_for_provider(config.api_provider(), &config.default_model()),
+        DEFAULT_SILICONFLOW_MODEL
+    );
     Ok(())
 }
 

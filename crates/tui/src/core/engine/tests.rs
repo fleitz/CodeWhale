@@ -3989,6 +3989,27 @@ fn filter_tool_call_delta_strips_function_calls_marker() {
 }
 
 #[test]
+fn filter_tool_call_delta_strips_siliconflow_v4_dsml_content_fixture() {
+    // #2900: a SiliconFlow CN `deepseek-ai/DeepSeek-V4-Pro` stream can leak
+    // DSML/function-call markup through the ordinary content channel. Keep it
+    // out of visible assistant text; do not reinterpret `<function_calls>` as
+    // an executable legacy text tool call.
+    let mut in_block = false;
+    let visible_a = filter_tool_call_delta(
+        "visible prefix <function_calls>\n{\"name\":\"exec_shell\",\"arguments\":{\"cmd\":\"echo leaked\"}}",
+        &mut in_block,
+    );
+    assert!(in_block);
+    assert_eq!(visible_a, "visible prefix ");
+
+    let visible_b = filter_tool_call_delta("\n</function_calls> visible suffix", &mut in_block);
+    assert!(!in_block);
+    assert_eq!(visible_b, " visible suffix");
+    assert!(!visible_b.contains("exec_shell"));
+    assert!(!visible_b.contains("<function_calls>"));
+}
+
+#[test]
 fn filter_tool_call_delta_handles_chunk_split_marker() {
     let mut in_block = false;
     // First chunk opens the wrapper but does not close it.
