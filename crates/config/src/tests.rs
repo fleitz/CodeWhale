@@ -1011,6 +1011,30 @@ fn insecure_skip_tls_verify_resolves_only_for_active_provider() {
 }
 
 #[test]
+fn openai_provider_accepts_dashscope_bailian_base_url_and_model() {
+    let _lock = env_lock();
+    let _env = EnvGuard::without_deepseek_runtime_overrides();
+    let mut config = ConfigToml {
+        provider: ProviderKind::Openai,
+        ..ConfigToml::default()
+    };
+    config.providers.openai.api_key = Some("dashscope-table-key".to_string());
+    config.providers.openai.base_url =
+        Some("https://dashscope-intl.aliyuncs.com/compatible-mode/v1".to_string());
+    config.providers.openai.model = Some("qwen-plus".to_string());
+
+    let resolved = config.resolve_runtime_options(&CliRuntimeOverrides::default());
+
+    assert_eq!(resolved.provider, ProviderKind::Openai);
+    assert_eq!(resolved.api_key.as_deref(), Some("dashscope-table-key"));
+    assert_eq!(
+        resolved.base_url,
+        "https://dashscope-intl.aliyuncs.com/compatible-mode/v1"
+    );
+    assert_eq!(resolved.model, "qwen-plus");
+}
+
+#[test]
 fn http_headers_env_overrides_config() {
     let _lock = env_lock();
     let _env = EnvGuard::without_deepseek_runtime_overrides();

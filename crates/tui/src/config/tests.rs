@@ -2865,6 +2865,7 @@ fn validate_route_rejects_mismatched_provider_model_tuple() {
     // Pass-through / aggregator providers stay permissive — the upstream
     // API remains the authority for them.
     assert!(validate_route(ApiProvider::Openai, "deepseek-v4-pro").is_ok());
+    assert!(validate_route(ApiProvider::Openai, "qwen-plus").is_ok());
     assert!(validate_route(ApiProvider::Openrouter, "deepseek-v4-pro").is_ok());
     assert!(validate_route(ApiProvider::NvidiaNim, "deepseek-v4-pro").is_ok());
 }
@@ -4113,6 +4114,45 @@ model = "glm-5"
         "https://openai-compatible.example/api/coding/paas/v4"
     );
     assert_eq!(config.default_model(), "glm-5");
+    Ok(())
+}
+
+#[test]
+fn openai_provider_accepts_dashscope_bailian_fixture() -> Result<()> {
+    let _lock = lock_test_env();
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let temp_root = env::temp_dir().join(format!(
+        "codewhale-tui-dashscope-openai-{}-{}",
+        std::process::id(),
+        nanos
+    ));
+    fs::create_dir_all(&temp_root)?;
+    let _guard = EnvGuard::new(&temp_root);
+
+    let config_path = temp_root.join(".deepseek").join("config.toml");
+    ensure_parent_dir(&config_path)?;
+    fs::write(
+        &config_path,
+        r#"provider = "openai"
+
+[providers.openai]
+api_key = "dashscope-table-key"
+base_url = "https://dashscope-intl.aliyuncs.com/compatible-mode/v1"
+model = "qwen-plus"
+"#,
+    )?;
+
+    let config = Config::load(None, None)?;
+    assert_eq!(config.api_provider(), ApiProvider::Openai);
+    assert_eq!(config.deepseek_api_key()?, "dashscope-table-key");
+    assert_eq!(
+        config.deepseek_base_url(),
+        "https://dashscope-intl.aliyuncs.com/compatible-mode/v1"
+    );
+    assert_eq!(config.default_model(), "qwen-plus");
     Ok(())
 }
 

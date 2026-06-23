@@ -222,6 +222,22 @@ legacy top-level `base_url`, so the OpenAI-compatible provider receives it.
 provider tables in one config, `[providers.openai].model` can be used as the
 OpenAI-provider-specific override.
 
+Alibaba Bailian / Model Studio DashScope Qwen routes use the same OpenAI
+provider shape:
+
+```toml
+provider = "openai"
+
+[providers.openai]
+api_key = "YOUR_DASHSCOPE_API_KEY"
+base_url = "https://dashscope-intl.aliyuncs.com/compatible-mode/v1"
+model = "qwen-plus"
+```
+
+Use the regional DashScope `compatible-mode/v1` base URL that matches the
+region of your API key. CodeWhale keeps `qwen-plus` scoped to the `openai`
+provider route and does not infer a different provider from the model prefix.
+
 If the gateway accepts `POST /chat/completions` but rejects
 `/v1/chat/completions`, set a provider-local `path_suffix`:
 

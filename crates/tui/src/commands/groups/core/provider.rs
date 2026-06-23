@@ -320,6 +320,19 @@ mod tests {
     }
 
     #[test]
+    fn switch_to_openai_preserves_dashscope_model_id() {
+        let mut app = create_test_app();
+        let result = provider(&mut app, Some("openai qwen-plus"));
+        match result.action {
+            Some(AppAction::SwitchProvider { provider, model }) => {
+                assert_eq!(provider, ApiProvider::Openai);
+                assert_eq!(model.as_deref(), Some("qwen-plus"));
+            }
+            other => panic!("expected SwitchProvider, got {other:?}"),
+        }
+    }
+
+    #[test]
     fn switch_to_novita_emits_action() {
         let mut app = create_test_app();
         let result = provider(&mut app, Some("novita"));
