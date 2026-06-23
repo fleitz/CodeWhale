@@ -1523,14 +1523,6 @@ impl SubAgentRuntime {
         self
     }
 
-    /// Override the per-tool execution timeout (default `DEFAULT_TOOL_TIMEOUT`).
-    /// Lets the engine raise the budget for long but legitimate tool runs.
-    #[must_use]
-    pub fn with_tool_timeout(mut self, timeout: Duration) -> Self {
-        self.tool_timeout = timeout;
-        self
-    }
-
     /// Preserve the configured speech output directory for sub-agent tools.
     #[must_use]
     pub fn with_speech_output_dir(mut self, output_dir: Option<PathBuf>) -> Self {

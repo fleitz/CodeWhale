@@ -4208,6 +4208,21 @@ fn with_step_api_timeout_overrides_runtime_field() {
 }
 
 #[test]
+fn tool_timeout_defaults_to_generous_budget_and_survives_spawn() {
+    // Track A raised the per-tool timeout from the old 30s (which killed long
+    // but legitimate tool runs) to a generous default, and that budget must
+    // survive the child/background spawn clone rather than reverting.
+    let parent = stub_runtime();
+    assert!(
+        parent.tool_timeout.as_secs() >= 300,
+        "per-tool timeout must be a generous (>=300s) budget, not the old 30s"
+    );
+    let expected = parent.tool_timeout;
+    assert_eq!(parent.child_runtime().tool_timeout, expected);
+    assert_eq!(parent.background_runtime().tool_timeout, expected);
+}
+
+#[test]
 fn child_runtime_preserves_step_api_timeout() {
     // Real sub-agents spawn through `child_runtime()` / `background_runtime()`;
     // forgetting to clone the timeout would silently drop the user's config
