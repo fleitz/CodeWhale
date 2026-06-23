@@ -10,6 +10,8 @@
 //! - [`ids`] — provider/model/wire string newtypes + namespace hints.
 //! - [`descriptor`] — route-facing view over the static provider registry.
 //! - [`offering`] — provider/model offering seam (wire-id binding).
+//! - [`candidate`] — the runtime-resolved executable route + its parts.
+//! - [`errors`] — route resolution errors.
 //!
 //! Naming: the request/response wire shape is spelled [`RequestProtocol`],
 //! which is a re-export alias of [`crate::provider::WireFormat`] rather than a
@@ -23,11 +25,17 @@
 /// avoid introducing yet another protocol synonym.
 pub use crate::provider::WireFormat as RequestProtocol;
 
+pub mod candidate;
 pub mod descriptor;
+pub mod errors;
 pub mod ids;
 pub mod offering;
 
+pub use candidate::{
+    PricingSku, ReadyRouteCandidate, ResolvedAuthSource, ResolvedEndpoint, ValidationReport,
+};
 pub use descriptor::{EndpointDescriptor, ProviderDescriptor};
+pub use errors::RouteError;
 pub use ids::{LogicalModelRef, ModelId, NamespaceHint, ProviderId, WireModelId};
 pub use offering::{ProviderModelOffering, bundled_offerings};
 
