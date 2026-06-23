@@ -3,7 +3,9 @@ pub mod catalog;
 pub mod models_dev;
 pub mod pricing;
 pub mod provider;
+mod provider_defaults;
 pub mod route;
+pub(crate) use provider_defaults::*;
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::{OsStr, OsString};
@@ -28,122 +30,6 @@ use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 
 pub const CONFIG_FILE_NAME: &str = "config.toml";
 pub const PERMISSIONS_FILE_NAME: &str = "permissions.toml";
-const DEFAULT_DEEPSEEK_MODEL: &str = "deepseek-v4-pro";
-const DEFAULT_DEEPSEEK_ANTHROPIC_MODEL: &str = DEFAULT_DEEPSEEK_MODEL;
-const DEFAULT_NVIDIA_NIM_MODEL: &str = "deepseek-ai/deepseek-v4-pro";
-const DEFAULT_NVIDIA_NIM_FLASH_MODEL: &str = "deepseek-ai/deepseek-v4-flash";
-const DEFAULT_OPENAI_MODEL: &str = "deepseek-v4-pro";
-const DEFAULT_DEEPSEEK_BASE_URL: &str = "https://api.deepseek.com/beta";
-const DEFAULT_DEEPSEEK_ANTHROPIC_BASE_URL: &str = "https://api.deepseek.com/anthropic";
-const DEFAULT_NVIDIA_NIM_BASE_URL: &str = "https://integrate.api.nvidia.com/v1";
-const DEFAULT_OPENAI_CODEX_MODEL: &str = "gpt-5.5";
-const DEFAULT_ANTHROPIC_MODEL: &str = "claude-sonnet-4-6";
-const DEFAULT_ANTHROPIC_BASE_URL: &str = "https://api.anthropic.com";
-const DEFAULT_OPENAI_CODEX_BASE_URL: &str = "https://chatgpt.com/backend-api";
-const DEFAULT_OPENAI_BASE_URL: &str = "https://api.openai.com/v1";
-const DEFAULT_ATLASCLOUD_MODEL: &str = "deepseek-ai/deepseek-v4-flash";
-const DEFAULT_ATLASCLOUD_BASE_URL: &str = "https://api.atlascloud.ai/v1";
-const DEFAULT_WANJIE_ARK_MODEL: &str = "deepseek-reasoner";
-const DEFAULT_WANJIE_ARK_BASE_URL: &str = "https://maas-openapi.wanjiedata.com/api/v1";
-const DEFAULT_VOLCENGINE_MODEL: &str = "DeepSeek-V4-Pro";
-const DEFAULT_VOLCENGINE_BASE_URL: &str = "https://ark.cn-beijing.volces.com/api/coding/v3";
-const DEFAULT_OPENROUTER_MODEL: &str = "deepseek/deepseek-v4-pro";
-const DEFAULT_OPENROUTER_FLASH_MODEL: &str = "deepseek/deepseek-v4-flash";
-const OPENROUTER_ARCEE_TRINITY_LARGE_THINKING_MODEL: &str = "arcee-ai/trinity-large-thinking";
-const OPENROUTER_GEMMA_4_31B_MODEL: &str = "google/gemma-4-31b-it";
-const OPENROUTER_GEMMA_4_26B_A4B_MODEL: &str = "google/gemma-4-26b-a4b-it";
-const OPENROUTER_GLM_5_1_MODEL: &str = "z-ai/glm-5.1";
-const OPENROUTER_GLM_5_2_MODEL: &str = "z-ai/glm-5.2";
-const OPENROUTER_KIMI_K2_7_CODE_MODEL: &str = "moonshotai/kimi-k2.7-code";
-const OPENROUTER_KIMI_K2_6_MODEL: &str = "moonshotai/kimi-k2.6";
-const OPENROUTER_MINIMAX_M3_MODEL: &str = "minimax/minimax-m3";
-const OPENROUTER_MINIMAX_2_7_MODEL: &str = "minimax/minimax-2.7";
-const OPENROUTER_NEMOTRON_3_NANO_OMNI_MODEL: &str =
-    "nvidia/nemotron-3-nano-omni-30b-a3b-reasoning:free";
-const OPENROUTER_QWEN_3_6_FLASH_MODEL: &str = "qwen/qwen3.6-flash";
-const OPENROUTER_QWEN_3_6_35B_A3B_MODEL: &str = "qwen/qwen3.6-35b-a3b";
-const OPENROUTER_QWEN_3_6_MAX_PREVIEW_MODEL: &str = "qwen/qwen3.6-max-preview";
-const OPENROUTER_QWEN_3_6_27B_MODEL: &str = "qwen/qwen3.6-27b";
-const OPENROUTER_QWEN_3_6_PLUS_MODEL: &str = "qwen/qwen3.6-plus";
-const OPENROUTER_QWEN_3_7_MAX_MODEL: &str = "qwen/qwen3.7-max";
-const OPENROUTER_TENCENT_HY3_PREVIEW_MODEL: &str = "tencent/hy3-preview";
-const OPENROUTER_XIAOMI_MIMO_V2_5_PRO_MODEL: &str = "xiaomi/mimo-v2.5-pro";
-const OPENROUTER_XIAOMI_MIMO_V2_5_MODEL: &str = "xiaomi/mimo-v2.5";
-const DEFAULT_XIAOMI_MIMO_MODEL: &str = "mimo-v2.5-pro";
-const XIAOMI_MIMO_V2_5_PRO_ULTRASPEED_MODEL: &str = "mimo-v2.5-pro-ultraspeed";
-const XIAOMI_MIMO_V2_5_OMNI_MODEL: &str = "mimo-v2.5";
-const XIAOMI_MIMO_ASR_MODEL: &str = "mimo-v2.5-asr";
-const XIAOMI_MIMO_TTS_MODEL: &str = "mimo-v2.5-tts";
-const XIAOMI_MIMO_TTS_VOICE_DESIGN_MODEL: &str = "mimo-v2.5-tts-voicedesign";
-const XIAOMI_MIMO_TTS_VOICE_CLONE_MODEL: &str = "mimo-v2.5-tts-voiceclone";
-const XIAOMI_MIMO_V2_TTS_MODEL: &str = "mimo-v2-tts";
-const DEFAULT_NOVITA_MODEL: &str = "deepseek/deepseek-v4-pro";
-const DEFAULT_NOVITA_FLASH_MODEL: &str = "deepseek/deepseek-v4-flash";
-const DEFAULT_FIREWORKS_MODEL: &str = "accounts/fireworks/models/deepseek-v4-pro";
-const DEFAULT_SILICONFLOW_MODEL: &str = "deepseek-ai/DeepSeek-V4-Pro";
-const DEFAULT_SILICONFLOW_FLASH_MODEL: &str = "deepseek-ai/DeepSeek-V4-Flash";
-const DEFAULT_ARCEE_MODEL: &str = "trinity-large-thinking";
-const ARCEE_TRINITY_LARGE_PREVIEW_MODEL: &str = "trinity-large-preview";
-const ARCEE_TRINITY_MINI_MODEL: &str = "trinity-mini";
-const DEFAULT_MOONSHOT_MODEL: &str = "kimi-k2.7-code";
-const MOONSHOT_KIMI_K2_6_MODEL: &str = "kimi-k2.6";
-const DEFAULT_MOONSHOT_BASE_URL: &str = "https://api.moonshot.ai/v1";
-const DEFAULT_KIMI_CODE_MODEL: &str = "kimi-for-coding";
-const DEFAULT_KIMI_CODE_BASE_URL: &str = "https://api.kimi.com/coding/v1";
-const DEFAULT_SGLANG_MODEL: &str = "deepseek-ai/DeepSeek-V4-Pro";
-const DEFAULT_SGLANG_FLASH_MODEL: &str = "deepseek-ai/DeepSeek-V4-Flash";
-const DEFAULT_OPENROUTER_BASE_URL: &str = "https://openrouter.ai/api/v1";
-const XIAOMI_MIMO_PAY_AS_YOU_GO_BASE_URL: &str = "https://api.xiaomimimo.com/v1";
-const DEFAULT_XIAOMI_MIMO_BASE_URL: &str = "https://token-plan-sgp.xiaomimimo.com/v1";
-const XIAOMI_MIMO_TOKEN_PLAN_CN_BASE_URL: &str = "https://token-plan-cn.xiaomimimo.com/v1";
-const XIAOMI_MIMO_TOKEN_PLAN_SGP_BASE_URL: &str = DEFAULT_XIAOMI_MIMO_BASE_URL;
-const XIAOMI_MIMO_TOKEN_PLAN_AMS_BASE_URL: &str = "https://token-plan-ams.xiaomimimo.com/v1";
-const DEFAULT_NOVITA_BASE_URL: &str = "https://api.novita.ai/openai/v1";
-const DEFAULT_FIREWORKS_BASE_URL: &str = "https://api.fireworks.ai/inference/v1";
-const DEFAULT_SILICONFLOW_BASE_URL: &str = "https://api.siliconflow.com/v1";
-const DEFAULT_SILICONFLOW_CN_BASE_URL: &str = "https://api.siliconflow.cn/v1";
-const DEFAULT_ARCEE_BASE_URL: &str = "https://api.arcee.ai/api/v1";
-const DEFAULT_HUGGINGFACE_MODEL: &str = "deepseek-ai/DeepSeek-V4-Pro";
-const DEFAULT_HUGGINGFACE_FLASH_MODEL: &str = "deepseek-ai/DeepSeek-V4-Flash";
-const DEFAULT_HUGGINGFACE_BASE_URL: &str = "https://router.huggingface.co/v1";
-const DEFAULT_TOGETHER_MODEL: &str = "deepseek-ai/DeepSeek-V4-Pro";
-const DEFAULT_TOGETHER_FLASH_MODEL: &str = "deepseek-ai/DeepSeek-V4-Flash";
-const DEFAULT_TOGETHER_BASE_URL: &str = "https://api.together.xyz/v1";
-const DEFAULT_QIANFAN_MODEL: &str = "ernie-4.0-turbo-8k";
-const DEFAULT_QIANFAN_BASE_URL: &str = "https://api.baiduqianfan.ai/v1";
-const DEFAULT_SGLANG_BASE_URL: &str = "http://localhost:30000/v1";
-const DEFAULT_VLLM_MODEL: &str = "deepseek-ai/DeepSeek-V4-Pro";
-const DEFAULT_VLLM_FLASH_MODEL: &str = "deepseek-ai/DeepSeek-V4-Flash";
-const DEFAULT_VLLM_BASE_URL: &str = "http://localhost:8000/v1";
-const DEFAULT_OLLAMA_MODEL: &str = "deepseek-coder:1.3b";
-const DEFAULT_OLLAMA_BASE_URL: &str = "http://localhost:11434/v1";
-
-// Z.ai (GLM Coding Plan) defaults
-const DEFAULT_ZAI_MODEL: &str = "GLM-5.2";
-const ZAI_GLM_5_1_MODEL: &str = "GLM-5.1";
-// GLM-5.2 is both the default and a named tier; the alias arm resolves the
-// `glm-5.2` spelling to DEFAULT_ZAI_MODEL directly, so this constant is only
-// referenced by the invariant test below.
-#[allow(dead_code)]
-const ZAI_GLM_5_2_MODEL: &str = "GLM-5.2";
-const ZAI_GLM_5_TURBO_MODEL: &str = "GLM-5-Turbo";
-const DEFAULT_ZAI_BASE_URL: &str = "https://api.z.ai/api/coding/paas/v4";
-// StepFun / StepFlash defaults
-const DEFAULT_STEPFUN_MODEL: &str = "step-3.7-flash";
-const DEFAULT_STEPFUN_BASE_URL: &str = "https://api.stepfun.ai/v1";
-// MiniMax defaults
-const DEFAULT_MINIMAX_MODEL: &str = "MiniMax-M3";
-const MINIMAX_M2_7_MODEL: &str = "MiniMax-M2.7";
-const MINIMAX_M2_7_HIGHSPEED_MODEL: &str = "MiniMax-M2.7-highspeed";
-const MINIMAX_M2_5_MODEL: &str = "MiniMax-M2.5";
-const MINIMAX_M2_5_HIGHSPEED_MODEL: &str = "MiniMax-M2.5-highspeed";
-const MINIMAX_M2_1_MODEL: &str = "MiniMax-M2.1";
-const MINIMAX_M2_1_HIGHSPEED_MODEL: &str = "MiniMax-M2.1-highspeed";
-const MINIMAX_M2_MODEL: &str = "MiniMax-M2";
-const DEFAULT_MINIMAX_BASE_URL: &str = "https://api.minimax.io/v1";
-const DEFAULT_DEEPINFRA_MODEL: &str = "deepseek-ai/DeepSeek-V4-Pro";
-const DEFAULT_DEEPINFRA_FLASH_MODEL: &str = "deepseek-ai/DeepSeek-V4-Flash";
-const DEFAULT_DEEPINFRA_BASE_URL: &str = "https://api.deepinfra.com/v1/openai";
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
 #[serde(rename_all = "kebab-case")]
