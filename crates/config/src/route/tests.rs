@@ -1,5 +1,7 @@
 //! Behavior tests for the route foundation (#2608 / #3084 / #3384).
 
+use super::RequestProtocol;
+use super::descriptor::ProviderDescriptor;
 use super::ids::{LogicalModelRef, ModelId, NamespaceHint, ProviderId, WireModelId};
 use crate::ProviderKind;
 
@@ -77,4 +79,40 @@ fn newtypes_serialize_transparently() {
         serde_json::to_string(&wire).unwrap(),
         "\"deepseek-ai/DeepSeek-V4-Pro\""
     );
+}
+
+#[test]
+fn descriptor_for_every_kind_has_nonempty_transport_facts() {
+    for kind in ProviderKind::ALL {
+        let d = ProviderDescriptor::for_kind(kind);
+        assert!(!d.id().as_str().is_empty(), "{kind:?} id empty");
+        assert!(
+            !d.default_base_url().is_empty(),
+            "{kind:?} default_base_url empty"
+        );
+        assert!(
+            !d.default_wire_model().as_str().is_empty(),
+            "{kind:?} default_wire_model empty"
+        );
+        // protocol() always yields a RequestProtocol; calling it must not panic.
+        let _: RequestProtocol = d.protocol();
+    }
+}
+
+#[test]
+fn descriptor_protocol_matches_provider_wire() {
+    for kind in ProviderKind::ALL {
+        let d = ProviderDescriptor::for_kind(kind);
+        assert_eq!(
+            d.protocol(),
+            kind.provider().wire(),
+            "{kind:?} protocol must equal provider().wire()"
+        );
+        let expected = match kind {
+            ProviderKind::OpenaiCodex => RequestProtocol::Responses,
+            ProviderKind::Anthropic => RequestProtocol::AnthropicMessages,
+            _ => RequestProtocol::ChatCompletions,
+        };
+        assert_eq!(d.protocol(), expected, "{kind:?} protocol mismatch");
+    }
 }

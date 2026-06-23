@@ -8,6 +8,8 @@
 //!
 //! Layering:
 //! - [`ids`] — provider/model/wire string newtypes + namespace hints.
+//! - [`descriptor`] — route-facing view over the static provider registry.
+//! - [`offering`] — provider/model offering seam (wire-id binding).
 //!
 //! Naming: the request/response wire shape is spelled [`RequestProtocol`],
 //! which is a re-export alias of [`crate::provider::WireFormat`] rather than a
@@ -21,9 +23,13 @@
 /// avoid introducing yet another protocol synonym.
 pub use crate::provider::WireFormat as RequestProtocol;
 
+pub mod descriptor;
 pub mod ids;
+pub mod offering;
 
+pub use descriptor::{EndpointDescriptor, ProviderDescriptor};
 pub use ids::{LogicalModelRef, ModelId, NamespaceHint, ProviderId, WireModelId};
+pub use offering::{ProviderModelOffering, bundled_offerings};
 
 #[cfg(test)]
 mod tests;
