@@ -609,7 +609,16 @@ impl ToolSpec for PrAttemptRecordTool {
     }
 
     async fn execute(&self, input: Value, context: &ToolContext) -> Result<ToolResult, ToolError> {
-        let task_id = task_id_from_input_or_context(&input, context)?;
+        let mut task_id = task_id_from_input_or_context(&input, context)?;
+        if let Some(manager) = context.runtime.task_manager.as_ref() {
+            task_id = manager
+                .get_task(&task_id)
+                .await
+                .map_err(|e| ToolError::execution_failed(e.to_string()))?
+                .id;
+        } else {
+            validate_storage_component(&task_id, "task_id")?;
+        }
         let base_sha = git_output(&context.workspace, &["rev-parse", "HEAD"]).ok();
         let head_sha = base_sha.clone();
         let branch = git_output(&context.workspace, &["rev-parse", "--abbrev-ref", "HEAD"]).ok();
@@ -624,7 +633,7 @@ impl ToolSpec for PrAttemptRecordTool {
             .filter(|line| !line.trim().is_empty())
             .map(ToString::to_string)
             .collect::<Vec<_>>();
-        let patch_path = write_task_artifact_for(context, &task_id, "attempt_patch", &diff)?;
+        let patch_path = write_task_artifact_for(context, &task_id, "attempt_patch", &diff).await?;
         let attempt = TaskAttemptRecord {
             id: format!("attempt_{}", &Uuid::new_v4().to_string()[..8]),
             attempt_group_id: optional_str(&input, "attempt_group_id")
@@ -872,21 +881,26 @@ fn write_runtime_artifact(
     ))
 }
 
-fn write_task_artifact_for(
+async fn write_task_artifact_for(
     context: &ToolContext,
     task_id: &str,
     label: &str,
     content: &str,
 ) -> Result<Option<PathBuf>, ToolError> {
     if let Some(manager) = context.runtime.task_manager.as_ref() {
+        let resolved = manager
+            .get_task(task_id)
+            .await
+            .map_err(|e| ToolError::execution_failed(e.to_string()))?;
         return manager
-            .write_task_artifact(task_id, label, content)
+            .write_task_artifact(&resolved.id, label, content)
             .map(Some)
             .map_err(|e| ToolError::execution_failed(e.to_string()));
     }
     if context.runtime.active_task_id.as_deref() != Some(task_id) {
         return Ok(None);
     }
+    validate_storage_component(task_id, "task_id")?;
     write_runtime_artifact(context, label, content)
 }
 
@@ -1020,7 +1034,47 @@ fn sanitize_filename(input: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Arc;
+
+    use crate::task_manager::{
+        ExecutionTask, TaskExecutionEvent, TaskExecutionResult, TaskExecutor, TaskManager,
+        TaskManagerConfig, TaskStatus,
+    };
+    use crate::tools::spec::RuntimeToolServices;
     use crate::tools::spec::ToolSpec;
+    use tokio::sync::mpsc;
+    use tokio_util::sync::CancellationToken;
+
+    struct NoopExecutor;
+
+    #[async_trait]
+    impl TaskExecutor for NoopExecutor {
+        async fn execute(
+            &self,
+            _task: ExecutionTask,
+            _events: mpsc::UnboundedSender<TaskExecutionEvent>,
+            _cancel: CancellationToken,
+        ) -> TaskExecutionResult {
+            TaskExecutionResult {
+                status: TaskStatus::Completed,
+                result_text: None,
+                error: None,
+            }
+        }
+    }
+
+    fn test_task_manager_config(root: PathBuf) -> TaskManagerConfig {
+        TaskManagerConfig {
+            data_dir: root,
+            worker_count: 1,
+            default_workspace: PathBuf::from("."),
+            default_model: "deepseek-v4-flash".to_string(),
+            default_mode: "agent".to_string(),
+            allow_shell: false,
+            trust_mode: false,
+            max_subagents: 2,
+        }
+    }
 
     #[test]
     fn durable_task_schema_requires_prompt() {
@@ -1046,6 +1100,37 @@ mod tests {
         let wait_schema = TaskShellWaitTool.input_schema();
         assert_eq!(wait_schema["required"][0], "task_id");
         assert!(wait_schema["properties"]["gate"].is_object());
+    }
+
+    #[tokio::test]
+    async fn task_artifact_helper_requires_existing_manager_task_before_write() {
+        let root = std::env::temp_dir().join(format!("codewhale-task-tool-{}", Uuid::new_v4()));
+        let manager = TaskManager::start_with_executor(
+            test_task_manager_config(root.clone()),
+            Arc::new(NoopExecutor),
+        )
+        .await
+        .expect("task manager");
+        let context =
+            ToolContext::new(std::env::temp_dir()).with_runtime_services(RuntimeToolServices {
+                task_manager: Some(manager),
+                task_data_dir: Some(root.clone()),
+                ..RuntimeToolServices::default()
+            });
+
+        let err = write_task_artifact_for(&context, "missing-task", "attempt_patch", "patch")
+            .await
+            .expect_err("missing task must be rejected before artifact write");
+
+        assert!(
+            err.to_string().contains("Task not found"),
+            "unexpected error: {err}"
+        );
+        assert!(
+            !root.join("artifacts").join("missing-task").exists(),
+            "artifact directory must not be created for missing task"
+        );
+        let _ = std::fs::remove_dir_all(root);
     }
 
     #[test]
