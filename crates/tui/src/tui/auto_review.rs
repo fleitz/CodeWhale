@@ -399,13 +399,120 @@ fn shell_params_are_publish_like(params: &Value) -> bool {
                 .filter(|token| !token.trim().is_empty())
                 .collect::<Vec<_>>()
         })
-        .any(|tokens| {
-            let canonical = crate::command_safety::classify_command(&tokens);
-            matches!(
-                canonical.as_str(),
-                "git push" | "git tag" | "gh release" | "npm publish" | "cargo publish"
-            )
-        })
+        .any(|tokens| shell_tokens_are_publish_like(&tokens))
+}
+
+fn shell_tokens_are_publish_like(tokens: &[&str]) -> bool {
+    if git_tag_tokens_are_publish_like(tokens) {
+        return true;
+    }
+
+    let canonical = crate::command_safety::classify_command(tokens);
+    matches!(
+        canonical.as_str(),
+        "git push" | "gh release" | "npm publish" | "cargo publish"
+    )
+}
+
+fn git_tag_tokens_are_publish_like(tokens: &[&str]) -> bool {
+    let Some(tag_index) = git_subcommand_index(tokens).filter(|index| {
+        tokens
+            .get(*index)
+            .is_some_and(|token| shell_token_eq(token, "tag"))
+    }) else {
+        return false;
+    };
+
+    let mut list_like = false;
+    let mut verify_only = false;
+    let mut has_positional = false;
+    let mut index = tag_index + 1;
+
+    while let Some(token) = tokens.get(index).map(|token| shell_token_trim(token)) {
+        match token {
+            "-d" | "--delete" => return true,
+            "-a" | "--annotate" | "-s" | "--sign" | "-f" | "--force" => {
+                return true;
+            }
+            "-u" | "--local-user" | "-m" | "--message" | "-F" | "--file" => {
+                return true;
+            }
+            "--list" | "-l" => list_like = true,
+            "-n" | "--verify" | "-v" => verify_only = true,
+            "--contains" | "--points-at" | "--merged" | "--no-merged" | "--sort" | "--format"
+            | "--column" => {
+                list_like = true;
+                index += 1;
+            }
+            _ if token.starts_with("--list=")
+                || token.starts_with("-n")
+                || token.starts_with("--contains=")
+                || token.starts_with("--points-at=")
+                || token.starts_with("--merged=")
+                || token.starts_with("--no-merged=")
+                || token.starts_with("--sort=")
+                || token.starts_with("--format=")
+                || token.starts_with("--column=") =>
+            {
+                list_like = true;
+            }
+            _ if token.starts_with('-') => {}
+            _ => has_positional = true,
+        }
+
+        index += 1;
+    }
+
+    has_positional && !list_like && !verify_only
+}
+
+fn git_subcommand_index(tokens: &[&str]) -> Option<usize> {
+    if !tokens
+        .first()
+        .is_some_and(|token| shell_token_eq(token, "git"))
+    {
+        return None;
+    }
+
+    let mut index = 1;
+    while let Some(token) = tokens.get(index).map(|token| shell_token_trim(token)) {
+        if git_global_option_takes_value(token) {
+            index += 2;
+            continue;
+        }
+
+        if git_global_option_has_value(token) || token.starts_with('-') {
+            index += 1;
+            continue;
+        }
+
+        return Some(index);
+    }
+
+    None
+}
+
+fn git_global_option_takes_value(token: &str) -> bool {
+    matches!(
+        token,
+        "-C" | "-c" | "--git-dir" | "--work-tree" | "--namespace" | "--config-env" | "--exec-path"
+    )
+}
+
+fn git_global_option_has_value(token: &str) -> bool {
+    token.starts_with("--git-dir=")
+        || token.starts_with("--work-tree=")
+        || token.starts_with("--namespace=")
+        || token.starts_with("--config-env=")
+        || token.starts_with("--exec-path=")
+}
+
+fn shell_token_eq(token: &str, expected: &str) -> bool {
+    shell_token_trim(token).eq_ignore_ascii_case(expected)
+}
+
+fn shell_token_trim(token: &str) -> &str {
+    token.trim_matches(|ch| matches!(ch, '\'' | '"'))
 }
 
 fn split_shell_segments_for_review(command: &str) -> Vec<String> {
@@ -607,6 +714,50 @@ mod tests {
         );
 
         assert_eq!(ctx.action_kind, ToolActionKind::Shell);
+    }
+
+    #[test]
+    fn shell_git_tag_list_does_not_match_publish_review() {
+        let ctx = ctx_for(
+            "exec_shell",
+            json!({ "command": "git remote -v && git rev-parse --show-toplevel && git branch --show-current && git rev-parse HEAD && git tag --list 'v0.8.65'" }),
+            RunOrigin::Interactive,
+            ApprovalMode::Auto,
+        );
+
+        assert_eq!(ctx.action_kind, ToolActionKind::Shell);
+    }
+
+    #[test]
+    fn shell_git_tag_creation_holds_for_publish_review() {
+        let policy = AutoReviewPolicy::default();
+        let ctx = ctx_for(
+            "exec_shell",
+            json!({ "command": "git tag v0.8.65" }),
+            RunOrigin::Interactive,
+            ApprovalMode::Auto,
+        );
+
+        let decision = policy.evaluate(&ctx);
+
+        assert_eq!(ctx.action_kind, ToolActionKind::Publish);
+        assert_eq!(decision.action, AutoReviewAction::HoldForReview);
+    }
+
+    #[test]
+    fn shell_git_tag_delete_holds_for_publish_review() {
+        let policy = AutoReviewPolicy::default();
+        let ctx = ctx_for(
+            "exec_shell",
+            json!({ "command": "git tag --delete v0.8.65" }),
+            RunOrigin::Interactive,
+            ApprovalMode::Auto,
+        );
+
+        let decision = policy.evaluate(&ctx);
+
+        assert_eq!(ctx.action_kind, ToolActionKind::Publish);
+        assert_eq!(decision.action, AutoReviewAction::HoldForReview);
     }
 
     #[test]

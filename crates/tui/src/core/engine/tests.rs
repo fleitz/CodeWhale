@@ -481,6 +481,24 @@ fn auto_review_policy_forces_prompt_for_shell_git_push() {
 }
 
 #[test]
+fn auto_review_policy_does_not_force_prompt_for_shell_git_tag_list_probe() {
+    let (decision, audit) = auto_review_plan_decision(
+        &crate::tui::auto_review::AutoReviewPolicy::default(),
+        "exec_shell",
+        &json!({"command": "git remote -v && git rev-parse --show-toplevel && git branch --show-current && git rev-parse HEAD && git tag --list 'v0.8.65'"}),
+        crate::tui::auto_review::RunOrigin::Interactive,
+        crate::tui::approval::ApprovalMode::Auto,
+        Some("inspect release status"),
+        true,
+        false,
+    );
+
+    assert_eq!(decision, AutoReviewPlanDecision::NoChange);
+    assert_eq!(audit["decision"], "ask_user");
+    assert_eq!(audit["action_kind"], "shell");
+}
+
+#[test]
 fn auto_review_policy_blocks_hold_when_approval_is_never() {
     let (decision, audit) = auto_review_plan_decision(
         &crate::tui::auto_review::AutoReviewPolicy::default(),
