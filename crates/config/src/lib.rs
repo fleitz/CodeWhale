@@ -1,4 +1,5 @@
 pub mod auth_source;
+pub mod catalog;
 pub mod models_dev;
 pub mod provider;
 pub mod route;
