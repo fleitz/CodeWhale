@@ -1393,7 +1393,7 @@ fn english(id: MessageId) -> &'static str {
         MessageId::CmdLspDescription => "Toggle LSP diagnostics on or off",
         MessageId::CmdShareDescription => "Export current session as a shareable web URL",
         MessageId::CmdJobsDescription => "Inspect and control background Bash jobs",
-        MessageId::CmdLinksDescription => "Show DeepSeek dashboard and docs links",
+        MessageId::CmdLinksDescription => "Show provider token, dashboard, and docs links",
         MessageId::CmdLoadDescription => "Load session from file",
         MessageId::CmdLogoutDescription => "Clear API key and return to setup",
         MessageId::CmdMcpDescription => "Open or manage MCP servers",
@@ -1614,10 +1614,12 @@ fn english(id: MessageId) -> &'static str {
             "Conversation cleared (plan state busy; run /clear again if needed)"
         }
         MessageId::ModelChanged => "Model changed: {old} \u{2192} {new}",
-        MessageId::LinksTitle => "DeepSeek Links:",
+        MessageId::LinksTitle => "Provider Links:",
         MessageId::LinksDashboard => "Dashboard:",
         MessageId::LinksDocs => "Docs:",
-        MessageId::LinksTip => "Tip: API keys are available in the dashboard console.",
+        MessageId::LinksTip => {
+            "Tip: Use the env var shown for your provider, or save the key with `codewhale auth set --provider <id>`."
+        }
         MessageId::SubagentsFetching => "Fetching sub-agent status...",
         MessageId::HelpUnknownCommand => "Unknown command: {topic}",
         MessageId::HomeDashboardTitle => "codewhale Home Dashboard",
@@ -2006,7 +2008,7 @@ fn vietnamese(id: MessageId) -> Option<&'static str> {
         }
         MessageId::CmdJobsDescription => "Kiểm tra và kiểm soát các lệnh chạy ngầm",
         MessageId::CmdLinksDescription => {
-            "Hiển thị các liên kết đến bảng điều khiển và tài liệu của DeepSeek"
+            "Hiển thị liên kết token, bảng điều khiển và tài liệu của nhà cung cấp"
         }
         MessageId::CmdLoadDescription => "Tải phiên làm việc từ tệp",
         MessageId::CmdLogoutDescription => "Xóa khóa API và quay lại bước thiết lập",
@@ -2247,10 +2249,12 @@ fn vietnamese(id: MessageId) -> Option<&'static str> {
             "Đã xóa cuộc trò chuyện (trạng thái plan đang bận; chạy lại /clear nếu cần)"
         }
         MessageId::ModelChanged => "Đã thay đổi mô hình: {old} \u{2192} {new}",
-        MessageId::LinksTitle => "Liên kết DeepSeek:",
+        MessageId::LinksTitle => "Liên kết nhà cung cấp:",
         MessageId::LinksDashboard => "Bảng điều khiển:",
         MessageId::LinksDocs => "Tài liệu:",
-        MessageId::LinksTip => "Mẹo: Mã khóa API có sẵn trong bảng điều khiển console.",
+        MessageId::LinksTip => {
+            "Mẹo: Dùng biến môi trường được hiển thị cho nhà cung cấp, hoặc lưu khóa bằng `codewhale auth set --provider <id>`."
+        }
         MessageId::SubagentsFetching => "Đang lấy trạng thái của các sub-agent...",
         MessageId::HelpUnknownCommand => "Lệnh không xác định: {topic}",
         MessageId::HomeDashboardTitle => "Bảng Điều Khiển Trang Chủ codewhale",
@@ -2815,7 +2819,9 @@ fn japanese(id: MessageId) -> Option<&'static str> {
         MessageId::CmdLspDescription => "LSP 診断のオン・オフを切り替え",
         MessageId::CmdShareDescription => "現在のセッションを共有可能な Web URL としてエクスポート",
         MessageId::CmdJobsDescription => "バックグラウンドのシェルジョブを確認・制御",
-        MessageId::CmdLinksDescription => "DeepSeek ダッシュボードとドキュメントへのリンクを表示",
+        MessageId::CmdLinksDescription => {
+            "プロバイダーのトークン、ダッシュボード、ドキュメントのリンクを表示"
+        }
         MessageId::CmdLoadDescription => "ファイルからセッションを読み込み",
         MessageId::CmdLogoutDescription => "API キーを消去してセットアップに戻る",
         MessageId::CmdMcpDescription => "MCP サーバを開く・管理する",
@@ -3037,10 +3043,12 @@ fn japanese(id: MessageId) -> Option<&'static str> {
             "会話履歴をクリアしました（plan 状態が忙しい；必要なら /clear を再度実行）"
         }
         MessageId::ModelChanged => "モデルを変更しました: {old} → {new}",
-        MessageId::LinksTitle => "DeepSeek リンク：",
+        MessageId::LinksTitle => "プロバイダーリンク：",
         MessageId::LinksDashboard => "ダッシュボード：",
         MessageId::LinksDocs => "ドキュメント：",
-        MessageId::LinksTip => "ヒント: API キーはダッシュボードコンソールで取得できます。",
+        MessageId::LinksTip => {
+            "ヒント: 表示されたプロバイダー用の環境変数を使うか、`codewhale auth set --provider <id>` でキーを保存してください。"
+        }
         MessageId::SubagentsFetching => "サブエージェントの状態を取得中...",
         MessageId::HelpUnknownCommand => "不明なコマンド: {topic}",
         MessageId::HomeDashboardTitle => "codewhale ホームダッシュボード",
@@ -3400,7 +3408,7 @@ fn chinese_simplified(id: MessageId) -> Option<&'static str> {
         MessageId::CmdLspDescription => "切换 LSP 诊断的开启或关闭",
         MessageId::CmdShareDescription => "将当前会话导出为可共享的 Web URL",
         MessageId::CmdJobsDescription => "查看并管理后台 shell 作业",
-        MessageId::CmdLinksDescription => "显示 DeepSeek 控制台与文档链接",
+        MessageId::CmdLinksDescription => "显示服务商令牌、控制台与文档链接",
         MessageId::CmdLoadDescription => "从文件加载会话",
         MessageId::CmdLogoutDescription => "清除 API 密钥并返回设置",
         MessageId::CmdMcpDescription => "打开或管理 MCP 服务器",
@@ -3592,10 +3600,12 @@ fn chinese_simplified(id: MessageId) -> Option<&'static str> {
             "对话已清空（Plan 状态忙碌；如需再次清空请运行 /clear）"
         }
         MessageId::ModelChanged => "模型已切换：{old} \u{2192} {new}",
-        MessageId::LinksTitle => "DeepSeek 链接：",
+        MessageId::LinksTitle => "服务商链接：",
         MessageId::LinksDashboard => "控制台：",
         MessageId::LinksDocs => "文档：",
-        MessageId::LinksTip => "提示：API 密钥可在控制台中获取。",
+        MessageId::LinksTip => {
+            "提示：使用所显示服务商的环境变量，或通过 `codewhale auth set --provider <id>` 保存密钥。"
+        }
         MessageId::SubagentsFetching => "正在获取子代理状态...",
         MessageId::HelpUnknownCommand => "未知命令：{topic}",
         MessageId::HomeDashboardTitle => "codewhale 主面板",
@@ -3945,7 +3955,9 @@ fn portuguese_brazil(id: MessageId) -> Option<&'static str> {
         MessageId::CmdLspDescription => "Alternar diagnóstico LSP ligado ou desligado",
         MessageId::CmdShareDescription => "Exportar a sessão atual como uma URL web compartilhável",
         MessageId::CmdJobsDescription => "Inspecionar e controlar jobs de shell em segundo plano",
-        MessageId::CmdLinksDescription => "Exibir links do painel e da documentação do DeepSeek",
+        MessageId::CmdLinksDescription => {
+            "Exibir links de tokens, painéis e documentação dos provedores"
+        }
         MessageId::CmdLoadDescription => "Carregar a sessão de um arquivo",
         MessageId::CmdLogoutDescription => "Limpar a chave de API e voltar à configuração",
         MessageId::CmdMcpDescription => "Abrir ou gerenciar servidores MCP",
@@ -4181,10 +4193,12 @@ fn portuguese_brazil(id: MessageId) -> Option<&'static str> {
             "Conversa limpa (estado do plano ocupado; execute /clear novamente se necessário)"
         }
         MessageId::ModelChanged => "Modelo alterado: {old} \u{2192} {new}",
-        MessageId::LinksTitle => "Links do DeepSeek:",
+        MessageId::LinksTitle => "Links dos provedores:",
         MessageId::LinksDashboard => "Painel:",
         MessageId::LinksDocs => "Documentação:",
-        MessageId::LinksTip => "Dica: chaves de API estão disponíveis no console do painel.",
+        MessageId::LinksTip => {
+            "Dica: use a variável de ambiente mostrada para seu provedor ou salve a chave com `codewhale auth set --provider <id>`."
+        }
         MessageId::SubagentsFetching => "Buscando status dos sub-agentes...",
         MessageId::HelpUnknownCommand => "Comando desconhecido: {topic}",
         MessageId::HomeDashboardTitle => "Painel Inicial do codewhale",
@@ -4572,7 +4586,9 @@ fn spanish_latin_america(id: MessageId) -> Option<&'static str> {
         MessageId::CmdJobsDescription => {
             "Inspeccionar y controlar trabajos de shell en segundo plano"
         }
-        MessageId::CmdLinksDescription => "Mostrar enlaces del panel y documentación de DeepSeek",
+        MessageId::CmdLinksDescription => {
+            "Mostrar enlaces de tokens, paneles y documentación de proveedores"
+        }
         MessageId::CmdLoadDescription => "Cargar la sesión desde un archivo",
         MessageId::CmdLogoutDescription => "Limpiar la clave de API y volver a la configuración",
         MessageId::CmdMcpDescription => "Abrir o gestionar servidores MCP",
@@ -4816,10 +4832,12 @@ fn spanish_latin_america(id: MessageId) -> Option<&'static str> {
             "Conversación limpia (estado del plan ocupado; ejecuta /clear de nuevo si es necesario)"
         }
         MessageId::ModelChanged => "Modelo cambiado: {old} \u{2192} {new}",
-        MessageId::LinksTitle => "Enlaces de DeepSeek:",
+        MessageId::LinksTitle => "Enlaces de proveedores:",
         MessageId::LinksDashboard => "Panel:",
         MessageId::LinksDocs => "Documentación:",
-        MessageId::LinksTip => "Tip: las claves de API están disponibles en la consola del panel.",
+        MessageId::LinksTip => {
+            "Tip: usa la variable de entorno mostrada para tu proveedor o guarda la clave con `codewhale auth set --provider <id>`."
+        }
         MessageId::SubagentsFetching => "Obteniendo estado de los sub-agentes...",
         MessageId::HelpUnknownCommand => "Comando desconocido: {topic}",
         MessageId::HomeDashboardTitle => "Panel Inicial de codewhale",

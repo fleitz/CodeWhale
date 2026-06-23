@@ -339,20 +339,203 @@ fn expand_workspace_path(path: &str) -> Result<PathBuf, String> {
     Ok(PathBuf::from(path))
 }
 
-/// Show `DeepSeek` dashboard and docs links
+struct ProviderLinkInfo {
+    key_url: Option<&'static str>,
+    docs_url: &'static str,
+    note: &'static str,
+}
+
+fn provider_link_info(provider_id: &str) -> ProviderLinkInfo {
+    match provider_id {
+        "deepseek" => ProviderLinkInfo {
+            key_url: Some("https://platform.deepseek.com/api_keys"),
+            docs_url: "https://api-docs.deepseek.com/",
+            note: "Create an API key in the DeepSeek platform console.",
+        },
+        "nvidia-nim" => ProviderLinkInfo {
+            key_url: Some("https://build.nvidia.com/settings/api-keys"),
+            docs_url: "https://build.nvidia.com/explore/discover",
+            note: "NVIDIA NIM keys are managed from the NVIDIA build console.",
+        },
+        "openai" => ProviderLinkInfo {
+            key_url: Some("https://platform.openai.com/api-keys"),
+            docs_url: "https://platform.openai.com/docs/api-reference",
+            note: "Use this for OpenAI or compatible endpoints that share OpenAI-style auth.",
+        },
+        "atlascloud" => ProviderLinkInfo {
+            key_url: None,
+            docs_url: "https://atlascloud.ai/docs/en/api-keys",
+            note: "Atlas Cloud documents API key creation in its API Keys guide.",
+        },
+        "wanjie-ark" => ProviderLinkInfo {
+            key_url: None,
+            docs_url: "https://platform.lingyiwanwu.com/docs",
+            note: "Use the Wanjie/01.AI platform console for provider credentials.",
+        },
+        "volcengine" => ProviderLinkInfo {
+            key_url: Some("https://console.volcengine.com/ark/apiKey"),
+            docs_url: "https://www.volcengine.com/docs/82379/1541594",
+            note: "Volcengine Ark API keys are managed in the Ark console.",
+        },
+        "openrouter" => ProviderLinkInfo {
+            key_url: Some("https://openrouter.ai/settings/keys"),
+            docs_url: "https://openrouter.ai/docs/api/reference/authentication",
+            note: "OpenRouter keys can include app credit limits and model routing controls.",
+        },
+        "xiaomi-mimo" => ProviderLinkInfo {
+            key_url: Some("https://platform.xiaomimimo.com/token-plan"),
+            docs_url: "https://mimo.mi.com/docs/en-US/tokenplan/Token%20Plan/subscription",
+            note: "Token Plan keys use the base URL shown on the Xiaomi MiMo Token Plan page.",
+        },
+        "novita" => ProviderLinkInfo {
+            key_url: Some("https://novita.ai/en/settings/key-management"),
+            docs_url: "https://novita.ai/docs/guides/quickstart",
+            note: "Novita keys are managed from Key Management in account settings.",
+        },
+        "fireworks" => ProviderLinkInfo {
+            key_url: Some("https://fireworks.ai/api-keys"),
+            docs_url: "https://docs.fireworks.ai/getting-started/quickstart",
+            note: "Create a Fireworks API key before exporting FIREWORKS_API_KEY.",
+        },
+        "siliconflow" => ProviderLinkInfo {
+            key_url: Some("https://cloud.siliconflow.com/account/ak"),
+            docs_url: "https://docs.siliconflow.com/en/userguide/quickstart",
+            note: "Use the global SiliconFlow console unless your route is the China endpoint.",
+        },
+        "siliconflow-CN" => ProviderLinkInfo {
+            key_url: Some("https://cloud.siliconflow.cn/account/ak"),
+            docs_url: "https://docs.siliconflow.cn/en/userguide/quickstart",
+            note: "Use the China SiliconFlow console for the China endpoint.",
+        },
+        "arcee" => ProviderLinkInfo {
+            key_url: None,
+            docs_url: "https://docs.arcee.ai/other/create-your-first-api-key",
+            note: "Arcee documents key creation from the platform API Keys page.",
+        },
+        "moonshot" => ProviderLinkInfo {
+            key_url: Some("https://platform.kimi.ai/console/api-keys"),
+            docs_url: "https://platform.kimi.ai/docs/api/overview",
+            note: "Moonshot/Kimi keys are managed in the Kimi Open Platform console.",
+        },
+        "sglang" => ProviderLinkInfo {
+            key_url: None,
+            docs_url: "https://docs.sglang.ai/",
+            note: "Self-hosted SGLang usually needs a local base URL, not a hosted token.",
+        },
+        "vllm" => ProviderLinkInfo {
+            key_url: None,
+            docs_url: "https://docs.vllm.ai/en/stable/serving/openai_compatible_server/",
+            note: "Self-hosted vLLM usually needs a local base URL, not a hosted token.",
+        },
+        "ollama" => ProviderLinkInfo {
+            key_url: None,
+            docs_url: "https://docs.ollama.com/api",
+            note: "Local Ollama does not require an API key by default.",
+        },
+        "huggingface" => ProviderLinkInfo {
+            key_url: Some("https://huggingface.co/settings/tokens"),
+            docs_url: "https://huggingface.co/docs/hub/en/security-tokens",
+            note: "Use a scoped Hugging Face access token.",
+        },
+        "together" => ProviderLinkInfo {
+            key_url: Some("https://api.together.ai/settings/api-keys"),
+            docs_url: "https://docs.together.ai/docs/api-keys-authentication",
+            note: "Together API keys are project-scoped.",
+        },
+        "openai-codex" => ProviderLinkInfo {
+            key_url: None,
+            docs_url: "https://developers.openai.com/codex/",
+            note: "This route uses Codex/ChatGPT auth instead of a normal provider API key.",
+        },
+        "anthropic" => ProviderLinkInfo {
+            key_url: Some("https://console.anthropic.com/settings/keys"),
+            docs_url: "https://docs.anthropic.com/en/api/overview",
+            note: "Create Claude API keys from the Anthropic Console.",
+        },
+        "zai" => ProviderLinkInfo {
+            key_url: None,
+            docs_url: "https://docs.z.ai/api-reference/introduction",
+            note: "Create or manage Z.ai API keys from the API Keys page linked in the docs.",
+        },
+        "stepfun" => ProviderLinkInfo {
+            key_url: Some("https://platform.stepfun.ai/"),
+            docs_url: "https://platform.stepfun.ai/docs/en/quickstart/overview",
+            note: "Open Account Management > Interface Keys in the StepFun console.",
+        },
+        "minimax" => ProviderLinkInfo {
+            key_url: Some(
+                "https://platform.minimax.io/user-center/basic-information/interface-key",
+            ),
+            docs_url: "https://platform.minimax.io/docs/api-reference/api-overview",
+            note: "MiniMax has separate pay-as-you-go API keys and Token Plan subscription keys.",
+        },
+        "deepinfra" => ProviderLinkInfo {
+            key_url: Some("https://deepinfra.com/dash/api_keys"),
+            docs_url: "https://docs.deepinfra.com/quickstart",
+            note: "Create DeepInfra API keys from the dashboard.",
+        },
+        _ => ProviderLinkInfo {
+            key_url: None,
+            docs_url: "https://codewhale.dev/docs/providers",
+            note: "Use the provider console for credentials, then configure the matching env var.",
+        },
+    }
+}
+
+/// Show provider dashboard, token, and docs links.
 pub fn deepseek_links(app: &mut App) -> CommandResult {
     let locale = app.ui_locale;
-    CommandResult::message(format!(
-        "{}\n\
-─────────────────────────────\n\
-{} https://platform.deepseek.com\n\
-{}      https://platform.deepseek.com/docs\n\n\
-{}",
-        tr(locale, MessageId::LinksTitle),
-        tr(locale, MessageId::LinksDashboard),
-        tr(locale, MessageId::LinksDocs),
-        tr(locale, MessageId::LinksTip),
-    ))
+    let active_provider = app.api_provider.as_str();
+    let mut message = format!(
+        "{}\n─────────────────────────────\n",
+        tr(locale, MessageId::LinksTitle)
+    );
+
+    for provider in codewhale_config::provider::providers_sorted_for_display() {
+        let links = provider_link_info(provider.id());
+        let active_marker = if provider.id() == active_provider {
+            " <- current"
+        } else {
+            ""
+        };
+        let _ = writeln!(
+            message,
+            "\n{} ({}){}",
+            provider.display_name(),
+            provider.id(),
+            active_marker
+        );
+        if let Some(key_url) = links.key_url {
+            let _ = writeln!(
+                message,
+                "{} {}",
+                tr(locale, MessageId::LinksDashboard),
+                key_url
+            );
+        } else {
+            let _ = writeln!(
+                message,
+                "{} {}",
+                tr(locale, MessageId::LinksDashboard),
+                links.note
+            );
+        }
+        let _ = writeln!(
+            message,
+            "{}      {}",
+            tr(locale, MessageId::LinksDocs),
+            links.docs_url
+        );
+        let env_vars = provider.env_vars();
+        if env_vars.is_empty() {
+            let _ = writeln!(message, "Env: none");
+        } else {
+            let _ = writeln!(message, "Env: {}", env_vars.join(", "));
+        }
+    }
+
+    let _ = writeln!(message, "\n{}", tr(locale, MessageId::LinksTip));
+    CommandResult::message(message)
 }
 
 /// Show home dashboard with stats and quick actions
@@ -598,7 +781,7 @@ mod tests {
         let result = help(&mut app, Some("links"));
         let msg = result.message.expect("help topic should return message");
         assert!(msg.contains("links"));
-        assert!(msg.contains("Show DeepSeek dashboard and docs links"));
+        assert!(msg.contains("Show provider token, dashboard, and docs links"));
         assert!(msg.contains("Usage: /links"));
         assert!(msg.contains("Aliases: dashboard, api"));
     }
@@ -1126,8 +1309,13 @@ mod tests {
         let result = deepseek_links(&mut app);
         assert!(result.message.is_some());
         let msg = result.message.unwrap();
-        assert!(msg.contains("DeepSeek Links"));
-        assert!(msg.contains("https://platform.deepseek.com"));
+        assert!(msg.contains("Provider Links"));
+        assert!(msg.contains("DeepSeek (deepseek) <- current"));
+        assert!(msg.contains("https://platform.deepseek.com/api_keys"));
+        assert!(msg.contains("Xiaomi MiMo (xiaomi-mimo)"));
+        assert!(msg.contains("https://platform.xiaomimimo.com/token-plan"));
+        assert!(msg.contains("OPENAI_API_KEY"));
+        assert!(msg.contains("XIAOMI_MIMO_TOKEN_PLAN_API_KEY"));
         assert!(result.action.is_none());
     }
 
