@@ -15,8 +15,10 @@ use crate::config::{
 #[serde(rename_all = "snake_case")]
 pub(crate) enum ModelAuthSource {
     Config,
+    Command,
     Env,
     OAuthCli,
+    Secret,
     KeylessLocal,
 }
 
@@ -196,6 +198,15 @@ fn auth_source_for_provider(config: &Config, provider: ApiProvider) -> Option<Mo
     if env_has_key_for(provider) {
         return Some(ModelAuthSource::Env);
     }
+    if let Some(auth) = config
+        .provider_config_for(provider)
+        .and_then(|entry| entry.auth.as_ref())
+    {
+        return match auth.source {
+            codewhale_config::AuthSourceKind::Command => Some(ModelAuthSource::Command),
+            codewhale_config::AuthSourceKind::Secret => Some(ModelAuthSource::Secret),
+        };
+    }
     if provider_uses_oauth_cli(config, provider) && has_api_key_for(config, provider) {
         return Some(ModelAuthSource::OAuthCli);
     }
@@ -280,5 +291,37 @@ mod tests {
                 .any(|candidate| candidate.provider == ApiProvider::Ollama
                     && candidate.auth_source == ModelAuthSource::KeylessLocal)
         );
+    }
+
+    #[test]
+    fn inventory_reports_command_auth_without_secret_value() {
+        let _env_lock = crate::test_support::lock_test_env();
+        let _deepseek = crate::test_support::EnvVarGuard::remove("DEEPSEEK_API_KEY");
+        let _openai = crate::test_support::EnvVarGuard::remove("OPENAI_API_KEY");
+        let mut providers = crate::config::ProvidersConfig::default();
+        providers.openai.auth = Some(codewhale_config::ProviderAuthSourceToml {
+            source: codewhale_config::AuthSourceKind::Command,
+            command: vec!["secret-tool".to_string(), "lookup".to_string()],
+            timeout_ms: Some(2000),
+            secret_id: None,
+        });
+        let config = Config {
+            provider: Some("openai".to_string()),
+            providers: Some(providers),
+            ..Default::default()
+        };
+
+        let inventory = ModelInventory::from_config(&config);
+        let candidate = inventory
+            .candidates
+            .iter()
+            .find(|candidate| candidate.provider == ApiProvider::Openai)
+            .expect("openai candidate");
+
+        assert_eq!(candidate.auth_source, ModelAuthSource::Command);
+        let json = inventory.router_context_json();
+        assert!(json.contains(r#""auth_source":"command""#));
+        assert!(!json.contains("secret-tool"));
+        assert!(!json.contains("lookup"));
     }
 }

@@ -66,6 +66,68 @@ fn permissions_toml_rejects_typed_allow_deny_shape() {
 }
 
 #[test]
+fn provider_command_auth_source_deserializes() {
+    let config: ConfigToml = toml::from_str(
+        r#"
+        [providers.deepseek.auth]
+        source = "command"
+        command = ["keepassxc-cli", "show", "CodeWhale/DeepSeek", "--attribute", "password"]
+        timeout_ms = 2000
+        "#,
+    )
+    .expect("config toml");
+
+    let auth = config
+        .providers
+        .deepseek
+        .auth
+        .expect("provider auth source");
+    assert_eq!(auth.source, AuthSourceKind::Command);
+    assert_eq!(auth.source_class(), "command");
+    assert_eq!(auth.command[0], "keepassxc-cli");
+    assert_eq!(auth.timeout_ms, Some(2000));
+    auth.validate().expect("valid command auth source");
+}
+
+#[test]
+fn provider_secret_auth_source_deserializes() {
+    let config: ConfigToml = toml::from_str(
+        r#"
+        [providers.openai.auth]
+        source = "secret"
+        secret_id = "codewhale/openai"
+        "#,
+    )
+    .expect("config toml");
+
+    let auth = config.providers.openai.auth.expect("provider auth source");
+    assert_eq!(auth.source, AuthSourceKind::Secret);
+    assert_eq!(auth.source_class(), "secret");
+    assert_eq!(auth.secret_id.as_deref(), Some("codewhale/openai"));
+    auth.validate().expect("valid secret auth source");
+}
+
+#[test]
+fn provider_auth_source_rejects_empty_command() {
+    let config: ConfigToml = toml::from_str(
+        r#"
+        [providers.deepseek.auth]
+        source = "command"
+        command = []
+        "#,
+    )
+    .expect("config toml");
+
+    let auth = config
+        .providers
+        .deepseek
+        .auth
+        .expect("provider auth source");
+    let err = auth.validate().expect_err("empty command must be invalid");
+    assert!(err.to_string().contains("command must include"));
+}
+
+#[test]
 fn hotbar_defaults_when_config_is_absent() {
     let config = ConfigToml::default();
 

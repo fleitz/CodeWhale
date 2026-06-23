@@ -1,3 +1,4 @@
+pub mod auth_source;
 pub mod provider;
 
 use std::collections::{BTreeMap, BTreeSet};
@@ -11,6 +12,7 @@ use std::path::{Component, Path, PathBuf};
 use std::sync::OnceLock;
 
 use anyhow::{Context, Result, bail};
+pub use auth_source::{AuthSourceKind, ProviderAuthSourceToml};
 pub use codewhale_execpolicy::ToolAskRule;
 use codewhale_execpolicy::{ExecPolicyEngine, Ruleset};
 use codewhale_secrets::SecretSource;
@@ -293,6 +295,8 @@ pub struct ProviderConfigToml {
     #[serde(default)]
     pub http_headers: BTreeMap<String, String>,
     pub path_suffix: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub auth: Option<ProviderAuthSourceToml>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]

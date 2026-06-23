@@ -319,6 +319,10 @@ max_subagents = 10 # optional (1-20)
 # model = "deepseek-ai/DeepSeek-V4-Pro"
 # http_headers = { "X-Model-Provider-Id" = "your-model-provider" } # optional custom request headers
 # path_suffix = "/chat/completions" # override the API path; skips /v1 versioning when set
+# [providers.deepseek.auth] # provider-scoped auth source metadata; command execution lands in a follow-up slice
+# source = "command"
+# command = ["secret-tool", "lookup", "service", "codewhale-deepseek"]
+# timeout_ms = 2000
 # insecure_skip_tls_verify = true # last resort for private gateways; prefer SSL_CERT_FILE
 
 # NVIDIA NIM-hosted DeepSeek V4 (https://build.nvidia.com)

@@ -2125,9 +2125,11 @@ fn report_write_status(label: &str, path: &Path, status: WriteStatus) {
 /// Source of the resolved DeepSeek API key, used in status reports.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ApiKeySource {
+    Command,
     Env,
     Config,
     Keyring,
+    Secret,
     Missing,
 }
 
@@ -2159,6 +2161,14 @@ fn resolve_api_key_source(config: &Config) -> ApiKeySource {
 
     if provider_config_key || root_deepseek_key {
         ApiKeySource::Config
+    } else if let Some(auth) = config
+        .provider_config()
+        .and_then(|entry| entry.auth.as_ref())
+    {
+        match auth.source {
+            codewhale_config::AuthSourceKind::Command => ApiKeySource::Command,
+            codewhale_config::AuthSourceKind::Secret => ApiKeySource::Secret,
+        }
     } else if provider_env_key_source(provider).is_some() {
         ApiKeySource::Env
     } else {
@@ -2225,6 +2235,10 @@ fn run_setup_status(config: &Config, workspace: &Path) -> Result<()> {
     println!("workspace: {}", workspace.display());
 
     match resolve_api_key_source(config) {
+        ApiKeySource::Command => println!(
+            "  {} api_key: configured via auth command",
+            "✓".truecolor(aqua_r, aqua_g, aqua_b)
+        ),
         ApiKeySource::Env => {
             let env_vars = provider_env_key_source(config.api_provider())
                 .map(str::to_string)
@@ -2240,6 +2254,10 @@ fn run_setup_status(config: &Config, workspace: &Path) -> Result<()> {
         ),
         ApiKeySource::Config => println!(
             "  {} api_key: set via config",
+            "✓".truecolor(aqua_r, aqua_g, aqua_b)
+        ),
+        ApiKeySource::Secret => println!(
+            "  {} api_key: configured via secret source",
             "✓".truecolor(aqua_r, aqua_g, aqua_b)
         ),
         ApiKeySource::Missing => {
@@ -2563,8 +2581,10 @@ async fn run_doctor(config: &Config, workspace: &Path, config_path_override: Opt
     let api_key_source = resolve_api_key_source(config);
     let has_api_key = if config.deepseek_api_key().is_ok() {
         let source_label = match api_key_source {
+            ApiKeySource::Command => "configured auth command",
             ApiKeySource::Config => "config.toml",
             ApiKeySource::Keyring => "OS keyring",
+            ApiKeySource::Secret => "configured secret source",
             ApiKeySource::Env => "environment",
             ApiKeySource::Missing
                 if matches!(
@@ -3283,9 +3303,11 @@ fn run_doctor_json(
         });
 
     let api_key_state = match resolve_api_key_source(config) {
+        ApiKeySource::Command => "command",
         ApiKeySource::Env => "env",
         ApiKeySource::Config => "config",
         ApiKeySource::Keyring => "keyring",
+        ApiKeySource::Secret => "secret",
         ApiKeySource::Missing => "missing",
     };
 
@@ -8693,6 +8715,54 @@ mod setup_helper_tests {
         let source = resolve_api_key_source(&cfg);
 
         assert_eq!(source, ApiKeySource::Env);
+    }
+
+    #[test]
+    fn resolve_api_key_source_reports_provider_command_auth_class() {
+        let _guard = crate::test_support::lock_test_env();
+        let _deepseek_key = crate::test_support::EnvVarGuard::remove("DEEPSEEK_API_KEY");
+        let _deepseek_source = crate::test_support::EnvVarGuard::remove("DEEPSEEK_API_KEY_SOURCE");
+        let _openai_key = crate::test_support::EnvVarGuard::remove("OPENAI_API_KEY");
+        let mut providers = crate::config::ProvidersConfig::default();
+        providers.openai.auth = Some(codewhale_config::ProviderAuthSourceToml {
+            source: codewhale_config::AuthSourceKind::Command,
+            command: vec!["secret-tool".to_string(), "lookup".to_string()],
+            timeout_ms: Some(2000),
+            secret_id: None,
+        });
+        let cfg = Config {
+            provider: Some("openai".to_string()),
+            providers: Some(providers),
+            ..Config::default()
+        };
+
+        let source = resolve_api_key_source(&cfg);
+
+        assert_eq!(source, ApiKeySource::Command);
+    }
+
+    #[test]
+    fn resolve_api_key_source_reports_provider_secret_auth_class() {
+        let _guard = crate::test_support::lock_test_env();
+        let _deepseek_key = crate::test_support::EnvVarGuard::remove("DEEPSEEK_API_KEY");
+        let _deepseek_source = crate::test_support::EnvVarGuard::remove("DEEPSEEK_API_KEY_SOURCE");
+        let _openai_key = crate::test_support::EnvVarGuard::remove("OPENAI_API_KEY");
+        let mut providers = crate::config::ProvidersConfig::default();
+        providers.openai.auth = Some(codewhale_config::ProviderAuthSourceToml {
+            source: codewhale_config::AuthSourceKind::Secret,
+            command: Vec::new(),
+            timeout_ms: None,
+            secret_id: Some("codewhale/openai".to_string()),
+        });
+        let cfg = Config {
+            provider: Some("openai".to_string()),
+            providers: Some(providers),
+            ..Config::default()
+        };
+
+        let source = resolve_api_key_source(&cfg);
+
+        assert_eq!(source, ApiKeySource::Secret);
     }
 
     #[test]

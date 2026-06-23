@@ -2564,6 +2564,7 @@ pub struct ProviderConfig {
     pub http_headers: Option<HashMap<String, String>>,
     #[serde(alias = "pathSuffix")]
     pub path_suffix: Option<String>,
+    pub auth: Option<codewhale_config::ProviderAuthSourceToml>,
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -5523,6 +5524,7 @@ fn merge_provider_config(base: ProviderConfig, override_cfg: ProviderConfig) -> 
             .or(base.insecure_skip_tls_verify),
         http_headers: override_cfg.http_headers.or(base.http_headers),
         path_suffix: override_cfg.path_suffix.or(base.path_suffix),
+        auth: override_cfg.auth.or(base.auth),
     }
 }
 
@@ -6000,6 +6002,13 @@ pub fn active_provider_has_config_api_key(config: &Config) -> bool {
     {
         return true;
     }
+    if config
+        .provider_config_for(provider)
+        .and_then(|entry| entry.auth.as_ref())
+        .is_some_and(|auth| auth.validate().is_ok())
+    {
+        return true;
+    }
 
     matches!(provider, ApiProvider::Deepseek | ApiProvider::DeepseekCN)
         && config
@@ -6059,6 +6068,13 @@ pub fn has_api_key_for(config: &Config, provider: ApiProvider) -> bool {
     if config
         .provider_config_string_with_runtime_fallback(provider, |entry| entry.api_key.clone())
         .is_some_and(|k| !k.trim().is_empty() && k != API_KEYRING_SENTINEL)
+    {
+        return true;
+    }
+    if config
+        .provider_config_for(provider)
+        .and_then(|entry| entry.auth.as_ref())
+        .is_some_and(|auth| auth.validate().is_ok())
     {
         return true;
     }

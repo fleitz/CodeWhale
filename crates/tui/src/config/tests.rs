@@ -5601,6 +5601,23 @@ fn has_api_key_for_uses_deepseek_cn_provider_table() -> Result<()> {
 }
 
 #[test]
+fn has_api_key_for_accepts_provider_auth_source_metadata() {
+    let mut providers = ProvidersConfig::default();
+    providers.openai.auth = Some(codewhale_config::ProviderAuthSourceToml {
+        source: codewhale_config::AuthSourceKind::Command,
+        command: vec!["secret-tool".to_string(), "lookup".to_string()],
+        timeout_ms: Some(2000),
+        secret_id: None,
+    });
+    let config = Config {
+        providers: Some(providers),
+        ..Config::default()
+    };
+
+    assert!(has_api_key_for(&config, ApiProvider::Openai));
+}
+
+#[test]
 fn has_api_key_for_uses_root_config_key_for_deepseek_variants() {
     let config = Config {
         api_key: Some("root-config-key".to_string()),
