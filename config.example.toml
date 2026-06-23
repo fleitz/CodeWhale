@@ -363,6 +363,10 @@ max_subagents = 10 # optional (1-20)
 # api_key = "YOUR_OPENROUTER_API_KEY"
 # base_url = "https://openrouter.ai/api/v1"
 # model = "deepseek/deepseek-v4-pro"
+# OpenRouter-compatible gateways can reuse this provider so reasoning/cache
+# parsing stays on the OpenRouter-compatible path instead of generic OpenAI:
+# base_url = "https://openrouter-compatible.example/v1"
+# model = "deepseek/deepseek-v4-pro"
 # Recent large model IDs also accepted here include arcee-ai/trinity-large-thinking,
 # minimax/minimax-m3, minimax/minimax-2.7, xiaomi/mimo-v2.5-pro, qwen/qwen3.6-flash,
 # qwen/qwen3.6-35b-a3b, qwen/qwen3.6-max-preview, qwen/qwen3.6-27b, qwen/qwen3.6-plus,

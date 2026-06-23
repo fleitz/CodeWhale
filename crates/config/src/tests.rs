@@ -4047,6 +4047,28 @@ fn openrouter_custom_base_url_preserves_provider_model() {
 }
 
 #[test]
+fn openrouter_compatible_base_url_preserves_namespaced_wire_model() {
+    let _lock = env_lock();
+    let _env = EnvGuard::without_deepseek_runtime_overrides();
+    let mut config = ConfigToml {
+        provider: ProviderKind::Openrouter,
+        ..ConfigToml::default()
+    };
+    config.providers.openrouter.base_url = Some("https://openrouter-compatible.example/v1".into());
+    config.providers.openrouter.model = Some("deepseek/deepseek-v4-pro".into());
+
+    let resolved = config.resolve_runtime_options(&CliRuntimeOverrides::default());
+
+    assert_eq!(resolved.provider, ProviderKind::Openrouter);
+    assert_eq!(resolved.provider_source, ProviderSource::Config);
+    assert_eq!(
+        resolved.base_url,
+        "https://openrouter-compatible.example/v1"
+    );
+    assert_eq!(resolved.model, "deepseek/deepseek-v4-pro");
+}
+
+#[test]
 fn fireworks_custom_base_url_preserves_provider_model() {
     let _lock = env_lock();
     let _env = EnvGuard::without_deepseek_runtime_overrides();

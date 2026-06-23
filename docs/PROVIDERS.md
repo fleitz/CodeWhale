@@ -190,6 +190,30 @@ includes `mimo-v2.5` for image input. CodeWhale exposes image analysis through t
 separate `[vision_model]` / `image_analyze` path; set that model to
 `mimo-v2.5` when using MiMo for vision.
 
+### OpenRouter-Compatible Base URLs
+
+OpenRouter-compatible gateways should usually stay on the `openrouter`
+provider with a provider-scoped `base_url` override instead of moving through
+the generic `openai` route. That keeps OpenRouter-style reasoning, streaming,
+cache usage, and namespaced wire model parsing attached to the selected route:
+
+```toml
+provider = "openrouter"
+
+[providers.openrouter]
+api_key = "sk-..."
+base_url = "https://openrouter-compatible.example/v1"
+model = "deepseek/deepseek-v4-pro"
+```
+
+CodeWhale preserves the `deepseek/` wire-model prefix under the OpenRouter
+provider scope; it does not infer a switch to the direct DeepSeek provider from
+that model string. Cache fields such as `prompt_cache_hit_tokens`,
+`prompt_cache_miss_tokens`, and `prompt_tokens_details.cached_tokens` are
+parsed when the upstream gateway sends them. If a key/account type omits those
+fields, CodeWhale treats them as absent for that response rather than as a
+different provider route.
+
 ### Recent OpenRouter Large Models
 
 OpenRouter completions and static registry rows include the April 2026 onward
