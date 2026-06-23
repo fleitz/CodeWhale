@@ -2867,6 +2867,9 @@ fn validate_route_rejects_mismatched_provider_model_tuple() {
     assert!(validate_route(ApiProvider::Openai, "deepseek-v4-pro").is_ok());
     assert!(validate_route(ApiProvider::Openrouter, "deepseek-v4-pro").is_ok());
     assert!(validate_route(ApiProvider::NvidiaNim, "deepseek-v4-pro").is_ok());
+    assert!(validate_route(ApiProvider::Together, DEFAULT_TOGETHER_MODEL).is_ok());
+    assert!(validate_route(ApiProvider::Together, DEFAULT_TOGETHER_FLASH_MODEL).is_ok());
+    assert!(validate_route(ApiProvider::Together, "deepseek-v4-pro").is_ok());
 }
 
 #[test]
@@ -2882,6 +2885,14 @@ fn wire_model_for_provider_matches_active_provider_shape() {
     assert_eq!(
         wire_model_for_provider(ApiProvider::NvidiaNim, DEFAULT_TEXT_MODEL),
         DEFAULT_NVIDIA_NIM_MODEL
+    );
+    assert_eq!(
+        wire_model_for_provider(ApiProvider::Together, DEFAULT_TEXT_MODEL),
+        DEFAULT_TOGETHER_MODEL
+    );
+    assert_eq!(
+        wire_model_for_provider(ApiProvider::Together, "deepseek-v4-flash"),
+        DEFAULT_TOGETHER_FLASH_MODEL
     );
     assert_eq!(
         wire_model_for_provider(ApiProvider::Openai, DEFAULT_OPENROUTER_MODEL),
@@ -2935,6 +2946,14 @@ fn normalize_model_name_for_provider_keeps_provider_specific_ids() {
     assert_eq!(
         normalize_model_name_for_provider(ApiProvider::Siliconflow, "deepseek-v3.2").as_deref(),
         Some("deepseek-v3.2")
+    );
+    assert_eq!(
+        normalize_model_name_for_provider(ApiProvider::Together, "deepseek-v4-pro").as_deref(),
+        Some(DEFAULT_TOGETHER_MODEL)
+    );
+    assert_eq!(
+        normalize_model_name_for_provider(ApiProvider::Together, "deepseek-chat").as_deref(),
+        Some(DEFAULT_TOGETHER_FLASH_MODEL)
     );
 }
 
@@ -3074,6 +3093,14 @@ fn model_completion_names_for_deepseek_api_are_deduplicated_bare_ids() {
     assert_eq!(
         model_completion_names_for_provider(ApiProvider::Deepseek),
         vec!["deepseek-v4-pro", "deepseek-v4-flash"]
+    );
+}
+
+#[test]
+fn model_completion_names_for_together_include_provider_owned_models() {
+    assert_eq!(
+        model_completion_names_for_provider(ApiProvider::Together),
+        vec![DEFAULT_TOGETHER_MODEL, DEFAULT_TOGETHER_FLASH_MODEL]
     );
 }
 

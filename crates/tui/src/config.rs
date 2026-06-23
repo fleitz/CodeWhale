@@ -183,6 +183,7 @@ pub const DEFAULT_DEEPINFRA_MODEL: &str = "deepseek-ai/DeepSeek-V4-Pro";
 pub const DEFAULT_DEEPINFRA_FLASH_MODEL: &str = "deepseek-ai/DeepSeek-V4-Flash";
 pub const DEFAULT_DEEPINFRA_BASE_URL: &str = "https://api.deepinfra.com/v1/openai";
 pub const DEFAULT_TOGETHER_MODEL: &str = "deepseek-ai/DeepSeek-V4-Pro";
+pub const DEFAULT_TOGETHER_FLASH_MODEL: &str = "deepseek-ai/DeepSeek-V4-Flash";
 pub const DEFAULT_TOGETHER_BASE_URL: &str = "https://api.together.xyz/v1";
 pub const DEFAULT_OPENAI_CODEX_MODEL: &str = "gpt-5.5";
 pub const DEFAULT_OPENAI_CODEX_BASE_URL: &str = "https://chatgpt.com/backend-api";
@@ -1107,6 +1108,12 @@ pub fn normalize_model_name_for_provider(provider: ApiProvider, model: &str) -> 
     }
 
     let normalized = normalize_model_name(model)?;
+    if matches!(provider, ApiProvider::Together) {
+        let provider_model = model_for_provider(provider, normalized.clone());
+        if provider_model != normalized {
+            return Some(provider_model);
+        }
+    }
     if matches!(provider, ApiProvider::Deepseek | ApiProvider::DeepseekCN)
         && let Some(canonical) = canonical_official_deepseek_model_id(&normalized)
     {
@@ -1185,7 +1192,7 @@ pub fn model_completion_names_for_provider(provider: ApiProvider) -> Vec<&'stati
         ApiProvider::Volcengine => vec![DEFAULT_VOLCENGINE_MODEL, DEFAULT_VOLCENGINE_FLASH_MODEL],
         ApiProvider::Ollama => Vec::new(),
         ApiProvider::Openai | ApiProvider::Atlascloud => OFFICIAL_DEEPSEEK_MODELS.to_vec(),
-        ApiProvider::Together => vec![DEFAULT_TOGETHER_MODEL],
+        ApiProvider::Together => vec![DEFAULT_TOGETHER_MODEL, DEFAULT_TOGETHER_FLASH_MODEL],
         ApiProvider::OpenaiCodex => vec![DEFAULT_OPENAI_CODEX_MODEL],
         ApiProvider::Zai => vec![DEFAULT_ZAI_MODEL, ZAI_GLM_5_1_MODEL, ZAI_GLM_5_TURBO_MODEL],
         ApiProvider::Stepfun => vec![DEFAULT_STEPFUN_MODEL],
@@ -3878,6 +3885,7 @@ fn root_deepseek_model_is_foreign_to_direct_provider(provider: ApiProvider, mode
             | ApiProvider::Siliconflow
             | ApiProvider::SiliconflowCn
             | ApiProvider::Deepinfra
+            | ApiProvider::Together
             | ApiProvider::Sglang
             | ApiProvider::Vllm
             | ApiProvider::Volcengine
@@ -5294,6 +5302,13 @@ fn model_for_provider(provider: ApiProvider, normalized: String) -> String {
         (ApiProvider::Deepinfra, "deepseek-v4-flash" | "deepseek-chat" | "deepseek-reasoner") => {
             DEFAULT_DEEPINFRA_FLASH_MODEL.to_string()
         }
+        (ApiProvider::Together, "deepseek-v4-pro" | "deepseek-v4pro") => {
+            DEFAULT_TOGETHER_MODEL.to_string()
+        }
+        (
+            ApiProvider::Together,
+            "deepseek-v4-flash" | "deepseek-v4flash" | "deepseek-chat" | "deepseek-reasoner",
+        ) => DEFAULT_TOGETHER_FLASH_MODEL.to_string(),
         (
             ApiProvider::Moonshot,
             "kimi"
