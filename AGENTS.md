@@ -25,8 +25,12 @@ state, trust live state and mention the mismatch in your handoff.
   `issue/<number>-short-slug` from the correct live base.
 - Keep each branch scoped to one issue or one reviewable concern unless issues
   are genuinely inseparable.
-- Do not bump versions, tag, publish, create GitHub Releases, push release
-  artifacts, or merge to `main` without Hunter's explicit approval.
+- Do not bump versions, tag, publish, create GitHub Releases, or push release
+  artifacts without Hunter's explicit approval.
+- Merge to `main` only when the current user goal or handoff authorizes landing
+  the lane, or Hunter explicitly approves that PR/queue. If merge approval is
+  ambiguous, ask before merging; do not use ambiguity as an excuse to leave an
+  already-authorized queue unmerged.
 - Preserve unrelated dirty or untracked files. Do not revert work you did not
   make.
 
@@ -37,10 +41,13 @@ state, trust live state and mention the mismatch in your handoff.
 3. Inspect the issue body, linked PRs, comments, code, docs, and tests before
    deciding what to change.
 4. Implement the smallest coherent slice that moves the issue toward done.
-5. Format, run targeted tests, commit, push, and open a draft PR while the work
-   is still under active validation.
+5. Format, run targeted tests, commit, push, and open a PR. Use draft only while
+   the branch is still under active validation; open or convert to ready once
+   the branch is locally verified and reviewable.
 6. In the PR body include goal, changes, verification commands/results, risks,
    and the linked issue.
+7. Carry the issue to a terminal disposition: merged and verified, closed as
+   already fixed with evidence, or blocked with a precise blocker comment.
 
 If the issue is already fixed, verify it from current code or CI before
 commenting or closing. If blocked, leave a precise comment with the blocker,
@@ -48,23 +55,27 @@ attempted work, branch or commit if any, and next action.
 
 ## PR Completion Loop
 
-Opening a PR is not the finish line. Every agent-owned PR needs an explicit
+Opening a PR is not the deliverable. The deliverable is landed code, a verified
+closure, or a documented blocker. Every agent-owned PR needs an explicit
 completion pass:
 
 1. Read back the PR body, diff, commits, linked issue, and CI/check status.
 2. If checks fail, fix the branch or leave a precise blocker comment.
-3. If the branch is verified and no longer needs draft protection, mark it
-   ready for review or say why it must remain draft.
-4. When Hunter has authorized merge for the current lane, merge green,
-   reviewable PRs instead of letting them pile up. Prefer the repository's
-   normal merge method and preserve contributor credit.
+3. If the branch is verified and reviewable, remove draft status. Do not leave
+   verified work in draft because the next step is uncomfortable.
+4. When the lane is merge-authorized, merge green, scoped, reviewable PRs
+   instead of letting them pile up. Prefer the repository's normal merge method
+   and preserve contributor credit.
 5. After merge, verify the landed commit on the target branch, then update or
    close linked issues with a short evidence-based comment.
+6. Before starting another issue, check whether your existing PRs need a
+   ready/merge/issue-cleanup pass.
 
 Do not merge just because a PR exists. Merge only after scope, tests, CI,
 review state, issue linkage, and the user's current approval posture all support
-it. If the user explicitly asks to advance the lane, include ready/merge/issue
-cleanup work in the plan instead of only opening more PRs.
+it. If the user asks to work through a release, milestone, or issue queue,
+include ready/merge/issue-cleanup work in the normal plan instead of only
+opening more PRs.
 
 ## Verification Defaults
 

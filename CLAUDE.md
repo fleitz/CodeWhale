@@ -19,8 +19,11 @@ If those sources disagree, trust live state and call out the mismatch.
 ## Core Rules
 
 - Never commit directly to `main`.
-- Do not tag, publish, create GitHub Releases, push release artifacts, or merge
-  without Hunter's explicit approval.
+- Do not tag, publish, create GitHub Releases, or push release artifacts without
+  Hunter's explicit approval.
+- Merge only when the current user goal or handoff authorizes landing the lane,
+  or Hunter explicitly approves that PR/queue. If merge approval is ambiguous,
+  ask before merging.
 - Preserve unrelated dirty work.
 - Keep each branch and PR narrowly reviewable.
 - Inspect linked issues, PRs, comments, code, tests, and CI before claiming work
@@ -38,11 +41,13 @@ For active issue or release work, follow `AGENTS.md`:
 3. Create or switch to the correct focused branch.
 4. Implement a coherent slice.
 5. Run formatting and targeted tests.
-6. Commit, push, and open a draft PR with goal, changes, verification, risks,
-   and issue linkage.
+6. Commit, push, and open a PR with goal, changes, verification, risks, and
+   issue linkage. Use draft only while the branch is still being validated.
 7. Revisit the PR after CI. Fix failures, mark verified branches ready for
-   review, merge when Hunter has authorized merge for the lane, and update or
-   close linked issues only after verifying the landed commit.
+   review, merge when the lane is authorized to land, and update or close linked
+   issues only after verifying the landed commit.
+8. Treat merged, verified closure, or documented blocker as the terminal state;
+   do not treat an open PR as finished work.
 
 Use scratch integration branches only for learning conflicts or coupling. Do
 not ship scratch branches directly.
