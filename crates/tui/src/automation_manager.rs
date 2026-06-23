@@ -319,17 +319,21 @@ impl AutomationManager {
         Self::open(default_automations_dir())
     }
 
-    fn automation_path(&self, id: &str) -> PathBuf {
-        self.automations_dir.join(format!("{id}.json"))
+    fn automation_path(&self, id: &str) -> Result<PathBuf> {
+        validate_storage_id("automation id", id)?;
+        Ok(self.automations_dir.join(format!("{id}.json")))
     }
 
-    fn runs_dir_for(&self, automation_id: &str) -> PathBuf {
-        self.runs_dir.join(automation_id)
+    fn runs_dir_for(&self, automation_id: &str) -> Result<PathBuf> {
+        validate_storage_id("automation id", automation_id)?;
+        Ok(self.runs_dir.join(automation_id))
     }
 
-    fn run_path(&self, automation_id: &str, run_id: &str) -> PathBuf {
-        self.runs_dir_for(automation_id)
-            .join(format!("{run_id}.json"))
+    fn run_path(&self, automation_id: &str, run_id: &str) -> Result<PathBuf> {
+        validate_storage_id("automation run id", run_id)?;
+        Ok(self
+            .runs_dir_for(automation_id)?
+            .join(format!("{run_id}.json")))
     }
 
     pub fn create_automation(&self, req: CreateAutomationRequest) -> Result<AutomationRecord> {
@@ -362,7 +366,7 @@ impl AutomationManager {
     }
 
     pub fn get_automation(&self, id: &str) -> Result<AutomationRecord> {
-        let path = self.automation_path(id);
+        let path = self.automation_path(id)?;
         let raw = fs::read_to_string(&path)
             .with_context(|| format!("Failed to read automation {}", path.display()))?;
         let record: AutomationRecord = serde_json::from_str(&raw)
@@ -378,7 +382,7 @@ impl AutomationManager {
     }
 
     pub fn save_automation(&self, record: &AutomationRecord) -> Result<()> {
-        write_json_atomic(&self.automation_path(&record.id), record)
+        write_json_atomic(&self.automation_path(&record.id)?, record)
     }
 
     pub fn list_automations(&self) -> Result<Vec<AutomationRecord>> {
@@ -476,11 +480,11 @@ impl AutomationManager {
 
     pub fn delete_automation(&self, id: &str) -> Result<AutomationRecord> {
         let existing = self.get_automation(id)?;
-        let path = self.automation_path(id);
+        let path = self.automation_path(id)?;
         fs::remove_file(&path)
             .with_context(|| format!("Failed to delete automation {}", path.display()))?;
 
-        let runs_dir = self.runs_dir_for(id);
+        let runs_dir = self.runs_dir_for(id)?;
         if runs_dir.exists() {
             fs::remove_dir_all(&runs_dir).with_context(|| {
                 format!("Failed to delete automation runs {}", runs_dir.display())
@@ -495,7 +499,7 @@ impl AutomationManager {
         automation_id: &str,
         limit: Option<usize>,
     ) -> Result<Vec<AutomationRunRecord>> {
-        let dir = self.runs_dir_for(automation_id);
+        let dir = self.runs_dir_for(automation_id)?;
         if !dir.exists() {
             return Ok(Vec::new());
         }
@@ -531,9 +535,9 @@ impl AutomationManager {
     }
 
     fn save_run(&self, run: &AutomationRunRecord) -> Result<()> {
-        let dir = self.runs_dir_for(&run.automation_id);
+        let dir = self.runs_dir_for(&run.automation_id)?;
         fs::create_dir_all(&dir).with_context(|| format!("Failed to create {}", dir.display()))?;
-        write_json_atomic(&self.run_path(&run.automation_id, &run.id), run)
+        write_json_atomic(&self.run_path(&run.automation_id, &run.id)?, run)
     }
 
     async fn enqueue_run_task(
@@ -769,6 +773,18 @@ fn validate_name_and_prompt(name: &str, prompt: &str) -> Result<()> {
     Ok(())
 }
 
+fn validate_storage_id(label: &str, id: &str) -> Result<()> {
+    if id.is_empty()
+        || id.trim() != id
+        || !id
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
+    {
+        bail!("{label} must be a safe path segment");
+    }
+    Ok(())
+}
+
 fn write_json_atomic<T: Serialize>(path: &Path, value: &T) -> Result<()> {
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)
@@ -941,14 +957,85 @@ mod tests {
             error: None,
         };
         manager.save_run(&run).expect("save run");
-        assert!(manager.runs_dir_for(&created.id).exists());
+        assert!(manager.runs_dir_for(&created.id).unwrap().exists());
 
         manager
             .delete_automation(&created.id)
             .expect("delete automation");
 
         assert!(manager.get_automation(&created.id).is_err());
-        assert!(!manager.runs_dir_for(&created.id).exists());
+        assert!(!manager.runs_dir_for(&created.id).unwrap().exists());
+    }
+
+    #[test]
+    fn automation_lookup_rejects_path_like_ids() {
+        let tempdir = tempfile::tempdir().expect("tempdir");
+        let manager = AutomationManager::open(tempdir.path().to_path_buf()).expect("manager");
+
+        for id in ["../outside", "..", "nested/id", "nested\\id", " id"] {
+            let get_err = manager
+                .get_automation(id)
+                .expect_err("path-like automation id should fail");
+            assert!(get_err.to_string().contains("safe path segment"));
+
+            let list_err = manager
+                .list_runs(id, None)
+                .expect_err("path-like automation id should fail");
+            assert!(list_err.to_string().contains("safe path segment"));
+        }
+    }
+
+    #[test]
+    fn save_automation_rejects_path_like_ids() {
+        let tempdir = tempfile::tempdir().expect("tempdir");
+        let manager = AutomationManager::open(tempdir.path().to_path_buf()).expect("manager");
+
+        let record = AutomationRecord {
+            schema_version: CURRENT_AUTOMATION_SCHEMA_VERSION,
+            id: "../outside".to_string(),
+            name: "name".to_string(),
+            prompt: "prompt".to_string(),
+            rrule: "FREQ=HOURLY;INTERVAL=1".to_string(),
+            cwds: Vec::new(),
+            status: AutomationStatus::Active,
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+            next_run_at: None,
+            last_run_at: None,
+        };
+
+        let err = manager
+            .save_automation(&record)
+            .expect_err("path-like automation id should fail");
+        assert!(err.to_string().contains("safe path segment"));
+    }
+
+    #[test]
+    fn save_run_rejects_path_like_ids() {
+        let tempdir = tempfile::tempdir().expect("tempdir");
+        let manager = AutomationManager::open(tempdir.path().to_path_buf()).expect("manager");
+
+        for (automation_id, run_id) in [("../outside", "run-1"), ("automation-1", "../run-1")] {
+            let run = AutomationRunRecord {
+                schema_version: CURRENT_RUN_SCHEMA_VERSION,
+                id: run_id.to_string(),
+                automation_id: automation_id.to_string(),
+                scheduled_for: Utc::now(),
+                status: AutomationRunStatus::Queued,
+                created_at: Utc::now(),
+                started_at: None,
+                ended_at: None,
+                task_id: None,
+                thread_id: None,
+                turn_id: None,
+                error: None,
+            };
+
+            let err = manager
+                .save_run(&run)
+                .expect_err("path-like run storage id should fail");
+            assert!(err.to_string().contains("safe path segment"));
+        }
     }
 
     #[test]
