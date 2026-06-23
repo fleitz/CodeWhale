@@ -1272,8 +1272,8 @@ fn non_yolo_mode_retains_default_defer_policy() {
     ));
     assert!(!should_default_defer_tool("web_search", &always_load));
     assert!(!should_default_defer_tool("write_file", &always_load));
-    assert!(!should_default_defer_tool("task_shell_start", &always_load));
-    assert!(!should_default_defer_tool("task_shell_wait", &always_load));
+    assert!(should_default_defer_tool("task_shell_start", &always_load));
+    assert!(should_default_defer_tool("task_shell_wait", &always_load));
     assert!(should_default_defer_tool("git_blame", &always_load));
 }
 
@@ -1318,7 +1318,7 @@ fn capability_compact_surface_defers_nonessential_core_tools() {
             api_tool("grep_files"),
             api_tool("read_file"),
             api_tool("run_tests"),
-            api_tool(TOOL_SEARCH_REGEX_NAME),
+            api_tool(TOOL_SEARCH_NAME),
             api_tool("update_plan"),
             api_tool("web_search"),
             api_tool("write_file"),
@@ -1340,7 +1340,7 @@ fn capability_compact_surface_defers_nonessential_core_tools() {
     assert_eq!(defer_loading("grep_files"), Some(false));
     assert_eq!(defer_loading("update_plan"), Some(false));
     assert_eq!(defer_loading("write_file"), Some(false));
-    assert_eq!(defer_loading(TOOL_SEARCH_REGEX_NAME), Some(false));
+    assert_eq!(defer_loading(TOOL_SEARCH_NAME), Some(false));
     assert_eq!(defer_loading("list_mcp_resources"), Some(false));
     assert_eq!(defer_loading("agent"), Some(true));
     assert_eq!(defer_loading("run_tests"), Some(true));
@@ -1504,7 +1504,7 @@ fn agent_catalog_advertises_and_searches_core_action_tools() {
 
         let mut active = initial_active_tools(&catalog);
         let result = execute_tool_search(
-            TOOL_SEARCH_BM25_NAME,
+            TOOL_SEARCH_NAME,
             &json!({ "query": tool_name }),
             &catalog,
             &mut active,
@@ -1560,7 +1560,7 @@ fn tool_search_reports_known_core_action_tool_when_current_catalog_omits_it() {
     let mut active = initial_active_tools(&catalog);
 
     let result = execute_tool_search(
-        TOOL_SEARCH_BM25_NAME,
+        TOOL_SEARCH_NAME,
         &json!({ "query": "exec_shell" }),
         &catalog,
         &mut active,
@@ -3818,7 +3818,7 @@ fn tool_search_activates_discovered_deferred_tools() {
     ensure_advanced_tooling(&mut catalog, AppMode::Agent, &always_load);
     let mut active = initial_active_tools(&catalog);
     let result = execute_tool_search(
-        TOOL_SEARCH_BM25_NAME,
+        TOOL_SEARCH_NAME,
         &json!({"query":"read file"}),
         &catalog,
         &mut active,
@@ -3860,11 +3860,11 @@ fn tool_search_reference_count(result: &ToolResult) -> usize {
 fn tool_search_defaults_to_twenty_results_for_regex_and_bm25() {
     let catalog = tool_search_catalog_with_matches(25);
 
-    for tool_name in [TOOL_SEARCH_REGEX_NAME, TOOL_SEARCH_BM25_NAME] {
+    for match_kind in ["regex", "bm25"] {
         let mut active = initial_active_tools(&catalog);
         let result = execute_tool_search(
-            tool_name,
-            &json!({"query":"matching"}),
+            TOOL_SEARCH_NAME,
+            &json!({"query":"matching","match":match_kind}),
             &catalog,
             &mut active,
         )
@@ -3880,7 +3880,7 @@ fn tool_search_respects_and_caps_max_results() {
 
     let mut active = initial_active_tools(&catalog);
     let limited = execute_tool_search(
-        TOOL_SEARCH_BM25_NAME,
+        TOOL_SEARCH_NAME,
         &json!({"query":"matching","max_results":7}),
         &catalog,
         &mut active,
@@ -3890,8 +3890,8 @@ fn tool_search_respects_and_caps_max_results() {
 
     let mut active = initial_active_tools(&catalog);
     let capped = execute_tool_search(
-        TOOL_SEARCH_REGEX_NAME,
-        &json!({"query":"matching","max_results":999}),
+        TOOL_SEARCH_NAME,
+        &json!({"query":"matching","match":"regex","max_results":999}),
         &catalog,
         &mut active,
     )
@@ -3905,17 +3905,16 @@ fn tool_search_schema_exposes_max_results_default_and_cap() {
     let always_load = HashSet::new();
     ensure_advanced_tooling(&mut catalog, AppMode::Agent, &always_load);
 
-    for tool_name in [TOOL_SEARCH_REGEX_NAME, TOOL_SEARCH_BM25_NAME] {
-        let tool = catalog
-            .iter()
-            .find(|tool| tool.name == tool_name)
-            .expect("tool search definition exists");
-        let schema = &tool.input_schema["properties"]["max_results"];
+    let tool = catalog
+        .iter()
+        .find(|tool| tool.name == TOOL_SEARCH_NAME)
+        .expect("tool search definition exists");
+    let schema = &tool.input_schema["properties"]["max_results"];
 
-        assert_eq!(schema["default"], 20);
-        assert_eq!(schema["maximum"], 100);
-        assert_eq!(schema["minimum"], 1);
-    }
+    assert_eq!(schema["default"], 20);
+    assert_eq!(schema["maximum"], 100);
+    assert_eq!(schema["minimum"], 1);
+    assert_eq!(tool.input_schema["properties"]["match"]["default"], "bm25");
 }
 
 #[tokio::test]
@@ -4030,7 +4029,7 @@ fn missing_tool_error_message_offers_suggestions() {
     let message = missing_tool_error_message("reed_file", &catalog);
     assert!(message.contains("Did you mean:"));
     assert!(message.contains("read_file"));
-    assert!(message.contains(TOOL_SEARCH_BM25_NAME));
+    assert!(message.contains(TOOL_SEARCH_NAME));
 }
 
 #[test]
@@ -4049,7 +4048,7 @@ fn missing_tool_error_message_includes_discovery_guidance_when_no_match() {
 
     let message = missing_tool_error_message("totally_unknown_tool", &catalog);
     assert!(message.contains("not available in the current tool catalog"));
-    assert!(message.contains(TOOL_SEARCH_BM25_NAME));
+    assert!(message.contains(TOOL_SEARCH_NAME));
 }
 
 #[test]
@@ -4082,10 +4081,7 @@ fn missing_shell_tool_error_message_names_allow_shell_gate() {
         );
         assert!(!message.contains("YOLO"), "{tool_name}: {message}");
         assert!(!message.contains("auto-approve"), "{tool_name}: {message}");
-        assert!(
-            message.contains(TOOL_SEARCH_BM25_NAME),
-            "{tool_name}: {message}"
-        );
+        assert!(message.contains(TOOL_SEARCH_NAME), "{tool_name}: {message}");
     }
 }
 
@@ -4104,7 +4100,7 @@ fn missing_shell_tool_error_message_keeps_allow_shell_hint_with_suggestions() {
     assert!(message.contains("Agent mode"));
     assert!(!message.contains("YOLO"));
     assert!(!message.contains("auto-approve"));
-    assert!(message.contains(TOOL_SEARCH_BM25_NAME));
+    assert!(message.contains(TOOL_SEARCH_NAME));
 }
 
 #[test]

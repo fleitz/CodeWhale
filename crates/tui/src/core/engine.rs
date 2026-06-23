@@ -3699,9 +3699,8 @@ use self::tool_catalog::{
 };
 #[cfg(test)]
 use self::tool_catalog::{
-    TOOL_SEARCH_BM25_NAME, TOOL_SEARCH_REGEX_NAME, build_model_tool_catalog,
-    maybe_activate_requested_deferred_tool, preflight_requested_deferred_tool,
-    should_default_defer_tool,
+    TOOL_SEARCH_NAME, build_model_tool_catalog, maybe_activate_requested_deferred_tool,
+    preflight_requested_deferred_tool, should_default_defer_tool,
 };
 use self::tool_execution::emit_tool_audit;
 use self::tool_setup::{sandbox_policy_for_mode, shell_policy_for_mode};

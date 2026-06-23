@@ -14,7 +14,7 @@ use serde_json::{Value, json};
 use crate::mcp::McpPool;
 use crate::model_profile::ToolSurfaceBudget;
 use crate::models::Tool;
-use crate::tools::spec::{ToolError, ToolResult, optional_u64, required_str};
+use crate::tools::spec::{ToolError, ToolResult, optional_str, optional_u64, required_str};
 use crate::tui::app::AppMode;
 
 use crate::dependencies::ExternalTool;
@@ -24,15 +24,18 @@ pub(super) const REQUEST_USER_INPUT_NAME: &str = "request_user_input";
 pub(super) const CODE_EXECUTION_TOOL_NAME: &str = "code_execution";
 const CODE_EXECUTION_TOOL_TYPE: &str = "code_execution_20250825";
 pub(super) use crate::tools::js_execution::JS_EXECUTION_TOOL_NAME;
-pub(super) const TOOL_SEARCH_REGEX_NAME: &str = "tool_search_tool_regex";
-const TOOL_SEARCH_REGEX_TYPE: &str = "tool_search_tool_regex_20251119";
-pub(super) const TOOL_SEARCH_BM25_NAME: &str = "tool_search_tool_bm25";
-const TOOL_SEARCH_BM25_TYPE: &str = "tool_search_tool_bm25_20251119";
+pub(super) const TOOL_SEARCH_NAME: &str = "tool_search";
+const TOOL_SEARCH_TYPE: &str = "tool_search_20251119";
+const LEGACY_TOOL_SEARCH_REGEX_NAME: &str = "tool_search_tool_regex";
+const LEGACY_TOOL_SEARCH_BM25_NAME: &str = "tool_search_tool_bm25";
 const TOOL_SEARCH_DEFAULT_MAX_RESULTS: usize = 20;
 const TOOL_SEARCH_MAX_RESULTS_LIMIT: usize = 100;
 
 pub(super) fn is_tool_search_tool(name: &str) -> bool {
-    matches!(name, TOOL_SEARCH_REGEX_NAME | TOOL_SEARCH_BM25_NAME)
+    matches!(
+        name,
+        TOOL_SEARCH_NAME | LEGACY_TOOL_SEARCH_REGEX_NAME | LEGACY_TOOL_SEARCH_BM25_NAME
+    )
 }
 
 pub(super) const DEFAULT_ACTIVE_NATIVE_TOOLS: &[&str] = &[
@@ -59,8 +62,6 @@ pub(super) const DEFAULT_ACTIVE_NATIVE_TOOLS: &[&str] = &[
     "task_create",
     "task_list",
     "task_read",
-    "task_shell_start",
-    "task_shell_wait",
     "update_plan",
     "wait_for_dev_server",
     "web_search",
@@ -197,13 +198,7 @@ fn apply_tool_surface_budget(
         }
         if matches!(
             tool.name.as_str(),
-            "agent"
-                | "run_tests"
-                | "run_verifiers"
-                | "task_create"
-                | "task_shell_start"
-                | "task_shell_wait"
-                | "web_search"
+            "agent" | "run_tests" | "run_verifiers" | "task_create" | "web_search"
         ) {
             tool.defer_loading = Some(true);
         }
@@ -262,42 +257,21 @@ pub(super) fn ensure_advanced_tooling(
         catalog.push(tool);
     }
 
-    if !catalog.iter().any(|t| t.name == TOOL_SEARCH_REGEX_NAME) {
+    if !catalog.iter().any(|t| t.name == TOOL_SEARCH_NAME) {
         catalog.push(Tool {
-            tool_type: Some(TOOL_SEARCH_REGEX_TYPE.to_string()),
-            name: TOOL_SEARCH_REGEX_NAME.to_string(),
-            description: "Search deferred tool definitions using a regex query and return matching tool references.".to_string(),
+            tool_type: Some(TOOL_SEARCH_TYPE.to_string()),
+            name: TOOL_SEARCH_NAME.to_string(),
+            description: "Search deferred tool definitions and return matching tool references.".to_string(),
             input_schema: json!({
                 "type": "object",
                 "properties": {
-                    "query": { "type": "string", "description": "Regex pattern to search tool names/descriptions/schema." },
-                    "max_results": {
-                        "type": "integer",
-                        "minimum": 1,
-                        "maximum": TOOL_SEARCH_MAX_RESULTS_LIMIT,
-                        "default": TOOL_SEARCH_DEFAULT_MAX_RESULTS,
-                        "description": "Maximum number of matching tool references to return."
-                    }
-                },
-                "required": ["query"]
-            }),
-            allowed_callers: Some(vec!["direct".to_string()]),
-            defer_loading: Some(false),
-            input_examples: None,
-            strict: None,
-            cache_control: None,
-        });
-    }
-
-    if !catalog.iter().any(|t| t.name == TOOL_SEARCH_BM25_NAME) {
-        catalog.push(Tool {
-            tool_type: Some(TOOL_SEARCH_BM25_TYPE.to_string()),
-            name: TOOL_SEARCH_BM25_NAME.to_string(),
-            description: "Search deferred tool definitions using natural-language matching and return matching tool references.".to_string(),
-            input_schema: json!({
-                "type": "object",
-                "properties": {
-                    "query": { "type": "string", "description": "Natural language query for tool discovery." },
+                    "query": { "type": "string", "description": "Search query for tool discovery." },
+                    "match": {
+                        "type": "string",
+                        "enum": ["bm25", "regex"],
+                        "default": "bm25",
+                        "description": "Matching algorithm: bm25 for natural-language matching, regex for a regular expression over tool names/descriptions/schema."
+                    },
                     "max_results": {
                         "type": "integer",
                         "minimum": 1,
@@ -651,12 +625,12 @@ pub(super) fn missing_tool_error_message(tool_name: &str, catalog: &[Tool]) -> S
         if let Some(shell_hint) = shell_hint {
             return format!(
                 "Tool '{tool_name}' is not available in the current tool catalog. \
-                 {shell_hint}, or use {TOOL_SEARCH_BM25_NAME} with a short query."
+                 {shell_hint}, or use {TOOL_SEARCH_NAME} with a short query."
             );
         }
         return format!(
             "Tool '{tool_name}' is not available in the current tool catalog. \
-             Verify mode/feature flags, or use {TOOL_SEARCH_BM25_NAME} with a short query."
+             Verify mode/feature flags, or use {TOOL_SEARCH_NAME} with a short query."
         );
     }
 
@@ -665,13 +639,13 @@ pub(super) fn missing_tool_error_message(tool_name: &str, catalog: &[Tool]) -> S
         return format!(
             "Tool '{tool_name}' is not available in the current tool catalog. \
              {suggestion_text} {shell_hint}. \
-             You can also use {TOOL_SEARCH_BM25_NAME} to discover tools."
+             You can also use {TOOL_SEARCH_NAME} to discover tools."
         );
     }
 
     format!(
         "Tool '{tool_name}' is not available in the current tool catalog. \
-         {suggestion_text} You can also use {TOOL_SEARCH_BM25_NAME} to discover tools."
+         {suggestion_text} You can also use {TOOL_SEARCH_NAME} to discover tools."
     )
 }
 
@@ -941,6 +915,16 @@ pub(super) fn execute_tool_search(
     active_tools: &mut HashSet<String>,
 ) -> Result<ToolResult, ToolError> {
     let query = required_str(input, "query")?;
+    let match_kind = match tool_name {
+        LEGACY_TOOL_SEARCH_REGEX_NAME => "regex",
+        LEGACY_TOOL_SEARCH_BM25_NAME => "bm25",
+        _ => optional_str(input, "match").unwrap_or("bm25"),
+    };
+    if !matches!(match_kind, "bm25" | "regex") {
+        return Err(ToolError::invalid_input(format!(
+            "Unsupported match algorithm '{match_kind}'. Expected one of: bm25, regex"
+        )));
+    }
     let max_results = usize::try_from(optional_u64(
         input,
         "max_results",
@@ -948,13 +932,13 @@ pub(super) fn execute_tool_search(
     ))
     .unwrap_or(TOOL_SEARCH_DEFAULT_MAX_RESULTS)
     .clamp(1, TOOL_SEARCH_MAX_RESULTS_LIMIT);
-    let discovered = if tool_name == TOOL_SEARCH_REGEX_NAME {
+    let discovered = if match_kind == "regex" {
         discover_tools_with_regex(catalog, query, max_results)?
     } else {
         discover_tools_with_bm25_like(catalog, query, max_results)
     };
     let remaining_results = max_results.saturating_sub(discovered.len());
-    let unavailable = if tool_name == TOOL_SEARCH_REGEX_NAME {
+    let unavailable = if match_kind == "regex" {
         unavailable_core_action_tools_with_regex(catalog, query, remaining_results)?
     } else {
         unavailable_core_action_tools_with_bm25_like(catalog, query, remaining_results)

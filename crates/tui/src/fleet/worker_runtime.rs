@@ -312,8 +312,7 @@ pub fn is_parallel_safe_read_only_tool(tool_name: &str) -> bool {
             | "git_blame"
             | "fetch_url"
             | "web_search"
-            | "tool_search_tool_regex"
-            | "tool_search_tool_bm25"
+            | "tool_search"
     )
 }
 
