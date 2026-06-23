@@ -129,6 +129,7 @@ pub(crate) fn fleet_task_prompt(task_spec: &FleetTaskSpec) -> String {
 fn fleet_role_to_agent_type(role: Option<&str>) -> SubAgentType {
     match role {
         Some("smoke-runner") => SubAgentType::Verifier,
+        Some("scout") => SubAgentType::Explore,
         Some("read-only") => SubAgentType::Explore,
         Some("reviewer") => SubAgentType::Review,
         Some("builder") => SubAgentType::Implementer,
@@ -486,6 +487,114 @@ mod tests {
         assert!(
             would_exceed(3),
             "depth 3 is the afforded ceiling; depth 4 is blocked"
+        );
+    }
+
+    #[test]
+    fn fleet_fanout_role_loadouts_keep_distinct_child_models() {
+        let worker = FleetWorkerSpec {
+            id: "local-worker".to_string(),
+            name: "Local worker".to_string(),
+            host: FleetHostSpec::Local,
+            trust_level: None,
+            labels: Default::default(),
+            capabilities: vec![],
+            max_concurrent_tasks: None,
+        };
+
+        let cases = [
+            (
+                "scout",
+                "deepseek-v4-flash",
+                SubAgentType::Explore,
+                AgentWorkerToolProfile::Explicit(vec![
+                    "read_file".to_string(),
+                    "grep_files".to_string(),
+                ]),
+            ),
+            (
+                "builder",
+                "deepseek-v4-pro",
+                SubAgentType::Implementer,
+                AgentWorkerToolProfile::Explicit(vec![
+                    "read_file".to_string(),
+                    "apply_patch".to_string(),
+                ]),
+            ),
+            (
+                "verifier",
+                "deepseek-v4-pro",
+                SubAgentType::Verifier,
+                AgentWorkerToolProfile::Explicit(vec![
+                    "exec_shell".to_string(),
+                    "read_file".to_string(),
+                ]),
+            ),
+        ];
+
+        let parent_model = "parent-session-model";
+        let mut child_models = std::collections::BTreeSet::new();
+        for (role, model, expected_type, expected_tools) in cases {
+            let task = FleetTaskSpec {
+                id: format!("{role}-task"),
+                name: format!("{role} task"),
+                description: None,
+                objective: Some(format!("{role} objective")),
+                instructions: "Complete the assigned fanout lane.".to_string(),
+                worker: Some(FleetTaskWorkerProfile {
+                    role: Some(role.to_string()),
+                    tool_profile: None,
+                    tools: match &expected_tools {
+                        AgentWorkerToolProfile::Explicit(tools) => tools.clone(),
+                        AgentWorkerToolProfile::Inherited => Vec::new(),
+                    },
+                    capabilities: vec![],
+                }),
+                workspace: None,
+                input_files: vec![],
+                context: vec![],
+                budget: None,
+                tags: vec![],
+                expected_artifacts: vec![],
+                scorer: None,
+                retry_policy: None,
+                alert_policy: None,
+                timeout_seconds: None,
+                metadata: Default::default(),
+            };
+
+            let spec = fleet_task_to_worker_spec(
+                &format!("{role}-worker"),
+                "run-3289",
+                &task,
+                &worker,
+                model,
+                std::path::Path::new("/tmp"),
+            );
+
+            assert_eq!(spec.role.as_deref(), Some(role));
+            assert_eq!(spec.agent_type, expected_type, "role {role}");
+            assert_eq!(spec.tool_profile, expected_tools, "role {role}");
+            assert_eq!(spec.model, model, "role {role}");
+            assert_ne!(
+                spec.model, parent_model,
+                "Fleet fanout child {role} must use its resolved loadout, not blindly inherit"
+            );
+            assert_eq!(
+                spec.runtime_profile.model,
+                ModelRoute::Fixed(model.to_string()),
+                "role {role}"
+            );
+            assert_eq!(spec.runtime_profile.role, expected_type, "role {role}");
+            child_models.insert(spec.model.clone());
+        }
+        assert_eq!(
+            child_models,
+            std::collections::BTreeSet::from([
+                "deepseek-v4-flash".to_string(),
+                "deepseek-v4-pro".to_string(),
+            ]),
+            "Fleet fanout should preserve a mixed scout/builder/verifier loadout"
         );
     }
 
