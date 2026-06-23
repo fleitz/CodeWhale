@@ -1182,6 +1182,72 @@ fn model_tool_catalog_applies_native_and_mcp_deferral() {
 }
 
 #[test]
+fn capability_compact_surface_defers_nonessential_core_tools() {
+    let always_load = HashSet::new();
+    let catalog = build_model_tool_catalog_with_surface(
+        vec![
+            api_tool("agent"),
+            api_tool("grep_files"),
+            api_tool("read_file"),
+            api_tool("run_tests"),
+            api_tool(TOOL_SEARCH_REGEX_NAME),
+            api_tool("update_plan"),
+            api_tool("web_search"),
+            api_tool("write_file"),
+        ],
+        vec![api_tool("list_mcp_resources"), api_tool("mcp_server_write")],
+        AppMode::Agent,
+        &always_load,
+        crate::model_profile::ToolSurfaceBudget::Compact,
+    );
+
+    let defer_loading = |name: &str| {
+        catalog
+            .iter()
+            .find(|tool| tool.name == name)
+            .and_then(|tool| tool.defer_loading)
+    };
+
+    assert_eq!(defer_loading("read_file"), Some(false));
+    assert_eq!(defer_loading("grep_files"), Some(false));
+    assert_eq!(defer_loading("update_plan"), Some(false));
+    assert_eq!(defer_loading("write_file"), Some(false));
+    assert_eq!(defer_loading(TOOL_SEARCH_REGEX_NAME), Some(false));
+    assert_eq!(defer_loading("list_mcp_resources"), Some(false));
+    assert_eq!(defer_loading("agent"), Some(true));
+    assert_eq!(defer_loading("run_tests"), Some(true));
+    assert_eq!(defer_loading("web_search"), Some(true));
+    assert_eq!(defer_loading("mcp_server_write"), Some(true));
+}
+
+#[test]
+fn capability_full_surface_preserves_default_core_tools() {
+    let always_load = HashSet::new();
+    let catalog = build_model_tool_catalog_with_surface(
+        vec![
+            api_tool("agent"),
+            api_tool("read_file"),
+            api_tool("run_tests"),
+        ],
+        Vec::new(),
+        AppMode::Agent,
+        &always_load,
+        crate::model_profile::ToolSurfaceBudget::Full,
+    );
+
+    for name in ["agent", "read_file", "run_tests"] {
+        assert_eq!(
+            catalog
+                .iter()
+                .find(|tool| tool.name == name)
+                .and_then(|tool| tool.defer_loading),
+            Some(false),
+            "{name} should stay eager on full tool surfaces"
+        );
+    }
+}
+
+#[test]
 fn plugin_or_benchmark_tools_marked_loaded_stay_active() {
     let always_load = HashSet::new();
     let mut catalog = build_model_tool_catalog(

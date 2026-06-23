@@ -2314,11 +2314,16 @@ impl Engine {
             Vec::new()
         };
         let tools = tool_registry.as_ref().map(|registry| {
-            let mut catalog = build_model_tool_catalog(
+            let capability = crate::model_profile::resolved_capability_profile(
+                self.api_config.api_provider(),
+                &self.config.model,
+            );
+            let mut catalog = build_model_tool_catalog_with_surface(
                 registry.to_api_tools_with_cache(true),
                 mcp_tools,
                 input_policy.mode,
                 &self.config.tools_always_load,
+                capability.tool_surface_budget,
             );
             for tool in &mut catalog {
                 if plugin_tool_names.contains(&tool.name) {
@@ -3653,15 +3658,16 @@ use self::streaming::{
 };
 use self::tool_catalog::{
     CODE_EXECUTION_TOOL_NAME, JS_EXECUTION_TOOL_NAME, MULTI_TOOL_PARALLEL_NAME,
-    REQUEST_USER_INPUT_NAME, active_tools_for_step, build_model_tool_catalog,
+    REQUEST_USER_INPUT_NAME, active_tools_for_step, build_model_tool_catalog_with_surface,
     ensure_advanced_tooling, execute_code_execution_tool, execute_tool_search,
     initial_active_tools, is_tool_search_tool, maybe_hydrate_requested_deferred_tool,
     missing_tool_error_message, tool_catalog_consistency_issues,
 };
 #[cfg(test)]
 use self::tool_catalog::{
-    TOOL_SEARCH_BM25_NAME, TOOL_SEARCH_REGEX_NAME, maybe_activate_requested_deferred_tool,
-    preflight_requested_deferred_tool, should_default_defer_tool,
+    TOOL_SEARCH_BM25_NAME, TOOL_SEARCH_REGEX_NAME, build_model_tool_catalog,
+    maybe_activate_requested_deferred_tool, preflight_requested_deferred_tool,
+    should_default_defer_tool,
 };
 use self::tool_execution::emit_tool_audit;
 use self::tool_setup::{sandbox_policy_for_mode, shell_policy_for_mode};

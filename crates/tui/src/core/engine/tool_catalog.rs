@@ -12,6 +12,7 @@ use std::time::Duration;
 use serde_json::{Value, json};
 
 use crate::mcp::McpPool;
+use crate::model_profile::ToolSurfaceBudget;
 use crate::models::Tool;
 use crate::tools::spec::{ToolError, ToolResult, optional_u64, required_str};
 use crate::tui::app::AppMode;
@@ -143,14 +144,33 @@ pub(super) fn apply_mcp_tool_deferral(catalog: &mut [Tool], mode: AppMode) {
 /// head. This invariant is critical for DeepSeek's KV prefix cache:
 /// the tools array is part of the immutable prefix, and any byte-level
 /// change in the head forces a full re-prefill on the next turn.
+#[cfg(test)]
 pub(super) fn build_model_tool_catalog(
+    native_tools: Vec<Tool>,
+    mcp_tools: Vec<Tool>,
+    mode: AppMode,
+    always_load: &HashSet<String>,
+) -> Vec<Tool> {
+    build_model_tool_catalog_with_surface(
+        native_tools,
+        mcp_tools,
+        mode,
+        always_load,
+        ToolSurfaceBudget::Standard,
+    )
+}
+
+pub(super) fn build_model_tool_catalog_with_surface(
     mut native_tools: Vec<Tool>,
     mut mcp_tools: Vec<Tool>,
     mode: AppMode,
     always_load: &HashSet<String>,
+    surface_budget: ToolSurfaceBudget,
 ) -> Vec<Tool> {
     apply_native_tool_deferral(&mut native_tools, always_load);
     apply_mcp_tool_deferral(&mut mcp_tools, mode);
+    apply_tool_surface_budget(&mut native_tools, surface_budget, always_load);
+    apply_tool_surface_budget(&mut mcp_tools, surface_budget, always_load);
     // Sort each partition by name for prefix-cache stability (#263). The
     // upstream `to_api_tools()` already sorts the registry's HashMap output;
     // this catalog is built from caller-supplied Vecs which the test harness
@@ -161,6 +181,33 @@ pub(super) fn build_model_tool_catalog(
     mcp_tools.sort_by(|a, b| a.name.cmp(&b.name));
     native_tools.extend(mcp_tools);
     native_tools
+}
+
+fn apply_tool_surface_budget(
+    catalog: &mut [Tool],
+    surface_budget: ToolSurfaceBudget,
+    always_load: &HashSet<String>,
+) {
+    if !matches!(surface_budget, ToolSurfaceBudget::Compact) {
+        return;
+    }
+    for tool in catalog {
+        if always_load.contains(&tool.name) {
+            continue;
+        }
+        if matches!(
+            tool.name.as_str(),
+            "agent"
+                | "run_tests"
+                | "run_verifiers"
+                | "task_create"
+                | "task_shell_start"
+                | "task_shell_wait"
+                | "web_search"
+        ) {
+            tool.defer_loading = Some(true);
+        }
+    }
 }
 
 pub(super) fn ensure_advanced_tooling(
