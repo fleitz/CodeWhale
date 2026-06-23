@@ -3675,9 +3675,11 @@ fn doctor_xiaomi_mimo_base_url_uses_token_plan(base_url: &str) -> bool {
 
 fn doctor_api_key_source_label(source: ApiKeySource) -> &'static str {
     match source {
+        ApiKeySource::Command => "command",
         ApiKeySource::Env => "env",
         ApiKeySource::Config => "config",
         ApiKeySource::Keyring => "keyring",
+        ApiKeySource::Secret => "secret",
         ApiKeySource::Missing => "missing",
     }
 }
