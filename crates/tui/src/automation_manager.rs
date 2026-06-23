@@ -22,6 +22,10 @@ use crate::utils::spawn_supervised;
 
 const CURRENT_AUTOMATION_SCHEMA_VERSION: u32 = 1;
 const CURRENT_RUN_SCHEMA_VERSION: u32 = 1;
+const DEFAULT_AUTOMATION_MODE: &str = "agent";
+const DEFAULT_AUTOMATION_ALLOW_SHELL: bool = false;
+const DEFAULT_AUTOMATION_TRUST_MODE: bool = false;
+const DEFAULT_AUTOMATION_AUTO_APPROVE: bool = true;
 
 const fn default_automation_schema_version() -> u32 {
     CURRENT_AUTOMATION_SCHEMA_VERSION
@@ -58,6 +62,14 @@ pub struct AutomationRecord {
     pub rrule: String,
     #[serde(default)]
     pub cwds: Vec<PathBuf>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mode: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub allow_shell: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub trust_mode: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub auto_approve: Option<bool>,
     pub status: AutomationStatus,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
@@ -65,6 +77,29 @@ pub struct AutomationRecord {
     pub next_run_at: Option<DateTime<Utc>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub last_run_at: Option<DateTime<Utc>>,
+}
+
+impl AutomationRecord {
+    fn task_mode(&self) -> String {
+        self.mode
+            .as_deref()
+            .map(str::trim)
+            .filter(|mode| !mode.is_empty())
+            .unwrap_or(DEFAULT_AUTOMATION_MODE)
+            .to_string()
+    }
+
+    fn task_allow_shell(&self) -> bool {
+        self.allow_shell.unwrap_or(DEFAULT_AUTOMATION_ALLOW_SHELL)
+    }
+
+    fn task_trust_mode(&self) -> bool {
+        self.trust_mode.unwrap_or(DEFAULT_AUTOMATION_TRUST_MODE)
+    }
+
+    fn task_auto_approve(&self) -> bool {
+        self.auto_approve.unwrap_or(DEFAULT_AUTOMATION_AUTO_APPROVE)
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -98,6 +133,14 @@ pub struct CreateAutomationRequest {
     #[serde(default)]
     pub cwds: Vec<PathBuf>,
     #[serde(default)]
+    pub mode: Option<String>,
+    #[serde(default)]
+    pub allow_shell: Option<bool>,
+    #[serde(default)]
+    pub trust_mode: Option<bool>,
+    #[serde(default)]
+    pub auto_approve: Option<bool>,
+    #[serde(default)]
     pub status: Option<AutomationStatus>,
 }
 
@@ -107,6 +150,10 @@ pub struct UpdateAutomationRequest {
     pub prompt: Option<String>,
     pub rrule: Option<String>,
     pub cwds: Option<Vec<PathBuf>>,
+    pub mode: Option<String>,
+    pub allow_shell: Option<bool>,
+    pub trust_mode: Option<bool>,
+    pub auto_approve: Option<bool>,
     pub status: Option<AutomationStatus>,
 }
 
@@ -354,6 +401,10 @@ impl AutomationManager {
             prompt: req.prompt.trim().to_string(),
             rrule: req.rrule.trim().to_ascii_uppercase(),
             cwds: req.cwds,
+            mode: normalize_optional_string(req.mode),
+            allow_shell: req.allow_shell,
+            trust_mode: req.trust_mode,
+            auto_approve: req.auto_approve,
             status,
             created_at: now,
             updated_at: now,
@@ -442,6 +493,18 @@ impl AutomationManager {
         }
         if let Some(cwds) = req.cwds {
             existing.cwds = cwds;
+        }
+        if let Some(mode) = req.mode {
+            existing.mode = normalize_optional_string(Some(mode));
+        }
+        if let Some(allow_shell) = req.allow_shell {
+            existing.allow_shell = Some(allow_shell);
+        }
+        if let Some(trust_mode) = req.trust_mode {
+            existing.trust_mode = Some(trust_mode);
+        }
+        if let Some(auto_approve) = req.auto_approve {
+            existing.auto_approve = Some(auto_approve);
         }
         if let Some(status) = req.status {
             existing.status = status;
@@ -552,10 +615,10 @@ impl AutomationManager {
             prompt: automation.prompt.clone(),
             model: None,
             workspace,
-            mode: Some("agent".to_string()),
-            allow_shell: Some(false),
-            trust_mode: Some(false),
-            auto_approve: Some(true),
+            mode: Some(automation.task_mode()),
+            allow_shell: Some(automation.task_allow_shell()),
+            trust_mode: Some(automation.task_trust_mode()),
+            auto_approve: Some(automation.task_auto_approve()),
         };
 
         match task_manager.add_task(new_task).await {
@@ -784,6 +847,12 @@ fn validate_name_and_prompt(name: &str, prompt: &str) -> Result<()> {
     Ok(())
 }
 
+fn normalize_optional_string(value: Option<String>) -> Option<String> {
+    value
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+}
+
 fn write_json_atomic<T: Serialize>(path: &Path, value: &T) -> Result<()> {
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)
@@ -883,6 +952,88 @@ pub fn spawn_scheduler(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use async_trait::async_trait;
+    use tokio::sync::mpsc;
+
+    use crate::task_manager::{
+        ExecutionTask, TaskExecutionEvent, TaskExecutionResult, TaskExecutor, TaskManager,
+        TaskManagerConfig,
+    };
+
+    struct AutomationNoopExecutor;
+
+    #[async_trait]
+    impl TaskExecutor for AutomationNoopExecutor {
+        async fn execute(
+            &self,
+            _task: ExecutionTask,
+            _events: mpsc::UnboundedSender<TaskExecutionEvent>,
+            _cancel: CancellationToken,
+        ) -> TaskExecutionResult {
+            TaskExecutionResult {
+                status: TaskStatus::Completed,
+                result_text: Some("done".to_string()),
+                error: None,
+            }
+        }
+    }
+
+    fn automation_task_config(root: PathBuf) -> TaskManagerConfig {
+        TaskManagerConfig {
+            data_dir: root,
+            worker_count: 1,
+            default_workspace: PathBuf::from("."),
+            default_model: "deepseek-v4-flash".to_string(),
+            default_mode: "plan".to_string(),
+            allow_shell: true,
+            trust_mode: true,
+            max_subagents: 2,
+        }
+    }
+
+    fn automation_record_with_settings(
+        mode: Option<&str>,
+        allow_shell: Option<bool>,
+        trust_mode: Option<bool>,
+        auto_approve: Option<bool>,
+    ) -> AutomationRecord {
+        let now = Utc::now();
+        AutomationRecord {
+            schema_version: CURRENT_AUTOMATION_SCHEMA_VERSION,
+            id: Uuid::new_v4().to_string(),
+            name: "Test automation".to_string(),
+            prompt: "Run the automation".to_string(),
+            rrule: "FREQ=HOURLY;INTERVAL=1".to_string(),
+            cwds: Vec::new(),
+            mode: mode.map(ToString::to_string),
+            allow_shell,
+            trust_mode,
+            auto_approve,
+            status: AutomationStatus::Active,
+            created_at: now,
+            updated_at: now,
+            next_run_at: None,
+            last_run_at: None,
+        }
+    }
+
+    fn queued_run_for(automation: &AutomationRecord) -> AutomationRunRecord {
+        let now = Utc::now();
+        AutomationRunRecord {
+            schema_version: CURRENT_RUN_SCHEMA_VERSION,
+            id: Uuid::new_v4().to_string(),
+            automation_id: automation.id.clone(),
+            scheduled_for: now,
+            status: AutomationRunStatus::Queued,
+            created_at: now,
+            started_at: None,
+            ended_at: None,
+            task_id: None,
+            thread_id: None,
+            turn_id: None,
+            error: None,
+        }
+    }
 
     #[test]
     fn parses_hourly_rrule() {
@@ -937,6 +1088,10 @@ mod tests {
                 prompt: "prompt".to_string(),
                 rrule: "FREQ=HOURLY;INTERVAL=1".to_string(),
                 cwds: Vec::new(),
+                mode: None,
+                allow_shell: None,
+                trust_mode: None,
+                auto_approve: None,
                 status: Some(AutomationStatus::Active),
             })
             .expect("create");
@@ -1014,6 +1169,71 @@ mod tests {
             .expect_err("traversal run ids must be rejected");
         assert!(err.to_string().contains("single path component"));
         assert!(!tempdir.path().join("escape-run.json").exists());
+    }
+
+    #[test]
+    fn automation_task_settings_default_for_legacy_records() {
+        let now = Utc::now().to_rfc3339();
+        let record: AutomationRecord = serde_json::from_value(serde_json::json!({
+            "schema_version": CURRENT_AUTOMATION_SCHEMA_VERSION,
+            "id": Uuid::new_v4().to_string(),
+            "name": "Legacy automation",
+            "prompt": "Run legacy automation",
+            "rrule": "FREQ=HOURLY;INTERVAL=1",
+            "cwds": [],
+            "status": "active",
+            "created_at": now,
+            "updated_at": now
+        }))
+        .expect("legacy automation record should deserialize");
+
+        assert_eq!(record.mode, None);
+        assert_eq!(record.task_mode(), "agent");
+        assert!(!record.task_allow_shell());
+        assert!(!record.task_trust_mode());
+        assert!(record.task_auto_approve());
+    }
+
+    #[tokio::test]
+    async fn automation_enqueue_uses_default_and_explicit_task_settings() -> Result<()> {
+        let tempdir = tempfile::tempdir().expect("tempdir");
+        let automation_manager =
+            AutomationManager::open(tempdir.path().join("automations")).expect("manager");
+        let task_manager = TaskManager::start_with_executor(
+            automation_task_config(tempdir.path().join("tasks")),
+            std::sync::Arc::new(AutomationNoopExecutor),
+        )
+        .await?;
+
+        let default_automation = automation_record_with_settings(None, None, None, None);
+        let mut default_run = queued_run_for(&default_automation);
+        automation_manager
+            .enqueue_run_task(&default_automation, &mut default_run, &task_manager)
+            .await?;
+        let default_task = task_manager
+            .get_task(default_run.task_id.as_deref().expect("task id"))
+            .await?;
+        assert_eq!(default_task.mode, "agent");
+        assert!(!default_task.allow_shell);
+        assert!(!default_task.trust_mode);
+        assert!(default_task.auto_approve);
+
+        let explicit_automation =
+            automation_record_with_settings(Some("plan"), Some(true), Some(true), Some(false));
+        let mut explicit_run = queued_run_for(&explicit_automation);
+        automation_manager
+            .enqueue_run_task(&explicit_automation, &mut explicit_run, &task_manager)
+            .await?;
+        let explicit_task = task_manager
+            .get_task(explicit_run.task_id.as_deref().expect("task id"))
+            .await?;
+        assert_eq!(explicit_task.mode, "plan");
+        assert!(explicit_task.allow_shell);
+        assert!(explicit_task.trust_mode);
+        assert!(!explicit_task.auto_approve);
+
+        task_manager.shutdown();
+        Ok(())
     }
 
     #[test]
