@@ -740,20 +740,20 @@ impl Renderable for ComposerWidget<'_> {
             };
 
             let mut block = Block::default()
-                .title(Line::from(Span::styled(
-                    if self.app.is_history_search_active() {
-                        self.app
-                            .tr(crate::localization::MessageId::HistorySearchTitle)
-                    } else if is_draft_mode {
-                        "Draft"
-                    } else {
-                        "Composer"
-                    },
-                    Style::default().fg(palette::TEXT_MUTED),
-                )))
                 .borders(Borders::ALL)
                 .border_style(Style::default().fg(border_color))
                 .style(background);
+            if self.app.is_history_search_active() || is_draft_mode {
+                block = block.title(Line::from(Span::styled(
+                    if self.app.is_history_search_active() {
+                        self.app
+                            .tr(crate::localization::MessageId::HistorySearchTitle)
+                    } else {
+                        "Draft"
+                    },
+                    Style::default().fg(palette::TEXT_MUTED),
+                )));
+            }
             // Top-right corner: editor state plus transient turn receipts.
             // Receipts are lifecycle chrome, not transcript content; they
             // should appear briefly without displacing conversation rows.
@@ -3906,7 +3906,7 @@ mod tests {
         widget.render(area, &mut buf);
         let rendered = buffer_text(&buf, area);
 
-        assert!(rendered.contains("Composer"));
+        assert!(!rendered.contains("Composer"));
         assert!(rendered.contains("my-session"));
     }
 
@@ -3929,9 +3929,42 @@ mod tests {
         widget.render(area, &mut buf);
         let rendered = buffer_text(&buf, area);
 
-        assert!(rendered.contains("Composer"));
+        assert!(!rendered.contains("Composer"));
         assert!(rendered.contains("turn completed"));
         assert!(rendered.contains("tool(s) used"));
+    }
+
+    #[test]
+    fn composer_border_keeps_mode_titles_contextual() {
+        let slash_menu_entries = Vec::<SlashMenuEntry>::new();
+        let mention_menu_entries = Vec::<String>::new();
+        let area = Rect {
+            x: 0,
+            y: 0,
+            width: 96,
+            height: 5,
+        };
+
+        let mut draft_app = create_test_app();
+        draft_app.composer_density = ComposerDensity::Comfortable;
+        draft_app.insert_str("first line\nsecond line");
+        let draft_widget =
+            ComposerWidget::new(&draft_app, 5, &slash_menu_entries, &mention_menu_entries);
+        let mut draft_buf = Buffer::empty(area);
+        draft_widget.render(area, &mut draft_buf);
+        assert!(buffer_text(&draft_buf, area).contains("Draft"));
+
+        let mut search_app = create_test_app();
+        search_app.composer_density = ComposerDensity::Comfortable;
+        search_app.start_history_search();
+        let search_widget =
+            ComposerWidget::new(&search_app, 5, &slash_menu_entries, &mention_menu_entries);
+        let mut search_buf = Buffer::empty(area);
+        search_widget.render(area, &mut search_buf);
+        assert!(
+            buffer_text(&search_buf, area)
+                .contains(&search_app.tr(crate::localization::MessageId::HistorySearchTitle))
+        );
     }
 
     #[test]
