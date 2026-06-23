@@ -258,3 +258,64 @@ fn resolver_passthrough_provider_preserves_custom_id_verbatim() {
     assert_eq!(out.wire_model_id.as_str(), "my-local:7b");
     assert!(out.validation.ok);
 }
+
+#[test]
+fn resolved_candidate_serializes_secret_free() {
+    let r = RouteResolver::new();
+    // Cover a direct, an aggregator, and a local/passthrough route.
+    let candidates = [
+        r.resolve(&req(Some(ProviderKind::Deepseek), Some("deepseek-v4-pro")))
+            .expect("direct resolves"),
+        r.resolve(&req(
+            Some(ProviderKind::Together),
+            Some("deepseek-ai/DeepSeek-V4-Pro"),
+        ))
+        .expect("aggregator resolves"),
+        r.resolve(&req(Some(ProviderKind::Ollama), Some("my-local:7b")))
+            .expect("local resolves"),
+    ];
+    for out in candidates {
+        let json = serde_json::to_string(&out).expect("candidate serializes");
+        // Carries provider/model/wire/protocol/auth-source class.
+        assert!(json.contains("provider_id"), "{json}");
+        assert!(json.contains("provider_kind"), "{json}");
+        assert!(json.contains("wire_model_id"), "{json}");
+        assert!(json.contains("protocol"), "{json}");
+        assert!(json.contains("auth"), "{json}");
+        // Never any secret/api-key material.
+        let lower = json.to_lowercase();
+        assert!(!lower.contains("api_key"), "leaked api_key: {json}");
+        assert!(!lower.contains("apikey"), "leaked apikey: {json}");
+        assert!(!lower.contains("secret_id"), "leaked secret_id: {json}");
+        assert!(!lower.contains("password"), "leaked password: {json}");
+        assert!(!lower.contains("bearer"), "leaked bearer: {json}");
+        assert!(
+            !lower.contains("authorization"),
+            "leaked authorization: {json}"
+        );
+    }
+}
+
+#[test]
+fn resolver_protocol_matches_descriptor_for_every_provider() {
+    let r = RouteResolver::new();
+    for kind in ProviderKind::ALL {
+        // Use each provider's own default wire id as the selector so strict
+        // direct providers do not reject; this exercises the resolver across
+        // the whole provider set.
+        let default_wire = ProviderDescriptor::for_kind(kind).default_wire_model();
+        let request = req(Some(kind), Some(default_wire.as_str()));
+        let out = r
+            .resolve(&request)
+            .unwrap_or_else(|e| panic!("{kind:?} should resolve its own default: {e}"));
+        assert_eq!(
+            out.protocol,
+            ProviderDescriptor::for_kind(kind).protocol(),
+            "{kind:?} candidate protocol must match descriptor"
+        );
+        assert_eq!(
+            out.endpoint.protocol, out.protocol,
+            "{kind:?} endpoint protocol"
+        );
+    }
+}
