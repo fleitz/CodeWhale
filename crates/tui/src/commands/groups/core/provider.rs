@@ -339,6 +339,19 @@ mod tests {
     }
 
     #[test]
+    fn switch_to_qianfan_preserves_model_id() {
+        let mut app = create_test_app();
+        let result = provider(&mut app, Some("qianfan custom-qianfan-service-id"));
+        match result.action {
+            Some(AppAction::SwitchProvider { provider, model }) => {
+                assert_eq!(provider, ApiProvider::Qianfan);
+                assert_eq!(model.as_deref(), Some("custom-qianfan-service-id"));
+            }
+            other => panic!("expected SwitchProvider, got {other:?}"),
+        }
+    }
+
+    #[test]
     fn switch_to_novita_emits_action() {
         let mut app = create_test_app();
         let result = provider(&mut app, Some("novita"));

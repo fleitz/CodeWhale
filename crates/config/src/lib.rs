@@ -104,6 +104,8 @@ const DEFAULT_HUGGINGFACE_BASE_URL: &str = "https://router.huggingface.co/v1";
 const DEFAULT_TOGETHER_MODEL: &str = "deepseek-ai/DeepSeek-V4-Pro";
 const DEFAULT_TOGETHER_FLASH_MODEL: &str = "deepseek-ai/DeepSeek-V4-Flash";
 const DEFAULT_TOGETHER_BASE_URL: &str = "https://api.together.xyz/v1";
+const DEFAULT_QIANFAN_MODEL: &str = "ernie-4.0-turbo-8k";
+const DEFAULT_QIANFAN_BASE_URL: &str = "https://api.baiduqianfan.ai/v1";
 const DEFAULT_SGLANG_BASE_URL: &str = "http://localhost:30000/v1";
 const DEFAULT_VLLM_MODEL: &str = "deepseek-ai/DeepSeek-V4-Pro";
 const DEFAULT_VLLM_FLASH_MODEL: &str = "deepseek-ai/DeepSeek-V4-Flash";
@@ -183,6 +185,8 @@ pub enum ProviderKind {
     Huggingface,
     #[serde(alias = "together-ai", alias = "together_ai")]
     Together,
+    #[serde(alias = "baidu-qianfan", alias = "baidu_qianfan", alias = "baidu")]
+    Qianfan,
     #[serde(
         alias = "openai-codex",
         alias = "openai_codex",
@@ -212,7 +216,7 @@ pub enum ProviderKind {
 }
 
 impl ProviderKind {
-    pub const ALL: [Self; 25] = [
+    pub const ALL: [Self; 26] = [
         Self::Deepseek,
         Self::NvidiaNim,
         Self::Openai,
@@ -232,6 +236,7 @@ impl ProviderKind {
         Self::Ollama,
         Self::Huggingface,
         Self::Together,
+        Self::Qianfan,
         Self::OpenaiCodex,
         Self::Anthropic,
         Self::Zai,
@@ -343,6 +348,13 @@ pub struct ProvidersToml {
     pub together: ProviderConfigToml,
     #[serde(
         default,
+        alias = "baidu-qianfan",
+        alias = "baidu_qianfan",
+        alias = "baidu"
+    )]
+    pub qianfan: ProviderConfigToml,
+    #[serde(
+        default,
         alias = "openai-codex",
         alias = "openai_codex",
         alias = "codex",
@@ -417,6 +429,7 @@ impl ProvidersToml {
             ProviderKind::Ollama => &self.ollama,
             ProviderKind::Huggingface => &self.huggingface,
             ProviderKind::Together => &self.together,
+            ProviderKind::Qianfan => &self.qianfan,
             ProviderKind::OpenaiCodex => &self.openai_codex,
             ProviderKind::Anthropic => &self.anthropic,
             ProviderKind::Zai => &self.zai,
@@ -447,6 +460,7 @@ impl ProvidersToml {
             ProviderKind::Ollama => &mut self.ollama,
             ProviderKind::Huggingface => &mut self.huggingface,
             ProviderKind::Together => &mut self.together,
+            ProviderKind::Qianfan => &mut self.qianfan,
             ProviderKind::OpenaiCodex => &mut self.openai_codex,
             ProviderKind::Anthropic => &mut self.anthropic,
             ProviderKind::Zai => &mut self.zai,
@@ -1968,6 +1982,7 @@ impl ConfigToml {
                 ProviderKind::Ollama => DEFAULT_OLLAMA_BASE_URL.to_string(),
                 ProviderKind::Huggingface => DEFAULT_HUGGINGFACE_BASE_URL.to_string(),
                 ProviderKind::Together => DEFAULT_TOGETHER_BASE_URL.to_string(),
+                ProviderKind::Qianfan => DEFAULT_QIANFAN_BASE_URL.to_string(),
                 ProviderKind::OpenaiCodex => DEFAULT_OPENAI_CODEX_BASE_URL.to_string(),
                 ProviderKind::Anthropic => DEFAULT_ANTHROPIC_BASE_URL.to_string(),
                 ProviderKind::Zai => DEFAULT_ZAI_BASE_URL.to_string(),
@@ -2220,6 +2235,7 @@ fn normalize_model_for_provider(provider: ProviderKind, model: &str) -> String {
             | ProviderKind::Zai
             | ProviderKind::Stepfun
             | ProviderKind::Minimax
+            | ProviderKind::Qianfan
             | ProviderKind::Ollama
     ) {
         return model.to_string();
@@ -2535,6 +2551,7 @@ fn default_model_for_provider(provider: ProviderKind) -> &'static str {
         ProviderKind::Ollama => DEFAULT_OLLAMA_MODEL,
         ProviderKind::Huggingface => DEFAULT_HUGGINGFACE_MODEL,
         ProviderKind::Together => DEFAULT_TOGETHER_MODEL,
+        ProviderKind::Qianfan => DEFAULT_QIANFAN_MODEL,
         ProviderKind::OpenaiCodex => DEFAULT_OPENAI_CODEX_MODEL,
         ProviderKind::Anthropic => DEFAULT_ANTHROPIC_MODEL,
         ProviderKind::Zai => DEFAULT_ZAI_MODEL,
@@ -2565,6 +2582,7 @@ fn default_base_url_for_provider(provider: ProviderKind) -> &'static str {
         ProviderKind::Ollama => DEFAULT_OLLAMA_BASE_URL,
         ProviderKind::Huggingface => DEFAULT_HUGGINGFACE_BASE_URL,
         ProviderKind::Together => DEFAULT_TOGETHER_BASE_URL,
+        ProviderKind::Qianfan => DEFAULT_QIANFAN_BASE_URL,
         ProviderKind::OpenaiCodex => DEFAULT_OPENAI_CODEX_BASE_URL,
         ProviderKind::Anthropic => DEFAULT_ANTHROPIC_BASE_URL,
         ProviderKind::Zai => DEFAULT_ZAI_BASE_URL,
@@ -4014,6 +4032,8 @@ struct EnvRuntimeOverrides {
     huggingface_model: Option<String>,
     together_base_url: Option<String>,
     together_model: Option<String>,
+    qianfan_base_url: Option<String>,
+    qianfan_model: Option<String>,
     openai_codex_base_url: Option<String>,
     openai_codex_model: Option<String>,
     anthropic_base_url: Option<String>,
@@ -4183,6 +4203,14 @@ impl EnvRuntimeOverrides {
             together_model: std::env::var("TOGETHER_MODEL")
                 .ok()
                 .filter(|v| !v.trim().is_empty()),
+            qianfan_base_url: std::env::var("QIANFAN_BASE_URL")
+                .or_else(|_| std::env::var("BAIDU_QIANFAN_BASE_URL"))
+                .ok()
+                .filter(|v| !v.trim().is_empty()),
+            qianfan_model: std::env::var("QIANFAN_MODEL")
+                .or_else(|_| std::env::var("BAIDU_QIANFAN_MODEL"))
+                .ok()
+                .filter(|v| !v.trim().is_empty()),
             openai_codex_base_url: std::env::var("OPENAI_CODEX_BASE_URL")
                 .or_else(|_| std::env::var("CODEX_BASE_URL"))
                 .ok()
@@ -4266,6 +4294,7 @@ impl EnvRuntimeOverrides {
             ProviderKind::Ollama => self.ollama_base_url.clone(),
             ProviderKind::Huggingface => self.huggingface_base_url.clone(),
             ProviderKind::Together => self.together_base_url.clone(),
+            ProviderKind::Qianfan => self.qianfan_base_url.clone(),
             ProviderKind::OpenaiCodex => self.openai_codex_base_url.clone(),
             ProviderKind::Anthropic => self.anthropic_base_url.clone(),
             ProviderKind::Zai => self.zai_base_url.clone(),
@@ -4290,6 +4319,7 @@ impl EnvRuntimeOverrides {
             ProviderKind::Fireworks => self.fireworks_model.clone(),
             ProviderKind::Huggingface => self.huggingface_model.clone(),
             ProviderKind::Together => self.together_model.clone(),
+            ProviderKind::Qianfan => self.qianfan_model.clone(),
             ProviderKind::OpenaiCodex => self.openai_codex_model.clone(),
             ProviderKind::Anthropic => self.anthropic_model.clone(),
             ProviderKind::Zai => self.zai_model.clone(),

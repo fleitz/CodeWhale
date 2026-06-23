@@ -2747,6 +2747,14 @@ fn provider_kind_parses_openrouter_and_novita_aliases() {
         assert_eq!(parsed.provider, ProviderKind::Deepinfra);
     }
 
+    for alias in ["qianfan", "baidu-qianfan", "baidu_qianfan", "baidu"] {
+        assert_eq!(ProviderKind::parse(alias), Some(ProviderKind::Qianfan));
+
+        let parsed: ConfigToml =
+            toml::from_str(&format!("provider = \"{alias}\"")).expect("qianfan alias");
+        assert_eq!(parsed.provider, ProviderKind::Qianfan);
+    }
+
     let parsed: ConfigToml =
         toml::from_str("provider = \"ark-wanjie\"").expect("wanjie provider alias");
     assert_eq!(parsed.provider, ProviderKind::WanjieArk);
@@ -3184,6 +3192,42 @@ fn zai_stepfun_and_minimax_default_to_first_party_routes() {
         assert_eq!(resolved.base_url, expected_base_url);
         assert_eq!(resolved.model, expected_model);
     }
+}
+
+#[test]
+fn qianfan_provider_defaults_to_openai_compatible_endpoint_and_model() {
+    let _lock = env_lock();
+    let _env = EnvGuard::without_deepseek_runtime_overrides();
+    let config = ConfigToml {
+        provider: ProviderKind::Qianfan,
+        ..ConfigToml::default()
+    };
+
+    let resolved = config.resolve_runtime_options(&CliRuntimeOverrides::default());
+
+    assert_eq!(resolved.provider, ProviderKind::Qianfan);
+    assert_eq!(resolved.base_url, DEFAULT_QIANFAN_BASE_URL);
+    assert_eq!(resolved.model, DEFAULT_QIANFAN_MODEL);
+}
+
+#[test]
+fn qianfan_provider_preserves_configured_base_url_and_model() {
+    let _lock = env_lock();
+    let _env = EnvGuard::without_deepseek_runtime_overrides();
+    let mut config = ConfigToml {
+        provider: ProviderKind::Qianfan,
+        ..ConfigToml::default()
+    };
+    config.providers.qianfan.api_key = Some("qianfan-table-key".to_string());
+    config.providers.qianfan.base_url = Some("https://qianfan.baidubce.com/v2".to_string());
+    config.providers.qianfan.model = Some("custom-qianfan-service-id".to_string());
+
+    let resolved = config.resolve_runtime_options(&CliRuntimeOverrides::default());
+
+    assert_eq!(resolved.provider, ProviderKind::Qianfan);
+    assert_eq!(resolved.api_key.as_deref(), Some("qianfan-table-key"));
+    assert_eq!(resolved.base_url, "https://qianfan.baidubce.com/v2");
+    assert_eq!(resolved.model, "custom-qianfan-service-id");
 }
 
 #[test]

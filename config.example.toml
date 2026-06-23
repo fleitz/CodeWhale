@@ -15,12 +15,12 @@
 # `/provider nvidia-nim` (or `--provider openai`, `--provider wanjie-ark`,
 # `--provider volcengine`, `--provider openrouter`, `--provider xiaomi-mimo`,
 # `--provider fireworks`, `--provider siliconflow`, `--provider siliconflow-CN`,
-# `/provider arcee`, `/provider moonshot`, `/provider sglang`, `/provider vllm`,
+# `/provider arcee`, `/provider moonshot`, `/provider qianfan`, `/provider sglang`, `/provider vllm`,
 # `/provider ollama`, `/provider huggingface`, `/provider stepfun`) toggle without having to re-enter keys. Top-level
 # `api_key` / `base_url` are
 # still read as DeepSeek defaults when `[providers.deepseek]` is absent
 # (backward compatibility).
-provider = "deepseek" # deepseek | deepseek-cn | nvidia-nim | openai | atlascloud | wanjie-ark | volcengine | openrouter | xiaomi-mimo | novita | fireworks | siliconflow | siliconflow-CN | arcee | moonshot | zai | stepfun | minimax | sglang | vllm | ollama | huggingface | together | openai-codex | anthropic | deepinfra
+provider = "deepseek" # deepseek | deepseek-cn | nvidia-nim | openai | atlascloud | wanjie-ark | volcengine | openrouter | xiaomi-mimo | novita | fireworks | siliconflow | siliconflow-CN | arcee | moonshot | zai | stepfun | minimax | sglang | vllm | ollama | huggingface | together | qianfan | openai-codex | anthropic | deepinfra
 api_key = "YOUR_DEEPSEEK_API_KEY" # must be non-empty
 base_url = "https://api.deepseek.com/beta"
 # provider = "deepseek-cn"                       # legacy alias (official host is still https://api.deepseek.com)
@@ -499,6 +499,17 @@ max_subagents = 10 # optional (1-20)
 # api_key = "YOUR_TOGETHER_API_KEY"
 # base_url = "https://api.together.xyz/v1"
 # model = "deepseek-ai/DeepSeek-V4-Pro"     # or deepseek-ai/DeepSeek-V4-Flash
+
+# ─────────────────────────────────────────────────────────────────────────────────
+# Baidu Qianfan Provider (https://intl.cloud.baidu.com/product/qianfan.html)
+# Provider aliases: qianfan, baidu-qianfan, baidu_qianfan, baidu
+# Env var aliases: QIANFAN_API_KEY / BAIDU_QIANFAN_API_KEY,
+#                  QIANFAN_BASE_URL / BAIDU_QIANFAN_BASE_URL,
+#                  QIANFAN_MODEL / BAIDU_QIANFAN_MODEL
+[providers.qianfan]
+# api_key = "YOUR_QIANFAN_API_KEY"
+# base_url = "https://api.baiduqianfan.ai/v1"
+# model = "ernie-4.0-turbo-8k"              # or your Qianfan service/model id
 
 # ─────────────────────────────────────────────────────────────────────────────────
 # OpenAI Codex (ChatGPT) Provider — EXPERIMENTAL

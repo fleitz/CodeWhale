@@ -76,6 +76,7 @@ fn deepseek_api_key_reads_metadata_env_vars_for_newer_providers() -> Result<()> 
             "TOGETHER_API_KEY",
             "together-env-key",
         ),
+        (ApiProvider::Qianfan, "QIANFAN_API_KEY", "qianfan-env-key"),
     ];
     let _env_guards: Vec<_> = cases
         .iter()
@@ -2166,6 +2167,9 @@ fn config_with_provider_scoped_key(provider: &str, api_key: &str) -> Config {
         "huggingface" => {
             providers.huggingface.api_key = Some(api_key.to_string());
         }
+        "qianfan" => {
+            providers.qianfan.api_key = Some(api_key.to_string());
+        }
         _ => panic!("unexpected provider {provider}"),
     }
 
@@ -2185,6 +2189,7 @@ fn has_api_key_uses_active_provider_scoped_config_key() {
         "novita",
         "fireworks",
         "siliconflow",
+        "qianfan",
     ] {
         let config = config_with_provider_scoped_key(provider, "provider-config-key");
 
@@ -2205,6 +2210,7 @@ fn has_api_key_uses_active_provider_env_key() -> Result<()> {
         ("novita", "NOVITA_API_KEY"),
         ("fireworks", "FIREWORKS_API_KEY"),
         ("siliconflow", "SILICONFLOW_API_KEY"),
+        ("qianfan", "QIANFAN_API_KEY"),
     ] {
         unsafe {
             std::env::set_var(env_var, "provider-env-key");
@@ -4229,6 +4235,45 @@ model = "qwen-plus"
         "https://dashscope-intl.aliyuncs.com/compatible-mode/v1"
     );
     assert_eq!(config.default_model(), "qwen-plus");
+    Ok(())
+}
+
+#[test]
+fn qianfan_provider_accepts_custom_model_and_base_url() -> Result<()> {
+    let _lock = lock_test_env();
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let temp_root = env::temp_dir().join(format!(
+        "codewhale-tui-qianfan-provider-{}-{}",
+        std::process::id(),
+        nanos
+    ));
+    fs::create_dir_all(&temp_root)?;
+    let _guard = EnvGuard::new(&temp_root);
+
+    let config_path = temp_root.join(".deepseek").join("config.toml");
+    ensure_parent_dir(&config_path)?;
+    fs::write(
+        &config_path,
+        r#"provider = "qianfan"
+
+[providers.qianfan]
+api_key = "qianfan-table-key"
+base_url = "https://qianfan.baidubce.com/v2"
+model = "custom-qianfan-service-id"
+"#,
+    )?;
+
+    let config = Config::load(None, None)?;
+    assert_eq!(config.api_provider(), ApiProvider::Qianfan);
+    assert_eq!(config.deepseek_api_key()?, "qianfan-table-key");
+    assert_eq!(
+        config.deepseek_base_url(),
+        "https://qianfan.baidubce.com/v2"
+    );
+    assert_eq!(config.default_model(), "custom-qianfan-service-id");
     Ok(())
 }
 

@@ -1347,6 +1347,7 @@ pub(super) fn apply_reasoning_effort(
             }
             ApiProvider::Openai
             | ApiProvider::WanjieArk
+            | ApiProvider::Qianfan
             | ApiProvider::Arcee
             | ApiProvider::Huggingface => {}
             ApiProvider::Moonshot => {
@@ -1425,7 +1426,10 @@ pub(super) fn apply_reasoning_effort(
                 };
                 body["reasoning_effort"] = json!(value);
             }
-            ApiProvider::Openai | ApiProvider::WanjieArk | ApiProvider::OpenaiCodex => {}
+            ApiProvider::Openai
+            | ApiProvider::WanjieArk
+            | ApiProvider::Qianfan
+            | ApiProvider::OpenaiCodex => {}
             ApiProvider::Moonshot => {
                 // #3024: Kimi models accept thinking enable.
                 body["thinking"] = json!({ "type": "enabled" });
@@ -1489,7 +1493,10 @@ pub(super) fn apply_reasoning_effort(
                 // "max" to "high" instead of sending an invalid value.
                 body["reasoning_effort"] = json!("high");
             }
-            ApiProvider::Openai | ApiProvider::WanjieArk | ApiProvider::OpenaiCodex => {}
+            ApiProvider::Openai
+            | ApiProvider::WanjieArk
+            | ApiProvider::Qianfan
+            | ApiProvider::OpenaiCodex => {}
             ApiProvider::Moonshot => {
                 // #3024: Kimi models accept thinking enable.
                 body["thinking"] = json!({ "type": "enabled" });
@@ -2810,6 +2817,7 @@ mod tests {
         for provider in [
             ApiProvider::Openai,
             ApiProvider::WanjieArk,
+            ApiProvider::Qianfan,
             ApiProvider::Arcee,
             ApiProvider::Huggingface,
             ApiProvider::Fireworks,

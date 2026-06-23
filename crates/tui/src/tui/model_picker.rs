@@ -1173,6 +1173,10 @@ mod tests {
             .insert("moonshot".to_string(), "kimi-k2.6".to_string());
         app.provider_models
             .insert("openai".to_string(), "qwen-plus".to_string());
+        app.provider_models.insert(
+            "qianfan".to_string(),
+            "custom-qianfan-service-id".to_string(),
+        );
 
         let view = ModelPickerView::new(&app);
         let model_ids = view.visible_model_ids();
@@ -1183,6 +1187,7 @@ mod tests {
         assert!(model_ids.contains(&"deepseek-v4-pro"));
         assert!(model_ids.contains(&"kimi-k2.6"));
         assert!(model_ids.contains(&"qwen-plus"));
+        assert!(model_ids.contains(&"custom-qianfan-service-id"));
         assert!(!view.show_custom_model_row);
 
         // Each cross-provider row carries its own provider so applying it
@@ -1204,6 +1209,15 @@ mod tests {
         assert_eq!(
             dashscope_row.provider,
             Some(crate::config::ApiProvider::Openai)
+        );
+        let qianfan_row = view
+            .visible_model_rows()
+            .iter()
+            .find(|row| row.id == "custom-qianfan-service-id")
+            .expect("custom Qianfan row present");
+        assert_eq!(
+            qianfan_row.provider,
+            Some(crate::config::ApiProvider::Qianfan)
         );
 
         // Active-provider model must appear before any cross-provider tail row.

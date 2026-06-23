@@ -309,6 +309,7 @@ fn provider_base_url_table_key(provider: ApiProvider) -> anyhow::Result<&'static
         ApiProvider::Vllm => Ok("vllm"),
         ApiProvider::Ollama => Ok("ollama"),
         ApiProvider::Together => Ok("together"),
+        ApiProvider::Qianfan => Ok("qianfan"),
         ApiProvider::OpenaiCodex => Ok("openai_codex"),
         ApiProvider::Zai => Ok("zai"),
         ApiProvider::Stepfun => Ok("stepfun"),

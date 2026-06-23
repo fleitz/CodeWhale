@@ -186,6 +186,8 @@ pub const DEFAULT_DEEPINFRA_BASE_URL: &str = "https://api.deepinfra.com/v1/opena
 pub const DEFAULT_TOGETHER_MODEL: &str = "deepseek-ai/DeepSeek-V4-Pro";
 pub const DEFAULT_TOGETHER_FLASH_MODEL: &str = "deepseek-ai/DeepSeek-V4-Flash";
 pub const DEFAULT_TOGETHER_BASE_URL: &str = "https://api.together.xyz/v1";
+pub const DEFAULT_QIANFAN_MODEL: &str = "ernie-4.0-turbo-8k";
+pub const DEFAULT_QIANFAN_BASE_URL: &str = "https://api.baiduqianfan.ai/v1";
 pub const DEFAULT_OPENAI_CODEX_MODEL: &str = "gpt-5.5";
 pub const DEFAULT_OPENAI_CODEX_BASE_URL: &str = "https://chatgpt.com/backend-api";
 pub const OPENAI_CODEX_EFFECTIVE_CONTEXT_WINDOW_TOKENS: u32 = 400_000;
@@ -250,6 +252,7 @@ pub enum ApiProvider {
     Ollama,
     Huggingface,
     Together,
+    Qianfan,
     OpenaiCodex,
     Anthropic,
     Zai,
@@ -371,6 +374,7 @@ impl ApiProvider {
             Self::Moonshot => "https://platform.kimi.ai/",
             Self::Huggingface => "https://huggingface.co/settings/tokens",
             Self::Together => "https://api.together.ai/settings/api-keys",
+            Self::Qianfan => "https://console.bce.baidu.com/iam/#/iam/accesslist",
             Self::Anthropic => "https://console.anthropic.com/settings/keys",
             Self::Zai => "https://z.ai/model-api",
             Self::Stepfun => "https://platform.stepfun.ai/",
@@ -388,7 +392,7 @@ impl ApiProvider {
 
     /// `ApiProvider` discriminant → `ProviderKind` lookup.
     /// Index 1 is `None` for the legacy `DeepseekCN` variant.
-    const KIND_LOOKUP: [Option<codewhale_config::ProviderKind>; 26] = [
+    const KIND_LOOKUP: [Option<codewhale_config::ProviderKind>; 27] = [
         Some(codewhale_config::ProviderKind::Deepseek),
         None, // DeepseekCN
         Some(codewhale_config::ProviderKind::NvidiaNim),
@@ -409,6 +413,7 @@ impl ApiProvider {
         Some(codewhale_config::ProviderKind::Ollama),
         Some(codewhale_config::ProviderKind::Huggingface),
         Some(codewhale_config::ProviderKind::Together),
+        Some(codewhale_config::ProviderKind::Qianfan),
         Some(codewhale_config::ProviderKind::OpenaiCodex),
         Some(codewhale_config::ProviderKind::Anthropic),
         Some(codewhale_config::ProviderKind::Zai),
@@ -418,7 +423,7 @@ impl ApiProvider {
     ];
 
     /// `ProviderKind` discriminant → `ApiProvider` lookup.
-    const FROM_KIND_LOOKUP: [Self; 25] = [
+    const FROM_KIND_LOOKUP: [Self; 26] = [
         Self::Deepseek,
         Self::NvidiaNim,
         Self::Openai,
@@ -438,6 +443,7 @@ impl ApiProvider {
         Self::Ollama,
         Self::Huggingface,
         Self::Together,
+        Self::Qianfan,
         Self::OpenaiCodex,
         Self::Anthropic,
         Self::Zai,
@@ -1232,6 +1238,7 @@ pub fn model_completion_names_for_provider(provider: ApiProvider) -> Vec<&'stati
         ApiProvider::Ollama => Vec::new(),
         ApiProvider::Openai | ApiProvider::Atlascloud => OFFICIAL_DEEPSEEK_MODELS.to_vec(),
         ApiProvider::Together => vec![DEFAULT_TOGETHER_MODEL, DEFAULT_TOGETHER_FLASH_MODEL],
+        ApiProvider::Qianfan => vec![DEFAULT_QIANFAN_MODEL],
         ApiProvider::OpenaiCodex => vec![DEFAULT_OPENAI_CODEX_MODEL],
         ApiProvider::Zai => vec![DEFAULT_ZAI_MODEL, ZAI_GLM_5_1_MODEL, ZAI_GLM_5_TURBO_MODEL],
         ApiProvider::Stepfun => vec![DEFAULT_STEPFUN_MODEL],
@@ -2677,6 +2684,13 @@ pub struct ProvidersConfig {
     pub together: ProviderConfig,
     #[serde(
         default,
+        alias = "baidu-qianfan",
+        alias = "baidu_qianfan",
+        alias = "baidu"
+    )]
+    pub qianfan: ProviderConfig,
+    #[serde(
+        default,
         alias = "openai-codex",
         alias = "openaiCodex",
         alias = "codex",
@@ -2976,6 +2990,7 @@ impl Config {
             ApiProvider::Huggingface => &providers.huggingface,
             ApiProvider::Deepinfra => &providers.deepinfra,
             ApiProvider::Together => &providers.together,
+            ApiProvider::Qianfan => &providers.qianfan,
             ApiProvider::OpenaiCodex => &providers.openai_codex,
             ApiProvider::Anthropic => &providers.anthropic,
             ApiProvider::Zai => &providers.zai,
@@ -3018,6 +3033,7 @@ impl Config {
             ApiProvider::Huggingface => &mut providers.huggingface,
             ApiProvider::Deepinfra => &mut providers.deepinfra,
             ApiProvider::Together => &mut providers.together,
+            ApiProvider::Qianfan => &mut providers.qianfan,
             ApiProvider::OpenaiCodex => &mut providers.openai_codex,
             ApiProvider::Anthropic => &mut providers.anthropic,
             ApiProvider::Zai => &mut providers.zai,
@@ -3165,6 +3181,7 @@ impl Config {
             ApiProvider::Huggingface => DEFAULT_HUGGINGFACE_MODEL,
             ApiProvider::Deepinfra => DEFAULT_DEEPINFRA_MODEL,
             ApiProvider::Together => DEFAULT_TOGETHER_MODEL,
+            ApiProvider::Qianfan => DEFAULT_QIANFAN_MODEL,
             ApiProvider::OpenaiCodex => DEFAULT_OPENAI_CODEX_MODEL,
             ApiProvider::Zai => DEFAULT_ZAI_MODEL,
             ApiProvider::Stepfun => DEFAULT_STEPFUN_MODEL,
@@ -3210,6 +3227,7 @@ impl Config {
             | ApiProvider::Huggingface
             | ApiProvider::Deepinfra
             | ApiProvider::Together
+            | ApiProvider::Qianfan
             | ApiProvider::OpenaiCodex
             | ApiProvider::Zai
             | ApiProvider::Stepfun
@@ -3262,6 +3280,7 @@ impl Config {
                         ApiProvider::Huggingface => DEFAULT_HUGGINGFACE_BASE_URL,
                         ApiProvider::Deepinfra => DEFAULT_DEEPINFRA_BASE_URL,
                         ApiProvider::Together => DEFAULT_TOGETHER_BASE_URL,
+                        ApiProvider::Qianfan => DEFAULT_QIANFAN_BASE_URL,
                         ApiProvider::OpenaiCodex => DEFAULT_OPENAI_CODEX_BASE_URL,
                         ApiProvider::Zai => DEFAULT_ZAI_BASE_URL,
                         ApiProvider::Stepfun => DEFAULT_STEPFUN_BASE_URL,
@@ -4467,6 +4486,13 @@ fn apply_env_overrides(config: &mut Config) {
                     .together
                     .base_url = Some(value);
             }
+            ApiProvider::Qianfan => {
+                config
+                    .providers
+                    .get_or_insert_with(ProvidersConfig::default)
+                    .qianfan
+                    .base_url = Some(value);
+            }
             ApiProvider::OpenaiCodex => {
                 config
                     .providers
@@ -4701,6 +4727,7 @@ fn apply_env_overrides(config: &mut Config) {
             ApiProvider::Huggingface => &mut providers.huggingface,
             ApiProvider::Deepinfra => &mut providers.deepinfra,
             ApiProvider::Together => &mut providers.together,
+            ApiProvider::Qianfan => &mut providers.qianfan,
             ApiProvider::OpenaiCodex => &mut providers.openai_codex,
             ApiProvider::Anthropic => &mut providers.anthropic,
             ApiProvider::Zai => &mut providers.zai,
@@ -4900,6 +4927,7 @@ fn apply_env_overrides(config: &mut Config) {
                 ApiProvider::Huggingface => &mut providers.huggingface,
                 ApiProvider::Deepinfra => &mut providers.deepinfra,
                 ApiProvider::Together => &mut providers.together,
+                ApiProvider::Qianfan => &mut providers.qianfan,
                 ApiProvider::OpenaiCodex => &mut providers.openai_codex,
                 ApiProvider::Anthropic => &mut providers.anthropic,
                 ApiProvider::Zai => &mut providers.zai,
@@ -5102,6 +5130,7 @@ pub(crate) fn provider_passes_model_through(provider: ApiProvider) -> bool {
             | ApiProvider::Volcengine
             | ApiProvider::XiaomiMimo
             | ApiProvider::Moonshot
+            | ApiProvider::Qianfan
             | ApiProvider::Ollama
             | ApiProvider::Huggingface
     )
@@ -5625,6 +5654,7 @@ fn merge_providers(
             huggingface: merge_provider_config(base.huggingface, override_cfg.huggingface),
             deepinfra: merge_provider_config(base.deepinfra, override_cfg.deepinfra),
             together: merge_provider_config(base.together, override_cfg.together),
+            qianfan: merge_provider_config(base.qianfan, override_cfg.qianfan),
             openai_codex: merge_provider_config(base.openai_codex, override_cfg.openai_codex),
             zai: merge_provider_config(base.zai, override_cfg.zai),
             stepfun: merge_provider_config(base.stepfun, override_cfg.stepfun),
