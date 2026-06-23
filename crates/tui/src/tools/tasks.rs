@@ -14,6 +14,7 @@ use crate::command_safety::{SafetyLevel, analyze_command};
 use crate::dependencies::ExternalTool;
 use crate::task_manager::{
     NewTaskRequest, TaskArtifactRef, TaskAttemptRecord, TaskGateRecord, TaskRecord,
+    validate_task_storage_id,
 };
 use crate::tools::shell::{ExecShellTool, ShellWaitTool};
 use crate::tools::spec::{
@@ -593,7 +594,17 @@ impl ToolSpec for PrAttemptRecordTool {
     }
 
     async fn execute(&self, input: Value, context: &ToolContext) -> Result<ToolResult, ToolError> {
-        let task_id = task_id_from_input_or_context(&input, context)?;
+        let mut task_id = task_id_from_input_or_context(&input, context)?;
+        if let Some(manager) = context.runtime.task_manager.as_ref() {
+            task_id = manager
+                .get_task(&task_id)
+                .await
+                .map_err(|e| ToolError::execution_failed(e.to_string()))?
+                .id;
+        } else {
+            validate_task_storage_id(&task_id)
+                .map_err(|e| ToolError::execution_failed(format!("invalid task id: {e}")))?;
+        }
         let base_sha = git_output(&context.workspace, &["rev-parse", "HEAD"]).ok();
         let head_sha = base_sha.clone();
         let branch = git_output(&context.workspace, &["rev-parse", "--abbrev-ref", "HEAD"]).ok();
@@ -608,7 +619,7 @@ impl ToolSpec for PrAttemptRecordTool {
             .filter(|line| !line.trim().is_empty())
             .map(ToString::to_string)
             .collect::<Vec<_>>();
-        let patch_path = write_task_artifact_for(context, &task_id, "attempt_patch", &diff)?;
+        let patch_path = write_task_artifact_for(context, &task_id, "attempt_patch", &diff).await?;
         let attempt = TaskAttemptRecord {
             id: format!("attempt_{}", &Uuid::new_v4().to_string()[..8]),
             attempt_group_id: optional_str(&input, "attempt_group_id")
@@ -826,6 +837,8 @@ fn write_runtime_artifact(
     let Some(task_id) = context.runtime.active_task_id.as_deref() else {
         return Ok(None);
     };
+    validate_task_storage_id(task_id)
+        .map_err(|e| ToolError::execution_failed(format!("invalid active task id: {e}")))?;
     let manager = context.runtime.task_manager.as_ref();
     if let Some(manager) = manager {
         return manager
@@ -855,21 +868,27 @@ fn write_runtime_artifact(
     ))
 }
 
-fn write_task_artifact_for(
+async fn write_task_artifact_for(
     context: &ToolContext,
     task_id: &str,
     label: &str,
     content: &str,
 ) -> Result<Option<PathBuf>, ToolError> {
     if let Some(manager) = context.runtime.task_manager.as_ref() {
+        let resolved = manager
+            .get_task(task_id)
+            .await
+            .map_err(|e| ToolError::execution_failed(e.to_string()))?;
         return manager
-            .write_task_artifact(task_id, label, content)
+            .write_task_artifact(&resolved.id, label, content)
             .map(Some)
             .map_err(|e| ToolError::execution_failed(e.to_string()));
     }
     if context.runtime.active_task_id.as_deref() != Some(task_id) {
         return Ok(None);
     }
+    validate_task_storage_id(task_id)
+        .map_err(|e| ToolError::execution_failed(format!("invalid task id: {e}")))?;
     write_runtime_artifact(context, label, content)
 }
 

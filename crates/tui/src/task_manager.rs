@@ -1361,6 +1361,7 @@ impl TaskManager {
     }
 
     fn write_artifact(&self, task_id: &str, label: &str, content: &str) -> Result<PathBuf> {
+        validate_task_storage_id(task_id)?;
         let artifact_dir = self.artifacts_dir.join(task_id);
         fs::create_dir_all(&artifact_dir)
             .with_context(|| format!("Failed to create artifact dir {}", artifact_dir.display()))?;
@@ -1638,6 +1639,31 @@ fn sanitize_filename(input: &str) -> String {
     } else {
         out
     }
+}
+
+pub(crate) fn validate_task_storage_id(task_id: &str) -> Result<()> {
+    validate_storage_component("task id", task_id)
+}
+
+fn validate_storage_component(label: &str, value: &str) -> Result<()> {
+    let value = value.trim();
+    if value.is_empty() {
+        bail!("{label} must not be empty");
+    }
+    if value.contains('/') || value.contains('\\') {
+        bail!("{label} must not contain path separators: {value}");
+    }
+    let mut components = Path::new(value).components();
+    let Some(component) = components.next() else {
+        bail!("{label} must not be empty");
+    };
+    if components.next().is_some() {
+        bail!("{label} must be a single path component: {value}");
+    }
+    if !matches!(component, std::path::Component::Normal(_)) {
+        bail!("{label} must be a normal path component: {value}");
+    }
+    Ok(())
 }
 
 fn duration_ms(start: DateTime<Utc>, end: DateTime<Utc>) -> u64 {
@@ -1959,6 +1985,30 @@ mod tests {
 
         assert_eq!(updated.gates.len(), 1);
         assert_eq!(updated.gates[0].classification, "passed");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn write_task_artifact_rejects_path_like_task_ids() -> Result<()> {
+        let root = std::env::temp_dir().join(format!("deepseek-task-test-{}", Uuid::new_v4()));
+        let outside = root.join("escape");
+        let manager =
+            TaskManager::start_with_executor(test_config(root.clone()), Arc::new(MockExecutor))
+                .await?;
+
+        let err = manager
+            .write_task_artifact("../escape", "attempt_patch", "patch")
+            .expect_err("path-like task id should be rejected");
+
+        assert!(
+            err.to_string().contains("task id must not contain"),
+            "unexpected error: {err:#}"
+        );
+        assert!(
+            !outside.exists(),
+            "artifact write must not create directories outside the artifact root"
+        );
+        let _ = fs::remove_dir_all(root);
         Ok(())
     }
 

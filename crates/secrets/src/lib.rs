@@ -13,6 +13,8 @@
 
 use std::collections::HashMap;
 use std::fs;
+#[cfg(unix)]
+use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
@@ -480,22 +482,26 @@ impl FileKeyringStore {
             }
         }
         let body = serde_json::to_string_pretty(blob)?;
-        fs::write(&self.path, body)?;
         #[cfg(unix)]
         {
+            use std::os::unix::fs::OpenOptionsExt;
             use std::os::unix::fs::PermissionsExt;
-            // Best-effort 0o600 — matches the parent-dir chmod above which
-            // is also `let _ = ...`. Filesystems that don't support Unix
-            // chmod (Docker bind-mounts of NTFS, network shares — #897)
-            // would otherwise fail the whole save here even though the
-            // blob already wrote successfully. The host's native ACLs
-            // are doing access control in those environments.
+            let mut file = fs::OpenOptions::new()
+                .write(true)
+                .create(true)
+                .truncate(true)
+                .mode(0o600)
+                .open(&self.path)?;
+            file.write_all(body.as_bytes())?;
+            file.sync_all()?;
             if let Ok(meta) = fs::metadata(&self.path) {
                 let mut perms = meta.permissions();
                 perms.set_mode(0o600);
                 let _ = fs::set_permissions(&self.path, perms);
             }
         }
+        #[cfg(not(unix))]
+        fs::write(&self.path, body)?;
         Ok(())
     }
 }

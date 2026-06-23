@@ -305,8 +305,11 @@ impl StateStore {
     }
 
     fn conn(&self) -> Result<Connection> {
-        Connection::open(&self.db_path)
-            .with_context(|| format!("failed to open state db {}", self.db_path.display()))
+        let conn = Connection::open(&self.db_path)
+            .with_context(|| format!("failed to open state db {}", self.db_path.display()))?;
+        conn.pragma_update(None, "foreign_keys", "ON")
+            .context("failed to enable SQLite foreign keys")?;
+        Ok(conn)
     }
 
     fn init_schema(&self) -> Result<()> {
@@ -1865,6 +1868,67 @@ mod tests {
             .upsert_thread_goal(&test_goal("missing-thread", "nope"))
             .expect_err("goal without a thread should fail");
         assert!(err.to_string().contains("thread missing-thread not found"));
+    }
+
+    #[test]
+    fn delete_thread_cascades_child_state() {
+        let store = temp_state_store("thread-delete-cascade");
+        store
+            .upsert_thread(&test_thread("thread-1"))
+            .expect("upsert thread");
+        store
+            .persist_dynamic_tools(
+                "thread-1",
+                &[DynamicToolRecord {
+                    position: 0,
+                    name: "custom_tool".to_string(),
+                    description: Some("test".to_string()),
+                    input_schema: serde_json::json!({"type": "object"}),
+                }],
+            )
+            .expect("dynamic tools");
+        store
+            .append_message("thread-1", "user", "hello", None)
+            .expect("append message");
+        store
+            .save_checkpoint("thread-1", "checkpoint-1", &serde_json::json!({"ok": true}))
+            .expect("checkpoint");
+        store
+            .upsert_thread_goal(&test_goal("thread-1", "Clean up children"))
+            .expect("goal");
+
+        store.delete_thread("thread-1").expect("delete thread");
+
+        assert!(
+            store
+                .get_thread("thread-1")
+                .expect("read deleted thread")
+                .is_none()
+        );
+        assert!(
+            store
+                .list_messages("thread-1", None)
+                .expect("messages after delete")
+                .is_empty()
+        );
+        assert!(
+            store
+                .list_checkpoints("thread-1", None)
+                .expect("checkpoints after delete")
+                .is_empty()
+        );
+        assert!(
+            store
+                .get_dynamic_tools("thread-1")
+                .expect("dynamic tools after delete")
+                .is_empty()
+        );
+        assert!(
+            store
+                .get_thread_goal("thread-1")
+                .expect("goal after delete")
+                .is_none()
+        );
     }
 
     #[test]

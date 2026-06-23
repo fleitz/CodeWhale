@@ -3249,6 +3249,17 @@ pub fn codewhale_home() -> Result<PathBuf> {
     Ok(home.join(CODEWHALE_APP_DIR))
 }
 
+fn explicit_codewhale_home() -> Option<PathBuf> {
+    std::env::var("CODEWHALE_HOME").ok().and_then(|val| {
+        let trimmed = val.trim();
+        if trimmed.is_empty() {
+            None
+        } else {
+            Some(PathBuf::from(trimmed))
+        }
+    })
+}
+
 /// Resolve the legacy DeepSeek home directory (`$HOME/.deepseek`).
 ///
 /// Always returns the legacy path regardless of whether it exists.
@@ -3305,6 +3316,9 @@ fn ensure_safe_state_subdir(subdir: &str) -> Result<()> {
 pub fn resolve_state_dir(subdir: &str) -> Result<PathBuf> {
     ensure_safe_state_subdir(subdir)?;
     let primary = codewhale_home()?.join(subdir);
+    if explicit_codewhale_home().is_some() {
+        return Ok(primary);
+    }
     if primary.exists() {
         return Ok(primary);
     }
@@ -3340,6 +3354,9 @@ pub fn ensure_state_dir(subdir: &str) -> Result<PathBuf> {
 /// config-file migration), or when no legacy directory is present.
 fn migrate_legacy_state_dir(primary: &Path, subdir: &str) -> Result<()> {
     if primary.exists() || subdir == "." || subdir.is_empty() {
+        return Ok(());
+    }
+    if explicit_codewhale_home().is_some() {
         return Ok(());
     }
     let legacy = match legacy_deepseek_home() {
@@ -3596,6 +3613,9 @@ pub fn default_config_path() -> Result<PathBuf> {
     // Prefer ~/.codewhale/config.toml when it exists (fresh install or
     // migrated), otherwise fall back to ~/.deepseek/config.toml.
     let primary = codewhale_home()?.join(CONFIG_FILE_NAME);
+    if explicit_codewhale_home().is_some() {
+        return Ok(primary);
+    }
     if primary.exists() {
         return Ok(primary);
     }
@@ -3630,6 +3650,9 @@ impl ConfigMigration {
 pub fn migrate_config_if_needed() -> Result<Option<ConfigMigration>> {
     let primary = codewhale_home()?.join(CONFIG_FILE_NAME);
     if primary.exists() {
+        return Ok(None);
+    }
+    if explicit_codewhale_home().is_some() {
         return Ok(None);
     }
     let legacy = legacy_deepseek_home()?.join(CONFIG_FILE_NAME);
