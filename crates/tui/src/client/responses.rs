@@ -714,19 +714,38 @@ mod tests {
     #[derive(Clone)]
     struct RetryThenSuccess {
         attempts: Arc<AtomicUsize>,
+        retry_status: u16,
+        retry_body: &'static str,
     }
 
     impl Respond for RetryThenSuccess {
         fn respond(&self, _request: &Request) -> ResponseTemplate {
             if self.attempts.fetch_add(1, Ordering::SeqCst) == 0 {
-                return ResponseTemplate::new(429)
-                    .insert_header("Retry-After", "0")
-                    .set_body_string("rate limited");
+                let mut response =
+                    ResponseTemplate::new(self.retry_status).set_body_string(self.retry_body);
+                if self.retry_status == 429 {
+                    response = response.insert_header("Retry-After", "0");
+                }
+                return response;
             }
 
             ResponseTemplate::new(200)
                 .insert_header("Content-Type", "text/event-stream")
                 .set_body_string("data: [DONE]\n\n")
+        }
+    }
+
+    #[derive(Clone)]
+    struct AlwaysError {
+        attempts: Arc<AtomicUsize>,
+        status: u16,
+        body: &'static str,
+    }
+
+    impl Respond for AlwaysError {
+        fn respond(&self, _request: &Request) -> ResponseTemplate {
+            self.attempts.fetch_add(1, Ordering::SeqCst);
+            ResponseTemplate::new(self.status).set_body_string(self.body)
         }
     }
 
@@ -782,6 +801,8 @@ mod tests {
             .and(path(CODEX_RESPONSES_PATH))
             .respond_with(RetryThenSuccess {
                 attempts: Arc::clone(&attempts),
+                retry_status: 429,
+                retry_body: "rate limited",
             })
             .mount(&server)
             .await;
@@ -808,6 +829,89 @@ mod tests {
         .expect("Responses retry stream should finish after [DONE]");
 
         assert_eq!(attempts.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn responses_stream_retries_transient_server_error() {
+        let server = MockServer::start().await;
+        let attempts = Arc::new(AtomicUsize::new(0));
+        Mock::given(method("POST"))
+            .and(path(CODEX_RESPONSES_PATH))
+            .respond_with(RetryThenSuccess {
+                attempts: Arc::clone(&attempts),
+                retry_status: 503,
+                retry_body: "temporarily unavailable",
+            })
+            .mount(&server)
+            .await;
+
+        let client = {
+            let _env_lock = crate::test_support::lock_test_env();
+            let _codex_token =
+                crate::test_support::EnvVarGuard::set("OPENAI_CODEX_ACCESS_TOKEN", "test-token");
+            let _legacy_codex_token =
+                crate::test_support::EnvVarGuard::remove("CODEX_ACCESS_TOKEN");
+            DeepSeekClient::new(&test_codex_config(&server)).unwrap()
+        };
+        let mut stream = client
+            .handle_responses_stream(minimal_responses_request())
+            .await
+            .unwrap();
+
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            while let Some(event) = stream.next().await {
+                event.unwrap();
+            }
+        })
+        .await
+        .expect("Responses retry stream should finish after [DONE]");
+
+        assert_eq!(attempts.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn responses_stream_fails_fast_on_non_retryable_provider_error() {
+        let server = MockServer::start().await;
+        let attempts = Arc::new(AtomicUsize::new(0));
+        Mock::given(method("POST"))
+            .and(path(CODEX_RESPONSES_PATH))
+            .respond_with(AlwaysError {
+                attempts: Arc::clone(&attempts),
+                status: 403,
+                body: "<html><title>Access Denied</title><body>Security alert. Contact support. Ray ID 1234abcd.</body></html>",
+            })
+            .mount(&server)
+            .await;
+
+        let client = {
+            let _env_lock = crate::test_support::lock_test_env();
+            let _codex_token =
+                crate::test_support::EnvVarGuard::set("OPENAI_CODEX_ACCESS_TOKEN", "test-token");
+            let _legacy_codex_token =
+                crate::test_support::EnvVarGuard::remove("CODEX_ACCESS_TOKEN");
+            DeepSeekClient::new(&test_codex_config(&server)).unwrap()
+        };
+
+        let err = match client
+            .handle_responses_stream(minimal_responses_request())
+            .await
+        {
+            Ok(_) => panic!("non-retryable Responses errors should fail fast"),
+            Err(err) => err,
+        };
+
+        assert_eq!(attempts.load(Ordering::SeqCst), 1);
+        let message = format!("{err:#}");
+        assert!(
+            message.contains("Responses API request failed"),
+            "{message}"
+        );
+        assert!(message.contains("OpenAI Codex"), "{message}");
+        assert!(message.contains("Access Denied"), "{message}");
+        assert!(
+            message.contains("blocked before it reached the model"),
+            "{message}"
+        );
     }
 
     #[test]
