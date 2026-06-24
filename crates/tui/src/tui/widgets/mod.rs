@@ -3980,7 +3980,7 @@ mod tests {
         assert!(!normal_rendered.contains("Draft"));
         assert!(
             !normal_rendered
-                .contains(&normal_app.tr(crate::localization::MessageId::HistorySearchTitle))
+                .contains(normal_app.tr(crate::localization::MessageId::HistorySearchTitle))
         );
 
         let mut draft_app = create_test_app();
@@ -4001,7 +4001,7 @@ mod tests {
         search_widget.render(area, &mut search_buf);
         assert!(
             buffer_text(&search_buf, area)
-                .contains(&search_app.tr(crate::localization::MessageId::HistorySearchTitle))
+                .contains(search_app.tr(crate::localization::MessageId::HistorySearchTitle))
         );
     }
 

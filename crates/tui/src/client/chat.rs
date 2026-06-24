@@ -2624,6 +2624,10 @@ enum SseDataFrame {
     Events(Vec<StreamEvent>),
 }
 
+// The six `&mut` streaming-state fields plus the style flag are a deliberate,
+// shared parser-state set (mirrored by `parse_sse_chunk*`); bundling them into a
+// struct would only add reborrow noise on this hot SSE path.
+#[allow(clippy::too_many_arguments)]
 fn parse_sse_data_frame(
     data: &str,
     content_index: &mut u32,
@@ -2685,6 +2689,8 @@ pub(super) fn parse_sse_chunk(
     )
 }
 
+// Same deliberate shared parser-state set as `parse_sse_data_frame`.
+#[allow(clippy::too_many_arguments)]
 fn parse_sse_chunk_with_reasoning_style(
     chunk: &Value,
     content_index: &mut u32,

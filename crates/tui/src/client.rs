@@ -1789,11 +1789,13 @@ mod tests {
 
     fn deepseek_anthropic_client(server: &MockServer) -> DeepSeekClient {
         let _ = rustls::crypto::ring::default_provider().install_default();
-        let mut providers = ProvidersConfig::default();
-        providers.deepseek_anthropic = ProviderConfig {
-            api_key: Some("ds-test".to_string()),
-            base_url: Some(server.uri()),
-            ..ProviderConfig::default()
+        let providers = ProvidersConfig {
+            deepseek_anthropic: ProviderConfig {
+                api_key: Some("ds-test".to_string()),
+                base_url: Some(server.uri()),
+                ..ProviderConfig::default()
+            },
+            ..ProvidersConfig::default()
         };
         DeepSeekClient::new(&Config {
             provider: Some("deepseek-anthropic".to_string()),

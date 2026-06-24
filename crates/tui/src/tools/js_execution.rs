@@ -282,6 +282,9 @@ mod tests {
         );
     }
 
+    // The env lock must stay held across the await so no other env-mutating test
+    // races the process env while the child node run reads it.
+    #[allow(clippy::await_holding_lock)]
     #[tokio::test]
     async fn execute_js_does_not_inherit_parent_secret_env() {
         if !node_present() {

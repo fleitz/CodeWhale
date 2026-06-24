@@ -1152,7 +1152,7 @@ mod tests {
         view.render(area, &mut buf);
 
         let y =
-            row_containing(&buf, area, &selected_id).expect("selected session row should render");
+            row_containing(&buf, area, selected_id).expect("selected session row should render");
         let rendered_row = buffer_row_text(&buf, area, y);
         let highlighted_cells = (area.x..area.x.saturating_add(area.width))
             .filter(|&x| {

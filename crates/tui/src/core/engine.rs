@@ -3407,6 +3407,10 @@ pub(super) fn auto_review_run_origin_for_plan(
     }
 }
 
+// The parameter list intentionally mirrors `AutoReviewContext::from_tool_call`,
+// which this thin wrapper builds; the 8 call sites (1 prod + tests) read clearer
+// passing the fields than constructing a context first.
+#[allow(clippy::too_many_arguments)]
 pub(super) fn auto_review_plan_decision(
     policy: &crate::tui::auto_review::AutoReviewPolicy,
     tool_name: &str,

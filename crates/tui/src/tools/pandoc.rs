@@ -214,6 +214,8 @@ mod tests {
         msg.contains("getXdgDirectory") || msg.contains("sHGetFolderPath")
     }
 
+    // Test-only skip diagnostic; the module-wide print_stderr deny targets prod code.
+    #[allow(clippy::print_stderr)]
     async fn execute_pandoc_or_skip(input: Value, ctx: &ToolContext) -> Option<ToolResult> {
         match PandocConvertTool.execute(input, ctx).await {
             Ok(result) => Some(result),
