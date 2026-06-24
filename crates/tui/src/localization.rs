@@ -547,6 +547,18 @@ pub enum MessageId {
     // Agent fanout card.
     FanoutCounts,
 
+    // App mode picker (prompt, names, hints) and composer vim indicator.
+    ModePickerPrompt,
+    AppModeAgent,
+    AppModeYolo,
+    AppModePlan,
+    AppModeAgentHint,
+    AppModePlanHint,
+    AppModeYoloHint,
+    VimModeNormal,
+    VimModeInsert,
+    VimModeVisual,
+
     // Approval dialog — risk badges, category labels, field labels, options.
     ApprovalRiskReview,
     ApprovalRiskDestructive,
@@ -985,6 +997,16 @@ pub const ALL_MESSAGE_IDS: &[MessageId] = &[
     MessageId::CtxMenuHelp,
     MessageId::CtxMenuHelpDesc,
     MessageId::FanoutCounts,
+    MessageId::ModePickerPrompt,
+    MessageId::AppModeAgent,
+    MessageId::AppModeYolo,
+    MessageId::AppModePlan,
+    MessageId::AppModeAgentHint,
+    MessageId::AppModePlanHint,
+    MessageId::AppModeYoloHint,
+    MessageId::VimModeNormal,
+    MessageId::VimModeInsert,
+    MessageId::VimModeVisual,
     MessageId::ApprovalRiskReview,
     MessageId::ApprovalRiskDestructive,
     MessageId::ApprovalCategorySafe,
@@ -1734,6 +1756,18 @@ fn english(id: MessageId) -> &'static str {
             "{done} done · {running} running · {failed} failed · {pending} pending"
         }
 
+        // App mode picker (prompt, names, hints) and composer vim indicator.
+        MessageId::ModePickerPrompt => "Choose how CodeWhale should operate:",
+        MessageId::AppModeAgent => "Agent",
+        MessageId::AppModeYolo => "YOLO",
+        MessageId::AppModePlan => "Plan",
+        MessageId::AppModeAgentHint => "Normal execution with approvals",
+        MessageId::AppModePlanHint => "Plan first before execution",
+        MessageId::AppModeYoloHint => "Auto-approve; shell enabled",
+        MessageId::VimModeNormal => "-- NORMAL --",
+        MessageId::VimModeInsert => "-- INSERT --",
+        MessageId::VimModeVisual => "-- VISUAL --",
+
         // Approval dialog.
         MessageId::ApprovalRiskReview => "REVIEW",
         MessageId::ApprovalRiskDestructive => "DESTRUCTIVE",
@@ -2376,6 +2410,18 @@ fn vietnamese(id: MessageId) -> Option<&'static str> {
             "{done} hoàn thành · {running} đang chạy · {failed} thất bại · {pending} chờ"
         }
 
+        // App mode picker (prompt, names, hints) and composer vim indicator.
+        MessageId::ModePickerPrompt => "Chọn cách CodeWhale hoạt động:",
+        MessageId::AppModeAgent => "Tác nhân",
+        MessageId::AppModeYolo => "YOLO",
+        MessageId::AppModePlan => "Kế hoạch",
+        MessageId::AppModeAgentHint => "Thực thi bình thường, hỏi trước khi thay đổi",
+        MessageId::AppModePlanHint => "Lập kế hoạch trước khi thực thi",
+        MessageId::AppModeYoloHint => "Tự động phê duyệt; bật shell (toàn quyền)",
+        MessageId::VimModeNormal => "-- BÌNH THƯỜNG --",
+        MessageId::VimModeInsert => "-- CHÈN --",
+        MessageId::VimModeVisual => "-- TRỰC QUAN --",
+
         // Approval dialog.
         MessageId::ApprovalRiskReview => "XEM XÉT",
         MessageId::ApprovalRiskDestructive => "NGUY HẠI",
@@ -2540,6 +2586,18 @@ fn traditional_chinese(id: MessageId) -> Option<&'static str> {
         MessageId::FanoutCounts => {
             "{done} 已完成 · {running} 運行中 · {failed} 失敗 · {pending} 等待中"
         }
+
+        // App mode picker (prompt, names, hints) and composer vim indicator.
+        MessageId::ModePickerPrompt => "選擇 CodeWhale 的運作方式：",
+        MessageId::AppModeAgent => "智能體",
+        MessageId::AppModeYolo => "YOLO",
+        MessageId::AppModePlan => "計畫",
+        MessageId::AppModeAgentHint => "正常執行，變更前需核准",
+        MessageId::AppModePlanHint => "先規劃，再執行",
+        MessageId::AppModeYoloHint => "自動核准；啟用 shell（完全存取）",
+        MessageId::VimModeNormal => "-- 一般 --",
+        MessageId::VimModeInsert => "-- 插入 --",
+        MessageId::VimModeVisual => "-- 可視 --",
 
         // Approval dialog.
         MessageId::ApprovalRiskReview => "審查",
@@ -3165,6 +3223,18 @@ fn japanese(id: MessageId) -> Option<&'static str> {
             "{done} 完了 · {running} 実行中 · {failed} 失敗 · {pending} 保留"
         }
 
+        // App mode picker (prompt, names, hints) and composer vim indicator.
+        MessageId::ModePickerPrompt => "CodeWhale の動作方法を選択してください:",
+        MessageId::AppModeAgent => "エージェント",
+        MessageId::AppModeYolo => "YOLO",
+        MessageId::AppModePlan => "プラン",
+        MessageId::AppModeAgentHint => "通常実行（変更前に承認を求めます）",
+        MessageId::AppModePlanHint => "実行前にまず計画します",
+        MessageId::AppModeYoloHint => "自動承認・シェル有効（フルアクセス）",
+        MessageId::VimModeNormal => "-- ノーマル --",
+        MessageId::VimModeInsert => "-- 挿入 --",
+        MessageId::VimModeVisual => "-- ビジュアル --",
+
         // Approval dialog.
         MessageId::ApprovalRiskReview => "確認",
         MessageId::ApprovalRiskDestructive => "破壊的操作",
@@ -3710,6 +3780,18 @@ fn chinese_simplified(id: MessageId) -> Option<&'static str> {
         MessageId::FanoutCounts => {
             "{done} 已完成 · {running} 运行中 · {failed} 失败 · {pending} 等待中"
         }
+
+        // App mode picker (prompt, names, hints) and composer vim indicator.
+        MessageId::ModePickerPrompt => "选择 CodeWhale 的运行方式：",
+        MessageId::AppModeAgent => "智能体",
+        MessageId::AppModeYolo => "YOLO",
+        MessageId::AppModePlan => "计划",
+        MessageId::AppModeAgentHint => "正常执行，变更前需批准",
+        MessageId::AppModePlanHint => "先规划，再执行",
+        MessageId::AppModeYoloHint => "自动批准；启用 shell（完全访问）",
+        MessageId::VimModeNormal => "-- 普通 --",
+        MessageId::VimModeInsert => "-- 插入 --",
+        MessageId::VimModeVisual => "-- 可视 --",
 
         // Approval dialog.
         MessageId::ApprovalRiskReview => "审查",
@@ -4322,6 +4404,18 @@ fn portuguese_brazil(id: MessageId) -> Option<&'static str> {
         MessageId::FanoutCounts => {
             "{done} concluído · {running} em execução · {failed} falhou · {pending} pendente"
         }
+
+        // App mode picker (prompt, names, hints) and composer vim indicator.
+        MessageId::ModePickerPrompt => "Escolha como o CodeWhale deve operar:",
+        MessageId::AppModeAgent => "Agente",
+        MessageId::AppModeYolo => "YOLO",
+        MessageId::AppModePlan => "Plano",
+        MessageId::AppModeAgentHint => "Execução normal com aprovações",
+        MessageId::AppModePlanHint => "Planeje antes de executar",
+        MessageId::AppModeYoloHint => "Aprovação automática; shell habilitado",
+        MessageId::VimModeNormal => "-- NORMAL --",
+        MessageId::VimModeInsert => "-- INSERIR --",
+        MessageId::VimModeVisual => "-- VISUAL --",
 
         // Approval dialog.
         MessageId::ApprovalRiskReview => "REVISÃO",
@@ -4959,6 +5053,18 @@ fn spanish_latin_america(id: MessageId) -> Option<&'static str> {
             "{done} completado · {running} ejecutando · {failed} falló · {pending} pendiente"
         }
 
+        // App mode picker (prompt, names, hints) and composer vim indicator.
+        MessageId::ModePickerPrompt => "Elige cómo debe funcionar CodeWhale:",
+        MessageId::AppModeAgent => "Agente",
+        MessageId::AppModeYolo => "YOLO",
+        MessageId::AppModePlan => "Plan",
+        MessageId::AppModeAgentHint => "Ejecución normal con aprobaciones",
+        MessageId::AppModePlanHint => "Planifica antes de ejecutar",
+        MessageId::AppModeYoloHint => "Aprobación automática; shell habilitado",
+        MessageId::VimModeNormal => "-- NORMAL --",
+        MessageId::VimModeInsert => "-- INSERTAR --",
+        MessageId::VimModeVisual => "-- VISUAL --",
+
         // Approval dialog.
         MessageId::ApprovalRiskReview => "REVISAR",
         MessageId::ApprovalRiskDestructive => "DESTRUCTIVO",
@@ -5159,6 +5265,34 @@ mod tests {
                 "{} is missing messages",
                 locale.tag()
             );
+        }
+    }
+
+    #[test]
+    fn mode_picker_strings_are_translated_in_non_english_locales() {
+        // The picker prompt and the three mode hints are full sentences; every
+        // shipped non-English locale must provide a real translation rather than
+        // leaking the English string through the fallback chain.
+        let sentences = [
+            MessageId::ModePickerPrompt,
+            MessageId::AppModeAgentHint,
+            MessageId::AppModePlanHint,
+            MessageId::AppModeYoloHint,
+        ];
+        for locale in Locale::shipped() {
+            if *locale == Locale::En {
+                continue;
+            }
+            for id in sentences {
+                let localized = tr(*locale, id);
+                assert!(!localized.is_empty(), "{} empty for {id:?}", locale.tag());
+                assert_ne!(
+                    localized,
+                    tr(Locale::En, id),
+                    "{} should translate {id:?}",
+                    locale.tag()
+                );
+            }
         }
     }
 

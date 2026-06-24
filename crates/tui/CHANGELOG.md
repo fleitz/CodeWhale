@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **Localized mode picker and composer indicators.** The `/mode` picker prompt,
+  mode names, and hints, plus the composer's Vim mode indicator, now render in
+  all seven shipped locales (model-facing mode labels stay English). Harvested
+  from #2239 by @gordonlu.
+
 ## [0.8.64] - 2026-06-22
 
 ### Added

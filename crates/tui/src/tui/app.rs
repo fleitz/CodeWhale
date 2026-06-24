@@ -958,13 +958,30 @@ impl AppMode {
         }
     }
 
+    /// Localized short name for the mode picker (user-facing surface only).
     #[must_use]
-    pub fn picker_hint(self) -> &'static str {
-        match self {
-            AppMode::Agent => "Normal execution with approvals",
-            AppMode::Plan => "Plan first before execution",
-            AppMode::Yolo => "Auto-approve; shell enabled",
-        }
+    pub fn display_name_localized(self, locale: Locale) -> &'static str {
+        tr(
+            locale,
+            match self {
+                AppMode::Agent => MessageId::AppModeAgent,
+                AppMode::Yolo => MessageId::AppModeYolo,
+                AppMode::Plan => MessageId::AppModePlan,
+            },
+        )
+    }
+
+    /// Localized one-line hint for the mode picker (user-facing surface only).
+    #[must_use]
+    pub fn picker_hint_localized(self, locale: Locale) -> &'static str {
+        tr(
+            locale,
+            match self {
+                AppMode::Agent => MessageId::AppModeAgentHint,
+                AppMode::Plan => MessageId::AppModePlanHint,
+                AppMode::Yolo => MessageId::AppModeYoloHint,
+            },
+        )
     }
 
     #[allow(dead_code)]
@@ -1087,14 +1104,17 @@ pub enum VimMode {
 }
 
 impl VimMode {
-    /// Short status-bar label shown in the composer border.
+    /// Localized status-bar label shown in the composer border (user-facing).
     #[must_use]
-    pub fn label(self) -> &'static str {
-        match self {
-            Self::Normal => "-- NORMAL --",
-            Self::Insert => "-- INSERT --",
-            Self::Visual => "-- VISUAL --",
-        }
+    pub fn label_localized(self, locale: Locale) -> &'static str {
+        tr(
+            locale,
+            match self {
+                Self::Normal => MessageId::VimModeNormal,
+                Self::Insert => MessageId::VimModeInsert,
+                Self::Visual => MessageId::VimModeVisual,
+            },
+        )
     }
 }
 

@@ -2140,7 +2140,7 @@ fn composer_top_right_chrome(app: &App, area_width: u16) -> Option<Line<'static>
     if let Some(receipt) = receipt {
         let receipt_text = receipt.trim();
         if app.composer.vim_enabled {
-            let vim_label = app.composer.vim_mode.label();
+            let vim_label = app.composer.vim_mode.label_localized(app.ui_locale);
             let vim_width = UnicodeWidthStr::width(vim_label);
             let sep_width = UnicodeWidthStr::width(" · ");
             if vim_width + sep_width + 4 <= max_width {
@@ -2165,7 +2165,10 @@ fn composer_top_right_chrome(app: &App, area_width: u16) -> Option<Line<'static>
     let mut spans: Vec<Span> = Vec::new();
     if app.composer.vim_enabled {
         spans.push(Span::styled(
-            truncate_display_width(app.composer.vim_mode.label(), max_width),
+            truncate_display_width(
+                app.composer.vim_mode.label_localized(app.ui_locale),
+                max_width,
+            ),
             vim_mode_style(app.composer.vim_mode),
         ));
     }

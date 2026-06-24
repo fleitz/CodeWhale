@@ -8,23 +8,26 @@ use ratatui::{
     text::{Line, Span},
     widgets::{Block, Borders, Clear, Padding, Paragraph, Widget},
 };
+use unicode_width::UnicodeWidthStr;
 
+use crate::localization::{Locale, MessageId, tr};
 use crate::palette;
 use crate::tui::app::AppMode;
 use crate::tui::views::{ModalKind, ModalView, ViewAction, ViewEvent};
 
 pub struct ModePickerView {
     cursor: usize,
+    locale: Locale,
 }
 
 impl ModePickerView {
     #[must_use]
-    pub fn new(current: AppMode) -> Self {
+    pub fn new(current: AppMode, locale: Locale) -> Self {
         let cursor = AppMode::CHOICES
             .iter()
             .position(|mode| *mode == current)
             .unwrap_or(0);
-        Self { cursor }
+        Self { cursor, locale }
     }
 
     fn selected_mode(&self) -> AppMode {
@@ -123,7 +126,7 @@ impl ModalView for ModePickerView {
 
         let mut lines = Vec::with_capacity(AppMode::CHOICES.len() + 1);
         lines.push(Line::from(Span::styled(
-            "Choose how CodeWhale should operate:",
+            tr(self.locale, MessageId::ModePickerPrompt),
             Style::default().fg(palette::TEXT_MUTED),
         )));
 
@@ -145,13 +148,17 @@ impl ModalView for ModePickerView {
                 Style::default().fg(palette::TEXT_MUTED)
             };
             let pointer = if is_cursor { ">" } else { " " };
+            let name = mode.display_name_localized(self.locale);
+            // Pad by terminal columns, not scalar count, so wide (CJK) mode
+            // names keep the hint column aligned.
+            let pad = " ".repeat(7usize.saturating_sub(UnicodeWidthStr::width(name)));
 
             lines.push(Line::from(vec![
                 Span::styled(
-                    format!("{pointer} {}. {:<7}", mode.number(), mode.display_name()),
+                    format!("{pointer} {}. {name}{pad}", mode.number()),
                     row_style,
                 ),
-                Span::styled(mode.picker_hint(), hint_style),
+                Span::styled(mode.picker_hint_localized(self.locale), hint_style),
             ]));
         }
 
@@ -166,13 +173,13 @@ mod tests {
 
     #[test]
     fn opens_on_current_mode() {
-        let view = ModePickerView::new(AppMode::Plan);
+        let view = ModePickerView::new(AppMode::Plan, Locale::En);
         assert_eq!(view.selected_mode(), AppMode::Plan);
     }
 
     #[test]
     fn enter_emits_selected_mode() {
-        let mut view = ModePickerView::new(AppMode::Agent);
+        let mut view = ModePickerView::new(AppMode::Agent, Locale::En);
         view.handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
         let action = view.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
         match action {
@@ -185,7 +192,7 @@ mod tests {
 
     #[test]
     fn number_keys_select_modes() {
-        let mut view = ModePickerView::new(AppMode::Agent);
+        let mut view = ModePickerView::new(AppMode::Agent, Locale::En);
         let action = view.handle_key(KeyEvent::new(KeyCode::Char('3'), KeyModifiers::NONE));
         match action {
             ViewAction::EmitAndClose(ViewEvent::ModeSelected { mode }) => {
