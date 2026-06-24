@@ -31,7 +31,7 @@ there's a model, endpoint, or feature you don't see that you want, open an issue
 
 ```bash
 npm install -g codewhale
-codewhale --version   # 0.8.63
+codewhale --version   # 0.8.64
 ```
 
 The npm wrapper (Node 18+) downloads SHA-256-verified binaries from GitHub

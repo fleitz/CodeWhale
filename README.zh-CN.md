@@ -20,7 +20,7 @@ DeepInfra 以及本地 vLLM/SGLang/Ollama 都是一等路由；当你手里是 A
 
 ```bash
 npm install -g codewhale
-codewhale --version   # 0.8.63
+codewhale --version   # 0.8.64
 ```
 
 npm wrapper（Node 18+）会从 GitHub Releases 下载经 SHA-256 校验的二进制，并安装

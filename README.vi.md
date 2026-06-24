@@ -21,7 +21,7 @@ bằng `/restore` cho mọi lượt.
 
 ```bash
 npm install -g codewhale
-codewhale --version   # 0.8.63
+codewhale --version   # 0.8.64
 ```
 
 Wrapper npm (Node 18+) tải binary đã xác minh SHA-256 từ GitHub Releases và

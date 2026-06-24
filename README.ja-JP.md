@@ -17,7 +17,7 @@ Rust 製の TUI と CLI、25 のプロバイダ。DeepSeek、OpenRouter、Huggin
 
 ```bash
 npm install -g codewhale
-codewhale --version   # 0.8.63
+codewhale --version   # 0.8.64
 ```
 
 npm wrapper（Node 18+）は GitHub Releases から SHA-256 検証済みのバイナリをダウンロードし、`codewhale`、`codew`、`codewhale-tui` をインストールします。ソースからビルドしたい場合は cargo（Rust 1.88+）で:
