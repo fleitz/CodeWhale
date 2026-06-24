@@ -1153,6 +1153,14 @@ pub fn wire_model_for_provider(provider: ApiProvider, model: &str) -> String {
 
 #[must_use]
 pub fn model_completion_names_for_provider(provider: ApiProvider) -> Vec<&'static str> {
+    // OpenRouter keeps a broader curated picker/search list in addition to the
+    // semantic DeepSeek route rows owned by route_catalog.
+    if !matches!(provider, ApiProvider::Openrouter)
+        && let Some(models) = crate::route_catalog::static_model_ids_for_provider(provider)
+    {
+        return models;
+    }
+
     match provider {
         ApiProvider::Deepseek | ApiProvider::DeepseekCN => OFFICIAL_DEEPSEEK_MODELS.to_vec(),
         ApiProvider::NvidiaNim => vec![DEFAULT_NVIDIA_NIM_MODEL, DEFAULT_NVIDIA_NIM_FLASH_MODEL],
@@ -3866,24 +3874,8 @@ impl Config {
 fn root_deepseek_model_is_foreign_to_direct_provider(provider: ApiProvider, model: &str) -> bool {
     if matches!(provider, ApiProvider::Deepseek | ApiProvider::DeepseekCN)
         || provider_passes_model_through(provider)
+        || crate::route_catalog::provider_can_route_model(provider, model)
     {
-        return false;
-    }
-    if matches!(
-        provider,
-        ApiProvider::NvidiaNim
-            | ApiProvider::Openrouter
-            | ApiProvider::Novita
-            | ApiProvider::Fireworks
-            | ApiProvider::Siliconflow
-            | ApiProvider::SiliconflowCn
-            | ApiProvider::Deepinfra
-            | ApiProvider::Sglang
-            | ApiProvider::Vllm
-            | ApiProvider::Volcengine
-            | ApiProvider::Atlascloud
-            | ApiProvider::WanjieArk
-    ) {
         return false;
     }
     normalize_model_name(model).is_some()
@@ -5265,35 +5257,12 @@ fn base_url_host(base_url: &str) -> Option<&str> {
 }
 
 fn model_for_provider(provider: ApiProvider, normalized: String) -> String {
+    if let Some(model) = crate::route_catalog::wire_model_for_provider(provider, &normalized) {
+        return model.to_string();
+    }
+
     let lowered = normalized.to_ascii_lowercase();
     match (provider, lowered.as_str()) {
-        (ApiProvider::NvidiaNim, "deepseek-v4-pro") => DEFAULT_NVIDIA_NIM_MODEL.to_string(),
-        (ApiProvider::NvidiaNim, "deepseek-v4-flash") => DEFAULT_NVIDIA_NIM_FLASH_MODEL.to_string(),
-        (ApiProvider::Openrouter, "deepseek-v4-pro") => DEFAULT_OPENROUTER_MODEL.to_string(),
-        (ApiProvider::Openrouter, "deepseek-v4-flash") => {
-            DEFAULT_OPENROUTER_FLASH_MODEL.to_string()
-        }
-        (ApiProvider::Novita, "deepseek-v4-pro") => DEFAULT_NOVITA_MODEL.to_string(),
-        (ApiProvider::Novita, "deepseek-v4-flash") => DEFAULT_NOVITA_FLASH_MODEL.to_string(),
-        (ApiProvider::Fireworks, "deepseek-v4-pro") => DEFAULT_FIREWORKS_MODEL.to_string(),
-        (
-            ApiProvider::Siliconflow | ApiProvider::SiliconflowCn,
-            "deepseek-v4-pro" | "deepseek-reasoner" | "deepseek-r1",
-        ) => DEFAULT_SILICONFLOW_MODEL.to_string(),
-        (
-            ApiProvider::Siliconflow | ApiProvider::SiliconflowCn,
-            "deepseek-v4-flash" | "deepseek-chat" | "deepseek-v3",
-        ) => DEFAULT_SILICONFLOW_FLASH_MODEL.to_string(),
-        (ApiProvider::Sglang, "deepseek-v4-pro") => DEFAULT_SGLANG_MODEL.to_string(),
-        (ApiProvider::Sglang, "deepseek-v4-flash") => DEFAULT_SGLANG_FLASH_MODEL.to_string(),
-        (ApiProvider::Vllm, "deepseek-v4-pro") => DEFAULT_VLLM_MODEL.to_string(),
-        (ApiProvider::Vllm, "deepseek-v4-flash") => DEFAULT_VLLM_FLASH_MODEL.to_string(),
-        (ApiProvider::Deepinfra, "deepseek-v4-pro" | "deepseek-v4pro") => {
-            DEFAULT_DEEPINFRA_MODEL.to_string()
-        }
-        (ApiProvider::Deepinfra, "deepseek-v4-flash" | "deepseek-chat" | "deepseek-reasoner") => {
-            DEFAULT_DEEPINFRA_FLASH_MODEL.to_string()
-        }
         (
             ApiProvider::Moonshot,
             "kimi"

@@ -91,25 +91,17 @@ pub(crate) fn provider_router_candidates(
         };
     }
 
+    if let Some((big, cheap)) = crate::route_catalog::primary_fast_pair_for_provider(provider) {
+        return RouterCandidates {
+            big: big.to_string(),
+            cheap: Some(cheap.to_string()),
+        };
+    }
+
     match provider {
-        ApiProvider::Deepseek | ApiProvider::DeepseekCN => RouterCandidates::deepseek(),
-        ApiProvider::NvidiaNim
-        | ApiProvider::Openrouter
-        | ApiProvider::Novita
-        | ApiProvider::Siliconflow
-        | ApiProvider::SiliconflowCn
-        | ApiProvider::Sglang
-        | ApiProvider::Vllm
-        | ApiProvider::WanjieArk => RouterCandidates {
-            big: crate::config::wire_model_for_provider(provider, "deepseek-v4-pro"),
-            cheap: Some(crate::config::wire_model_for_provider(
-                provider,
-                "deepseek-v4-flash",
-            )),
-        },
-        ApiProvider::Volcengine => RouterCandidates {
-            big: crate::config::DEFAULT_VOLCENGINE_MODEL.to_string(),
-            cheap: Some(crate::config::DEFAULT_VOLCENGINE_FLASH_MODEL.to_string()),
+        ApiProvider::WanjieArk => RouterCandidates {
+            big: "deepseek-v4-pro".to_string(),
+            cheap: Some("deepseek-v4-flash".to_string()),
         },
         _ => RouterCandidates {
             big: current_model.to_string(),
