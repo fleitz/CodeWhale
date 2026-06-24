@@ -61,6 +61,7 @@ pub struct ProviderDashboardRow {
     pub default_route: ProviderDefaultRoute,
     pub usage_meter: String,
     pub readiness: ProviderReadiness,
+    pub maturity: ProviderMaturity,
     pub messages: Vec<String>,
     pub is_active: bool,
     has_key: bool,
@@ -99,6 +100,36 @@ pub enum ProviderReadiness {
     Invalid,
 }
 
+/// How battle-tested a provider integration is, independent of whether the
+/// user has credentials configured (which `ProviderReadiness` already tracks).
+/// Kept intentionally minimal — the only two honest states today are an
+/// experimental integration and a supported one (#2984).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProviderMaturity {
+    Experimental,
+    Supported,
+}
+
+impl ProviderMaturity {
+    /// Maturity is seeded from a small table keyed by provider. Only the
+    /// OpenAI Codex bridge is experimental today; everything else is supported.
+    fn for_provider(provider: ApiProvider) -> Self {
+        match provider {
+            ApiProvider::OpenaiCodex => Self::Experimental,
+            _ => Self::Supported,
+        }
+    }
+
+    /// Compact tag for the picker hint. Returns `None` when the integration is
+    /// supported so the common case stays noise-free (#2984).
+    fn tag(self) -> Option<&'static str> {
+        match self {
+            Self::Experimental => Some("experimental"),
+            Self::Supported => None,
+        }
+    }
+}
+
 impl ProviderDashboardRow {
     fn from_config(provider: ApiProvider, active: ApiProvider, config: &Config) -> Self {
         let has_key = has_api_key_for(config, provider);
@@ -135,6 +166,7 @@ impl ProviderDashboardRow {
                 },
                 usage_meter,
                 readiness: ProviderReadiness::Legacy,
+                maturity: ProviderMaturity::for_provider(provider),
                 messages: vec![
                     "legacy DeepSeek China alias; routing maps through DeepSeek compatibility"
                         .to_string(),
@@ -226,6 +258,7 @@ impl ProviderDashboardRow {
             default_route,
             usage_meter: resolved_pricing,
             readiness,
+            maturity: ProviderMaturity::for_provider(provider),
             messages,
             is_active: provider == active,
             has_key,
@@ -234,7 +267,7 @@ impl ProviderDashboardRow {
 
     fn compact_hint(&self) -> String {
         format!(
-            "{} | auth:{} | {} | {} | base:{} | route:{}{} | catalog:{}",
+            "{} | auth:{} | {} | {} | base:{} | route:{}{} | catalog:{}{}",
             self.readiness.label(),
             self.auth_status.label(),
             self.usage_meter,
@@ -242,7 +275,13 @@ impl ProviderDashboardRow {
             compact_base_url(&self.base_url),
             self.default_route.logical_model,
             route_wire_suffix(&self.default_route),
-            self.catalog_label()
+            self.catalog_label(),
+            // Only experimental integrations add a tag; supported ones stay
+            // noise-free (#2984).
+            self.maturity
+                .tag()
+                .map(|tag| format!(" | {tag}"))
+                .unwrap_or_default(),
         )
     }
 
@@ -554,6 +593,8 @@ impl ProviderPickerView {
                 Span::raw(format!("{enter_action} ")),
                 Span::styled(" R ", Style::default().fg(palette::TEXT_MUTED)),
                 Span::raw("edit key "),
+                Span::styled(" M ", Style::default().fg(palette::TEXT_MUTED)),
+                Span::raw("models "),
                 Span::styled(" Esc ", Style::default().fg(palette::TEXT_MUTED)),
                 Span::raw("cancel "),
             ]))
@@ -753,6 +794,13 @@ impl ModalView for ProviderPickerView {
                 KeyCode::Char(c) if key.modifiers.is_empty() && c.eq_ignore_ascii_case(&'r') => {
                     self.enter_key_entry();
                     ViewAction::None
+                }
+                // Jump to the `/model` picker pre-filtered to this provider
+                // (#3083). Handled before the type-ahead arm so `m`/`M` opens
+                // models instead of seeking a provider whose name starts with m.
+                KeyCode::Char(c) if key.modifiers.is_empty() && c.eq_ignore_ascii_case(&'m') => {
+                    let provider = self.selected_provider();
+                    ViewAction::EmitAndClose(ViewEvent::ProviderPickerOpenModels { provider })
                 }
                 // Type-ahead: any other letter jumps to the next provider whose
                 // name starts with it (e.g. `z` -> "Z.ai").
@@ -1001,6 +1049,42 @@ mod tests {
     }
 
     #[test]
+    fn openai_codex_row_is_experimental_and_tagged_in_hint() {
+        let config = Config::default();
+        let row = ProviderDashboardRow::from_config(
+            ApiProvider::OpenaiCodex,
+            ApiProvider::Deepseek,
+            &config,
+        );
+
+        // #2984: maturity is a separate axis from auth/readiness.
+        assert_eq!(row.maturity, ProviderMaturity::Experimental);
+        assert!(
+            row.compact_hint().contains("experimental"),
+            "experimental maturity must surface in the hint, got {:?}",
+            row.compact_hint()
+        );
+    }
+
+    #[test]
+    fn mainstream_provider_is_supported_without_experimental_tag() {
+        let config = Config::default();
+        let row = ProviderDashboardRow::from_config(
+            ApiProvider::Deepseek,
+            ApiProvider::Deepseek,
+            &config,
+        );
+
+        // #2984: supported integrations stay noise-free (no tag).
+        assert_eq!(row.maturity, ProviderMaturity::Supported);
+        assert!(
+            !row.compact_hint().contains("experimental"),
+            "supported providers must omit the experimental tag, got {:?}",
+            row.compact_hint()
+        );
+    }
+
+    #[test]
     fn provider_dashboard_row_uses_route_resolver_for_custom_openai_endpoint() {
         let config = Config {
             providers: Some(crate::config::ProvidersConfig {
@@ -1132,6 +1216,40 @@ mod tests {
                 assert_eq!(provider, ApiProvider::Ollama);
             }
             other => panic!("expected ProviderPickerApplied, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn pressing_m_opens_models_for_selected_provider() {
+        let config = Config::default();
+        let mut picker = ProviderPickerView::new(ApiProvider::Deepseek, &config);
+        move_to_provider(&mut picker, ApiProvider::Openrouter);
+
+        let action = picker.handle_key(key(KeyCode::Char('m')));
+
+        // #3083: `m` jumps to the model picker scoped to the highlighted
+        // provider rather than acting as a type-ahead seek.
+        match action {
+            ViewAction::EmitAndClose(ViewEvent::ProviderPickerOpenModels { provider }) => {
+                assert_eq!(provider, ApiProvider::Openrouter);
+            }
+            other => panic!("expected ProviderPickerOpenModels, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn pressing_uppercase_m_also_opens_models() {
+        let config = Config::default();
+        let mut picker = ProviderPickerView::new(ApiProvider::Deepseek, &config);
+
+        // Case-insensitive like the `R` edit-key affordance: a bare `M` works.
+        let action = picker.handle_key(key(KeyCode::Char('M')));
+
+        match action {
+            ViewAction::EmitAndClose(ViewEvent::ProviderPickerOpenModels { provider }) => {
+                assert_eq!(provider, ApiProvider::Deepseek);
+            }
+            other => panic!("expected ProviderPickerOpenModels, got {other:?}"),
         }
     }
 

@@ -176,6 +176,11 @@ pub enum ViewEvent {
     ProviderPickerKimiOAuthEnabled {
         provider: crate::config::ApiProvider,
     },
+    /// Emitted by the `/provider` picker (the `M` action) to jump straight to
+    /// the `/model` picker pre-filtered to the highlighted provider (#3083).
+    ProviderPickerOpenModels {
+        provider: crate::config::ApiProvider,
+    },
     /// Emitted by the `/mode` picker when the user chooses a mode.
     ModeSelected {
         mode: crate::tui::app::AppMode,

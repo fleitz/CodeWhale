@@ -8747,6 +8747,27 @@ fn toggle_live_transcript_overlay(app: &mut App) {
     app.needs_redraw = true;
 }
 
+/// Open the `/model` picker pre-filtered to `provider` (#3083). The model
+/// picker's search already scopes rows by provider display name, so we reuse
+/// the standard "open model picker" path and seed its query by replaying the
+/// provider's display name as character input through the public view-stack
+/// key path — no model-picker internals are touched.
+fn open_model_picker_for_provider(app: &mut App, provider: crate::config::ApiProvider) {
+    if app.view_stack.top_kind() != Some(ModalKind::ModelPicker) {
+        app.view_stack
+            .push(crate::tui::model_picker::ModelPickerView::new(app));
+    }
+    for ch in provider.display_name().chars() {
+        // Char input updates the query and never emits a ViewEvent, so the
+        // returned (empty) event list is safe to drop.
+        let _ = app.view_stack.handle_key(crossterm::event::KeyEvent::new(
+            KeyCode::Char(ch),
+            KeyModifiers::NONE,
+        ));
+    }
+    app.needs_redraw = true;
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn handle_view_events(
     terminal: &mut AppTerminal,
@@ -9093,6 +9114,9 @@ async fn handle_view_events(
                     "Linked Kimi CLI OAuth",
                 )
                 .await;
+            }
+            ViewEvent::ProviderPickerOpenModels { provider } => {
+                open_model_picker_for_provider(app, provider);
             }
             ViewEvent::ModeSelected { mode } => {
                 let prior_mode = app.mode;
