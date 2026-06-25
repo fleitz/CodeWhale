@@ -55,6 +55,19 @@ Editing the message you're about to send.
 
 Hotbar trigger semantics are intentionally `Alt-1` through `Alt-8` only. Bare `1`-`8` is normal text input in the composer and remains owned by pickers, onboarding, approval prompts, and modal views.
 
+Fresh configs resolve to this default bar unless `[[hotbar]]` overrides it or `hotbar = []` disables it:
+
+| Slot | Chord   | Default action     | Label     |
+|------|---------|--------------------|-----------|
+| 1    | `Alt-1` | `voice.toggle`     | `voice`   |
+| 2    | `Alt-2` | `session.compact`  | `compact` |
+| 3    | `Alt-3` | `mode.plan`        | `plan`    |
+| 4    | `Alt-4` | `mode.agent`       | `agent`   |
+| 5    | `Alt-5` | `mode.yolo`        | `yolo`    |
+| 6    | `Alt-6` | `palette.open`     | `palette` |
+| 7    | `Alt-7` | `sidebar.toggle`   | `side`    |
+| 8    | `Alt-8` | `trust.toggle`     | `trust`   |
+
 | Focus state | Hotbar behavior |
 |-------------|-----------------|
 | Composer empty, text, or whitespace | `Alt-1`-`Alt-8` dispatches a configured slot |

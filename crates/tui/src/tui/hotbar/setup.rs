@@ -14,9 +14,10 @@ use crate::palette;
 use crate::tui::app::App;
 use crate::tui::views::{ModalKind, ModalView, ViewAction, ViewEvent};
 
-#[cfg(test)]
-use super::actions::HotbarRecommendation;
-use super::actions::{HotbarActionCategory, HotbarActionMetadata, HotbarArgsBehavior};
+use super::actions::{
+    HotbarActionCategory, HotbarActionMetadata, HotbarArgsBehavior, HotbarRecommendationOptions,
+    recommend_hotbar_actions,
+};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct HotbarSetupActionRow {
@@ -45,6 +46,7 @@ pub struct HotbarSetupView {
     selected_slot: u8,
     original_bindings: BTreeMap<u8, codewhale_config::HotbarBindingToml>,
     draft_bindings: BTreeMap<u8, codewhale_config::HotbarBindingToml>,
+    recommended_action_ids: BTreeSet<String>,
     validation_errors: Vec<String>,
     help_visible: bool,
 }
@@ -83,6 +85,11 @@ impl HotbarSetupView {
             .collect::<BTreeSet<_>>()
             .into_iter()
             .collect::<Vec<_>>();
+        let recommended_action_ids =
+            recommend_hotbar_actions(app, HotbarRecommendationOptions::for_setup_wizard())
+                .into_iter()
+                .map(|entry| entry.metadata.id)
+                .collect::<BTreeSet<_>>();
 
         let known_action_ids = app
             .hotbar_actions
@@ -113,6 +120,7 @@ impl HotbarSetupView {
             selected_slot: 1,
             draft_bindings: original_bindings.clone(),
             original_bindings,
+            recommended_action_ids,
             validation_errors: Vec::new(),
             help_visible: false,
         }
@@ -160,17 +168,8 @@ impl HotbarSetupView {
 
     #[must_use]
     #[cfg(test)]
-    pub fn recommended_action_ids(&self) -> BTreeSet<String> {
-        self.actions
-            .iter()
-            .filter(|row| {
-                matches!(
-                    row.metadata.recommendation,
-                    HotbarRecommendation::Default | HotbarRecommendation::Eligible
-                )
-            })
-            .map(|row| row.metadata.id.clone())
-            .collect()
+    pub fn recommended_action_ids(&self) -> &BTreeSet<String> {
+        &self.recommended_action_ids
     }
 
     #[must_use]
@@ -395,8 +394,14 @@ impl HotbarSetupView {
             } else {
                 " "
             };
+            let recommended = if self.recommended_action_ids.contains(&row.metadata.id) {
+                "rec"
+            } else {
+                ""
+            };
             let mut text = format!(
-                "{marker}{checked} {:<20} {:<8} {}",
+                "{marker}{checked} {:<3} {:<20} {:<8} {}",
+                recommended,
                 row.metadata.display_name,
                 row.status_label(),
                 row.metadata.description

@@ -1,3 +1,4 @@
+use std::cmp::Ordering;
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
@@ -147,6 +148,40 @@ impl HotbarActionMetadata {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HotbarRecommendationEntry {
+    pub metadata: HotbarActionMetadata,
+    pub disabled_reason: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct HotbarRecommendationOptions {
+    pub max_total: usize,
+    pub max_eligible_per_category: usize,
+    pub include_required_args: bool,
+}
+
+impl HotbarRecommendationOptions {
+    #[must_use]
+    pub const fn for_setup_wizard() -> Self {
+        Self {
+            max_total: usize::MAX,
+            max_eligible_per_category: usize::MAX,
+            include_required_args: false,
+        }
+    }
+}
+
+impl Default for HotbarRecommendationOptions {
+    fn default() -> Self {
+        Self {
+            max_total: usize::from(codewhale_config::HOTBAR_SLOT_COUNT),
+            max_eligible_per_category: usize::MAX,
+            include_required_args: false,
+        }
+    }
+}
+
 /// Uniform interface for actions that can be bound to a hotbar slot.
 #[allow(dead_code)]
 pub trait HotbarAction: Send + Sync {
@@ -174,6 +209,102 @@ pub trait HotbarAction: Send + Sync {
 
     /// Fire the action.
     fn dispatch(&self, app: &mut App) -> Result<HotbarDispatch>;
+}
+
+#[must_use]
+pub fn recommend_hotbar_actions(
+    app: &App,
+    options: HotbarRecommendationOptions,
+) -> Vec<HotbarRecommendationEntry> {
+    let mut entries = app
+        .hotbar_actions
+        .iter()
+        .filter_map(|action| {
+            let metadata = action.metadata(app.ui_locale);
+            if !metadata.recommendation.is_recommendable() {
+                return None;
+            }
+            if matches!(metadata.args, HotbarArgsBehavior::Required)
+                && !options.include_required_args
+            {
+                return None;
+            }
+            let disabled_reason = action.disabled_reason(app);
+            if disabled_reason.is_some() {
+                return None;
+            }
+            Some(HotbarRecommendationEntry {
+                metadata,
+                disabled_reason,
+            })
+        })
+        .collect::<Vec<_>>();
+
+    entries.sort_by(|a, b| compare_recommendation_metadata(&a.metadata, &b.metadata));
+
+    let mut selected = Vec::new();
+    let mut eligible_by_category: BTreeMap<HotbarActionCategory, usize> = BTreeMap::new();
+    for entry in entries {
+        if selected.len() >= options.max_total {
+            break;
+        }
+        if !matches!(entry.metadata.recommendation, HotbarRecommendation::Default) {
+            let count = eligible_by_category
+                .entry(entry.metadata.category)
+                .or_insert(0);
+            if *count >= options.max_eligible_per_category {
+                continue;
+            }
+            *count += 1;
+        }
+        selected.push(entry);
+    }
+    selected
+}
+
+#[must_use]
+#[allow(dead_code)]
+pub fn recommended_hotbar_bindings(
+    app: &App,
+    options: HotbarRecommendationOptions,
+) -> Vec<codewhale_config::HotbarBindingToml> {
+    recommend_hotbar_actions(app, options)
+        .into_iter()
+        .take(usize::from(codewhale_config::HOTBAR_SLOT_COUNT))
+        .enumerate()
+        .map(|(idx, entry)| codewhale_config::HotbarBindingToml {
+            slot: u8::try_from(idx + 1).expect("recommended hotbar slot fits in u8"),
+            action: entry.metadata.id,
+            label: Some(entry.metadata.compact_label),
+        })
+        .collect()
+}
+
+fn default_hotbar_position(action_id: &str) -> Option<usize> {
+    codewhale_config::DEFAULT_HOTBAR_ACTIONS
+        .iter()
+        .position(|default_id| *default_id == action_id)
+}
+
+fn compare_recommendation_metadata(a: &HotbarActionMetadata, b: &HotbarActionMetadata) -> Ordering {
+    match (
+        default_hotbar_position(&a.id),
+        default_hotbar_position(&b.id),
+    ) {
+        (Some(a_pos), Some(b_pos)) => return a_pos.cmp(&b_pos),
+        (Some(_), None) => return Ordering::Less,
+        (None, Some(_)) => return Ordering::Greater,
+        (None, None) => {}
+    }
+
+    a.category
+        .cmp(&b.category)
+        .then_with(|| {
+            a.display_name
+                .to_ascii_lowercase()
+                .cmp(&b.display_name.to_ascii_lowercase())
+        })
+        .then_with(|| a.id.cmp(&b.id))
 }
 
 #[derive(Default, Clone)]
@@ -831,6 +962,122 @@ mod tests {
             reasoning.disabled_reason(&app).as_deref(),
             Some("Reasoning effort is controlled by auto model routing.")
         );
+    }
+
+    #[test]
+    fn hotbar_recommendations_default_to_stable_slot_order() {
+        let app = test_app();
+
+        let recommendations =
+            recommend_hotbar_actions(&app, HotbarRecommendationOptions::default());
+
+        assert_eq!(
+            recommendations
+                .iter()
+                .map(|entry| entry.metadata.id.as_str())
+                .collect::<Vec<_>>(),
+            codewhale_config::DEFAULT_HOTBAR_ACTIONS
+        );
+        assert!(recommendations.iter().all(|entry| {
+            entry.metadata.recommendation == HotbarRecommendation::Default
+                && entry.disabled_reason.is_none()
+        }));
+    }
+
+    #[test]
+    fn hotbar_recommendations_exclude_disabled_actions() {
+        let mut app = test_app();
+        app.auto_model = true;
+
+        let recommendations =
+            recommend_hotbar_actions(&app, HotbarRecommendationOptions::for_setup_wizard());
+
+        assert!(
+            !recommendations
+                .iter()
+                .any(|entry| entry.metadata.id == "reasoning.cycle")
+        );
+    }
+
+    #[test]
+    fn hotbar_recommendations_exclude_required_args_by_default() {
+        let app = test_app();
+
+        let recommendations =
+            recommend_hotbar_actions(&app, HotbarRecommendationOptions::for_setup_wizard());
+
+        assert!(
+            !recommendations
+                .iter()
+                .any(|entry| entry.metadata.id == "slash.rename")
+        );
+    }
+
+    #[test]
+    fn hotbar_recommendations_limit_eligible_actions_by_category() {
+        let app = test_app();
+        let recommendations = recommend_hotbar_actions(
+            &app,
+            HotbarRecommendationOptions {
+                max_total: usize::MAX,
+                max_eligible_per_category: 1,
+                include_required_args: false,
+            },
+        );
+
+        for default_id in codewhale_config::DEFAULT_HOTBAR_ACTIONS {
+            assert!(
+                recommendations
+                    .iter()
+                    .any(|entry| entry.metadata.id == default_id),
+                "default recommendation {default_id} should not be category-capped"
+            );
+        }
+        let slash_recommendations = recommendations
+            .iter()
+            .filter(|entry| entry.metadata.category == HotbarActionCategory::Slash)
+            .collect::<Vec<_>>();
+        assert_eq!(slash_recommendations.len(), 1);
+    }
+
+    #[test]
+    fn recommended_hotbar_bindings_serialize_action_ids_and_labels() {
+        let app = test_app();
+
+        let bindings = recommended_hotbar_bindings(&app, HotbarRecommendationOptions::default());
+
+        assert_eq!(
+            bindings
+                .iter()
+                .map(|binding| binding.action.as_str())
+                .collect::<Vec<_>>(),
+            codewhale_config::DEFAULT_HOTBAR_ACTIONS
+        );
+        assert_eq!(
+            bindings
+                .iter()
+                .map(|binding| (binding.slot, binding.label.as_deref()))
+                .collect::<Vec<_>>(),
+            vec![
+                (1, Some("voice")),
+                (2, Some("compact")),
+                (3, Some("plan")),
+                (4, Some("agent")),
+                (5, Some("yolo")),
+                (6, Some("palette")),
+                (7, Some("side")),
+                (8, Some("trust")),
+            ]
+        );
+
+        let config = codewhale_config::ConfigToml {
+            hotbar: Some(bindings.clone()),
+            ..Default::default()
+        };
+        let serialized = toml::to_string_pretty(&config).expect("serialize hotbar recommendations");
+        let round_tripped: codewhale_config::ConfigToml =
+            toml::from_str(&serialized).expect("deserialize hotbar recommendations");
+        assert_eq!(round_tripped.hotbar, Some(bindings));
     }
 
     #[test]
