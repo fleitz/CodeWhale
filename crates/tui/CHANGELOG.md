@@ -12,6 +12,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Added WhaleFlow-to-Fleet launch-shape validation: the default Fleet workflow
   contract allows up to 100 total agents and 5 recursive rings, requires
   bounded loops/expands before launch, and preserves per-slot model selection.
+- Added a read-only `/config ask-rules` view for the resolved
+  `permissions.toml` path, file status, rule count, and configured
+  tool/command/path ask rules. Merged from #3569 by @greyfreedom.
 
 ### Changed
 
