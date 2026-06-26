@@ -6,7 +6,7 @@ use crate::config::{
 use crate::config_ui::{self, WebConfigSession, WebConfigSessionEvent};
 use crate::core::engine::mock_engine_handle;
 use crate::tui::active_cell::ActiveCell;
-use crate::tui::app::{SidebarHoverRow, SidebarHoverSection, ToolDetailRecord};
+use crate::tui::app::{ReasoningEffort, SidebarHoverRow, SidebarHoverSection, ToolDetailRecord};
 use crate::tui::file_mention::{
     apply_mention_menu_selection, find_file_mention_completions, partial_file_mention_at_cursor,
     try_autocomplete_file_mention, user_request_with_file_mentions, visible_mention_menu_entries,
@@ -4072,6 +4072,36 @@ fn hotbar_dispatches_slash_command_slot() {
         Some(HotbarDispatch::AppAction(AppAction::OpenModePicker))
     );
     assert!(app.input.is_empty());
+}
+
+#[test]
+fn hotbar_bound_disabled_action_reports_reason_without_dispatching() {
+    let mut app = create_test_app();
+    app.onboarding = OnboardingState::None;
+    app.auto_model = true;
+    app.reasoning_effort = ReasoningEffort::Off;
+    app.needs_redraw = false;
+    let config = Config {
+        hotbar: Some(vec![codewhale_config::HotbarBindingToml {
+            slot: 1,
+            label: Some("reason".to_string()),
+            action: "reasoning.cycle".to_string(),
+        }]),
+        ..Config::default()
+    };
+
+    assert_eq!(
+        dispatch_hotbar_slot(&mut app, &config, 1).expect("disabled slot dispatch"),
+        Some(HotbarDispatch::Handled)
+    );
+    assert_eq!(app.reasoning_effort, ReasoningEffort::Off);
+    assert_eq!(
+        app.status_message.as_deref(),
+        Some(
+            "Hotbar slot 1 action is not available: Reasoning effort is controlled by auto model routing."
+        )
+    );
+    assert!(app.needs_redraw);
 }
 
 #[test]

@@ -5007,6 +5007,14 @@ fn dispatch_hotbar_slot(
         return Ok(Some(HotbarDispatch::Handled));
     };
 
+    if let Some(reason) = action.disabled_reason(app) {
+        app.status_message = Some(format!(
+            "Hotbar slot {slot} action is not available: {reason}"
+        ));
+        app.needs_redraw = true;
+        return Ok(Some(HotbarDispatch::Handled));
+    }
+
     action.dispatch(app).map(Some)
 }
 
