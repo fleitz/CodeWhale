@@ -2552,6 +2552,7 @@ impl RuntimeThreadManager {
                     system_prompt_override: thread.system_prompt.is_some(),
                     model: thread.model.clone(),
                     workspace: thread.workspace.clone(),
+                    mode: parse_mode(&thread.mode),
                 })
                 .await
                 .map_err(|e| anyhow!("Failed to sync thread session: {e}"))?;

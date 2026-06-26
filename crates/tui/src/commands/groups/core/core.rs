@@ -66,6 +66,7 @@ pub fn clear(app: &mut App) -> CommandResult {
             system_prompt: None,
             model: app.model.clone(),
             workspace: app.workspace.clone(),
+            mode: app.mode,
         },
     )
 }

@@ -1587,6 +1587,7 @@ impl Engine {
                         system_prompt_override,
                         model,
                         workspace,
+                        mode,
                     } => {
                         if let Some(session_id) = session_id {
                             self.session.id = session_id;
@@ -1606,6 +1607,7 @@ impl Engine {
                         self.session.auto_model = model.trim().eq_ignore_ascii_case("auto");
                         self.session.model = model;
                         self.session.workspace = workspace.clone();
+                        self.current_mode = mode;
                         self.config.model.clone_from(&self.session.model);
                         self.config.workspace = workspace.clone();
                         let ctx =

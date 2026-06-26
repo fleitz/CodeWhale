@@ -6,7 +6,7 @@ use std::path::PathBuf;
 use crate::session_manager::{
     create_saved_session_with_id_and_mode, create_saved_session_with_mode,
 };
-use crate::tui::app::{App, AppAction};
+use crate::tui::app::{App, AppAction, AppMode};
 use crate::tui::history::{HistoryCell, history_cells_from_message};
 use crate::tui::session_picker::SessionPickerView;
 
@@ -129,6 +129,7 @@ pub fn fork(app: &mut App) -> CommandResult {
             system_prompt: app.system_prompt.clone(),
             model: app.model.clone(),
             workspace: app.workspace.clone(),
+            mode: app.mode,
         },
     )
 }
@@ -176,6 +177,7 @@ pub fn new_session(app: &mut App, arg: Option<&str>) -> CommandResult {
             system_prompt: None,
             model: app.model.clone(),
             workspace: app.workspace.clone(),
+            mode: app.mode,
         },
     )
 }
@@ -239,6 +241,9 @@ pub fn load(app: &mut App, path: Option<&str>) -> CommandResult {
     app.set_model_selection(session.metadata.model.clone());
     app.update_model_compaction_budget();
     app.workspace.clone_from(&session.metadata.workspace);
+    if let Some(mode) = session.metadata.mode.as_deref().and_then(AppMode::parse) {
+        app.set_mode(mode);
+    }
     app.session.total_tokens = u32::try_from(session.metadata.total_tokens).unwrap_or(u32::MAX);
     app.session.total_conversation_tokens = app.session.total_tokens;
     // Accumulated token breakdown is per-runtime-session; zero on load.
@@ -277,6 +282,7 @@ pub fn load(app: &mut App, path: Option<&str>) -> CommandResult {
             system_prompt: app.system_prompt.clone(),
             model: app.model.clone(),
             workspace: app.workspace.clone(),
+            mode: app.mode,
         },
     )
 }
@@ -443,7 +449,7 @@ mod tests {
     use super::*;
     use crate::config::{Config, DEFAULT_TEXT_MODEL};
     use crate::test_support::EnvVarGuard;
-    use crate::tui::app::{App, ReasoningEffort, TuiOptions, TurnCacheRecord};
+    use crate::tui::app::{App, AppMode, ReasoningEffort, TuiOptions, TurnCacheRecord};
     use std::time::Instant;
     use tempfile::TempDir;
 
@@ -747,6 +753,7 @@ mod tests {
             }],
         });
         app1.session.total_tokens = 500;
+        app1.set_mode(AppMode::Plan);
         let save_path = tmpdir.path().join("test.json");
         save(&mut app1, Some(save_path.to_str().unwrap()));
 
@@ -760,8 +767,15 @@ mod tests {
         assert!(msg.contains("messages"));
         assert_eq!(app2.api_messages.len(), 1);
         assert_eq!(app2.session.total_tokens, 500);
+        assert_eq!(app2.mode, AppMode::Plan);
         assert!(app2.current_session_id.is_some());
-        assert!(matches!(result.action, Some(AppAction::SyncSession { .. })));
+        assert!(matches!(
+            result.action,
+            Some(AppAction::SyncSession {
+                mode: AppMode::Plan,
+                ..
+            })
+        ));
     }
 
     #[test]

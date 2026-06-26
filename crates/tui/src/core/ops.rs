@@ -193,6 +193,7 @@ pub enum Op {
         system_prompt_override: bool,
         model: String,
         workspace: PathBuf,
+        mode: AppMode,
     },
 
     /// Run context compaction immediately.

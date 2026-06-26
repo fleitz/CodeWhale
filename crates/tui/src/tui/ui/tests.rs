@@ -8145,6 +8145,24 @@ fn apply_loaded_session_restores_auto_model_mode() {
 }
 
 #[test]
+fn apply_loaded_session_restores_saved_mode() {
+    let mut app = create_test_app();
+    app.set_mode(crate::tui::app::AppMode::Agent);
+    let mut session = saved_session_with_messages(vec![
+        text_message("user", "draft a plan"),
+        text_message("assistant", "plan response"),
+    ]);
+    session.metadata.mode = Some("plan".to_string());
+
+    let recovered = apply_loaded_session(&mut app, &Config::default(), &session);
+
+    assert!(!recovered);
+    assert_eq!(app.mode, crate::tui::app::AppMode::Plan);
+    assert!(!app.allow_shell);
+    assert!(!app.trust_mode);
+}
+
+#[test]
 fn app_new_restores_saved_model_and_reasoning_effort() {
     let _guard = ConfigPathEnvGuard::new();
     let settings = crate::settings::Settings {

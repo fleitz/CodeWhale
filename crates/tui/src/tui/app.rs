@@ -5813,6 +5813,7 @@ pub enum AppAction {
         system_prompt: Option<SystemPrompt>,
         model: String,
         workspace: PathBuf,
+        mode: AppMode,
     },
     OpenConfigEditor(ConfigUiMode),
     OpenConfigView,

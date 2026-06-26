@@ -6866,6 +6866,7 @@ async fn run_exec_agent(
                 system_prompt_override: false,
                 model: saved.metadata.model,
                 workspace: saved.metadata.workspace,
+                mode,
             })
             .await?;
         loaded_session_id = Some(saved_id.clone());
