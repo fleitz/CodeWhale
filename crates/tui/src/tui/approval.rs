@@ -257,12 +257,16 @@ impl ApprovalRequest {
         build_prominent_details(&self.tool_name, self.category, &self.params)
             .into_iter()
             .map(|mut detail| {
+                let is_preview = detail.label == "Preview";
                 detail.label = localize_detail_label(&detail.label, locale).to_string();
-                if let Some(lines) = detail.shell_lines.as_mut() {
-                    for line in lines.iter_mut() {
-                        *line = localize_detail_label(line, locale).to_string();
+                if is_preview {
+                    if let Some(lines) = detail.shell_lines.as_mut() {
+                        for line in lines.iter_mut() {
+                            *line = localize_preview_shell_line(&self.tool_name, line, locale)
+                                .to_string();
+                        }
+                        detail.value = lines.join("\n");
                     }
-                    detail.value = lines.join("\n");
                 }
                 detail
             })
@@ -766,6 +770,9 @@ fn apply_patch_preview_lines(patch: &str) -> Option<Vec<String>> {
     }
 
     if omitted > 0 {
+        if lines.len() >= PREVIEW_LIMIT {
+            omitted += 1;
+        }
         append_preview_truncation(
             &mut lines,
             format!("... (+{omitted} more patch lines)"),
@@ -852,6 +859,16 @@ fn localize_detail_label(label: &str, locale: Locale) -> &str {
             _ => label,
         },
         _ => label,
+    }
+}
+
+fn localize_preview_shell_line<'a>(tool_name: &str, line: &'a str, locale: Locale) -> &'a str {
+    match tool_name {
+        "write_file" if line == "proposed content" => localize_detail_label(line, locale),
+        "edit_file" if matches!(line, "replace this" | "with this") => {
+            localize_detail_label(line, locale)
+        }
+        _ => line,
     }
 }
 
@@ -1934,11 +1951,32 @@ mod tests {
             preview.len() <= 7,
             "preview should stay bounded: {preview:?}"
         );
-        assert!(
-            preview
-                .last()
-                .is_some_and(|line| line.contains("more patch lines")),
-            "omitted context should be counted: {preview:?}"
+        assert_eq!(
+            preview.last().map(String::as_str),
+            Some("... (+5 more patch lines)")
+        );
+    }
+
+    #[test]
+    fn apply_patch_preview_counts_replaced_visible_line_as_omitted() {
+        let patch = r#"diff --git a/src/lib.rs b/src/lib.rs
+--- a/src/lib.rs
++++ b/src/lib.rs
+@@ -1,4 +1,4 @@
+-old1
++new1
+-old2
++new2
+ context one
+ context two
+"#;
+
+        let preview = apply_patch_preview_lines(patch).expect("patch preview");
+
+        assert_eq!(preview.len(), 7);
+        assert_eq!(
+            preview.last().map(String::as_str),
+            Some("... (+4 more patch lines)")
         );
     }
 
@@ -1948,7 +1986,7 @@ mod tests {
             "test-id",
             "write_file",
             "Write a file",
-            &json!({"path": "src/lib.rs", "content": "hello"}),
+            &json!({"path": "src/lib.rs", "content": "proposed content\nreplacement content"}),
             "tool:write_file",
         );
         let write_preview = write
@@ -1958,7 +1996,8 @@ mod tests {
             .and_then(|detail| detail.shell_lines)
             .expect("localized write preview");
         assert!(write_preview.iter().any(|line| line == "拟写入内容"));
-        assert!(!write_preview.iter().any(|line| line == "proposed content"));
+        assert!(write_preview.iter().any(|line| line == "+ proposed content"));
+        assert!(write_preview.iter().any(|line| line == "+ replacement content"));
 
         let edit = ApprovalRequest::new(
             "test-id",
@@ -1966,8 +2005,8 @@ mod tests {
             "Edit a file",
             &json!({
                 "path": "src/lib.rs",
-                "search": "old_call();",
-                "replace": "new_call();"
+                "search": "with this",
+                "replace": "replace this"
             }),
             "tool:edit_file",
         );
@@ -1979,6 +2018,8 @@ mod tests {
             .expect("localized edit preview");
         assert!(edit_preview.iter().any(|line| line == "替换此内容"));
         assert!(edit_preview.iter().any(|line| line == "替换为"));
+        assert!(edit_preview.iter().any(|line| line == "- with this"));
+        assert!(edit_preview.iter().any(|line| line == "+ replace this"));
     }
 
     #[test]
