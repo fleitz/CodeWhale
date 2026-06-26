@@ -786,7 +786,8 @@ fn changes_preview_lines(changes: &[Value]) -> Option<Vec<String>> {
     const PREVIEW_LIMIT: usize = 7;
 
     let mut lines = Vec::new();
-    for (idx, change) in changes.iter().take(2).enumerate() {
+    let mut rendered_changes = 0usize;
+    for (idx, change) in changes.iter().enumerate() {
         let path = change
             .get("path")
             .and_then(Value::as_str)
@@ -800,6 +801,7 @@ fn changes_preview_lines(changes: &[Value]) -> Option<Vec<String>> {
         if !push_preview_line(&mut lines, format!("file: {path}"), PREVIEW_LIMIT) {
             break;
         }
+        rendered_changes += 1;
         for line in prefixed_preview_lines("replacement content", "+ ", content, PREVIEW_LIMIT)
             .into_iter()
             .skip(1)
@@ -812,10 +814,11 @@ fn changes_preview_lines(changes: &[Value]) -> Option<Vec<String>> {
             break;
         }
     }
-    if changes.len() > 2 {
+    let skipped_changes = changes.len().saturating_sub(rendered_changes);
+    if skipped_changes > 0 {
         append_preview_truncation(
             &mut lines,
-            format!("... (+{} more files)", changes.len() - 2),
+            format!("... (+{skipped_changes} more files)"),
             PREVIEW_LIMIT,
         );
     }
@@ -1906,6 +1909,45 @@ mod tests {
                     {
                         "path": "src/extra.rs",
                         "content": "extra"
+                    }
+                ]
+            }),
+            "tool:apply_patch",
+        );
+
+        let details = request.prominent_detail_items(Locale::En);
+        let preview = details
+            .iter()
+            .find(|detail| detail.label == "Preview")
+            .and_then(|detail| detail.shell_lines.as_ref())
+            .expect("changes preview");
+
+        assert!(
+            preview.len() <= 7,
+            "preview should stay bounded: {preview:?}"
+        );
+        assert!(preview.iter().any(|line| line == "file: src/lib.rs"));
+        assert_eq!(
+            preview.last().map(String::as_str),
+            Some("... (+2 more files)")
+        );
+    }
+
+    #[test]
+    fn apply_patch_changes_array_preview_reports_second_file_when_first_fills_buffer() {
+        let request = ApprovalRequest::new(
+            "test-id",
+            "apply_patch",
+            "Apply a patch",
+            &json!({
+                "changes": [
+                    {
+                        "path": "src/lib.rs",
+                        "content": "one\ntwo\nthree\nfour\nfive\nsix\nseven\neight"
+                    },
+                    {
+                        "path": "src/main.rs",
+                        "content": "main"
                     }
                 ]
             }),
