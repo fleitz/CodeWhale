@@ -459,6 +459,14 @@ fn file_ask_rule_engine(tool: &str, path: &str) -> codewhale_execpolicy::ExecPol
     ])
 }
 
+fn model_turn_event_timeout() -> Duration {
+    if cfg!(windows) {
+        Duration::from_secs(30)
+    } else {
+        Duration::from_secs(10)
+    }
+}
+
 #[test]
 fn auto_review_policy_forces_prompt_for_publish_like_actions() {
     let (decision, audit) = auto_review_plan_decision(
@@ -2350,7 +2358,7 @@ async fn yolo_mode_does_not_prompt_for_model_driven_typed_ask_rule() {
 
     let mut saw_complete = false;
     let mut rx = handle.rx_event.write().await;
-    while let Some(event) = tokio::time::timeout(Duration::from_secs(10), rx.recv())
+    while let Some(event) = tokio::time::timeout(model_turn_event_timeout(), rx.recv())
         .await
         .expect("timed out waiting for engine event")
     {
@@ -2487,7 +2495,7 @@ async fn yolo_mode_does_not_prompt_for_background_shell_safety_floor() {
 
     let mut saw_complete = false;
     let mut rx = handle.rx_event.write().await;
-    while let Some(event) = tokio::time::timeout(Duration::from_secs(10), rx.recv())
+    while let Some(event) = tokio::time::timeout(model_turn_event_timeout(), rx.recv())
         .await
         .expect("timed out waiting for engine event")
     {
