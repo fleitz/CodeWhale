@@ -865,6 +865,7 @@ default_text_model = "deepseek-ai/deepseek-v4-pro"
 #   python     → pyright-langserver --stdio
 #   typescript → typescript-language-server --stdio
 #   java       → jdtls
+#   php        → intelephense --stdio
 #   vue        → vue-language-server --stdio
 #   c, cpp     → clangd
 #
@@ -872,6 +873,23 @@ default_text_model = "deepseek-ai/deepseek-v4-pro"
 # not required, and installing IntelliJ IDEA alone does not install `jdtls`.
 #
 # Override the defaults via the `servers` table below.
+#
+# For languages not in the built-in list (Ruby, C#, Swift, etc.), use
+# `[lsp.custom.<ext>]` to register a language server:
+#
+# [lsp.custom.rb]
+# command = "ruby-lsp"
+# args = ["--stdio"]
+# language_id = "ruby"
+#
+# [lsp.custom.cs]
+# command = "csharp-ls"
+# args = []
+# language_id = "csharp"
+#
+# [lsp.custom.swift]
+# command = "sourcekit-lsp"
+# language_id = "swift"
 [lsp]
 # enabled = true
 # poll_after_edit_ms = 5000
@@ -881,6 +899,7 @@ default_text_model = "deepseek-ai/deepseek-v4-pro"
 # rust = ["rust-analyzer"]
 # go = ["gopls", "serve"]
 # java = ["jdtls"]
+# php = ["intelephense", "--stdio"]
 # vue = ["vue-language-server", "--stdio"]
 
 # ─────────────────────────────────────────────────────────────────────────────────

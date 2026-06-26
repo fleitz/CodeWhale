@@ -1462,6 +1462,19 @@ impl Default for NetworkPolicyToml {
     }
 }
 
+/// User-defined LSP server for one file extension (used inside
+/// [`LspConfigToml::custom`]).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+pub struct CustomLspDef {
+    /// LSP `languageId` value used in `textDocument/didOpen`.
+    pub language_id: String,
+    /// Executable to spawn.
+    pub command: String,
+    /// Arguments passed to the executable.
+    #[serde(default)]
+    pub args: Vec<String>,
+}
+
 /// On-disk schema for the `[lsp]` table (#136). See `config.example.toml`
 /// for documentation. All fields are optional so the TUI runtime can fall
 /// back to its own defaults when keys are absent.
@@ -1477,6 +1490,9 @@ pub struct LspConfigToml {
     pub include_warnings: Option<bool>,
     /// Optional override for the `language -> [cmd, ...args]` table.
     pub servers: Option<BTreeMap<String, Vec<String>>>,
+    /// User-defined LSP servers for file extensions not in the built-in
+    /// registry. Keyed by extension (e.g. `"php"`, `"rb"`).
+    pub custom: Option<BTreeMap<String, CustomLspDef>>,
 }
 
 impl ConfigToml {

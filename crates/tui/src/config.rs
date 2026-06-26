@@ -2357,6 +2357,10 @@ pub struct LspConfigToml {
     /// are language slugs (`"rust"`, `"go"`, etc.).
     #[serde(default)]
     pub servers: Option<HashMap<String, Vec<String>>>,
+    /// User-defined LSP servers for file extensions not in the built-in
+    /// registry. Keyed by extension (e.g. `"php"`, `"rb"`).
+    #[serde(default)]
+    pub custom: Option<HashMap<String, crate::lsp::CustomLspDef>>,
 }
 
 impl LspConfigToml {
@@ -2375,6 +2379,7 @@ impl LspConfigToml {
                 .unwrap_or(defaults.max_diagnostics_per_file),
             include_warnings: self.include_warnings.unwrap_or(defaults.include_warnings),
             servers: self.servers.unwrap_or_default(),
+            custom: self.custom.unwrap_or_default(),
         }
     }
 }
