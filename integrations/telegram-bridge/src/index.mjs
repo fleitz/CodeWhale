@@ -28,6 +28,7 @@ import { ThreadStore as CoreThreadStore } from "../../bridge-core/src/lib.mjs";
 
 const TYPING_INTERVAL_MS = 2000;
 const TYPING_TIMEOUT_MS = 1500;
+const LAST_SEQ_FLUSH_INTERVAL_MS = 2000;
 
 class ThreadStore extends CoreThreadStore {
   constructor(filePath) {
@@ -547,9 +548,19 @@ async function streamTurnEvents(chatId, threadId, turnId, sinceSeq, options = {}
   }
   let responseText = "";
   let latestSeq = sinceSeq;
+  let flushedSeq = sinceSeq;
+  let lastSeqFlushAt = 0;
   let sentProgressAt = Date.now();
   let typingPaused = false;
   let typingInFlight = false;
+
+  async function flushLastSeq(force = false) {
+    if (latestSeq <= flushedSeq) return;
+    if (!force && Date.now() - lastSeqFlushAt < LAST_SEQ_FLUSH_INTERVAL_MS) return;
+    await threadStore.patchChat(chatId, { lastSeq: latestSeq });
+    flushedSeq = latestSeq;
+    lastSeqFlushAt = Date.now();
+  }
 
   const tickTyping = async () => {
     if (stopping || typingPaused || typingInFlight) return;
@@ -585,7 +596,7 @@ async function streamTurnEvents(chatId, threadId, turnId, sinceSeq, options = {}
       if (!event.data) continue;
       const record = JSON.parse(event.data);
       latestSeq = Math.max(latestSeq, Number(record.seq || 0));
-      await threadStore.patchChat(chatId, { lastSeq: latestSeq });
+      await flushLastSeq(false);
 
       if (turnId && record.turn_id && record.turn_id !== turnId) continue;
       const lifecycleStatus =
@@ -690,6 +701,7 @@ async function streamTurnEvents(chatId, threadId, turnId, sinceSeq, options = {}
     clearInterval(typingTimer);
     clearTimeout(timeout);
     options.signal?.removeEventListener("abort", abortFromCaller);
+    await flushLastSeq(true);
   }
 }
 

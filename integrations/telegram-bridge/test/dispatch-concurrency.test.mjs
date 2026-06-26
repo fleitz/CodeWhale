@@ -146,3 +146,22 @@ test("turn streams keep Telegram typing visible and pause while waiting for appr
   assert.match(sendTypingAction, /setTimeout\(\(\) => controller\.abort\(\), TYPING_TIMEOUT_MS\)/);
   assert.match(telegramApiOnce, /signal: options\.signal/);
 });
+
+test("turn streams debounce last-seq writes and flush before exit", async () => {
+  const source = await readBridgeSource();
+  const streamTurnEvents = extractFunction(source, "streamTurnEvents");
+  const flushLastSeq = extractFunction(source, "flushLastSeq");
+  const streamWithoutFlushHelper = streamTurnEvents.replace(flushLastSeq, "");
+
+  assert.match(source, /const LAST_SEQ_FLUSH_INTERVAL_MS = 2000;/);
+  assert.doesNotMatch(
+    streamWithoutFlushHelper,
+    /await threadStore\.patchChat\(chatId, \{ lastSeq: latestSeq \}\);/
+  );
+  assert.match(streamTurnEvents, /await flushLastSeq\(false\);/);
+  assert.match(streamTurnEvents, /await flushLastSeq\(true\);/);
+  assert.match(flushLastSeq, /if \(latestSeq <= flushedSeq\) return;/);
+  assert.match(flushLastSeq, /Date\.now\(\) - lastSeqFlushAt < LAST_SEQ_FLUSH_INTERVAL_MS/);
+  assert.match(flushLastSeq, /await threadStore\.patchChat\(chatId, \{ lastSeq: latestSeq \}\);/);
+  assert.match(flushLastSeq, /flushedSeq = latestSeq;/);
+});
