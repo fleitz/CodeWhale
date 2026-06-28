@@ -357,7 +357,7 @@ fn safety_floor(ctx: &AutoReviewContext<'_>) -> Option<AutoReviewDecision> {
 
 fn deterministic_fallback(ctx: &AutoReviewContext<'_>) -> AutoReviewDecision {
     match (ctx.category, ctx.risk, ctx.action_kind) {
-        (ToolCategory::Safe | ToolCategory::McpRead, RiskLevel::Benign, _) => {
+        (_, RiskLevel::Benign, _) => {
             AutoReviewDecision::new(AutoReviewAction::Allow, "read-only action is allowed")
         }
         (_, _, ToolActionKind::McpAction) => AutoReviewDecision::new(
@@ -371,10 +371,6 @@ fn deterministic_fallback(ctx: &AutoReviewContext<'_>) -> AutoReviewDecision {
         (_, RiskLevel::Destructive, _) => AutoReviewDecision::new(
             AutoReviewAction::AskUser,
             "destructive action requires explicit review",
-        ),
-        _ => AutoReviewDecision::new(
-            AutoReviewAction::AskUser,
-            "no deterministic allow rule matched",
         ),
     }
 }
@@ -581,6 +577,24 @@ mod tests {
 
         let decision = policy.evaluate(&ctx);
 
+        assert_eq!(decision.action, AutoReviewAction::Allow);
+        assert!(decision.reason.contains("read-only"));
+    }
+
+    #[test]
+    fn read_only_shell_allows_by_default() {
+        let policy = AutoReviewPolicy::default();
+        let ctx = ctx_for(
+            "exec_shell",
+            json!({ "command": "codewhale --version" }),
+            RunOrigin::Interactive,
+            ApprovalMode::Auto,
+        );
+
+        let decision = policy.evaluate(&ctx);
+
+        assert_eq!(ctx.category, ToolCategory::Shell);
+        assert_eq!(ctx.risk, RiskLevel::Benign);
         assert_eq!(decision.action, AutoReviewAction::Allow);
         assert!(decision.reason.contains("read-only"));
     }

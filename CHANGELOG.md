@@ -56,6 +56,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Calmed approval risk classification for read-only shell commands such as
+  `codewhale --version`, `codewhale --help`, and `git status --porcelain` so
+  the modal no longer labels proven read-only shell as destructive (#3730).
 - Added provider/model route columns to `/cache` turn telemetry so DeepSeek
   cache-hit regressions can be correlated with Auto route changes (#3738).
 - Fixed runtime API approval handling so workspace trust no longer auto-resolves

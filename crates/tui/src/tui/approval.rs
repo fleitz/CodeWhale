@@ -14,9 +14,10 @@
 //! - **Benign** (`RiskLevel::Benign`) — read-only ops, MCP discovery,
 //!   query-only network. A single `Enter` / `1` / `y` approves once;
 //!   `2` / `a` approves for the session.
-//! - **Destructive** (`RiskLevel::Destructive`) — file writes, shell,
-//!   patches, MCP actions, unclassified tools, and any "fetch arbitrary
-//!   content" surface. The takeover keeps the destructive badge and
+//! - **Destructive** (`RiskLevel::Destructive`) — file writes, shell
+//!   commands that are not proven read-only, patches, MCP actions,
+//!   unclassified tools, and any "fetch arbitrary content" surface.
+//!   The takeover keeps the destructive badge and
 //!   impact summary visible, then lets `Enter` commit the highlighted
 //!   option or `y` / `a` / `d` commit directly.
 //!
@@ -26,6 +27,7 @@
 //! happen *before* the view is constructed (see `tui/ui.rs`); this
 //! module always assumes the user is being asked.
 
+use crate::command_safety::is_parallel_readonly_command;
 use crate::localization::Locale;
 use crate::sandbox::SandboxPolicy;
 use crate::tui::views::{ModalKind, ModalView, ViewAction, ViewEvent};
@@ -509,12 +511,13 @@ pub fn classify_risk(tool_name: &str, category: ToolCategory, params: &Value) ->
             "web_search" | "web_run" | "wait_for_dev_server" => RiskLevel::Benign,
             _ => RiskLevel::Destructive,
         },
-        // Shell is always destructive. We probe command_safety for
-        // shape so a future routing tweak (say, pure-readonly `ls`
-        // staying benign) lands here without a second pass.
+        // Shell stays destructive unless the existing command-safety analyzer
+        // can prove the concrete command is read-only.
         ToolCategory::Shell => {
             if let Some(cmd) = params.get("command").and_then(Value::as_str) {
-                let _ = crate::command_safety::analyze_command(cmd);
+                if is_parallel_readonly_command(cmd) {
+                    return RiskLevel::Benign;
+                }
             }
             RiskLevel::Destructive
         }
@@ -1769,6 +1772,22 @@ mod tests {
                 classify_risk(name, cat, &json!({})),
                 RiskLevel::Destructive,
                 "expected {name:?} to be Destructive",
+            );
+        }
+    }
+
+    #[test]
+    fn risk_read_only_shell_commands_route_benign() {
+        let cat = ToolCategory::Shell;
+        for command in [
+            "codewhale --version",
+            "codewhale --help",
+            "git status --porcelain",
+        ] {
+            assert_eq!(
+                classify_risk("exec_shell", cat, &json!({ "command": command })),
+                RiskLevel::Benign,
+                "expected read-only shell command {command:?} to be Benign",
             );
         }
     }

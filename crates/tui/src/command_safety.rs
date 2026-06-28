@@ -413,6 +413,9 @@ pub fn is_parallel_readonly_command(command: &str) -> bool {
         .iter()
         .map(String::as_str)
         .collect::<Vec<_>>();
+    if is_codewhale_readonly_invocation(&command_refs) {
+        return true;
+    }
     let canonical = classify_command(&command_refs);
     if canonical == "tail"
         && command_refs.iter().skip(1).any(|token| {
@@ -428,6 +431,16 @@ pub fn is_parallel_readonly_command(command: &str) -> bool {
     PARALLEL_READONLY_PREFIXES
         .iter()
         .any(|prefix| *prefix == canonical)
+}
+
+fn is_codewhale_readonly_invocation(tokens: &[&str]) -> bool {
+    let Some((command, args)) = tokens.split_first() else {
+        return false;
+    };
+    if !matches!(*command, "codewhale" | "codew") {
+        return false;
+    }
+    matches!(args, ["--version"] | ["-V"] | ["-v"] | ["--help"] | ["-h"])
 }
 
 fn readonly_shell_wrapper_inner_command(tokens: &[String]) -> Option<&str> {
@@ -1033,6 +1046,16 @@ fn target_contains_parent_escape(target: &str) -> bool {
 /// Check if a command is known to be safe
 fn is_safe_command(command: &str) -> bool {
     let command_lower = command.to_lowercase();
+    let tokens = shell_words(command);
+    if let Some(start) = primary_token_index(&tokens) {
+        let refs = tokens[start..]
+            .iter()
+            .map(String::as_str)
+            .collect::<Vec<_>>();
+        if is_codewhale_readonly_invocation(&refs) {
+            return true;
+        }
+    }
 
     for safe_cmd in SAFE_COMMANDS {
         if command_lower.starts_with(safe_cmd) {
@@ -1120,6 +1143,11 @@ mod tests {
         assert_eq!(analyze_command("ls -la").level, SafetyLevel::Safe);
         assert_eq!(analyze_command("cat file.txt").level, SafetyLevel::Safe);
         assert_eq!(analyze_command("git status").level, SafetyLevel::Safe);
+        assert_eq!(
+            analyze_command("codewhale --version").level,
+            SafetyLevel::Safe
+        );
+        assert_eq!(analyze_command("codewhale --help").level, SafetyLevel::Safe);
         assert_eq!(
             analyze_command("grep pattern file").level,
             SafetyLevel::Safe
