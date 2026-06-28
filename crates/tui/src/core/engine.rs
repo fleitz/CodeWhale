@@ -1091,7 +1091,8 @@ impl Engine {
                 "Tool 'exec_shell' is disabled by feature flag".to_string(),
             ))
         } else if let Some(spec) = registry.get(&tool_name) {
-            let mut approval_required = spec.approval_requirement() != ApprovalRequirement::Auto
+            let mut approval_required = spec.approval_requirement_for(&tool_input)
+                != ApprovalRequirement::Auto
                 && !registry.context().auto_approve;
             let mut approval_description = spec.description().to_string();
             let mut approval_force_prompt = false;

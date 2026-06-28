@@ -2313,6 +2313,58 @@ async fn run_shell_command_op_skips_approval_when_auto_approved() {
 }
 
 #[tokio::test]
+async fn run_shell_command_op_allows_readonly_shell_in_auto_mode() {
+    let (mut engine, handle) = Engine::new(EngineConfig::default(), &Config::default());
+    let handle_for_approval = handle.clone();
+
+    let task = tokio::spawn(async move {
+        engine
+            .handle_run_shell_command(
+                "pwd".to_string(),
+                AppMode::Auto,
+                true,
+                false,
+                false,
+                crate::tui::approval::ApprovalMode::Auto,
+            )
+            .await;
+    });
+
+    let mut saw_approval = false;
+    let mut saw_complete = false;
+    let mut rx = handle.rx_event.write().await;
+    while let Some(event) = rx.recv().await {
+        match event {
+            Event::ApprovalRequired { id, .. } => {
+                saw_approval = true;
+                handle_for_approval
+                    .approve_tool_call(id)
+                    .await
+                    .expect("approve unexpected shell prompt");
+            }
+            Event::ToolCallComplete { result, .. } => {
+                saw_complete = true;
+                let result = result.expect("shell result");
+                assert!(result.success, "{result:?}");
+            }
+            Event::TurnComplete { status, .. } => {
+                assert_eq!(status, TurnOutcomeStatus::Completed);
+                break;
+            }
+            _ => {}
+        }
+    }
+    drop(rx);
+    task.await.expect("shell op task");
+
+    assert!(
+        !saw_approval,
+        "read-only shell shortcut should not request approval in Auto mode"
+    );
+    assert!(saw_complete);
+}
+
+#[tokio::test]
 async fn yolo_mode_does_not_prompt_for_typed_ask_rule() {
     // #3386: a command matching a typed ask-rule (permissions.toml) must not
     // surface an approval modal in YOLO mode, even though Yolo resolves to
