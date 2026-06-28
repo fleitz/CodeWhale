@@ -1810,13 +1810,10 @@ fn push_destructive_approval_semantics(
 
 fn destructive_approval_compact_semantics(locale: Locale) -> (&'static str, &'static str) {
     match locale {
-        Locale::ZhHans => (
-            "规则: ",
-            "YOLO 提示=审查/询问规则；拒绝跳过本次，Esc 中止整轮。",
-        ),
+        Locale::ZhHans => ("规则: ", "批准策略要求确认；拒绝跳过本次，Esc 中止整轮。"),
         _ => (
             "Policy: ",
-            "YOLO prompt = review rule or ask-rule; d denies this call, Esc aborts turn.",
+            "Approval policy requires review; d denies, Esc aborts.",
         ),
     }
 }
@@ -1826,14 +1823,14 @@ fn destructive_approval_semantics(locale: Locale) -> [(&'static str, &'static st
         Locale::ZhHans => [
             (
                 "规则: ",
-                "YOLO 会跳过普通批准；仍出现此提示表示命中审查规则或显式询问规则。",
+                "当前批准策略、审查规则或显式询问规则要求用户确认。",
             ),
             ("取消: ", "拒绝只跳过本次工具调用；Esc 会中止整轮。"),
         ],
         _ => [
             (
                 "Policy: ",
-                "YOLO skips ordinary approvals; this prompt means a review rule or explicit ask-rule is active.",
+                "The active approval policy, a review rule, or an explicit ask-rule requires confirmation.",
             ),
             (
                 "Cancel: ",
@@ -5246,9 +5243,12 @@ diff --git a/src/b.rs b/src/b.rs\n\
         assert!(rendered.contains("Review the Bash command"), "{rendered}");
         assert!(rendered.contains("Command:"), "{rendered}");
         assert!(rendered.contains("cargo clippy"), "{rendered}");
-        assert!(rendered.contains("YOLO prompt = review rule"), "{rendered}");
-        assert!(rendered.contains("d denies this call"), "{rendered}");
-        assert!(rendered.contains("aborts turn"), "{rendered}");
+        assert!(
+            rendered.contains("Approval policy requires review"),
+            "{rendered}"
+        );
+        assert!(rendered.contains("d denies"), "{rendered}");
+        assert!(rendered.contains("Esc aborts"), "{rendered}");
         assert!(rendered.contains("[y]"), "{rendered}");
         assert!(rendered.contains("[a]"), "{rendered}");
         assert!(rendered.contains("[d]"), "{rendered}");

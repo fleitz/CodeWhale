@@ -162,6 +162,7 @@ fn onboarding_is_workspace_trust_gate(
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AppMode {
     Agent,
+    #[allow(dead_code)]
     Auto,
     Yolo,
     Plan,

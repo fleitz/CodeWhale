@@ -2949,8 +2949,8 @@ diff --git a/src/b.rs b/src/b.rs
             "destructive hint missing:\n{joined}"
         );
         assert!(
-            joined.contains("YOLO skips ordinary approvals"),
-            "missing YOLO/review-rule semantics:\n{joined}"
+            joined.contains("active approval policy"),
+            "missing policy/review-rule semantics:\n{joined}"
         );
         assert!(
             joined.contains("Deny rejects only this tool call"),

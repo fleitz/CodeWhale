@@ -42,10 +42,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
-- Deferred Auto mode from the user-facing mode picker, cycle, hotbar, and
-  `/mode` command until it has a distinct prompt and auto-review behavior;
-  existing `auto` mode text now folds back to Agent instead of selecting a
-  hollow mode (#3730, #3733).
+- Deferred Auto mode from the user-facing mode picker, cycle, hotbar, `/mode`
+  command, and runtime-thread mode overrides until it has a distinct prompt and
+  auto-review behavior; existing `auto` mode text now folds back to Agent
+  instead of selecting a hollow mode, and approval modal copy no longer implies
+  the current mode is YOLO (#3730, #3733).
 - Clarified the Fleet setup surface and docs so Fleet is treated as the durable
   sub-agent configuration layer while WhaleFlow is the agent-authored
   orchestration plan that selects and monitors Fleet slots.
