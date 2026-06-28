@@ -2831,13 +2831,27 @@ pub fn load_config_with_workspace(global_path: &Path, workspace: &Path) -> Resul
     Ok(merged)
 }
 
-fn merge_plugin_mcp_servers(mut config: McpConfig) -> Result<McpConfig> {
-    let plugins = crate::plugins::try_with_registry(|r| r.list_enabled()).unwrap_or_default();
+fn merge_plugin_mcp_servers(config: McpConfig) -> Result<McpConfig> {
+    let plugins = crate::plugins::try_with_registry(|r| {
+        r.list_enabled()
+            .into_iter()
+            .map(|(name, plugin)| (name.clone(), plugin.clone()))
+            .collect::<Vec<_>>()
+    })
+    .unwrap_or_default();
 
+    merge_plugin_mcp_servers_from_plugins(config, plugins)
+}
+
+fn merge_plugin_mcp_servers_from_plugins(
+    mut config: McpConfig,
+    plugins: impl IntoIterator<Item = (String, crate::plugins::manifest::LoadedPlugin)>,
+) -> Result<McpConfig> {
     for (plugin_name, plugin) in plugins {
         if let Some(mcp_servers) = &plugin.manifest.mcp_servers {
-            for (server_name, mut server_config) in mcp_servers {
+            for (server_name, server_config) in mcp_servers {
                 let qualified_name = format!("{}-{}", plugin_name, server_name);
+                let mut server_config = server_config.clone();
 
                 if server_config.command.is_some() && server_config.url.is_none() {
                     server_config.cwd = Some(resolve_plugin_mcp_cwd(

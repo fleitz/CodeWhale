@@ -466,6 +466,56 @@ fn workspace_manager_snapshot_counts_global_and_project_servers() {
 }
 
 #[test]
+fn plugin_mcp_servers_are_qualified_and_resolve_relative_cwd() {
+    let dir = tempfile::tempdir().unwrap();
+    let plugin_base = dir.path().join("plugins").join("fleet");
+    fs::create_dir_all(&plugin_base).unwrap();
+
+    let manifest = toml::from_str::<crate::plugins::manifest::PluginManifest>(
+        r#"
+[plugin]
+name = "fleet"
+
+[mcp_servers.local]
+command = "node"
+args = ["server.js"]
+cwd = "servers/local"
+
+[mcp_servers.remote]
+url = "https://example.invalid/mcp"
+"#,
+    )
+    .unwrap();
+    let plugin = crate::plugins::manifest::LoadedPlugin {
+        manifest,
+        base_path: plugin_base.clone(),
+        enabled: true,
+    };
+    let mut config = McpConfig::default();
+    config.servers.insert(
+        "global".to_string(),
+        serde_json::from_str(r#"{"command":"node","args":["global.js"]}"#).unwrap(),
+    );
+
+    let cfg =
+        merge_plugin_mcp_servers_from_plugins(config, vec![("fleet".to_string(), plugin)]).unwrap();
+
+    assert!(cfg.servers.contains_key("global"));
+
+    let local = cfg.servers.get("fleet-local").unwrap();
+    assert_eq!(local.command.as_deref(), Some("node"));
+    assert_eq!(local.args, vec!["server.js"]);
+    assert_eq!(
+        local.cwd.as_deref(),
+        Some(plugin_base.join("servers/local").as_path())
+    );
+
+    let remote = cfg.servers.get("fleet-remote").unwrap();
+    assert_eq!(remote.url.as_deref(), Some("https://example.invalid/mcp"));
+    assert!(remote.cwd.is_none());
+}
+
+#[test]
 fn workspace_mcp_config_ignores_project_file_until_workspace_trusted() {
     let dir = tempfile::tempdir().unwrap();
     let global_path = dir.path().join("global-mcp.json");

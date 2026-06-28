@@ -156,18 +156,16 @@ fn plugin_info(_app: &App, name: &str) -> CommandResult {
             if let Some(mcp_servers) = &plugin.manifest.mcp_servers {
                 out.push_str(&format!("MCP servers: {}\n", mcp_servers.len()));
                 for (server_name, server) in mcp_servers {
-                    out.push_str(&format!("  - {}: {}\n", server_name, server.command));
-                    if let Some(args) = &server.args {
-                        out.push_str(&format!("    args: {}\n", args.join(" ")));
+                    let command = server.command.as_deref().unwrap_or("<url>");
+                    out.push_str(&format!("  - {}: {}\n", server_name, command));
+                    if !server.args.is_empty() {
+                        out.push_str(&format!("    args: {}\n", server.args.join(" ")));
                     }
-                    if let Some(env) = &server.env {
-                        out.push_str(&format!("    env vars: {}\n", env.len()));
+                    if !server.env.is_empty() {
+                        out.push_str(&format!("    env vars: {}\n", server.env.len()));
                     }
                     if let Some(cwd) = &server.cwd {
-                        out.push_str(&format!("    cwd: {}\n", cwd));
-                    }
-                    if let Some(sandbox) = server.sandbox {
-                        out.push_str(&format!("    sandbox: {}\n", sandbox));
+                        out.push_str(&format!("    cwd: {}\n", cwd.display()));
                     }
                 }
             }
