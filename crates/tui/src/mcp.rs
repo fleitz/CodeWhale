@@ -23,7 +23,7 @@ mod stdio;
 
 use self::headers::{apply_safe_custom_headers, with_default_mcp_http_headers};
 use self::stdio::StdioTransport;
-#[cfg(test)]
+#[cfg(all(test, unix))]
 use self::stdio::{STDIO_SHUTDOWN_GRACE, StderrTail};
 use crate::network_policy::{Decision, NetworkPolicyDecider, host_from_url};
 use crate::utils::write_atomic;
