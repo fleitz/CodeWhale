@@ -32,9 +32,9 @@ impl RegisterCommand for HotbarCmd {
                 CommandResult::action(AppAction::RestoreHotbarDefaults)
             }
             Some("help" | "?") => CommandResult::message(
-                "Hotbar gives you Alt-1..Alt-8 shortcuts (Option key on macOS, Alt \
-                 elsewhere). Use `/hotbar` to customize, `/hotbar off` to hide it, \
-                 `/hotbar on` to restore the default slots.",
+                "Hotbar gives you Alt+1 through Alt+8 shortcuts (Option key on macOS, Alt \
+                 elsewhere). Use `/hotbar` to customize, `/hotbar off` to hide it \
+                 (`hotbar = []`), and `/hotbar on` to restore the default slots.",
             ),
             Some(other) => CommandResult::error(format!(
                 "Unknown /hotbar target '{other}'. Try `/hotbar`, `/hotbar off`, \
@@ -109,8 +109,14 @@ mod tests {
             .as_deref()
             .expect("help should return a message");
         assert!(
-            message.contains("/hotbar") && message.contains("customize"),
+            message.contains("/hotbar")
+                && message.contains("customize")
+                && message.contains("Alt+1 through Alt+8"),
             "help should point at /hotbar to customize: {message:?}"
+        );
+        assert!(
+            message.contains("hotbar = []"),
+            "help should mention the explicit disabled config: {message:?}"
         );
         assert!(
             message.contains("/hotbar off") && message.contains("/hotbar on"),
