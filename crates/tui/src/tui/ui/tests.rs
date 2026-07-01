@@ -20,7 +20,7 @@ use crate::tui::footer_ui::{
 use crate::tui::history::{
     ExecCell, ExecSource, GenericToolCell, HistoryCell, SubAgentCell, ToolCell, ToolStatus,
 };
-use crate::tui::hotbar::actions::HotbarDispatch;
+use crate::tui::hotbar::actions::{HotbarActionCategory, HotbarDispatch};
 use crate::tui::views::{HelpView, ModalView, ViewAction};
 use crate::working_set::Workspace;
 use crossterm::event::{KeyEvent, MouseButton, MouseEvent, MouseEventKind};
@@ -4273,6 +4273,42 @@ fn hotbar_dispatches_slash_command_slot() {
         Some(HotbarDispatch::AppAction(AppAction::OpenModePicker))
     );
     assert!(app.input.is_empty());
+}
+
+#[test]
+fn hotbar_dispatches_route_switch_slot() {
+    let mut app = create_test_app();
+    app.onboarding = OnboardingState::None;
+    let route_metadata = app
+        .hotbar_actions
+        .iter()
+        .map(|action| action.metadata(crate::localization::Locale::En))
+        .find(|metadata| metadata.category == HotbarActionCategory::Route)
+        .expect("test app should register at least the active provider route");
+    let route_id = route_metadata.id.clone();
+    let route_suffix = route_metadata
+        .id
+        .strip_prefix("route.")
+        .expect("route id prefix");
+    let (provider_key, model) = route_suffix.split_once('.').expect("route id shape");
+    let provider = ApiProvider::parse(provider_key).expect("provider key parses");
+    let model = model.to_string();
+    let config = Config {
+        hotbar: Some(vec![codewhale_config::HotbarBindingToml {
+            slot: 1,
+            label: Some(route_metadata.compact_label),
+            action: route_id,
+        }]),
+        ..Config::default()
+    };
+
+    assert_eq!(
+        dispatch_hotbar_slot(&mut app, &config, 1).expect("route slot dispatch"),
+        Some(HotbarDispatch::AppAction(AppAction::SwitchModelRoute {
+            provider,
+            model,
+        }))
+    );
 }
 
 #[test]

@@ -7510,6 +7510,25 @@ async fn apply_command_result(
                     }
                 }
             }
+            AppAction::SwitchModelRoute { provider, model } => {
+                let previous_model = if app.auto_model {
+                    "auto".to_string()
+                } else {
+                    app.model.clone()
+                };
+                let previous_effort = app.reasoning_effort;
+                apply_model_picker_choice(
+                    app,
+                    engine_handle,
+                    config,
+                    model,
+                    Some(provider),
+                    previous_effort.normalize_for_provider(provider),
+                    previous_model,
+                    previous_effort,
+                )
+                .await;
+            }
             AppAction::UpdateCompaction(compaction) => {
                 apply_model_and_compaction_update(
                     engine_handle,

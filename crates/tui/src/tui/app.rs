@@ -2551,9 +2551,15 @@ impl App {
             crate::mcp::load_config_with_workspace(&mcp_config_path, &workspace)
                 .map(|cfg| cfg.servers.len())
                 .unwrap_or(0);
+        let hotbar_actions = HotbarActionRegistry::with_configured_routes(
+            config,
+            provider,
+            &model,
+            &provider_models,
+        );
         Self {
             mode: initial_mode,
-            hotbar_actions: HotbarActionRegistry::with_builtins(),
+            hotbar_actions,
             composer: ComposerState {
                 input: initial_input_text,
                 cursor_position: initial_input_cursor,
@@ -5949,6 +5955,12 @@ pub enum AppAction {
     SwitchProvider {
         provider: ApiProvider,
         model: Option<String>,
+    },
+    /// Switch provider+model through the same apply path as a `/model` route
+    /// row. Used by Hotbar route slots so dispatch does not hand-mutate config.
+    SwitchModelRoute {
+        provider: ApiProvider,
+        model: String,
     },
     UpdateCompaction(CompactionConfig),
     UpdateStreamChunkTimeout(u64),
