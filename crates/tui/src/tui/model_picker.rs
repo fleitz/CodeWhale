@@ -11,7 +11,7 @@
 use crossterm::event::{KeyCode, KeyEvent, MouseEvent, MouseEventKind};
 use ratatui::{
     buffer::Buffer,
-    layout::{Constraint, Direction, Layout, Rect},
+    layout::Rect,
     style::{Modifier, Style},
     text::{Line, Span},
     widgets::{Block, Borders, Paragraph, Widget},
@@ -22,7 +22,7 @@ use crate::model_registry;
 use crate::palette;
 use crate::tui::app::{App, ReasoningEffort};
 use crate::tui::views::{
-    ActionHint, ModalKind, ModalView, ViewAction, ViewEvent, centered_modal_area,
+    ActionHint, ListDetailLayout, ModalKind, ModalView, ViewAction, ViewEvent, centered_modal_area,
     render_modal_footer, render_modal_surface,
 };
 
@@ -888,10 +888,7 @@ impl ModelPickerView {
             ],
         );
 
-        let columns = Layout::default()
-            .direction(Direction::Horizontal)
-            .constraints([Constraint::Percentage(68), Constraint::Percentage(32)])
-            .split(content);
+        let layout = ListDetailLayout::split(content, 24);
 
         let mut model_rows: Vec<(String, String)> = self
             .visible_model_rows()
@@ -922,7 +919,7 @@ impl ModelPickerView {
             format!("Model: {}", self.query.trim())
         };
         self.render_pane(
-            columns[0],
+            layout.list,
             buf,
             &model_title,
             model_rows,
@@ -959,7 +956,7 @@ impl ModelPickerView {
             })
             .collect();
         self.render_pane(
-            columns[1],
+            layout.detail,
             buf,
             "Thinking",
             effort_rows,
@@ -2165,6 +2162,11 @@ mod tests {
             // Footer keeps every action (it wraps instead of clipping).
             for label in ["move", "switch", "filter", "apply", "cancel"] {
                 assert!(text.contains(label), "{w}x{h}: missing '{label}' hint");
+            }
+            // The shared list/detail layout keeps both picker panes visible;
+            // narrow blocker sizes stack them instead of squeezing columns.
+            for label in ["Model", "Thinking"] {
+                assert!(text.contains(label), "{w}x{h}: missing '{label}' pane");
             }
             // Composited frame is fully opaque: no sentinel survives and the
             // center cell carries the modal ink background.
