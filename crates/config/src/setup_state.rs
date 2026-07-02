@@ -181,6 +181,25 @@ impl ConstitutionChoice {
     }
 }
 
+/// How the active custom constitution was authored. Recorded alongside
+/// [`ConstitutionChoice::GuidedCustom`] so `/setup`, `doctor`, and the report
+/// can show provenance without parsing free-text step results.
+///
+/// This is a *new optional field* rather than a new [`ConstitutionChoice`]
+/// variant so records written by this lane still load in older binaries
+/// (unknown fields are ignored on read; an unknown enum variant would fail the
+/// whole parse and force the inherited-state fallback).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ConstitutionAuthoring {
+    /// Deterministically rendered from the guided answers.
+    Guided,
+    /// Drafted by the user's configured model from the guided answers, then
+    /// schema-validated, bounded, previewed, and ratified. Advisory authorship
+    /// only — the drafting model gains no authority from having written it.
+    ModelDrafted,
+}
+
 /// Which constitution surface is currently the active user-global law.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -264,6 +283,10 @@ pub struct SetupState {
     /// Validity of the active user-global constitution file.
     #[serde(default)]
     pub constitution_validity: ConstitutionValidity,
+    /// How the active custom constitution was authored (guided deterministic
+    /// vs model-drafted-then-ratified). `None` for bundled/deferred/inherited.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub constitution_authoring: Option<ConstitutionAuthoring>,
     /// Stable content hash of the most recently previewed/accepted rendered
     /// constitution (see [`crate::user_constitution::UserConstitution::preview_hash`]).
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -298,6 +321,7 @@ impl Default for SetupState {
             constitution_language: None,
             constitution_source: ConstitutionSource::default(),
             constitution_validity: ConstitutionValidity::default(),
+            constitution_authoring: None,
             constitution_preview_hash: None,
             constitution_preview_version: 0,
             runtime_posture_source: RuntimePostureSource::default(),
@@ -637,6 +661,41 @@ mod tests {
         let raw = std::fs::read_to_string(&path).unwrap();
         assert!(raw.contains("\"provider_model\""), "{raw}");
         assert!(raw.contains("openai · mimo-ultraspeed"));
+    }
+
+    #[test]
+    fn constitution_authoring_round_trips_and_stays_optional() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join(SETUP_STATE_FILE_NAME);
+
+        let mut state = SetupState::default();
+        state.constitution_choice = ConstitutionChoice::GuidedCustom;
+        state.constitution_authoring = Some(ConstitutionAuthoring::ModelDrafted);
+        state.save_to(&path).unwrap();
+
+        let loaded = SetupState::load_from(&path).expect("record should load");
+        assert_eq!(
+            loaded.constitution_authoring,
+            Some(ConstitutionAuthoring::ModelDrafted)
+        );
+        let raw = std::fs::read_to_string(&path).unwrap();
+        assert!(raw.contains("\"model_drafted\""), "{raw}");
+    }
+
+    #[test]
+    fn record_without_authoring_field_still_loads() {
+        // Records written before the model-drafting lane carry no
+        // constitution_authoring key; they must load with None, not fail.
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join(SETUP_STATE_FILE_NAME);
+        std::fs::write(
+            &path,
+            r#"{"schema_version":1,"constitution_choice":"guided_custom"}"#,
+        )
+        .unwrap();
+        let loaded = SetupState::load_from(&path).expect("legacy record should load");
+        assert_eq!(loaded.constitution_authoring, None);
+        assert_eq!(loaded.constitution_choice, ConstitutionChoice::GuidedCustom);
     }
 
     #[test]

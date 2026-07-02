@@ -19,10 +19,12 @@ pub use model_reference::{Modality, ModelReferenceCard, ModelReferenceDatabase};
 pub(crate) use provider_defaults::*;
 pub use provider_kind::ProviderKind;
 pub use setup_state::{
-    ConstitutionChoice, ConstitutionSource, ConstitutionValidity, InheritedConfigFacts,
-    RuntimePostureSource, SetupState, SetupStep, StepEntry, StepStatus,
+    ConstitutionAuthoring, ConstitutionChoice, ConstitutionSource, ConstitutionValidity,
+    InheritedConfigFacts, RuntimePostureSource, SetupState, SetupStep, StepEntry, StepStatus,
 };
-pub use user_constitution::{AutonomyPreference, UserConstitution, UserConstitutionLoad};
+pub use user_constitution::{
+    AutonomyPreference, UntrustedDraftParse, UserConstitution, UserConstitutionLoad,
+};
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::{OsStr, OsString};
