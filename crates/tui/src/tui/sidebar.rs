@@ -5527,6 +5527,78 @@ mod tests {
     }
 
     #[test]
+    fn agents_panel_keeps_cjk_names_and_objectives_width_safe() {
+        let mut role_counts = std::collections::BTreeMap::new();
+        role_counts.insert("implementer".to_string(), 1);
+        let summary = SidebarSubagentSummary {
+            cached_total: 1,
+            cached_running: 1,
+            role_counts,
+            ..SidebarSubagentSummary::default()
+        };
+        let rows = vec![SidebarAgentRow {
+            id: "agent_e0b2dcf1".to_string(),
+            parent_run_id: None,
+            spawn_depth: 1,
+            name: "抹香鲸".to_string(),
+            role: "implementer".to_string(),
+            status: "running".to_string(),
+            objective: Some(
+                "QUESTION: Add Zhipu GLM as a first-class provider-scoped route；验证中文输出"
+                    .to_string(),
+            ),
+            git_branch: Some("codex/issue-3439-zhipu-glm-fixture".to_string()),
+            progress: Some("10+ step(s) · 124838ms · 正在运行 read_file".to_string()),
+            steps_taken: 10,
+            duration_ms: Some(124_838),
+        }];
+
+        for width in [24, 40] {
+            let text = lines_to_text(&subagent_panel_lines(
+                &summary,
+                &rows,
+                width,
+                8,
+                &palette::UI_THEME,
+            ));
+
+            assert!(
+                text.iter()
+                    .all(|line| unicode_width::UnicodeWidthStr::width(line.as_str()) <= width),
+                "CJK agent rows must stay within width {width}: {text:?}"
+            );
+            assert!(
+                text.iter().all(|line| !line.contains('\u{FFFD}')),
+                "CJK truncation must not emit replacement characters: {text:?}"
+            );
+            assert!(
+                text.iter()
+                    .any(|line| line.contains("[~] implementer 抹香鲸")),
+                "CJK agent name should remain readable when it fits: {text:?}"
+            );
+            assert!(
+                text.iter()
+                    .any(|line| line.contains("10 step(s)") || line.contains("10...")),
+                "progress detail should keep a stable prefix at width {width}: {text:?}"
+            );
+        }
+
+        let hover = subagent_panel_hover_texts(&summary, &rows, 6);
+        let label = hover
+            .iter()
+            .find(|text| text.contains("抹香鲸"))
+            .expect("label hover row should exist");
+        assert!(
+            label.contains("objective: QUESTION: Add Zhipu GLM") && label.contains("验证中文输出"),
+            "label hover should preserve the full mixed-language objective: {label:?}"
+        );
+        assert!(
+            label.contains("branch: codex/issue-3439-zhipu-glm-fixture"),
+            "label hover should preserve the branch: {label:?}"
+        );
+    }
+
+    #[test]
     fn navigator_uses_fanout_total_when_fanout_has_seeded_slots() {
         let summary = SidebarSubagentSummary {
             cached_total: 1,
