@@ -3291,6 +3291,13 @@ async fn run_event_loop(
         // Drain any completed background @mention completion walk so the
         // popup repaints as soon as results are ready (#3899).
         crate::tui::file_mention::poll_mention_completion(app);
+        // Drain completed file-tree walks (initial build / expands) so the
+        // spliced children repaint without waiting for an input event (#3900).
+        if let Some(tree) = app.file_tree.as_mut()
+            && tree.poll_background()
+        {
+            app.needs_redraw = true;
+        }
 
         // Draw is gated by the frame-rate limiter (120 FPS cap). When a
         // redraw is needed but the limiter says we're inside the cooldown
@@ -4088,6 +4095,12 @@ async fn run_event_loop(
             if mention_menu_open && app.mention_menu_selected >= mention_menu_entries.len() {
                 app.mention_menu_selected = mention_menu_entries.len().saturating_sub(1);
             }
+            // A background completion walk for the token under the cursor
+            // with nothing to show yet (#3899): Enter must wait rather than
+            // submit a half-typed @mention, matching the pre-async behavior
+            // where the walk finished inside the key event.
+            let mention_walk_pending =
+                !mention_menu_open && crate::tui::file_mention::mention_walk_pending(app);
 
             // Cancel a pending Esc-Esc prime as soon as any non-Esc key
             // arrives. Without this the prime would hang around for the
@@ -4347,7 +4360,7 @@ async fn run_event_loop(
                 KeyCode::Esc if app.clear_composer_attachment_selection() => {
                     continue;
                 }
-                KeyCode::Esc if mention_menu_open => {
+                KeyCode::Esc if mention_menu_open || mention_walk_pending => {
                     app.mention_menu_hidden = true;
                     app.mention_menu_selected = 0;
                 }
@@ -4743,6 +4756,22 @@ async fn run_event_loop(
                             }
                         }
                     }
+                }
+                KeyCode::Enter if mention_walk_pending => {
+                    // Completion results for the mention under the cursor
+                    // haven't landed yet — hold the submit so a half-typed
+                    // @mention isn't sent (#3899). The walk finishing sets
+                    // needs_redraw, so the popup opens (or, with no
+                    // matches, a following Enter submits) moments later.
+                    if let Some((_, partial)) =
+                        crate::tui::file_mention::partial_file_mention_at_cursor(
+                            &app.input,
+                            app.cursor_position,
+                        )
+                    {
+                        app.status_message = Some(format!("Scanning files for @{partial}…"));
+                    }
+                    continue;
                 }
                 KeyCode::Enter => {
                     // #573: when the user typed a slash-command prefix that

@@ -253,14 +253,15 @@ pub fn visible_mention_menu_entries(app: &mut App, limit: usize) -> Vec<String> 
                 }
             }
             None => {
-                // Still walking. Keep it only if it is for the current key;
-                // a stale-needle walk is dropped so the respawn below starts
-                // the walk for the fresh needle (latest keystroke wins, at
-                // most one walk in flight).
-                if pending.key == key {
-                    app.composer.mention_completion_pending = Some(pending);
-                    return stale_mention_fallback_entries(app, &key);
-                }
+                // Still walking. Keep it even when the needle has moved on:
+                // dropping the handle cannot stop the blocking walk, so
+                // respawning per keystroke would stack concurrent
+                // full-workspace walks on the blocking pool. Keeping the
+                // old walk serializes them — its result is discarded on
+                // landing (key mismatch above) and the very next call
+                // spawns the walk for the live needle.
+                app.composer.mention_completion_pending = Some(pending);
+                return stale_mention_fallback_entries(app, &key);
             }
         }
     }
@@ -311,15 +312,35 @@ fn run_mention_completion_walk(key: &MentionCompletionKey) -> Vec<String> {
 
 /// While a walk is in flight, keep showing the previous keystroke's entries
 /// so the popup stays open and Enter/Up/Down keep routing to it — but only
-/// when the cached results come from the same session context (an older
-/// partial is fine; a different workspace/behavior/depth is not).
+/// when the cached results come from the same session context AND the same
+/// token lineage (the live partial extends the cached one, or vice versa
+/// for backspacing). Results for an unrelated earlier mention token must
+/// never surface here: Enter/Tab apply the shown list against the live
+/// token, so an unbounded fallback could splice the wrong file.
 fn stale_mention_fallback_entries(app: &App, key: &MentionCompletionKey) -> Vec<String> {
     app.composer
         .mention_completion_cache
         .as_ref()
         .filter(|cache| cache.key.same_context(key))
+        .filter(|cache| {
+            key.partial.starts_with(&cache.key.partial)
+                || cache.key.partial.starts_with(&key.partial)
+        })
         .map(|cache| cache.entries.clone())
         .unwrap_or_default()
+}
+
+/// Whether a completion walk is in flight for the mention token under the
+/// cursor while the popup has nothing to show yet. The key router treats
+/// this as popup-open for Enter/Esc: before #3899 the walk ran
+/// synchronously inside the key event, so Enter could never submit a
+/// half-typed mention — swallowing Enter for the walk's duration preserves
+/// that guarantee without blocking the UI thread.
+#[must_use]
+pub fn mention_walk_pending(app: &App) -> bool {
+    !app.mention_menu_hidden
+        && app.composer.mention_completion_pending.is_some()
+        && partial_file_mention_at_cursor(&app.input, app.cursor_position).is_some()
 }
 
 /// Drain a completed background completion walk outside the render path.
