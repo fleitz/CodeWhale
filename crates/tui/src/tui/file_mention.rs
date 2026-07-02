@@ -27,7 +27,9 @@ use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
-use crate::tui::app::{App, MentionCompletionCache};
+use crate::tui::app::{
+    App, MentionCompletionCache, MentionCompletionKey, MentionCompletionPending,
+};
 use crate::working_set::Workspace;
 
 /// Maximum number of `@`-mentions whose contents are inlined into one user
@@ -219,47 +221,139 @@ pub fn visible_mention_menu_entries(app: &mut App, limit: usize) -> Vec<String> 
         return Vec::new();
     }
 
-    let workspace = app.workspace.clone();
-    let cwd = std::env::current_dir().ok();
-    let walk_depth = app.mention_walk_depth;
-    let behavior = app.mention_menu_behavior.clone();
-    let follow_links = app.workspace_follow_symlinks;
+    let key = MentionCompletionKey {
+        workspace: app.workspace.clone(),
+        cwd: std::env::current_dir().ok(),
+        partial,
+        limit,
+        walk_depth: app.mention_walk_depth,
+        behavior: app.mention_menu_behavior.clone(),
+        follow_links: app.workspace_follow_symlinks,
+    };
+
     if let Some(ref cache) = app.composer.mention_completion_cache
-        && cache.workspace == workspace
-        && cache.cwd == cwd
-        && cache.partial == partial
-        && cache.limit == limit
-        && cache.walk_depth == walk_depth
-        && cache.behavior == behavior
-        && cache.follow_links == follow_links
+        && cache.key == key
     {
         return cache.entries.clone();
     }
 
-    let ws = Workspace::with_cwd_depth_and_follow_links(
-        workspace.clone(),
-        cwd.clone(),
-        walk_depth,
-        app.workspace_follow_symlinks,
-    );
-    let entries = if behavior == "browser" {
-        find_file_mention_browser_completions(&ws, &partial, limit)
+    // Drain a completed background walk: promote it when it still matches
+    // the live key, discard it when the needle has moved on (#3899).
+    if let Some(pending) = app.composer.mention_completion_pending.take() {
+        let ready = pending.cell.lock().ok().and_then(|mut cell| cell.take());
+        match ready {
+            Some(entries) => {
+                let promoted = pending.key == key;
+                app.composer.mention_completion_cache = Some(MentionCompletionCache {
+                    key: pending.key,
+                    entries: entries.clone(),
+                });
+                if promoted {
+                    return entries;
+                }
+            }
+            None => {
+                // Still walking. Keep it only if it is for the current key;
+                // a stale-needle walk is dropped so the respawn below starts
+                // the walk for the fresh needle (latest keystroke wins, at
+                // most one walk in flight).
+                if pending.key == key {
+                    app.composer.mention_completion_pending = Some(pending);
+                    return stale_mention_fallback_entries(app, &key);
+                }
+            }
+        }
+    }
+
+    // Cache miss with no matching walk in flight: start one. Without a tokio
+    // runtime (plain unit tests) fall back to the synchronous walk so
+    // results and test semantics are identical to the pre-async behavior.
+    if tokio::runtime::Handle::try_current().is_ok() {
+        let cell = std::sync::Arc::new(std::sync::Mutex::new(None));
+        let walker_cell = cell.clone();
+        let walker_key = key.clone();
+        crate::utils::spawn_blocking_supervised("mention-completion", move || {
+            let entries = run_mention_completion_walk(&walker_key);
+            if let Ok(mut guard) = walker_cell.lock() {
+                *guard = Some(entries);
+            }
+        });
+        app.composer.mention_completion_pending = Some(MentionCompletionPending {
+            key: key.clone(),
+            cell,
+        });
+        stale_mention_fallback_entries(app, &key)
     } else {
-        find_file_mention_completions(&ws, &partial, limit)
+        let entries = run_mention_completion_walk(&key);
+        app.composer.mention_completion_cache = Some(MentionCompletionCache {
+            key,
+            entries: entries.clone(),
+        });
+        entries
+    }
+}
+
+/// Run the completion walk described by `key`. Called on a background thread
+/// for live keystrokes and synchronously when no runtime is available.
+fn run_mention_completion_walk(key: &MentionCompletionKey) -> Vec<String> {
+    let ws = Workspace::with_cwd_depth_and_follow_links(
+        key.workspace.clone(),
+        key.cwd.clone(),
+        key.walk_depth,
+        key.follow_links,
+    );
+    if key.behavior == "browser" {
+        find_file_mention_browser_completions(&ws, &key.partial, key.limit)
+    } else {
+        find_file_mention_completions(&ws, &key.partial, key.limit)
+    }
+}
+
+/// While a walk is in flight, keep showing the previous keystroke's entries
+/// so the popup stays open and Enter/Up/Down keep routing to it — but only
+/// when the cached results come from the same session context (an older
+/// partial is fine; a different workspace/behavior/depth is not).
+fn stale_mention_fallback_entries(app: &App, key: &MentionCompletionKey) -> Vec<String> {
+    app.composer
+        .mention_completion_cache
+        .as_ref()
+        .filter(|cache| cache.key.same_context(key))
+        .map(|cache| cache.entries.clone())
+        .unwrap_or_default()
+}
+
+/// Drain a completed background completion walk outside the render path.
+/// Called once per event-loop iteration (next to the workspace-context
+/// refresh) so a finished walk repaints the popup without waiting for an
+/// input event. Sets `needs_redraw` only when the drained result changes
+/// what the popup would show — never while merely waiting (#3899).
+pub fn poll_mention_completion(app: &mut App) {
+    if app.composer.mention_completion_pending.is_none() {
+        return;
+    }
+    // Cursor left the mention token: the walk result can never be shown.
+    if app.mention_menu_hidden
+        || partial_file_mention_at_cursor(&app.input, app.cursor_position).is_none()
+    {
+        app.composer.mention_completion_pending = None;
+        return;
+    }
+    let Some(pending) = app.composer.mention_completion_pending.take() else {
+        return;
     };
-
-    app.composer.mention_completion_cache = Some(MentionCompletionCache {
-        workspace,
-        cwd,
-        partial,
-        limit,
-        walk_depth,
-        behavior,
-        follow_links,
-        entries: entries.clone(),
-    });
-
-    entries
+    let ready = pending.cell.lock().ok().and_then(|mut cell| cell.take());
+    match ready {
+        Some(entries) => {
+            app.composer.mention_completion_cache = Some(MentionCompletionCache {
+                key: pending.key,
+                entries,
+            });
+            app.needs_redraw = true;
+        }
+        None => {
+            app.composer.mention_completion_pending = Some(pending);
+        }
+    }
 }
 
 /// Apply the currently selected `@`-mention popup entry to the composer

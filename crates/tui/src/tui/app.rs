@@ -1201,10 +1201,11 @@ impl VimMode {
     }
 }
 
-/// Cached @-mention completion results to avoid re-walking the filesystem when
-/// the cursor moves inside the same mention token.
-#[derive(Debug, Clone)]
-pub struct MentionCompletionCache {
+/// Everything an @-mention completion walk depends on. Two walks with equal
+/// keys produce identical results, so the key doubles as the cache/invalidation
+/// identity for both the completed cache and the in-flight background walk.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MentionCompletionKey {
     /// Workspace root used for this completion walk.
     pub workspace: PathBuf,
     /// Process cwd captured for cwd-relative completion entries.
@@ -1222,8 +1223,41 @@ pub struct MentionCompletionCache {
     /// Whether symlink following was enabled for this completion walk.
     /// Included so live config changes invalidate cached popup results.
     pub follow_links: bool,
+}
+
+impl MentionCompletionKey {
+    /// Whether `other` differs from `self` only in the typed partial —
+    /// i.e. the same session/config context at a different keystroke.
+    #[must_use]
+    pub fn same_context(&self, other: &Self) -> bool {
+        self.workspace == other.workspace
+            && self.cwd == other.cwd
+            && self.limit == other.limit
+            && self.walk_depth == other.walk_depth
+            && self.behavior == other.behavior
+            && self.follow_links == other.follow_links
+    }
+}
+
+/// Cached @-mention completion results to avoid re-walking the filesystem when
+/// the cursor moves inside the same mention token.
+#[derive(Debug, Clone)]
+pub struct MentionCompletionCache {
+    /// The walk inputs that produced `entries`.
+    pub key: MentionCompletionKey,
     /// Cached completion entries.
     pub entries: Vec<String>,
+}
+
+/// An @-mention completion walk running on a background thread (#3899).
+/// The result lands in `cell` and is promoted (or discarded, if the needle
+/// moved on) by `visible_mention_menu_entries` / `poll_mention_completion`.
+#[derive(Debug, Clone)]
+pub struct MentionCompletionPending {
+    /// The walk inputs the background thread was started with.
+    pub key: MentionCompletionKey,
+    /// Shared cell the background walk writes its entries into.
+    pub cell: std::sync::Arc<std::sync::Mutex<Option<Vec<String>>>>,
 }
 
 /// Composer input state — grouped fields for the text input area.
@@ -1257,6 +1291,8 @@ pub struct ComposerState {
     /// Cached @-mention completions to avoid re-walking the filesystem when
     /// the cursor moves inside the same mention token.
     pub mention_completion_cache: Option<MentionCompletionCache>,
+    /// In-flight background @-mention completion walk, if any (#3899).
+    pub mention_completion_pending: Option<MentionCompletionPending>,
     /// Whether vim modal editing is enabled for this composer.
     /// Sourced from `Settings::composer_vim_mode` at startup.
     pub vim_enabled: bool,
@@ -1293,6 +1329,7 @@ impl Default for ComposerState {
             mention_menu_selected: 0,
             mention_menu_hidden: false,
             mention_completion_cache: None,
+            mention_completion_pending: None,
             vim_enabled: false,
             vim_mode: VimMode::Normal,
             vim_pending_d: false,
@@ -2573,6 +2610,7 @@ impl App {
                 mention_menu_selected: 0,
                 mention_menu_hidden: false,
                 mention_completion_cache: None,
+                mention_completion_pending: None,
                 vim_enabled: composer_vim_enabled,
                 vim_mode: VimMode::Normal,
                 vim_pending_d: false,

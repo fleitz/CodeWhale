@@ -3288,6 +3288,9 @@ async fn run_event_loop(
         let allow_workspace_context_refresh =
             !app.is_loading && !has_running_agents && !app.is_compacting && !app.is_purging;
         workspace_context::refresh_if_needed(app, now, allow_workspace_context_refresh);
+        // Drain any completed background @mention completion walk so the
+        // popup repaints as soon as results are ready (#3899).
+        crate::tui::file_mention::poll_mention_completion(app);
 
         // Draw is gated by the frame-rate limiter (120 FPS cap). When a
         // redraw is needed but the limiter says we're inside the cooldown
