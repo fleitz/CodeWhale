@@ -149,6 +149,33 @@ This is the accepted state for v0.8.67; expanding setup/constitution coverage
 to the remaining full locales is follow-up localization work (tracked under
 the #3792/#3793 localization residuals).
 
+## Enhancement-Pass Snapshot (2026-07-01, overnight)
+
+- Branch: `claude/v0.8.67-constitution-setup-174rj9`
+- Head: `d73875b7a` (19 commits ahead of origin)
+
+Landed after the release-orchestration snapshot: `d46047a74` (keep-existing
+constitution checkpoint completion, #3794), `ed6b21be1` (calm/compact
+stakes-based approval prompt + `agent` tool classification), `41d26c774` /
+`c57062077` / `7f82737b7` (#3757 startup and @mention performance +
+startup milestone tracing), `a429f82c2` (route-identity pinning fixes four
+machine-dependent test failures, verified pre-existing at the handoff head),
+`d73875b7a` (model-drafted fleet profiles behind the draft→preview→ratify
+gate — the constitution pipeline's second consumer), and website phase 1
+(`28efab313`, `5a38e2059`, `d3d1d5e25`: live star badge/version nav, the
+constitution-thesis hero in en+zh, and the animated terminal player over the
+real session traces).
+
+Final battery at this head (exact observed counts):
+
+```
+cargo test -p codewhale-tui --bin codewhale-tui --locked   5676 passed; 0 failed; 2 ignored
+cargo test -p codewhale-config --lib                        342 passed; 0 failed
+cargo build --release -p codewhale-cli -p codewhale-tui     clean (47.94s)
+cargo fmt --all -- --check                                  PASS
+cd web && npm run build                                     prerenders all locale routes
+```
+
 ## Remaining Manual Evidence
 
 Before the release is called ready, keep the final manual pass from the QA
