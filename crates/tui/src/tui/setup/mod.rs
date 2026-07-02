@@ -32,8 +32,8 @@ use crate::tui::views::{
 
 use codewhale_config::{
     AutonomyPreference, ConstitutionAuthoring, ConstitutionChoice, ConstitutionSource,
-    ConstitutionValidity, InheritedConfigFacts, RuntimePostureSource, SetupState, SetupStep,
-    StepEntry, StepStatus, UserConstitution, UserConstitutionLoad,
+    ConstitutionValidity, HotbarConfigWarning, InheritedConfigFacts, RuntimePostureSource,
+    SetupState, SetupStep, StepEntry, StepStatus, UserConstitution, UserConstitutionLoad,
     user_constitution::MAX_NOTES_LEN,
 };
 
@@ -47,6 +47,7 @@ pub(crate) use model_draft::draft_constitution_with_model;
 /// package remains 0.8.66 until release approval, so this cannot read
 /// `CARGO_PKG_VERSION` yet.
 pub const CONSTITUTION_CHECKPOINT_VERSION: &str = "0.8.67";
+pub const HOTBAR_SETUP_VERSION: &str = "0.8.68";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SetupCommitKind {
@@ -87,7 +88,7 @@ impl SetupWizardStep for StaticSetupStep {
     }
 }
 
-const STEP_SPECS: [StaticSetupStep; 5] = [
+const STEP_SPECS: [StaticSetupStep; 6] = [
     StaticSetupStep {
         id: SetupStep::Language,
         title_id: MessageId::SetupStepLanguageTitle,
@@ -105,6 +106,12 @@ const STEP_SPECS: [StaticSetupStep; 5] = [
         title_id: MessageId::SetupStepTrustSandboxTitle,
         why_id: MessageId::SetupStepTrustSandboxWhy,
         required: true,
+    },
+    StaticSetupStep {
+        id: SetupStep::Hotbar,
+        title_id: MessageId::SetupStepHotbarTitle,
+        why_id: MessageId::SetupStepHotbarWhy,
+        required: false,
     },
     StaticSetupStep {
         id: SetupStep::Constitution,
@@ -170,6 +177,7 @@ struct SetupRuntimeFacts {
     constitution_autonomy: String,
     constitution_file: SetupConstitutionFileState,
     expert_override: SetupExpertOverrideState,
+    hotbar: SetupHotbarSnapshot,
 }
 
 impl Default for SetupRuntimeFacts {
@@ -197,6 +205,7 @@ impl Default for SetupRuntimeFacts {
             constitution_autonomy: "not loaded".to_string(),
             constitution_file: SetupConstitutionFileState::NotChecked,
             expert_override: SetupExpertOverrideState::NotChecked,
+            hotbar: SetupHotbarSnapshot::off_by_default(),
         }
     }
 }
@@ -312,7 +321,115 @@ impl SetupRuntimeFacts {
             constitution_autonomy,
             constitution_file: SetupConstitutionFileState::load(),
             expert_override,
+            hotbar: hotbar_snapshot_for_app(app, config),
         }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SetupHotbarState {
+    OffByDefault,
+    Disabled,
+    Configured,
+    Partial,
+    Unknown,
+}
+
+impl SetupHotbarState {
+    fn label(self) -> &'static str {
+        match self {
+            Self::OffByDefault => "off by default",
+            Self::Disabled => "disabled",
+            Self::Configured => "configured",
+            Self::Partial => "partial",
+            Self::Unknown => "unknown",
+        }
+    }
+
+    fn step_status(self) -> StepStatus {
+        match self {
+            Self::OffByDefault => StepStatus::Optional,
+            Self::Disabled | Self::Configured | Self::Partial => StepStatus::Verified,
+            Self::Unknown => StepStatus::NeedsAction,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct SetupHotbarSnapshot {
+    state: SetupHotbarState,
+    active_bindings: usize,
+    warnings: Vec<String>,
+}
+
+impl SetupHotbarSnapshot {
+    fn off_by_default() -> Self {
+        Self {
+            state: SetupHotbarState::OffByDefault,
+            active_bindings: 0,
+            warnings: Vec::new(),
+        }
+    }
+
+    fn from_config(config: &Config, known_action_ids: &[&str]) -> Self {
+        let resolution = config.resolve_hotbar_bindings(known_action_ids);
+        let has_unknown_action = resolution
+            .warnings
+            .iter()
+            .any(|warning| matches!(warning, HotbarConfigWarning::UnknownAction { .. }));
+        let state = match config.hotbar.as_deref() {
+            None => SetupHotbarState::OffByDefault,
+            Some([]) => SetupHotbarState::Disabled,
+            Some(_) if has_unknown_action => SetupHotbarState::Unknown,
+            Some(_) if !resolution.warnings.is_empty() => SetupHotbarState::Partial,
+            Some(_) => SetupHotbarState::Configured,
+        };
+        Self {
+            state,
+            active_bindings: resolution.bindings.len(),
+            warnings: resolution
+                .warnings
+                .into_iter()
+                .map(|warning| warning.to_string())
+                .collect(),
+        }
+    }
+
+    fn result_summary(&self) -> String {
+        match self.state {
+            SetupHotbarState::OffByDefault => {
+                "off by default; configure with /hotbar or the setup Hotbar card".to_string()
+            }
+            SetupHotbarState::Disabled => "disabled (hotbar = [])".to_string(),
+            SetupHotbarState::Configured => {
+                format!("configured ({} binding(s))", self.active_bindings)
+            }
+            SetupHotbarState::Partial => format!(
+                "partial ({} active binding(s); {})",
+                self.active_bindings,
+                self.warning_summary()
+            ),
+            SetupHotbarState::Unknown => format!(
+                "unknown action(s) present ({} active binding(s); {})",
+                self.active_bindings,
+                self.warning_summary()
+            ),
+        }
+    }
+
+    fn warning_summary(&self) -> String {
+        match self.warnings.as_slice() {
+            [] => "no warnings".to_string(),
+            [only] => only.clone(),
+            [first, second] => format!("{first}; {second}"),
+            [first, second, rest @ ..] => {
+                format!("{first}; {second}; +{} more warning(s)", rest.len())
+            }
+        }
+    }
+
+    fn step_entry(&self, version: &str) -> StepEntry {
+        StepEntry::new(self.state.step_status(), false, version).with_result(self.result_summary())
     }
 }
 
@@ -1115,8 +1232,34 @@ impl SetupWizardView {
         STEP_SPECS[self.selected].id()
     }
 
+    pub fn refresh_hotbar_from_config(
+        &mut self,
+        config: &Config,
+        known_action_ids: &[&str],
+    ) -> SetupState {
+        self.facts.hotbar = SetupHotbarSnapshot::from_config(config, known_action_ids);
+        let mut state = self.state.clone();
+        state.set_step(
+            SetupStep::Hotbar,
+            self.facts.hotbar.step_entry(HOTBAR_SETUP_VERSION),
+        );
+        self.state = state.clone();
+        state
+    }
+
     fn selected_spec(&self) -> &'static dyn SetupWizardStep {
         &STEP_SPECS[self.selected]
+    }
+
+    fn status_for_step(&self, step: SetupStep) -> StepStatus {
+        if step == SetupStep::Hotbar {
+            self.state
+                .steps
+                .get(&step)
+                .map_or(self.facts.hotbar.state.step_status(), |entry| entry.status)
+        } else {
+            self.state.status(step)
+        }
     }
 
     fn new_with_facts(state: SetupState, locale: Locale, facts: SetupRuntimeFacts) -> Self {
@@ -1274,6 +1417,23 @@ impl SetupWizardView {
             preset: self.runtime_preset,
             state,
             message: tr(self.locale, MessageId::SetupRuntimePresetApplied).to_string(),
+        })
+    }
+
+    fn commit_hotbar_status(&mut self) -> ViewAction {
+        let mut state = self.state.clone();
+        state.set_step(
+            SetupStep::Hotbar,
+            self.facts.hotbar.step_entry(HOTBAR_SETUP_VERSION),
+        );
+        self.state = state.clone();
+        self.move_next();
+        ViewAction::Emit(ViewEvent::SetupStateCommitRequested {
+            state,
+            message: format!(
+                "Hotbar setup status recorded; current config is {}.",
+                self.facts.hotbar.result_summary()
+            ),
         })
     }
 
@@ -1587,6 +1747,9 @@ impl ModalView for SetupWizardView {
                 self.move_next();
                 ViewAction::None
             }
+            KeyCode::Char('s') if self.selected_step() == SetupStep::Hotbar => {
+                self.commit_hotbar_status()
+            }
             KeyCode::Char('s') => {
                 self.commit_selected_status(StepStatus::Skipped, MessageId::SetupStepSkipped, true)
             }
@@ -1610,6 +1773,9 @@ impl ModalView for SetupWizardView {
             KeyCode::Char('c') if self.selected_step() == SetupStep::TrustSandbox => {
                 ViewAction::EmitAndClose(ViewEvent::SetupOpenConfigRequested)
             }
+            KeyCode::Char('h') if self.selected_step() == SetupStep::Hotbar => {
+                ViewAction::Emit(ViewEvent::SetupOpenHotbarRequested)
+            }
             KeyCode::Char(key @ ('1' | '2' | '3'))
                 if self.selected_step() == SetupStep::TrustSandbox =>
             {
@@ -1632,8 +1798,12 @@ impl ModalView for SetupWizardView {
             KeyCode::Char('k') if self.selected_step() == SetupStep::Constitution => {
                 self.commit_keep_existing_constitution()
             }
-            KeyCode::Char('u') => self.commit_constitution(SetupCommitKind::BundledConstitution),
-            KeyCode::Char('d') => self.commit_constitution(SetupCommitKind::DeferredConstitution),
+            KeyCode::Char('u') if self.selected_step() == SetupStep::Constitution => {
+                self.commit_constitution(SetupCommitKind::BundledConstitution)
+            }
+            KeyCode::Char('d') if self.selected_step() == SetupStep::Constitution => {
+                self.commit_constitution(SetupCommitKind::DeferredConstitution)
+            }
             KeyCode::Enter if self.selected_step() == SetupStep::Constitution => {
                 self.commit_constitution(SetupCommitKind::BundledConstitution)
             }
@@ -1642,6 +1812,9 @@ impl ModalView for SetupWizardView {
             }
             KeyCode::Enter if self.selected_step() == SetupStep::TrustSandbox => {
                 self.commit_runtime_posture_review()
+            }
+            KeyCode::Enter if self.selected_step() == SetupStep::Hotbar => {
+                ViewAction::Emit(ViewEvent::SetupOpenHotbarRequested)
             }
             KeyCode::Enter if self.selected_step() == SetupStep::Verification => {
                 self.commit_setup_report()
@@ -1727,6 +1900,14 @@ impl ModalView for SetupWizardView {
                     tr(self.locale, MessageId::SetupActionKeepExisting).to_string(),
                 ));
             }
+            hints.push(ActionHint::new(
+                "U",
+                tr(self.locale, MessageId::SetupActionUseBundled).to_string(),
+            ));
+            hints.push(ActionHint::new(
+                "D",
+                tr(self.locale, MessageId::SetupActionDefer).to_string(),
+            ));
         } else if self.selected_step() == SetupStep::ProviderModel {
             hints.push(ActionHint::new(
                 "P",
@@ -1753,21 +1934,16 @@ impl ModalView for SetupWizardView {
                 "C",
                 tr(self.locale, MessageId::SetupActionConfig).to_string(),
             ));
+        } else if self.selected_step() == SetupStep::Hotbar {
+            hints.push(ActionHint::new(
+                "H",
+                tr(self.locale, MessageId::SetupActionHotbar).to_string(),
+            ));
         }
-        hints.extend([
-            ActionHint::new(
-                "U",
-                tr(self.locale, MessageId::SetupActionUseBundled).to_string(),
-            ),
-            ActionHint::new(
-                "D",
-                tr(self.locale, MessageId::SetupActionDefer).to_string(),
-            ),
-            ActionHint::new(
-                "Esc",
-                tr(self.locale, MessageId::SetupActionCancel).to_string(),
-            ),
-        ]);
+        hints.push(ActionHint::new(
+            "Esc",
+            tr(self.locale, MessageId::SetupActionCancel).to_string(),
+        ));
         let content_area = render_modal_footer(inner, buf, &hints);
         let spec = self.selected_spec();
         let mut lines = vec![
@@ -1803,7 +1979,8 @@ impl ModalView for SetupWizardView {
                 Span::styled(tr(self.locale, step.title_id()).to_string(), style),
                 Span::raw("  "),
                 Span::styled(
-                    self.status_label(self.state.status(step.id())).to_string(),
+                    self.status_label(self.status_for_step(step.id()))
+                        .to_string(),
                     Style::default().fg(palette::WHALE_ACCENT_PRIMARY),
                 ),
             ]));
@@ -1827,6 +2004,7 @@ impl SetupWizardView {
         match self.selected_step() {
             SetupStep::ProviderModel => self.provider_model_detail_lines(),
             SetupStep::TrustSandbox => self.runtime_posture_detail_lines(),
+            SetupStep::Hotbar => self.hotbar_detail_lines(),
             SetupStep::Constitution => self.constitution_detail_lines(),
             SetupStep::Verification => self.verification_detail_lines(),
             _ => Vec::new(),
@@ -2013,6 +2191,39 @@ impl SetupWizardView {
         lines
     }
 
+    fn hotbar_detail_lines(&self) -> Vec<Line<'static>> {
+        let bindings = if self.facts.hotbar.active_bindings == 0 {
+            "none".to_string()
+        } else {
+            format!(
+                "{}/{} active",
+                self.facts.hotbar.active_bindings,
+                codewhale_config::HOTBAR_SLOT_COUNT
+            )
+        };
+        let warnings = if self.facts.hotbar.warnings.is_empty() {
+            "none".to_string()
+        } else {
+            self.facts.hotbar.warning_summary()
+        };
+        vec![
+            self.detail_row(
+                MessageId::SetupHotbarStatusLabel,
+                &format!(
+                    "{} · {}",
+                    self.facts.hotbar.state.label(),
+                    self.facts.hotbar.result_summary()
+                ),
+            ),
+            self.detail_row(MessageId::SetupHotbarBindingsLabel, &bindings),
+            self.detail_row(MessageId::SetupHotbarWarningsLabel, &warnings),
+            Line::from(Span::styled(
+                tr(self.locale, MessageId::SetupHotbarHint).to_string(),
+                Style::default().fg(palette::TEXT_MUTED),
+            )),
+        ]
+    }
+
     fn verification_detail_lines(&self) -> Vec<Line<'static>> {
         let mut lines = vec![
             self.detail_row(
@@ -2046,8 +2257,13 @@ impl SetupWizardView {
 
         for spec in STEP_SPECS {
             let step = spec.id();
-            let entry = self.state.steps.get(&step);
-            let required = entry.map_or(spec.required(), |entry| entry.required);
+            let entry = self.state.steps.get(&step).cloned().or_else(|| {
+                (step == SetupStep::Hotbar)
+                    .then(|| self.facts.hotbar.step_entry(HOTBAR_SETUP_VERSION))
+            });
+            let required = entry
+                .as_ref()
+                .map_or(spec.required(), |entry| entry.required);
             let required_label = if required {
                 tr(self.locale, MessageId::SetupReportRequired)
             } else {
@@ -2055,13 +2271,17 @@ impl SetupWizardView {
             };
             let mut value = format!(
                 "{} ({})",
-                self.status_label(self.state.status(step)),
+                self.status_label(
+                    entry
+                        .as_ref()
+                        .map_or_else(|| self.state.status(step), |entry| entry.status)
+                ),
                 required_label
             );
-            if let Some(version) = entry.and_then(|entry| entry.version.as_deref()) {
+            if let Some(version) = entry.as_ref().and_then(|entry| entry.version.as_deref()) {
                 value.push_str(&format!(" · {version}"));
             }
-            if let Some(result) = entry.and_then(|entry| entry.result.as_deref()) {
+            if let Some(result) = entry.as_ref().and_then(|entry| entry.result.as_deref()) {
                 value.push_str(&format!(" · {result}"));
             }
             lines.push(self.detail_row(spec.title_id(), &value));
@@ -2260,7 +2480,7 @@ fn project_runtime_override_warning(workspace: &Path, locale: Locale) -> Option<
 
 fn setup_report_result(state: &SetupState, facts: &SetupRuntimeFacts) -> String {
     format!(
-        "first_run={}, update={}, constitution={:?}, autonomy={}, posture={:?}, runtime={}",
+        "first_run={}, update={}, constitution={:?}, autonomy={}, posture={:?}, runtime={}, hotbar={}",
         if state.first_run_ready() {
             "ready"
         } else {
@@ -2274,7 +2494,8 @@ fn setup_report_result(state: &SetupState, facts: &SetupRuntimeFacts) -> String 
         state.constitution_choice,
         facts.constitution_autonomy,
         state.runtime_posture_source,
-        facts.runtime_result
+        facts.runtime_result,
+        facts.hotbar.result_summary()
     )
 }
 
@@ -2532,6 +2753,15 @@ pub fn load_setup_state_for_app(app: &App, config: &Config) -> SetupState {
     SetupState::derive_inherited(&inherited_facts_for_app(app, config))
 }
 
+fn hotbar_snapshot_for_app(app: &App, config: &Config) -> SetupHotbarSnapshot {
+    let hotbar_action_ids = app
+        .hotbar_actions
+        .iter()
+        .map(|action| action.id())
+        .collect::<Vec<_>>();
+    SetupHotbarSnapshot::from_config(config, &hotbar_action_ids)
+}
+
 #[must_use]
 fn inherited_facts_for_app(app: &App, config: &Config) -> InheritedConfigFacts {
     let user_constitution = UserConstitution::load().ok();
@@ -2630,7 +2860,7 @@ mod tests {
     }
 
     #[test]
-    fn visible_release_rail_skips_optional_placeholder_steps() {
+    fn visible_release_rail_includes_hotbar_and_skips_later_placeholder_steps() {
         let steps = STEP_SPECS.iter().map(|step| step.id()).collect::<Vec<_>>();
 
         assert_eq!(
@@ -2639,6 +2869,7 @@ mod tests {
                 SetupStep::Language,
                 SetupStep::ProviderModel,
                 SetupStep::TrustSandbox,
+                SetupStep::Hotbar,
                 SetupStep::Constitution,
                 SetupStep::Verification,
             ]
@@ -2863,6 +3094,42 @@ mod tests {
             config_action,
             ViewAction::EmitAndClose(ViewEvent::SetupOpenConfigRequested)
         ));
+    }
+
+    #[test]
+    fn hotbar_skip_records_current_state_without_changing_config() {
+        let facts = SetupRuntimeFacts {
+            hotbar: SetupHotbarSnapshot::off_by_default(),
+            ..SetupRuntimeFacts::default()
+        };
+        let mut view = SetupWizardView::new_at_with_facts(
+            SetupState::default(),
+            Locale::En,
+            SetupStep::Hotbar,
+            facts,
+        );
+
+        let action = view.handle_key(key(KeyCode::Char('s')));
+
+        let ViewAction::Emit(ViewEvent::SetupStateCommitRequested { state, message }) = action
+        else {
+            panic!("expected setup-state commit event");
+        };
+        let entry = state
+            .steps
+            .get(&SetupStep::Hotbar)
+            .expect("hotbar step entry");
+        assert_eq!(entry.status, StepStatus::Optional);
+        assert!(!entry.required);
+        assert_eq!(entry.version.as_deref(), Some(HOTBAR_SETUP_VERSION));
+        assert!(
+            entry
+                .result
+                .as_deref()
+                .is_some_and(|result| result.contains("off by default"))
+        );
+        assert!(message.contains("Hotbar setup status recorded"));
+        assert_eq!(view.selected_step(), SetupStep::Constitution);
     }
 
     #[test]
@@ -3736,7 +4003,7 @@ mod tests {
             RuntimePostureSource::Confirmed
         );
         assert!(message.contains("Runtime posture reviewed"));
-        assert_eq!(view.selected_step(), SetupStep::Constitution);
+        assert_eq!(view.selected_step(), SetupStep::Hotbar);
     }
 
     #[test]
@@ -3818,7 +4085,7 @@ mod tests {
         assert_eq!(entry.result.as_deref(), Some("skipped by user"));
         assert_eq!(state.runtime_posture_source, RuntimePostureSource::Unset);
         assert!(message.contains("skipped"));
-        assert_eq!(view.selected_step(), SetupStep::Constitution);
+        assert_eq!(view.selected_step(), SetupStep::Hotbar);
     }
 
     #[test]
@@ -3941,7 +4208,206 @@ mod tests {
                 })
         );
         assert!(message.contains("Runtime preset applied"));
+        assert_eq!(view.selected_step(), SetupStep::Hotbar);
+    }
+
+    #[test]
+    fn hotbar_snapshot_classifies_default_disabled_configured_partial_and_unknown() {
+        let known_actions = ["mode.plan", "mode.agent"];
+
+        let off_by_default = SetupHotbarSnapshot::from_config(&Config::default(), &known_actions);
+        assert_eq!(off_by_default.state, SetupHotbarState::OffByDefault);
+        assert_eq!(off_by_default.state.step_status(), StepStatus::Optional);
+        assert_eq!(off_by_default.active_bindings, 0);
+        assert!(off_by_default.result_summary().contains("off by default"));
+
+        let disabled = SetupHotbarSnapshot::from_config(
+            &Config {
+                hotbar: Some(Vec::new()),
+                ..Config::default()
+            },
+            &known_actions,
+        );
+        assert_eq!(disabled.state, SetupHotbarState::Disabled);
+        assert_eq!(disabled.state.step_status(), StepStatus::Verified);
+        assert_eq!(disabled.result_summary(), "disabled (hotbar = [])");
+
+        let configured = SetupHotbarSnapshot::from_config(
+            &Config {
+                hotbar: Some(vec![codewhale_config::HotbarBindingToml {
+                    slot: 1,
+                    action: "mode.plan".to_string(),
+                    label: None,
+                }]),
+                ..Config::default()
+            },
+            &known_actions,
+        );
+        assert_eq!(configured.state, SetupHotbarState::Configured);
+        assert_eq!(configured.state.step_status(), StepStatus::Verified);
+        assert_eq!(configured.active_bindings, 1);
+        assert!(configured.warnings.is_empty());
+
+        let partial = SetupHotbarSnapshot::from_config(
+            &Config {
+                hotbar: Some(vec![
+                    codewhale_config::HotbarBindingToml {
+                        slot: 9,
+                        action: "mode.plan".to_string(),
+                        label: None,
+                    },
+                    codewhale_config::HotbarBindingToml {
+                        slot: 2,
+                        action: "mode.agent".to_string(),
+                        label: None,
+                    },
+                ]),
+                ..Config::default()
+            },
+            &known_actions,
+        );
+        assert_eq!(partial.state, SetupHotbarState::Partial);
+        assert_eq!(partial.state.step_status(), StepStatus::Verified);
+        assert_eq!(partial.active_bindings, 1);
+        assert!(partial.warning_summary().contains("outside 1-8"));
+
+        let unknown = SetupHotbarSnapshot::from_config(
+            &Config {
+                hotbar: Some(vec![codewhale_config::HotbarBindingToml {
+                    slot: 1,
+                    action: "missing.action".to_string(),
+                    label: None,
+                }]),
+                ..Config::default()
+            },
+            &known_actions,
+        );
+        assert_eq!(unknown.state, SetupHotbarState::Unknown);
+        assert_eq!(unknown.state.step_status(), StepStatus::NeedsAction);
+        assert_eq!(unknown.active_bindings, 1);
+        assert!(unknown.warning_summary().contains("unknown action"));
+        assert!(
+            unknown
+                .result_summary()
+                .contains("unknown action(s) present")
+        );
+    }
+
+    #[test]
+    fn hotbar_step_opens_existing_wizard_without_closing_setup() {
+        let mut view = SetupWizardView::new_at_with_facts(
+            SetupState::default(),
+            Locale::En,
+            SetupStep::Hotbar,
+            SetupRuntimeFacts::default(),
+        );
+
+        assert!(matches!(
+            view.handle_key(key(KeyCode::Char('h'))),
+            ViewAction::Emit(ViewEvent::SetupOpenHotbarRequested)
+        ));
+        assert_eq!(view.selected_step(), SetupStep::Hotbar);
+        assert!(matches!(
+            view.handle_key(key(KeyCode::Enter)),
+            ViewAction::Emit(ViewEvent::SetupOpenHotbarRequested)
+        ));
+        assert_eq!(view.selected_step(), SetupStep::Hotbar);
+    }
+
+    #[test]
+    fn hotbar_skip_records_current_state_without_rewriting_config() {
+        let facts = SetupRuntimeFacts {
+            hotbar: SetupHotbarSnapshot::from_config(
+                &Config {
+                    hotbar: Some(Vec::new()),
+                    ..Config::default()
+                },
+                &["mode.plan"],
+            ),
+            ..SetupRuntimeFacts::default()
+        };
+        let mut view = SetupWizardView::new_at_with_facts(
+            SetupState::default(),
+            Locale::En,
+            SetupStep::Hotbar,
+            facts,
+        );
+
+        let action = view.handle_key(key(KeyCode::Char('s')));
+
+        let ViewAction::Emit(ViewEvent::SetupStateCommitRequested { state, message }) = action
+        else {
+            panic!("expected setup-state commit event");
+        };
+        let entry = state
+            .steps
+            .get(&SetupStep::Hotbar)
+            .expect("hotbar step entry");
+        assert_eq!(entry.status, StepStatus::Verified);
+        assert!(!entry.required);
+        assert_eq!(entry.version.as_deref(), Some(HOTBAR_SETUP_VERSION));
+        assert_eq!(entry.result.as_deref(), Some("disabled (hotbar = [])"));
+        assert!(message.contains("current config is disabled"));
         assert_eq!(view.selected_step(), SetupStep::Constitution);
+    }
+
+    #[test]
+    fn hotbar_refresh_updates_setup_state_after_existing_wizard_save() {
+        let mut view = SetupWizardView::new_at_with_facts(
+            SetupState::default(),
+            Locale::En,
+            SetupStep::Hotbar,
+            SetupRuntimeFacts::default(),
+        );
+        let config = Config {
+            hotbar: Some(vec![codewhale_config::HotbarBindingToml {
+                slot: 1,
+                action: "mode.plan".to_string(),
+                label: Some("Plan".to_string()),
+            }]),
+            ..Config::default()
+        };
+
+        let state = view.refresh_hotbar_from_config(&config, &["mode.plan"]);
+
+        let entry = state
+            .steps
+            .get(&SetupStep::Hotbar)
+            .expect("hotbar step entry");
+        assert_eq!(entry.status, StepStatus::Verified);
+        assert!(!entry.required);
+        assert_eq!(entry.version.as_deref(), Some(HOTBAR_SETUP_VERSION));
+        assert_eq!(entry.result.as_deref(), Some("configured (1 binding(s))"));
+        assert_eq!(
+            view.state()
+                .steps
+                .get(&SetupStep::Hotbar)
+                .and_then(|entry| entry.result.as_deref()),
+            Some("configured (1 binding(s))")
+        );
+        let text = lines_to_text(view.hotbar_detail_lines());
+        assert!(text.contains("configured"));
+        assert!(text.contains("1/8 active"));
+        assert!(text.contains("Warnings:"));
+        assert!(text.contains("none"));
+        assert!(text.contains("Slash commands are included"));
+    }
+
+    #[test]
+    fn verification_detail_lines_reports_hotbar_default_off_as_non_failure() {
+        let view = SetupWizardView::new_at_with_facts(
+            SetupState::default(),
+            Locale::En,
+            SetupStep::Verification,
+            SetupRuntimeFacts::default(),
+        );
+
+        let text = lines_to_text(view.verification_detail_lines());
+
+        assert!(text.contains("Hotbar"));
+        assert!(text.contains("optional"));
+        assert!(text.contains(HOTBAR_SETUP_VERSION));
+        assert!(text.contains("off by default"));
     }
 
     #[test]

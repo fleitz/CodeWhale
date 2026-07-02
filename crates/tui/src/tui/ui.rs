@@ -8056,7 +8056,9 @@ async fn apply_command_result(
                 }
             }
             AppAction::UseBundledConstitution => use_bundled_constitution(app, config),
-            AppAction::DisableHotbar => disable_hotbar(app, config),
+            AppAction::DisableHotbar => {
+                let _ = disable_hotbar(app, config);
+            }
             AppAction::RestoreHotbarDefaults => restore_hotbar_defaults(app, config),
             AppAction::OpenExternalUrl { url, label } => match open_external_url(&url) {
                 Ok(()) => {
@@ -9529,19 +9531,55 @@ fn apply_hotbar_setup_saved(
     app: &mut App,
     config: &mut Config,
     bindings: Vec<codewhale_config::HotbarBindingToml>,
-) {
+) -> bool {
     match crate::config_persistence::persist_hotbar_bindings(app.config_path.as_deref(), &bindings)
     {
         Ok(path) => {
             config.hotbar = Some(bindings);
             app.status_message = Some(format!("Hotbar bindings saved to {}", path.display()));
+            app.needs_redraw = true;
+            true
         }
         Err(err) => {
             app.status_message = Some(format!("Failed to save Hotbar bindings: {err}"));
             app.add_message(HistoryCell::System {
                 content: format!("Failed to save Hotbar bindings: {err}"),
             });
+            app.needs_redraw = true;
+            false
         }
+    }
+}
+
+fn record_setup_hotbar_state_if_open(app: &mut App, config: &Config) {
+    if app.view_stack.top_kind() != Some(ModalKind::SetupWizard) {
+        return;
+    }
+    let known_action_ids = app
+        .hotbar_actions
+        .iter()
+        .map(|action| action.id().to_string())
+        .collect::<Vec<_>>();
+    let known_action_refs = known_action_ids
+        .iter()
+        .map(String::as_str)
+        .collect::<Vec<_>>();
+
+    let Some(mut boxed) = app.view_stack.pop() else {
+        return;
+    };
+    let state = boxed
+        .as_any_mut()
+        .downcast_mut::<crate::tui::setup::SetupWizardView>()
+        .map(|wizard| wizard.refresh_hotbar_from_config(config, &known_action_refs));
+    app.view_stack.push_boxed(boxed);
+    if let Some(state) = state
+        && let Err(err) = state.save()
+    {
+        app.status_message = Some(format!("Setup Hotbar status could not be saved: {err}"));
+        app.add_message(HistoryCell::System {
+            content: format!("Setup Hotbar status could not be saved: {err}"),
+        });
     }
     app.needs_redraw = true;
 }
@@ -9586,7 +9624,7 @@ fn use_bundled_constitution(app: &mut App, config: &Config) {
 /// clear the live in-memory slots so the panel disappears immediately. The
 /// explicit empty array — not a missing key — is what disables defaults, so we
 /// store `Some(vec![])` rather than `None`.
-fn disable_hotbar(app: &mut App, config: &mut Config) {
+fn disable_hotbar(app: &mut App, config: &mut Config) -> bool {
     match crate::config_persistence::persist_hotbar_bindings(app.config_path.as_deref(), &[]) {
         Ok(path) => {
             config.hotbar = Some(Vec::new());
@@ -9594,15 +9632,18 @@ fn disable_hotbar(app: &mut App, config: &mut Config) {
                 "Hotbar hidden (hotbar = [] in {}). Bring it back with `/hotbar on`.",
                 path.display()
             ));
+            app.needs_redraw = true;
+            true
         }
         Err(err) => {
             app.status_message = Some(format!("Failed to hide Hotbar: {err}"));
             app.add_message(HistoryCell::System {
                 content: format!("Failed to hide Hotbar: {err}"),
             });
+            app.needs_redraw = true;
+            false
         }
     }
-    app.needs_redraw = true;
 }
 
 /// Show the default recommended Hotbar slots. Since #3807 an absent `hotbar`
@@ -9918,7 +9959,9 @@ async fn handle_view_events(
                 }
             }
             ViewEvent::HotbarSetupSaved { bindings } => {
-                apply_hotbar_setup_saved(app, config, bindings);
+                if apply_hotbar_setup_saved(app, config, bindings) {
+                    record_setup_hotbar_state_if_open(app, config);
+                }
             }
             ViewEvent::SetupStateCommitRequested { state, message } => match state.save() {
                 Ok(()) => {
@@ -10092,8 +10135,19 @@ async fn handle_view_events(
                         Some("Config view opened from /setup runtime posture.".to_string());
                 }
             }
+            ViewEvent::SetupOpenHotbarRequested => {
+                if app.view_stack.top_kind() != Some(ModalKind::HotbarSetup) {
+                    app.view_stack
+                        .push(crate::tui::hotbar::setup::HotbarSetupView::new(app, config));
+                    app.status_message =
+                        Some("Hotbar setup opened from /setup personalization.".to_string());
+                    app.needs_redraw = true;
+                }
+            }
             ViewEvent::HotbarDisableRequested => {
-                disable_hotbar(app, config);
+                if disable_hotbar(app, config) {
+                    record_setup_hotbar_state_if_open(app, config);
+                }
             }
             ViewEvent::SubAgentsRefresh => {
                 app.status_message = Some("Refreshing sub-agents...".to_string());

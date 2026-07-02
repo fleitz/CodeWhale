@@ -18,7 +18,7 @@ coverage.
 
 | Scenario | Expected behavior | Evidence |
 | --- | --- | --- |
-| No hotbar config | Default slots resolve to the shipped eight-slot bar. | `crates/config/src/tests.rs::hotbar_defaults_when_config_is_absent` |
+| No hotbar config | Hotbar is off by default until the user opts in; `/setup` reports `off by default` without writing config. | `crates/config/src/tests.rs::hotbar_hidden_when_config_is_absent`; `crates/tui/src/tui/setup/mod.rs::verification_detail_lines_reports_hotbar_default_off_as_non_failure` |
 | Empty hotbar config | `hotbar = []` disables all default slots. | `crates/config/src/tests.rs::hotbar_empty_array_disables_default_slots`; `crates/tui/src/config_persistence.rs::persist_hotbar_bindings_writes_empty_array_to_disable_defaults` |
 | Partial config | Missing slots render empty without filling from defaults. | `crates/tui/src/tui/sidebar.rs::hotbar_panel_slots_handle_empty_partial_and_unknown_config` |
 | Unknown actions | Unknown configured actions stay visible as unknown instead of being dropped silently. | `crates/config/src/tests.rs::hotbar_validation_warns_without_dropping_unknown_actions`; `crates/tui/src/tui/sidebar.rs::hotbar_panel_slots_handle_empty_partial_and_unknown_config` |
@@ -35,7 +35,8 @@ coverage.
 | Hidden/sidebar focus states | Hotbar dispatch is still available from hidden, auto, pinned, and focused sidebar states. | `crates/tui/src/tui/ui/tests.rs::hotbar_alt_digit_fires_from_composer_and_sidebar_states` |
 | Narrow sidebar | Hotbar panel keeps fixed two-row layout and bounded hover/status text. | `crates/tui/src/tui/sidebar.rs::hotbar_panel_lines_keep_two_fixed_rows_and_hover_status`; `docs/evidence/terminal-visual-regression-matrix.md` |
 | Modal/overlay open | Modal, approval, picker, decision-card, and onboarding states block Hotbar numeric ownership. | `crates/tui/src/tui/ui/tests.rs::hotbar_digits_are_blocked_while_modal_or_onboarding_is_active`; `crates/tui/src/tui/ui/tests.rs::hotbar_alt_digit_is_blocked_while_inline_selectors_are_open`; `crates/tui/src/tui/ui/tests.rs::hotbar_alt_digit_is_blocked_while_decision_card_is_active` |
-| Setup wizard open/save | Setup lists supported source categories, updates draft bindings, saves, and persists. | `crates/tui/src/tui/hotbar/setup.rs::wizard_sources_follow_registered_action_categories`; `crates/tui/src/tui/hotbar/setup.rs::wizard_save_emits_bindings_but_escape_only_closes`; `crates/tui/src/tui/ui/tests.rs::hotbar_setup_save_persists_bindings_to_config_path` |
+| `/setup` Hotbar step | Setup reports off-by-default, disabled, configured, partial, and unknown states; `H`/Enter opens the existing `/hotbar` wizard and `S` records state without changing config. | `crates/tui/src/tui/setup/mod.rs::hotbar_step_opens_existing_wizard_without_closing_setup`; `crates/tui/src/tui/setup/mod.rs::hotbar_snapshot_classifies_default_disabled_configured_partial_and_unknown`; `crates/tui/src/tui/setup/mod.rs::hotbar_refresh_updates_setup_state_after_existing_wizard_save` |
+| Hotbar wizard open/save | Setup lists supported source categories, updates draft bindings, saves, and persists. | `crates/tui/src/tui/hotbar/setup.rs::wizard_sources_follow_registered_action_categories`; `crates/tui/src/tui/hotbar/setup.rs::wizard_save_emits_bindings_but_escape_only_closes`; `crates/tui/src/tui/ui/tests.rs::hotbar_setup_save_persists_bindings_to_config_path` |
 | Restart/re-dispatch | Persisted bindings parse back into config and resolve through the same dispatch path. | `crates/config/src/tests.rs::hotbar_tables_parse_and_round_trip`; `crates/tui/src/tui/ui/tests.rs::hotbar_dispatches_bound_slot_and_ignores_empty_slot` |
 
 ## Dispatch Outcomes
@@ -62,15 +63,17 @@ Run before claiming Hotbar MVP readiness:
 
 Manual pass, if a release candidate binary is available:
 
-1. Start with no `[hotbar]` config and verify the default eight slots render in
-   the sidebar with visible `Alt1` through `Alt8` accelerator labels.
-2. Open `/hotbar`, bind a slash command, save, restart, and verify the binding
+1. Start with no `hotbar` config and verify the sidebar does not render a
+   Hotbar until `/setup` or `/hotbar on` opts in.
+2. Open `/setup`, reach Hotbar, verify status is `off by default`, then press
+   `H` or Enter and confirm the existing `/hotbar` wizard opens.
+3. Open `/hotbar`, bind a slash command, save, restart, and verify the binding
    persists.
-3. Press `Alt-1` through `Alt-8` from composer/sidebar states and verify only
+4. Press `Alt-1` through `Alt-8` from composer/sidebar states and verify only
    `Alt` chords dispatch.
-4. Open command palette, slash menu, setup wizard, decision card, and an
+5. Open command palette, slash menu, setup wizard, decision card, and an
    approval modal; verify Hotbar digits are blocked while those surfaces own
    input.
-5. Confirm MCP, skill, and plugin entries remain discoverable through their
+6. Confirm MCP, skill, and plugin entries remain discoverable through their
    existing command-palette or slash-command paths and are not offered as direct
    Hotbar bindable actions.

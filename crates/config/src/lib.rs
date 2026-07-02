@@ -364,8 +364,8 @@ pub struct ConfigToml {
     /// v0.9 slices; this is the durable config data model.
     #[serde(default)]
     pub harness_profiles: Vec<HarnessProfile>,
-    /// Optional 1-8 hotbar slot bindings (#2064). When absent, the TUI falls
-    /// back to the built-in default slots.
+    /// Optional 1-8 hotbar slot bindings (#2064). When absent, the Hotbar stays
+    /// hidden until the user opts in through `/setup`, `/hotbar`, or `/hotbar on`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub hotbar: Option<Vec<HotbarBindingToml>>,
     /// App-server hook sink configuration. Kept separate from the TUI

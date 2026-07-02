@@ -1834,6 +1834,59 @@ fn hotbar_setup_save_error_leaves_live_config_and_file_unchanged() {
 }
 
 #[test]
+fn hotbar_setup_save_refreshes_setup_wizard_under_closed_overlay() {
+    let _home = SettingsHomeGuard::new();
+    let config_path = crate::config_persistence::config_toml_path(None).expect("config path");
+    std::fs::create_dir_all(config_path.parent().expect("config parent"))
+        .expect("config parent exists");
+    std::fs::write(&config_path, "model = \"deepseek-v4-pro\"\n").expect("seed config");
+
+    let mut app = create_test_app();
+    app.config_path = Some(config_path.clone());
+    let mut config = Config::load(Some(config_path), None).expect("load config");
+    app.view_stack
+        .push(crate::tui::setup::SetupWizardView::new_for_app_at(
+            &app,
+            &config,
+            codewhale_config::SetupStep::Hotbar,
+        ));
+    let bindings = vec![codewhale_config::HotbarBindingToml {
+        slot: 1,
+        action: "mode.plan".to_string(),
+        label: Some("Plan".to_string()),
+    }];
+
+    assert!(apply_hotbar_setup_saved(&mut app, &mut config, bindings));
+    record_setup_hotbar_state_if_open(&mut app, &config);
+
+    assert_eq!(app.view_stack.top_kind(), Some(ModalKind::SetupWizard));
+    let mut setup = app.view_stack.pop().expect("setup wizard");
+    let setup = setup
+        .as_any_mut()
+        .downcast_mut::<crate::tui::setup::SetupWizardView>()
+        .expect("setup wizard view");
+    let entry = setup
+        .state()
+        .steps
+        .get(&codewhale_config::SetupStep::Hotbar)
+        .expect("hotbar setup entry");
+    assert_eq!(entry.status, codewhale_config::StepStatus::Verified);
+    assert_eq!(
+        entry.version.as_deref(),
+        Some(crate::tui::setup::HOTBAR_SETUP_VERSION)
+    );
+    assert_eq!(entry.result.as_deref(), Some("configured (1 binding(s))"));
+
+    let saved_state = codewhale_config::SetupState::load()
+        .expect("load saved setup state")
+        .expect("saved setup state");
+    assert_eq!(
+        saved_state.status(codewhale_config::SetupStep::Hotbar),
+        codewhale_config::StepStatus::Verified
+    );
+}
+
+#[test]
 fn app_system_prompt_includes_configured_instructions() {
     let tmp = tempfile::tempdir().expect("tempdir");
     let instructions = tmp.path().join("extra-instructions.md");

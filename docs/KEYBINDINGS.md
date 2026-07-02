@@ -57,7 +57,7 @@ Hotbar trigger semantics are intentionally `Alt-1` through `Alt-8` only. On macO
 
 Function keys and `Cmd-1` through `Cmd-8` are not the primary Hotbar chords. Many terminals reserve those keys for tabs, windows, or OS shortcuts, and some never forward them to terminal apps. If a terminal is configured to send `Alt-1` for a custom shortcut, the Hotbar receives the same reliable chord.
 
-Fresh configs resolve to this default bar unless `[[hotbar]]` overrides it or `hotbar = []` disables it:
+Fresh configs keep the Hotbar hidden until you opt in with `/setup`, `/hotbar`, or `/hotbar on`. Explicit `[[hotbar]]` entries configure slots, and `hotbar = []` keeps the Hotbar disabled. `/hotbar on` persists this recommended bar:
 
 | Slot | Chord   | Default action     | Label     |
 |------|---------|--------------------|-----------|
