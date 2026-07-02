@@ -386,7 +386,6 @@ fn hotbar_panel_hover_texts(slots: &[HotbarPanelSlot]) -> Vec<String> {
 }
 
 fn hotbar_slot_cell_text(slot: &HotbarPanelSlot, cell_width: usize) -> String {
-    let chord = format!("Alt{}", slot.slot);
     let marker = match slot.state {
         HotbarSlotState::Empty => "-",
         HotbarSlotState::Inactive => "",
@@ -394,11 +393,11 @@ fn hotbar_slot_cell_text(slot: &HotbarPanelSlot, cell_width: usize) -> String {
         HotbarSlotState::Unknown => "?",
     };
     let text = if marker.is_empty() {
-        format!("{chord}:{}", slot.label)
+        format!("{}:{}", slot.slot, slot.label)
     } else if slot.state == HotbarSlotState::Empty {
-        format!("{chord}:{marker}")
+        format!("{}:{marker}", slot.slot)
     } else {
-        format!("{chord}:{marker}{}", slot.label)
+        format!("{}:{marker}{}", slot.slot, slot.label)
     };
     pad_to_display_width(clip_line_to_width(&text, cell_width), cell_width)
 }
@@ -3466,7 +3465,7 @@ mod tests {
 
     #[test]
     fn is_hotbar_disabled_only_for_an_explicit_empty_array() {
-        // A missing `hotbar` key means "use defaults" — NOT disabled.
+        // A missing `hotbar` key means "hidden until opt-in" — NOT disabled.
         assert!(!is_hotbar_disabled(&Config::default()));
 
         // An explicit `hotbar = []` is the disabled state.
@@ -3635,12 +3634,17 @@ mod tests {
             "hotbar lines must stay within the sidebar content width: {text:?}"
         );
         assert!(
-            text[0].contains("Alt1"),
+            text[0].contains("1:voice"),
             "first row should show slot 1: {text:?}"
         );
         assert!(
-            text[0].contains("Alt4:*"),
-            "active slot should be visibly marked in the fixed grid: {text:?}"
+            text[0].contains("4:*"),
+            "active slot should keep its marker in the fixed grid: {text:?}"
+        );
+        let narrow = lines_to_text(&hotbar_panel_lines(&slots, 20, &app.ui_theme));
+        assert!(
+            narrow[0].contains("4:*"),
+            "narrow cells should preserve the active marker instead of clipping to the modifier prefix: {narrow:?}"
         );
         assert_eq!(hover.len(), 2);
         let slot_4_chord = format!("{}4", crate::tui::widgets::key_hint::alt_prefix());
@@ -3714,11 +3718,11 @@ mod tests {
             "hotbar panel title should expose the accelerator: {rendered:?}"
         );
         assert!(
-            rendered.contains("Alt1"),
+            rendered.contains("1:voice"),
             "slot 1 default binding should render: {rendered:?}"
         );
         assert!(
-            rendered.contains("Alt4"),
+            rendered.contains("4:*agent"),
             "active agent-mode slot should render distinctly: {rendered:?}"
         );
     }
