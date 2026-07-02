@@ -1,13 +1,15 @@
-//! Voice input commands — `/voice`, `/voice-send`, `/voice-control`.
+//! Voice input commands — `/voice`, plus compatibility aliases
+//! `/voice-send` and `/voice-control`.
 //!
 //! Records audio from the default microphone, sends it to the configured
 //! provider's API for transcription, and inserts the transcribed text into
 //! the composer. The interaction model mirrors MiMo Code's voice UX:
 //!
 //!   `/voice`         — toggle voice input on/off (records when toggled on)
-//!   `/voice-send`    — toggle auto-send when the transcript ends with
+//!   `/voice record`  — record/transcribe now without needing a toggle dance
+//!   `/voice send`    — configure auto-send when the transcript ends with
 //!                      "send it" / "发送"
-//!   `/voice-control` — toggle AI-assisted dictation that sees the current
+//!   `/voice control` — configure AI-assisted dictation that sees the current
 //!                      composer text
 //!
 //! The slash commands only flip state and emit [`AppAction::VoiceCapture`];
@@ -42,7 +44,7 @@ const VOICE_CONTROL_MODEL: &str = "mimo-v2.5";
 pub(in crate::commands) const VOICE_INFO: CommandInfo = CommandInfo {
     name: "voice",
     aliases: &["yuyin", "语音"],
-    usage: "/voice",
+    usage: "/voice [record|status|send|control|on|off|toggle|help]",
     description_id: MessageId::CmdVoiceDescription,
 };
 
@@ -69,8 +71,8 @@ impl RegisterCommand for VoiceCmd {
         &VOICE_INFO
     }
 
-    fn execute(app: &mut App, _arg: Option<&str>) -> CommandResult {
-        voice(app)
+    fn execute(app: &mut App, arg: Option<&str>) -> CommandResult {
+        voice_command(app, arg)
     }
 }
 
@@ -492,15 +494,75 @@ pub async fn capture_and_transcribe(
 
 // --- Command handlers ------------------------------------------------------
 
-/// Handle the `/voice` command: toggle voice input. Toggling on requests a
-/// one-shot recording + transcription via [`AppAction::VoiceCapture`].
-pub fn voice(app: &mut App) -> CommandResult {
-    let locale = app.ui_locale;
+fn on_off(enabled: bool) -> &'static str {
+    if enabled { "on" } else { "off" }
+}
 
-    if app.voice_enabled {
-        app.voice_enabled = false;
-        return CommandResult::message(tr(locale, MessageId::VoiceDisabled));
+fn voice_status_message(app: &App) -> String {
+    format!(
+        "Voice status: input={}, auto-send={}, control={}. Use `/voice record`, `/voice send on`, `/voice control on`, or `/voice off`.",
+        on_off(app.voice_enabled),
+        on_off(app.voice_send_enabled),
+        on_off(app.voice_control_enabled)
+    )
+}
+
+fn voice_help_message() -> &'static str {
+    "Voice commands:\n\
+     /voice or /voice toggle - toggle voice input and record when turning on\n\
+     /voice record - record/transcribe now\n\
+     /voice on|off - enable or disable voice input\n\
+     /voice send [on|off|toggle|status] - control auto-send\n\
+     /voice control [on|off|toggle|status] - control AI-assisted dictation\n\
+     Compatibility: /voicesend, /voice-send, /voicecontrol, /voice-control"
+}
+
+fn parse_toggle_target(arg: Option<&str>) -> Result<Option<bool>, String> {
+    match arg.map(str::trim).filter(|value| !value.is_empty()) {
+        None => Ok(None),
+        Some(value) => match value.to_ascii_lowercase().as_str() {
+            "toggle" => Ok(None),
+            "on" | "enable" | "enabled" | "true" | "yes" => Ok(Some(true)),
+            "off" | "disable" | "disabled" | "false" | "no" => Ok(Some(false)),
+            "status" => Err("status".to_string()),
+            _ => Err(format!("unknown toggle value `{value}`")),
+        },
     }
+}
+
+fn apply_voice_toggle(
+    app: &mut App,
+    target: Option<&str>,
+    field: fn(&mut App) -> &mut bool,
+    enabled_message: MessageId,
+    disabled_message: MessageId,
+    usage: &str,
+) -> CommandResult {
+    let locale = app.ui_locale;
+    let target = match parse_toggle_target(target) {
+        Ok(target) => target,
+        Err(value) if value == "status" => {
+            let enabled = *field(app);
+            return CommandResult::message(format!(
+                "{}: {}",
+                usage.trim_start_matches('/'),
+                on_off(enabled)
+            ));
+        }
+        Err(err) => return CommandResult::error(format!("{err}. usage: {usage}")),
+    };
+    let enabled = field(app);
+    *enabled = target.unwrap_or(!*enabled);
+    let message_id = if *enabled {
+        enabled_message
+    } else {
+        disabled_message
+    };
+    CommandResult::message(tr(locale, message_id))
+}
+
+fn start_voice_capture(app: &mut App) -> CommandResult {
+    let locale = app.ui_locale;
     if !is_available() {
         return CommandResult::error(tr(locale, MessageId::VoiceErrNoRecorder));
     }
@@ -511,30 +573,81 @@ pub fn voice(app: &mut App) -> CommandResult {
     )
 }
 
+fn disable_voice_capture(app: &mut App) -> CommandResult {
+    let locale = app.ui_locale;
+    app.voice_enabled = false;
+    CommandResult::message(tr(locale, MessageId::VoiceDisabled))
+}
+
+pub fn voice_command(app: &mut App, arg: Option<&str>) -> CommandResult {
+    let Some(arg) = arg.map(str::trim).filter(|value| !value.is_empty()) else {
+        return voice(app);
+    };
+    let mut parts = arg.splitn(2, char::is_whitespace);
+    let action = parts.next().unwrap_or_default().trim().to_ascii_lowercase();
+    let rest = parts
+        .next()
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+
+    match action.as_str() {
+        "record" | "capture" | "now" => start_voice_capture(app),
+        "on" | "enable" | "start" => start_voice_capture(app),
+        "off" | "disable" | "stop" => disable_voice_capture(app),
+        "toggle" => voice(app),
+        "send" | "auto-send" | "autosend" => voice_send_with_target(app, rest),
+        "control" | "dictation" => voice_control_with_target(app, rest),
+        "status" => CommandResult::message(voice_status_message(app)),
+        "help" | "?" => CommandResult::message(voice_help_message()),
+        other => CommandResult::error(format!(
+            "unknown /voice subcommand `{other}`. usage: {}",
+            VOICE_INFO.usage
+        )),
+    }
+}
+
+/// Handle the `/voice` command: toggle voice input. Toggling on requests a
+/// one-shot recording + transcription via [`AppAction::VoiceCapture`].
+pub fn voice(app: &mut App) -> CommandResult {
+    let locale = app.ui_locale;
+
+    if app.voice_enabled {
+        app.voice_enabled = false;
+        return CommandResult::message(tr(locale, MessageId::VoiceDisabled));
+    }
+    start_voice_capture(app)
+}
+
+pub fn voice_send_with_target(app: &mut App, target: Option<&str>) -> CommandResult {
+    apply_voice_toggle(
+        app,
+        target,
+        |app| &mut app.voice_send_enabled,
+        MessageId::VoiceSendEnabled,
+        MessageId::VoiceSendDisabled,
+        "/voice send [on|off|toggle|status]",
+    )
+}
+
 /// Handle the `/voice-send` command: toggle auto-send after transcription.
 pub fn voice_send(app: &mut App) -> CommandResult {
-    let locale = app.ui_locale;
-    app.voice_send_enabled = !app.voice_send_enabled;
+    voice_send_with_target(app, None)
+}
 
-    let msg = if app.voice_send_enabled {
-        tr(locale, MessageId::VoiceSendEnabled)
-    } else {
-        tr(locale, MessageId::VoiceSendDisabled)
-    };
-    CommandResult::message(msg)
+pub fn voice_control_with_target(app: &mut App, target: Option<&str>) -> CommandResult {
+    apply_voice_toggle(
+        app,
+        target,
+        |app| &mut app.voice_control_enabled,
+        MessageId::VoiceControlEnabled,
+        MessageId::VoiceControlDisabled,
+        "/voice control [on|off|toggle|status]",
+    )
 }
 
 /// Handle the `/voice-control` command: toggle AI-assisted dictation.
 pub fn voice_control(app: &mut App) -> CommandResult {
-    let locale = app.ui_locale;
-    app.voice_control_enabled = !app.voice_control_enabled;
-
-    let msg = if app.voice_control_enabled {
-        tr(locale, MessageId::VoiceControlEnabled)
-    } else {
-        tr(locale, MessageId::VoiceControlDisabled)
-    };
-    CommandResult::message(msg)
+    voice_control_with_target(app, None)
 }
 
 #[cfg(test)]

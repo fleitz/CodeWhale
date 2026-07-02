@@ -886,6 +886,64 @@ mod tests {
         assert!(!app.voice_control_enabled);
     }
 
+    #[test]
+    fn voice_command_family_controls_send_control_status_and_help() {
+        let mut app = create_test_app();
+
+        let result = execute("/voice status", &mut app);
+        assert!(!result.is_error);
+        let message = result.message.expect("voice status message");
+        assert!(message.contains("input=off"));
+        assert!(message.contains("auto-send=off"));
+        assert!(message.contains("control=off"));
+
+        let result = execute("/voice send on", &mut app);
+        assert!(!result.is_error);
+        assert!(app.voice_send_enabled);
+        let result = execute("/voice send status", &mut app);
+        assert!(!result.is_error);
+        assert_eq!(
+            result.message.as_deref(),
+            Some("voice send [on|off|toggle|status]: on")
+        );
+        let result = execute("/voice send off", &mut app);
+        assert!(!result.is_error);
+        assert!(!app.voice_send_enabled);
+
+        let result = execute("/voice control on", &mut app);
+        assert!(!result.is_error);
+        assert!(app.voice_control_enabled);
+        let result = execute("/voice control toggle", &mut app);
+        assert!(!result.is_error);
+        assert!(!app.voice_control_enabled);
+
+        let result = execute("/voice help", &mut app);
+        assert!(!result.is_error);
+        let message = result.message.expect("voice help message");
+        assert!(message.contains("/voice record"));
+        assert!(message.contains("/voice send [on|off|toggle|status]"));
+
+        let result = execute("/voice send maybe", &mut app);
+        assert!(result.is_error);
+        assert!(
+            result
+                .message
+                .as_deref()
+                .is_some_and(|message| message.contains("usage: /voice send"))
+        );
+    }
+
+    #[test]
+    fn voice_compatibility_commands_are_hidden_until_filtered() {
+        let send = get_command_info("voicesend").expect("voicesend command info");
+        let control = get_command_info("voicecontrol").expect("voicecontrol command info");
+
+        assert!(!send.show_in_empty_discovery());
+        assert!(!control.show_in_empty_discovery());
+        assert!(send.show_in_slash_completion("voice"));
+        assert!(control.show_in_slash_completion("voice"));
+    }
+
     /// `/voice` defers the actual capture to the UI event loop via
     /// `AppAction::VoiceCapture`, so executing it never records audio.
     /// On hosts without a recorder it must fail gracefully instead.

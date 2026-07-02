@@ -70,7 +70,7 @@ impl CommandInfo {
 
     pub fn discovery(&self) -> CommandDiscovery {
         match self.name {
-            "subagents" => CommandDiscovery::Compatibility,
+            "subagents" | "voicesend" | "voicecontrol" => CommandDiscovery::Compatibility,
             "anchor" | "balance" | "cache" | "change" | "context" | "debt" | "diff" | "edit"
             | "goal" | "hf" | "hooks" | "lsp" | "modeldb" | "models" | "network" | "plugins"
             | "profile" | "purge" | "relay" | "rename" | "rlm" | "settings" | "share"

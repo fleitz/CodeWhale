@@ -510,6 +510,7 @@ fn command_runs_directly(name: &str) -> bool {
             | "agent"
             | "plan"
             | "trust"
+            | "voice"
             | "logout"
             | "tokens"
             | "change"
@@ -1545,6 +1546,29 @@ mod tests {
         assert!(matches!(
             &change.action,
             CommandPaletteAction::ExecuteCommand { command } if command == "/change"
+        ));
+    }
+
+    #[test]
+    fn command_palette_runs_voice_even_with_optional_subcommands() {
+        let entries = build_entries(
+            Locale::En,
+            Path::new("."),
+            false,
+            Path::new("."),
+            Path::new("mcp.json"),
+            None,
+        );
+        let voice = entries
+            .iter()
+            .find(|entry| entry.section == PaletteSection::Command && entry.label == "/voice")
+            .expect("voice command entry");
+
+        assert_eq!(voice.command, "/voice ");
+        assert!(voice.description.contains("/voice [record|status"));
+        assert!(matches!(
+            &voice.action,
+            CommandPaletteAction::ExecuteCommand { command } if command == "/voice"
         ));
     }
 
