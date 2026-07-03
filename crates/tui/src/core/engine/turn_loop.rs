@@ -232,10 +232,8 @@ impl Engine {
             return 0;
         }
 
-        for completion in completions {
-            self.add_session_message(subagent_completion_runtime_message(&completion.payload))
-                .await;
-        }
+        self.add_session_message(subagent_completion_batch_runtime_message(&completions))
+            .await;
         let prefix = if status_label.is_empty() {
             String::new()
         } else {
@@ -2705,7 +2703,50 @@ XML unless the user explicitly asks to debug sub-agent internals.\n\n\
     )
 }
 
+fn subagent_completion_batch_runtime_text(
+    completions: &[crate::tools::subagent::SubAgentCompletion],
+) -> String {
+    if let [completion] = completions {
+        return subagent_completion_runtime_text(&completion.payload);
+    }
+
+    let count = completions.len();
+    let mut payload = String::new();
+    for (index, completion) in completions.iter().enumerate() {
+        if !payload.is_empty() {
+            payload.push_str("\n\n");
+        }
+        payload.push_str(&format!(
+            "--- sub-agent completion {}/{}: {} ---\n{}",
+            index + 1,
+            count,
+            completion.agent_id,
+            completion.payload
+        ));
+    }
+
+    format!(
+        "<codewhale:runtime_event kind=\"subagent_completion_batch\" visibility=\"internal\">\n\
+This is a batched internal runtime event, not user input. Use the {count} \
+sub-agent completions below to continue coordinating the current task. Do not \
+tell the user they pasted sentinels, do not explain the sentinel protocol, and \
+do not quote the raw XML unless the user explicitly asks to debug sub-agent \
+internals.\n\n\
+{payload}\n\
+</codewhale:runtime_event>"
+    )
+}
+
 fn subagent_completion_runtime_message(payload: &str) -> Message {
+    subagent_completion_batch_runtime_message(&[crate::tools::subagent::SubAgentCompletion {
+        agent_id: "agent".to_string(),
+        payload: payload.to_string(),
+    }])
+}
+
+fn subagent_completion_batch_runtime_message(
+    completions: &[crate::tools::subagent::SubAgentCompletion],
+) -> Message {
     // Role is "user", not "system": some OpenAI-compatible backends apply a
     // strict chat template (e.g. vLLM serving Qwen3) that requires any system
     // message to be messages[0]. A system message appended mid-conversation
@@ -2718,7 +2759,7 @@ fn subagent_completion_runtime_message(payload: &str) -> Message {
         role: "user".to_string(),
         content: vec![
             ContentBlock::Text {
-                text: subagent_completion_runtime_text(payload),
+                text: subagent_completion_batch_runtime_text(completions),
                 cache_control: None,
             },
             runtime_event_turn_metadata_block(UserInputProvenance::SubAgentHandoff),
@@ -3189,6 +3230,37 @@ mod tests {
         assert!(text.contains("Do not tell the user they pasted sentinels"));
         assert!(text.contains("<codewhale:subagent.done>"));
         assert!(text.contains("Build passed"));
+    }
+
+    #[test]
+    fn subagent_completion_batch_handoff_uses_one_internal_message_for_many_agents() {
+        let completions: Vec<_> = (0..30)
+            .map(|index| crate::tools::subagent::SubAgentCompletion {
+                agent_id: format!("agent_{index:02}"),
+                payload: format!(
+                    "Agent {index} complete\n<codewhale:subagent.done>{{\"agent_id\":\"agent_{index:02}\"}}</codewhale:subagent.done>"
+                ),
+            })
+            .collect();
+
+        let message = subagent_completion_batch_runtime_message(&completions);
+
+        assert_eq!(message.role, "user");
+        assert_eq!(
+            message.content.len(),
+            2,
+            "batched completions should add one text block plus turn metadata"
+        );
+        let text = match &message.content[0] {
+            ContentBlock::Text { text, .. } => text,
+            other => panic!("expected text block, got {other:?}"),
+        };
+        assert!(text.contains("kind=\"subagent_completion_batch\""));
+        assert!(text.contains("Use the 30 sub-agent completions below"));
+        assert_eq!(text.matches("<codewhale:runtime_event").count(), 1);
+        assert_eq!(text.matches("<codewhale:subagent.done>").count(), 30);
+        assert!(text.contains("agent_00"));
+        assert!(text.contains("agent_29"));
     }
 
     #[test]
