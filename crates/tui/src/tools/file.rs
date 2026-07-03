@@ -516,11 +516,7 @@ fn read_ipynb(
     max_lines: usize,
 ) -> Result<ToolResult, ToolError> {
     let raw = fs::read_to_string(path).map_err(|e| {
-        ToolError::execution_failed(format!(
-            "Failed to read notebook {}: {}",
-            path.display(),
-            e
-        ))
+        ToolError::execution_failed(format!("Failed to read notebook {}: {}", path.display(), e))
     })?;
 
     let nb: serde_json::Value = serde_json::from_str(&raw).map_err(|e| {
@@ -531,15 +527,9 @@ fn read_ipynb(
         ))
     })?;
 
-    let cells = nb
-        .get("cells")
-        .and_then(|c| c.as_array())
-        .ok_or_else(|| {
-            ToolError::execution_failed(format!(
-                "Notebook {} has no 'cells' array",
-                path.display()
-            ))
-        })?;
+    let cells = nb.get("cells").and_then(|c| c.as_array()).ok_or_else(|| {
+        ToolError::execution_failed(format!("Notebook {} has no 'cells' array", path.display()))
+    })?;
 
     let mut rendered = String::new();
     let mut total_output_bytes: usize = 0;
@@ -567,7 +557,11 @@ fn read_ipynb(
                     .collect::<Vec<_>>()
                     .concat()
             })
-            .or_else(|| cell.get("source").and_then(|v| v.as_str()).map(|s| s.to_string()))
+            .or_else(|| {
+                cell.get("source")
+                    .and_then(|v| v.as_str())
+                    .map(|s| s.to_string())
+            })
             .unwrap_or_default();
 
         let cell_header = format!("## Cell {i} [{cell_type}]\n");
@@ -680,14 +674,21 @@ fn render_notebook_output(output: &serde_json::Value) -> String {
                         .collect::<Vec<_>>()
                         .concat()
                 })
-                .or_else(|| output.get("text").and_then(|v| v.as_str()).map(|s| s.to_string()))
+                .or_else(|| {
+                    output
+                        .get("text")
+                        .and_then(|v| v.as_str())
+                        .map(|s| s.to_string())
+                })
                 .unwrap_or_default();
             if text.is_empty() {
                 return String::new();
             }
             let truncated = truncate_bytes(&text, CELL_MAX_OUTPUT_BYTES);
             if truncated.len() < text.len() {
-                format!("[{name}]:\n{truncated}\n[... truncated at {CELL_MAX_OUTPUT_BYTES} bytes]\n")
+                format!(
+                    "[{name}]:\n{truncated}\n[... truncated at {CELL_MAX_OUTPUT_BYTES} bytes]\n"
+                )
             } else {
                 format!("[{name}]:\n{truncated}\n")
             }
@@ -738,10 +739,7 @@ fn render_notebook_output(output: &serde_json::Value) -> String {
                 .get("ename")
                 .and_then(|v| v.as_str())
                 .unwrap_or("Error");
-            let evalue = output
-                .get("evalue")
-                .and_then(|v| v.as_str())
-                .unwrap_or("");
+            let evalue = output.get("evalue").and_then(|v| v.as_str()).unwrap_or("");
             let traceback = output
                 .get("traceback")
                 .and_then(|v| v.as_array())
@@ -782,12 +780,7 @@ fn truncate_bytes(s: &str, max_bytes: usize) -> &str {
 fn is_archive(path: &Path) -> bool {
     path.extension()
         .and_then(|e| e.to_str())
-        .is_some_and(|ext| {
-            matches!(
-                ext.to_ascii_lowercase().as_str(),
-                "zip" | "tar" | "tgz"
-            )
-        })
+        .is_some_and(|ext| matches!(ext.to_ascii_lowercase().as_str(), "zip" | "tar" | "tgz"))
         || path
             .file_name()
             .and_then(|n| n.to_str())
@@ -815,7 +808,9 @@ fn read_archive(
 
     match (ext.as_str(), is_targz) {
         ("zip", _) => read_zip_archive(path, requested_path, entry),
-        ("tar", _) | (_, true) | ("tgz", _) => read_tar_archive(path, requested_path, entry, is_targz || ext == "tgz"),
+        ("tar", _) | (_, true) | ("tgz", _) => {
+            read_tar_archive(path, requested_path, entry, is_targz || ext == "tgz")
+        }
         (ext, is_tgz) => Err(ToolError::execution_failed(format!(
             "Unsupported archive format: ext={ext}, is_tgz={is_tgz}"
         ))),
@@ -850,31 +845,24 @@ fn read_zip_archive(
     entry: Option<&str>,
 ) -> Result<ToolResult, ToolError> {
     let file = fs::File::open(path).map_err(|e| {
+        ToolError::execution_failed(format!("Failed to open archive {}: {}", path.display(), e))
+    })?;
+
+    let mut archive = zip::ZipArchive::new(file).map_err(|e| {
         ToolError::execution_failed(format!(
-            "Failed to open archive {}: {}",
+            "Failed to read zip archive {}: {}",
             path.display(),
             e
         ))
     })?;
 
-    let mut archive =
-        zip::ZipArchive::new(file).map_err(|e| {
-            ToolError::execution_failed(format!(
-                "Failed to read zip archive {}: {}",
-                path.display(),
-                e
-            ))
-        })?;
-
     if let Some(entry_name) = entry {
         reject_path_traversal(entry_name)?;
-        let mut found = false;
         for i in 0..archive.len() {
             let mut ze = archive.by_index(i).map_err(|e| {
                 ToolError::execution_failed(format!("Failed to access zip entry: {e}"))
             })?;
             if ze.name() == entry_name {
-                found = true;
                 if ze.is_dir() {
                     return Err(ToolError::execution_failed(format!(
                         "Archive entry '{entry_name}' is a directory, not a file"
@@ -891,35 +879,24 @@ fn read_zip_archive(
                 )));
             }
         }
-        if !found {
-            // Enumerate entries for a helpful error message
-            let names: Vec<String> = (0..archive.len())
-                .filter_map(|i| {
-                    archive
-                        .by_index(i)
-                        .ok()
-                        .map(|e| e.name().to_string())
-                })
-                .collect();
-            return Err(ToolError::execution_failed(format!(
-                "Archive entry '{entry_name}' not found. Available entries: {}",
-                names.join(", ")
-            )));
-        }
+        // Enumerate entries for a helpful error message
+        let names: Vec<String> = (0..archive.len())
+            .filter_map(|i| archive.by_index(i).ok().map(|e| e.name().to_string()))
+            .collect();
+        return Err(ToolError::execution_failed(format!(
+            "Archive entry '{entry_name}' not found. Available entries: {}",
+            names.join(", ")
+        )));
     }
 
     // No entry specified — list all entries
     let mut listing = String::new();
     for i in 0..archive.len() {
-        let ze = archive.by_index(i).map_err(|e| {
-            ToolError::execution_failed(format!("Failed to access zip entry: {e}"))
-        })?;
+        let ze = archive
+            .by_index(i)
+            .map_err(|e| ToolError::execution_failed(format!("Failed to access zip entry: {e}")))?;
         let kind = if ze.is_dir() { "dir " } else { "file" };
-        listing.push_str(&format!(
-            "{kind}  {:>8}  {}\n",
-            ze.size(),
-            ze.name()
-        ));
+        listing.push_str(&format!("{kind}  {:>8}  {}\n", ze.size(), ze.name()));
     }
 
     Ok(ToolResult::success(format!(
@@ -940,11 +917,7 @@ fn read_tar_archive(
     gzipped: bool,
 ) -> Result<ToolResult, ToolError> {
     let file = fs::File::open(path).map_err(|e| {
-        ToolError::execution_failed(format!(
-            "Failed to open archive {}: {}",
-            path.display(),
-            e
-        ))
+        ToolError::execution_failed(format!("Failed to open archive {}: {}", path.display(), e))
     })?;
 
     let entries: Vec<TarEntry> = if gzipped {
@@ -960,11 +933,7 @@ fn read_tar_archive(
         reject_path_traversal(entry_name)?;
         // Need to re-open the archive to extract the entry
         let file2 = fs::File::open(path).map_err(|e| {
-            ToolError::execution_failed(format!(
-                "Failed to open archive {}: {}",
-                path.display(),
-                e
-            ))
+            ToolError::execution_failed(format!("Failed to open archive {}: {}", path.display(), e))
         })?;
 
         if gzipped {
@@ -1051,9 +1020,7 @@ fn extract_tar_entry<R: std::io::Read>(
             }
             let mut contents = String::new();
             std::io::Read::read_to_string(&mut entry, &mut contents).map_err(|e| {
-                ToolError::execution_failed(format!(
-                    "Failed to read tar entry '{entry_name}': {e}"
-                ))
+                ToolError::execution_failed(format!("Failed to read tar entry '{entry_name}': {e}"))
             })?;
             return Ok(ToolResult::success(format!(
                 "<archive_entry path=\"{requested_path}\" entry=\"{entry_name}\">\n{contents}\n</archive_entry>"
@@ -1064,11 +1031,7 @@ fn extract_tar_entry<R: std::io::Read>(
     // Entry not found — list available names
     // Re-open again to build listing
     let file = fs::File::open(path).map_err(|e| {
-        ToolError::execution_failed(format!(
-            "Failed to open archive {}: {}",
-            path.display(),
-            e
-        ))
+        ToolError::execution_failed(format!("Failed to open archive {}: {}", path.display(), e))
     })?;
 
     let names: Vec<String> = if gzipped(path) {
@@ -1076,9 +1039,7 @@ fn extract_tar_entry<R: std::io::Read>(
         let mut archive = tar::Archive::new(decoder);
         archive
             .entries()
-            .map_err(|e| {
-                ToolError::execution_failed(format!("Failed to read tar archive: {e}"))
-            })?
+            .map_err(|e| ToolError::execution_failed(format!("Failed to read tar archive: {e}")))?
             .filter_map(|e| {
                 e.ok()
                     .and_then(|e| e.path().ok().map(|p| p.to_string_lossy().to_string()))
@@ -1088,9 +1049,7 @@ fn extract_tar_entry<R: std::io::Read>(
         let mut archive = tar::Archive::new(file);
         archive
             .entries()
-            .map_err(|e| {
-                ToolError::execution_failed(format!("Failed to read tar archive: {e}"))
-            })?
+            .map_err(|e| ToolError::execution_failed(format!("Failed to read tar archive: {e}")))?
             .filter_map(|e| {
                 e.ok()
                     .and_then(|e| e.path().ok().map(|p| p.to_string_lossy().to_string()))
@@ -1111,9 +1070,7 @@ fn gzipped(path: &Path) -> bool {
         || path
             .file_name()
             .and_then(|n| n.to_str())
-            .is_some_and(|name| {
-                name.to_ascii_lowercase().ends_with(".tar.gz")
-            })
+            .is_some_and(|name| name.to_ascii_lowercase().ends_with(".tar.gz"))
 }
 
 // === WriteFileTool ===
