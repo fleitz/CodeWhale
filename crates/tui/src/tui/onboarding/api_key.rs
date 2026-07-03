@@ -97,8 +97,9 @@ fn mask_key(input: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::Config;
+    use crate::config::{Config, SavedCredential};
     use crate::localization::Locale;
+    use crate::test_support::{EnvVarGuard, lock_test_env};
     use crate::tui::app::TuiOptions;
     use std::path::PathBuf;
 
@@ -172,5 +173,50 @@ mod tests {
             body.contains("Press Enter to save"),
             "expected en footer, got: {body}"
         );
+    }
+
+    #[test]
+    fn api_key_screen_and_save_status_use_active_config_path() {
+        let _lock = lock_test_env();
+        let temp = tempfile::tempdir().expect("tempdir");
+        let home = temp.path().join("home");
+        let codewhale_home = temp.path().join("codewhale-home");
+        let config_path = temp.path().join("managed").join("custom-config.toml");
+        std::fs::create_dir_all(&home).expect("home dir");
+
+        let _home = EnvVarGuard::set("HOME", home.as_os_str());
+        let _codewhale_home = EnvVarGuard::set("CODEWHALE_HOME", codewhale_home.as_os_str());
+        let _config_path = EnvVarGuard::set("CODEWHALE_CONFIG_PATH", config_path.as_os_str());
+        let _legacy_config = EnvVarGuard::remove("DEEPSEEK_CONFIG_PATH");
+
+        let mut app = test_app_with_locale(Locale::En);
+        let body: String = lines(&app)
+            .iter()
+            .flat_map(|l| l.spans.iter().map(|s| s.content.to_string()))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            body.contains("active CodeWhale config"),
+            "expected neutral active-config copy, got: {body}"
+        );
+        assert!(
+            !body.contains("~/.codewhale/config.toml"),
+            "onboarding hint must not hard-code the default path: {body}"
+        );
+
+        app.api_key_input = "sk-1234567890abcdef".to_string();
+        let saved = app.submit_api_key().expect("save api key");
+        assert_eq!(saved, SavedCredential::ConfigFile(config_path.clone()));
+
+        let status = format!("API key saved to {}", saved.describe());
+        assert!(
+            status.contains(&config_path.display().to_string()),
+            "save status should show effective config path, got: {status}"
+        );
+        assert!(
+            !status.contains("~/.codewhale/config.toml"),
+            "save status must not report the default path under CODEWHALE_CONFIG_PATH: {status}"
+        );
+        assert!(config_path.exists(), "expected config file to be written");
     }
 }
