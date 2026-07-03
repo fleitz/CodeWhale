@@ -1844,7 +1844,7 @@ async fn run_event_loop(
     // Fire-and-forget version check — runs once per session in the
     // background. On success, a short status toast advertises the update
     // without replacing the user's configured footer/status-line chips.
-    let mut version_check: Option<tokio::task::JoinHandle<Option<String>>> =
+    let mut version_check: Option<tokio::task::JoinHandle<Option<UpdateNotice>>> =
         spawn_startup_version_check(config.update_config());
 
     // Fire a one-shot initial balance fetch for DeepSeek providers
@@ -1876,12 +1876,18 @@ async fn run_event_loop(
         if let Some(ref handle) = version_check {
             done = handle.is_finished();
         }
-        if done && let Ok(Some(hint)) = version_check.take().unwrap().await {
+        if done && let Ok(Some(notice)) = version_check.take().unwrap().await {
+            // Transient toast for immediate visibility, plus a durable
+            // in-transcript notice so the prompt survives the toast TTL and
+            // stays actionable during a busy session (#3961).
             app.push_status_toast(
-                hint,
+                notice.toast_line(),
                 StatusToastLevel::Info,
                 Some(VERSION_HINT_TOAST_TTL_MS),
             );
+            app.add_message(HistoryCell::System {
+                content: notice.notice_block(),
+            });
         }
 
         if !drain_web_config_events(&mut web_config_session, app, config, &engine_handle).await {
@@ -12555,7 +12561,7 @@ fn startup_version_check_source(config: &UpdateConfig) -> StartupVersionCheckSou
 
 fn spawn_startup_version_check(
     config: UpdateConfig,
-) -> Option<tokio::task::JoinHandle<Option<String>>> {
+) -> Option<tokio::task::JoinHandle<Option<UpdateNotice>>> {
     let source = startup_version_check_source(&config);
     if source == StartupVersionCheckSource::Disabled {
         return None;
@@ -12570,7 +12576,7 @@ fn spawn_startup_version_check(
 async fn version_hint_from_startup_source(
     source: StartupVersionCheckSource,
     current: &str,
-) -> Option<String> {
+) -> Option<UpdateNotice> {
     match source {
         StartupVersionCheckSource::Disabled => None,
         StartupVersionCheckSource::ConfiguredUrl(url) => {
@@ -12596,7 +12602,7 @@ async fn version_hint_from_startup_source(
     }
 }
 
-async fn version_hint_from_release_mirror_env(current: &str) -> Option<String> {
+async fn version_hint_from_release_mirror_env(current: &str) -> Option<UpdateNotice> {
     if !release_mirror_env_configured() {
         return None;
     }
@@ -12616,7 +12622,7 @@ fn release_mirror_env_configured() -> bool {
 async fn version_hint_from_configured_update_uri(
     update_uri: &str,
     current: &str,
-) -> Result<Option<String>> {
+) -> Result<Option<UpdateNotice>> {
     let body = codewhale_release::fetch_release_json_async(update_uri, "configured latest release")
         .await?;
     let json: serde_json::Value = serde_json::from_str(&body).with_context(|| {
@@ -12625,7 +12631,7 @@ async fn version_hint_from_configured_update_uri(
     Ok(version_hint_from_custom_release_json(&json, current))
 }
 
-fn version_hint_from_release_json(json: &serde_json::Value, current: &str) -> Option<String> {
+fn version_hint_from_release_json(json: &serde_json::Value, current: &str) -> Option<UpdateNotice> {
     if !release_has_required_assets(json) {
         return None;
     }
@@ -12637,7 +12643,7 @@ fn version_hint_from_release_json(json: &serde_json::Value, current: &str) -> Op
 fn version_hint_from_custom_release_json(
     json: &serde_json::Value,
     current: &str,
-) -> Option<String> {
+) -> Option<UpdateNotice> {
     if !release_is_publishable(json) {
         return None;
     }
@@ -12648,15 +12654,47 @@ fn version_hint_from_custom_release_json(
     version_hint_from_latest_tag(tag, current)
 }
 
-fn version_hint_from_latest_tag(tag: &str, current: &str) -> Option<String> {
+/// A newer-stable-release notice, carrying enough context to render both the
+/// short transient toast and the durable in-transcript update prompt (#3961).
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct UpdateNotice {
+    current: String,
+    latest: String,
+}
+
+impl UpdateNotice {
+    /// Short line for the transient status toast (unchanged wording).
+    fn toast_line(&self) -> String {
+        format!(
+            "v{latest} available - run `codewhale update` and restart",
+            latest = self.latest
+        )
+    }
+
+    /// Durable, actionable notice pushed into the transcript so it survives the
+    /// toast TTL. Includes current/latest versions, release notes, the exact
+    /// update command, and restart guidance.
+    fn notice_block(&self) -> String {
+        format!(
+            "Update available: v{current} -> v{latest}\n\
+             Release notes: https://github.com/Hmbown/CodeWhale/releases/tag/v{latest}\n\
+             Run `codewhale update` (preview with `codewhale update --check`), then restart CodeWhale.",
+            current = self.current,
+            latest = self.latest
+        )
+    }
+}
+
+fn version_hint_from_latest_tag(tag: &str, current: &str) -> Option<UpdateNotice> {
     let latest = tag.trim_start_matches('v');
     if !is_newer_version(latest, current) {
         return None;
     }
 
-    Some(format!(
-        "v{latest} available - run `codewhale update` and restart"
-    ))
+    Some(UpdateNotice {
+        current: current.to_string(),
+        latest: latest.to_string(),
+    })
 }
 
 fn release_has_required_assets(json: &serde_json::Value) -> bool {

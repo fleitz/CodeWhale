@@ -5659,7 +5659,7 @@ fn complete_release_json(tag: &str) -> serde_json::Value {
 fn version_hint_requires_complete_release_assets() {
     let complete = complete_release_json("v0.8.47");
     let hint = version_hint_from_release_json(&complete, "0.8.46").expect("newer complete release");
-    assert!(hint.contains("v0.8.47 available"));
+    assert!(hint.toast_line().contains("v0.8.47 available"));
 
     let mut missing_manifest = complete_release_json("v0.8.47");
     missing_manifest["assets"] = serde_json::Value::Array(
@@ -5747,7 +5747,43 @@ fn custom_update_uri_accepts_tag_only_release_json() {
 
     let hint = version_hint_from_custom_release_json(&json, "0.8.46")
         .expect("tag-only custom metadata should be enough for mirrors");
-    assert!(hint.contains("v0.8.47 available"));
+    assert!(hint.toast_line().contains("v0.8.47 available"));
+}
+
+#[test]
+fn update_notice_block_is_persistent_and_actionable() {
+    let complete = complete_release_json("v0.8.47");
+    let notice = version_hint_from_release_json(&complete, "0.8.46")
+        .expect("newer complete release yields a notice");
+
+    // Durable notice carries current + latest versions, release-notes link,
+    // the exact update command, and restart guidance (#3961 acceptance).
+    let block = notice.notice_block();
+    assert!(
+        block.contains("v0.8.46"),
+        "shows current version: {block:?}"
+    );
+    assert!(block.contains("v0.8.47"), "shows latest version: {block:?}");
+    assert!(
+        block.contains("https://github.com/Hmbown/CodeWhale/releases/tag/v0.8.47"),
+        "includes release-notes link: {block:?}"
+    );
+    assert!(
+        block.contains("codewhale update"),
+        "includes the update command: {block:?}"
+    );
+    assert!(
+        block.contains("codewhale update --check"),
+        "prefers the check-first command: {block:?}"
+    );
+    assert!(
+        block.to_lowercase().contains("restart"),
+        "includes restart guidance: {block:?}"
+    );
+
+    // A current release produces no notice at all (no toast, no transcript spam).
+    let current = complete_release_json("v0.8.46");
+    assert!(version_hint_from_release_json(&current, "0.8.46").is_none());
 }
 
 #[test]
