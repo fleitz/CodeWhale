@@ -278,30 +278,8 @@ impl ToolSpec for ApplyPatchTool {
         let preflight = preflight_apply_patch_plan(&input)?;
 
         if let Some(expected) = expected_hash {
-            // Validate hash for the file being patched.
-            if let Some(path) = preflight.summary.path_override.as_deref() {
-                let resolved = context.resolve_path(path)?;
-                if resolved.exists() {
-                    let contents = read_file_content(&resolved)?;
-                    let actual = format!("sha256:{}", crate::hashing::sha256_hex(contents.as_bytes()));
-                    if actual != expected {
-                        return Err(ToolError::execution_failed(
-                            "File content has changed since last read. Expected hash does not match current content. Re-read the file with read_file before applying the patch."
-                        ));
-                    }
-                }
-            } else if preflight.summary.touched_files.len() == 1 {
-                let path = &preflight.summary.touched_files[0];
-                let resolved = context.resolve_path(path)?;
-                if resolved.exists() {
-                    let contents = read_file_content(&resolved)?;
-                    let actual = format!("sha256:{}", crate::hashing::sha256_hex(contents.as_bytes()));
-                    if actual != expected {
-                        return Err(ToolError::execution_failed(
-                            "File content has changed since last read. Expected hash does not match current content. Re-read the file with read_file before applying the patch."
-                        ));
-                    }
-                }
+            if let Some(path) = expected_hash_target(&preflight.summary) {
+                validate_expected_hash(context, path, expected)?;
             }
         }
 
@@ -378,6 +356,38 @@ impl ToolSpec for ApplyPatchTool {
         }
         Ok(tool_result)
     }
+}
+
+fn expected_hash_target(preflight: &ApplyPatchPreflight) -> Option<&str> {
+    preflight
+        .path_override
+        .as_deref()
+        .or_else(|| preflight.touched_files.first().map(String::as_str))
+}
+
+fn validate_expected_hash(
+    context: &ToolContext,
+    path: &str,
+    expected: &str,
+) -> Result<(), ToolError> {
+    let resolved = context.resolve_path(path)?;
+    if !resolved.exists() {
+        return Err(expected_hash_mismatch_error());
+    }
+
+    let contents = read_file_content(&resolved)?;
+    let actual = format!("sha256:{}", crate::hashing::sha256_hex(contents.as_bytes()));
+    if actual != expected {
+        return Err(expected_hash_mismatch_error());
+    }
+
+    Ok(())
+}
+
+fn expected_hash_mismatch_error() -> ToolError {
+    ToolError::execution_failed(
+        "File content has changed since last read. Expected hash does not match current content. Re-read the file with read_file before applying the patch.",
+    )
 }
 
 /// Parse `apply_patch` input into a reusable, no-mutation preflight summary.
@@ -2058,6 +2068,36 @@ diff --git a/b.txt b/b.txt
     }
 
     #[tokio::test]
+    async fn test_apply_patch_content_hash_guard_rejects_missing_target() {
+        let tmp = tempdir().expect("tempdir");
+        let ctx = ToolContext::new(tmp.path().to_path_buf());
+
+        let previous_hash = format!(
+            "sha256:{}",
+            crate::hashing::sha256_hex("hello world\n".as_bytes())
+        );
+
+        let patch = "@@ -1 +1 @@\n-hello world\n+hi world\n";
+
+        let err = ApplyPatchTool
+            .execute(
+                json!({
+                    "path": "missing.txt",
+                    "patch": patch,
+                    "expected_hash": previous_hash
+                }),
+                &ctx,
+            )
+            .await
+            .expect_err("missing target with expected hash should fail");
+        let message = err.to_string();
+        assert!(
+            message.contains("File content has changed since last read"),
+            "{message}"
+        );
+    }
+
+    #[tokio::test]
     async fn test_apply_patch_content_hash_guard_no_path_matches_first_file() {
         let tmp = tempdir().expect("tempdir");
         let ctx = ToolContext::new(tmp.path().to_path_buf());
@@ -2070,9 +2110,8 @@ diff --git a/b.txt b/b.txt
             crate::hashing::sha256_hex("hello world\n".as_bytes())
         );
 
-        let patch = format!(
-            "--- a/single.txt\n+++ b/single.txt\n@@ -1 +1 @@\n-hello world\n+hi world\n"
-        );
+        let patch =
+            format!("--- a/single.txt\n+++ b/single.txt\n@@ -1 +1 @@\n-hello world\n+hi world\n");
 
         let result = ApplyPatchTool
             .execute(
@@ -2085,5 +2124,53 @@ diff --git a/b.txt b/b.txt
             .await
             .expect("execute with matching hash should succeed");
         assert!(result.success);
+    }
+
+    #[tokio::test]
+    async fn test_apply_patch_content_hash_guard_multi_file_checks_first_file() {
+        let tmp = tempdir().expect("tempdir");
+        let ctx = ToolContext::new(tmp.path().to_path_buf());
+
+        fs::write(tmp.path().join("first.txt"), "first\n").expect("write first");
+        fs::write(tmp.path().join("second.txt"), "second\n").expect("write second");
+
+        let second_file_hash = format!(
+            "sha256:{}",
+            crate::hashing::sha256_hex("second\n".as_bytes())
+        );
+
+        let patch = "\
+--- a/first.txt
++++ b/first.txt
+@@ -1 +1 @@
+-first
++first edited
+--- a/second.txt
++++ b/second.txt
+@@ -1 +1 @@
+-second
++second edited
+";
+
+        let err = ApplyPatchTool
+            .execute(
+                json!({
+                    "patch": patch,
+                    "expected_hash": second_file_hash
+                }),
+                &ctx,
+            )
+            .await
+            .expect_err("hash for a later file should not validate first file");
+        let message = err.to_string();
+        assert!(
+            message.contains("File content has changed since last read"),
+            "{message}"
+        );
+
+        let first = fs::read_to_string(tmp.path().join("first.txt")).expect("read first");
+        let second = fs::read_to_string(tmp.path().join("second.txt")).expect("read second");
+        assert_eq!(first, "first\n");
+        assert_eq!(second, "second\n");
     }
 }

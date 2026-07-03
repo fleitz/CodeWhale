@@ -109,8 +109,7 @@ impl ToolSpec for ReadFileTool {
         // tiny file would silently ignore the request.
         if !explicit_range && total_lines <= SMALL_FILE_LINES && total_bytes <= SMALL_FILE_BYTES {
             return Ok(
-                ToolResult::success(contents)
-                    .with_metadata(json!({"content_hash": content_hash})),
+                ToolResult::success(contents).with_metadata(json!({"content_hash": content_hash}))
             );
         }
 
@@ -659,7 +658,7 @@ impl ToolSpec for EditFileTool {
             let actual = format!("sha256:{}", crate::hashing::sha256_hex(contents.as_bytes()));
             if actual != expected {
                 return Err(ToolError::execution_failed(
-                    "File content has changed since last read. Expected hash does not match current content. Re-read the file with read_file before editing."
+                    "File content has changed since last read. Expected hash does not match current content. Re-read the file with read_file before editing.",
                 ));
             }
         }
@@ -2152,7 +2151,9 @@ mod tests {
         assert!(result.success);
         // Small file goes through fast path — hash is in metadata.
         let metadata = result.metadata.expect("should have metadata");
-        let content_hash = metadata["content_hash"].as_str().expect("should have content_hash");
+        let content_hash = metadata["content_hash"]
+            .as_str()
+            .expect("should have content_hash");
         assert!(content_hash.starts_with("sha256:"));
         assert_eq!(content_hash.len(), 71); // "sha256:" + 64 hex chars
     }
