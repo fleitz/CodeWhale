@@ -368,7 +368,11 @@ impl ModelPickerView {
         let visible_height = usize::from(area.height.saturating_sub(2));
         let (start, end) = visible_row_window(selected, rows.len(), visible_height);
         let title = if rows.len() > visible_height && visible_height > 0 {
-            format!(" {title} {}-{}/{} ", start + 1, end, rows.len())
+            if end == start + 1 {
+                format!(" {title} {}/{} ", start + 1, rows.len())
+            } else {
+                format!(" {title} {}-{}/{} ", start + 1, end, rows.len())
+            }
         } else {
             format!(" {title} ")
         };
