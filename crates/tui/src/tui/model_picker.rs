@@ -1728,6 +1728,47 @@ mod tests {
     }
 
     #[test]
+    fn short_picker_titles_collapse_single_row_ranges_only() {
+        let (app, config, _lock) = create_test_app();
+        let view = ModelPickerView::new(&app, &config);
+        let rows = vec![
+            ("auto".to_string(), String::new()),
+            ("deepseek-v4-pro".to_string(), String::new()),
+            ("deepseek-v4-flash".to_string(), String::new()),
+            ("deepseek-r1".to_string(), String::new()),
+        ];
+
+        let single_row_area = Rect::new(0, 0, 40, 3);
+        let mut single_row_buf = Buffer::empty(single_row_area);
+        view.render_pane(
+            single_row_area,
+            &mut single_row_buf,
+            "Model",
+            rows.clone(),
+            1,
+            true,
+        );
+        let single_row_title = buffer_row_text(&single_row_buf, single_row_area, 0);
+        assert!(
+            single_row_title.contains("Model 2/4"),
+            "single visible row should render as N/total: {single_row_title:?}"
+        );
+        assert!(
+            !single_row_title.contains("Model 2-2/4"),
+            "single visible row should not render a degenerate range: {single_row_title:?}"
+        );
+
+        let multi_row_area = Rect::new(0, 0, 40, 4);
+        let mut multi_row_buf = Buffer::empty(multi_row_area);
+        view.render_pane(multi_row_area, &mut multi_row_buf, "Model", rows, 2, true);
+        let multi_row_title = buffer_row_text(&multi_row_buf, multi_row_area, 0);
+        assert!(
+            multi_row_title.contains("Model 2-3/4"),
+            "multi-row panes should keep the visible range: {multi_row_title:?}"
+        );
+    }
+
+    #[test]
     fn narrow_picker_rows_hide_hint_before_clipping_model_id() {
         let spans = picker_row_spans(
             "minimax/minimax-m3",
