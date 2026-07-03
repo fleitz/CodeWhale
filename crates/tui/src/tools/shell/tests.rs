@@ -1,7 +1,19 @@
 use super::*;
 
+use crate::sandbox::{CommandSpec, SandboxPolicy as ExecutionSandboxPolicy};
+use crate::tools::shell::hints::{
+    looks_like_macos_provenance_failure, shell_network_restricted_hint,
+};
+use crate::tools::shell::process::{STALE_NO_OUTPUT_AFTER, push_shell_args};
+use crate::tools::shell::tools::build_shell_delta_tool_result;
+#[cfg(windows)]
+use crate::tools::shell::types::WindowsJob;
+use crate::tools::shell_output::{summarize_output, truncate_with_meta};
 use crate::tools::spec::ToolContext;
+use crate::tools::spec::{ApprovalRequirement, ToolCapability, ToolSpec};
 use serde_json::{Value, json};
+use std::process::Command;
+use std::time::{Duration, Instant};
 use tempfile::tempdir;
 
 #[cfg(windows)]
