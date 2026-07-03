@@ -210,6 +210,9 @@ product, not an afterthought.
   working across turns — reading, editing, running, checking results — until the
   goal is done, it's blocked, or you stop it. No turn cap. `/task` tracks
   background tasks; the Work sidebar shows live plan and checklist state.
+  The same Work state is injected into every model turn as a `<work_state>` block
+  for grounded continuity across long sessions, compaction, and sub-agent
+  handoff. See [`docs/WORK_SURFACE.md`](docs/WORK_SURFACE.md).
 - **Durable sessions.** Persist across restarts and system sleep; a task that
   takes forty tool calls survives the forty-first.
 - **Headless mode.** `codewhale exec` with `--allowed-tools`,

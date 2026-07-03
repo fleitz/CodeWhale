@@ -86,6 +86,10 @@ checklist entries are the model-visible progress projection. Use `update_plan`
 only for strategy metadata that helps a parent or later worker understand the
 approach.
 
+See [`docs/WORK_SURFACE.md`](WORK_SURFACE.md) for the full Work surface model
+and the shared `<work_state>` block shape used across parent turns, fork state,
+and `/relay`.
+
 ## Worktree isolation
 
 For parallel edit lanes, launch the child with `worktree: true`. CodeWhale

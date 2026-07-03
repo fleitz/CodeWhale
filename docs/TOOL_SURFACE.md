@@ -165,6 +165,10 @@ remains the counted task ledger. When both exist, UI projections should group
 strategy around the checklist instead of showing two peer checklist/progress
 systems for the same run.
 
+See [`docs/WORK_SURFACE.md`](WORK_SURFACE.md) for the full Work surface model,
+the `<work_state>` block shape, and the three continuity paths (parent turn,
+fork state, `/relay`).
+
 ### Verification gates and artifacts
 
 | Tool | Niche |
