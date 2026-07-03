@@ -6944,12 +6944,13 @@ async fn run_interactive(
     );
     let use_alt_screen = should_use_alt_screen(cli, config);
     let use_mouse_capture = should_use_mouse_capture(cli, config, use_alt_screen);
-    let use_bracketed_paste = crate::settings::Settings::load()
-        .map(|s| s.effective_bracketed_paste())
-        .unwrap_or_else(|_| !crate::settings::detected_legacy_windows_console_host());
+    // Avoid a full Settings::load() here just to decide bracketed-paste mode —
+    // the terminal-mode flag can use the same cheap detection the full load uses
+    // as its fallback.  The App ctor loads Settings fully and stores the
+    // authoritative value; this early probe only controls the terminal escape
+    // sequence, so the cheap default is correct on every known terminal (#3757).
+    let use_bracketed_paste = !crate::settings::detected_legacy_windows_console_host();
 
-    // Auto-install bundled system skills (e.g. skill-creator) on first launch.
-    // Errors are non-fatal: log a warning and continue.
     let skills_dir = config.skills_dir();
     if let Err(e) = crate::skills::install_system_skills(&skills_dir) {
         logging::warn(format!("Failed to install system skills: {e}"));

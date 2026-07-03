@@ -6,7 +6,7 @@ use std::fmt::Write as _;
 use std::io::{self, Stdout, Write};
 use std::path::PathBuf;
 use std::sync::{
-    Arc, LazyLock,
+    Arc, LazyLock, OnceLock,
     atomic::{AtomicBool, Ordering},
 };
 use std::thread::{self, JoinHandle};
@@ -644,6 +644,7 @@ fn surface_prompt_override_notices(app: &mut App) {
 /// # }
 /// ```
 pub async fn run_tui(config: &Config, options: TuiOptions) -> Result<()> {
+    crate::startup_trace::mark("run_tui_enter");
     let use_alt_screen = options.use_alt_screen;
     let use_mouse_capture = options.use_mouse_capture;
     let use_bracketed_paste = options.use_bracketed_paste;
@@ -778,6 +779,7 @@ pub async fn run_tui(config: &Config, options: TuiOptions) -> Result<()> {
         && !crate::settings::detected_legacy_windows_console_host();
     reset_terminal_viewport(&mut terminal, sync_output_at_init)?;
     let event_broker = EventBroker::new();
+    crate::startup_trace::mark("terminal_ready");
 
     // Local mutable copy so runtime config flips (e.g. `/provider` switch)
     // can rebuild the API client without restarting the process.
@@ -933,15 +935,10 @@ pub async fn run_tui(config: &Config, options: TuiOptions) -> Result<()> {
     // startup, even when the API key is missing, the base URL is malformed,
     // or the network is unavailable.
     // Translations are skipped with a logged warning until a key is saved.
-    let translation_client = match DeepSeekClient::new(config) {
-        Ok(client) => Some(Arc::new(client)),
-        Err(err) => {
-            if app.onboarding == OnboardingState::None {
-                tracing::warn!("Translation client initialization failed: {err}");
-            }
-            None
-        }
-    };
+    //
+    // Deferred to first use via OnceLock so the HTTP client setup does not
+    // delay early paint (#3757).  Most sessions never translate at all.
+    let translation_client: OnceLock<Option<Arc<DeepSeekClient>>> = OnceLock::new();
 
     if !app.api_messages.is_empty() {
         let _ = engine_handle
@@ -981,7 +978,7 @@ pub async fn run_tui(config: &Config, options: TuiOptions) -> Result<()> {
         engine_handle,
         task_manager,
         &event_broker,
-        translation_client,
+        &translation_client,
     )
     .await;
     automation_cancel.cancel();
@@ -1789,6 +1786,24 @@ fn should_fetch_deepseek_balance(app: &App) -> bool {
         )
 }
 
+fn lazy_translation_client<'a>(
+    translation_client: &'a OnceLock<Option<Arc<DeepSeekClient>>>,
+    config: &Config,
+    onboarding: OnboardingState,
+) -> Option<&'a Arc<DeepSeekClient>> {
+    translation_client
+        .get_or_init(|| match DeepSeekClient::new(config) {
+            Ok(client) => Some(Arc::new(client)),
+            Err(err) => {
+                if onboarding == OnboardingState::None {
+                    tracing::warn!("Translation client initialization failed: {err}");
+                }
+                None
+            }
+        })
+        .as_ref()
+}
+
 #[allow(clippy::too_many_lines)]
 async fn run_event_loop(
     terminal: &mut AppTerminal,
@@ -1797,7 +1812,7 @@ async fn run_event_loop(
     mut engine_handle: EngineHandle,
     task_manager: SharedTaskManager,
     event_broker: &EventBroker,
-    translation_client: Option<Arc<DeepSeekClient>>,
+    translation_client: &OnceLock<Option<Arc<DeepSeekClient>>>,
 ) -> Result<()> {
     // Track streaming state
     let mut current_streaming_text = String::new();
@@ -2158,7 +2173,8 @@ async fn run_event_loop(
                         if app.translation_enabled
                             && !current_streaming_text.is_empty()
                             && crate::tui::translation::needs_translation(&current_streaming_text)
-                            && let Some(translation_client) = translation_client.as_ref()
+                            && let Some(translation_client) =
+                                lazy_translation_client(translation_client, config, app.onboarding)
                         {
                             app.status_message = Some(
                                 crate::localization::tr(
@@ -2246,7 +2262,11 @@ async fn run_event_loop(
                             }
                             if !original_thinking.is_empty()
                                 && crate::tui::translation::needs_translation(&original_thinking)
-                                && let Some(translation_client) = translation_client.as_ref()
+                                && let Some(translation_client) = lazy_translation_client(
+                                    translation_client,
+                                    config,
+                                    app.onboarding,
+                                )
                             {
                                 app.status_message = Some(
                                     crate::localization::thinking_translation_in_progress(

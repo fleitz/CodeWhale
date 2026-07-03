@@ -2355,7 +2355,7 @@ impl App {
             allow_shell,
             use_alt_screen,
             use_mouse_capture,
-            use_bracketed_paste,
+            use_bracketed_paste: _use_bracketed_paste_tui_option,
             max_subagents,
             skills_dir: global_skills_dir,
             memory_path,
@@ -2370,6 +2370,13 @@ impl App {
         } = options;
 
         let settings = Settings::load().unwrap_or_else(|_| Settings::default());
+
+        // Override the bracketed-paste flag with the user's persisted preference.
+        // The TuiOptions value is a cheap terminal-suitable default (set before
+        // Settings I/O); this is the authoritative value for paste processing
+        // and for terminal-mode recovery after config-ui / external-editor
+        // round-trips (#3757).
+        let use_bracketed_paste = settings.effective_bracketed_paste();
 
         // If settings.toml exists on disk but couldn't be parsed (we fell back
         // to defaults), surface a warning in the TUI so the user knows their
