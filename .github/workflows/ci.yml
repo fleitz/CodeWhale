@@ -65,8 +65,42 @@ jobs:
           heavy=false
           whaleflow=false
           for path in "${changed[@]}"; do
+            # Heavy classification. ORDER MATTERS: the must-stay-heavy inputs are
+            # matched BEFORE any light entry so a script that only a heavy-gated
+            # job exercises can never be misclassified as light -- even if a
+            # broad light glob is added to this case later. Anything
+            # unrecognized falls through to the default-heavy `*)` arm
+            # (fail-safe default-heavy).
             case "${path}" in
-              docs/*|*.md|.github/PULL_REQUEST_TEMPLATE.md|.github/ISSUE_TEMPLATE/*|.github/workflows/auto-tag.yml|.github/workflows/stale.yml|.github/workflows/triage.yml)
+              # --- MUST STAY HEAVY: sole inputs to HEAVY-only CI jobs. ---
+              # Only the heavy path exercises these, so a change to them needs
+              # the full heavy suite to validate it:
+              #   scripts/release/npm-wrapper-smoke.js -> npm-wrapper-smoke
+              #       (real steps gated heavy==true AND runner.os != Linux)
+              #   scripts/mobile-smoke.sh              -> mobile-smoke
+              #       (entire job gated heavy==true)
+              #   scripts/check-provider-registry.py   -> lint
+              #       (step gated heavy==true)
+              scripts/release/npm-wrapper-smoke.js|scripts/mobile-smoke.sh|scripts/check-provider-registry.py)
+                heavy=true
+                ;;
+              # --- LIGHT: provably cannot change any Rust build/test outcome
+              # AND is not the trigger input of any heavy-gated job. ---
+              #   docs/*, *.md, PR/issue templates, passive workflows:
+              #       documentation/automation only, no compiled-code impact.
+              #   scripts/v0867-setup-qa.sh: manual QA probe. Referenced by NO
+              #       Rust test, NO build.rs, NO include_str!/Command, and NO CI
+              #       job (only docs/evidence/*.md mention it). CI never runs it
+              #       even under heavy, so lighting it drops ZERO coverage.
+              #       This is the #4024 fix.
+              #   scripts/release/check-versions.sh, check-ohos-deps.sh:
+              #       exercised ONLY by the ALWAYS-on "Version drift" job (no
+              #       needs/if gate), which runs regardless of heavy; a change
+              #       to either is still fully exercised. Coverage preserved.
+              #   scripts/check-coauthor-trailers.py: exercised by the ALWAYS-on
+              #       (non-schedule) lint "Check harvested contributor credit"
+              #       step, which runs regardless of heavy. Coverage preserved.
+              docs/*|*.md|.github/PULL_REQUEST_TEMPLATE.md|.github/ISSUE_TEMPLATE/*|.github/workflows/auto-tag.yml|.github/workflows/stale.yml|.github/workflows/triage.yml|scripts/v0867-setup-qa.sh|scripts/release/check-versions.sh|scripts/release/check-ohos-deps.sh|scripts/check-coauthor-trailers.py)
                 ;;
               *)
                 heavy=true
@@ -148,6 +182,11 @@ jobs:
             -A clippy::unnecessary_map_or \
             -A clippy::collapsible_if \
             -A clippy::assertions_on_constants
+      - name: sccache stats
+        if: needs.changes.outputs.heavy == 'true'
+        continue-on-error: true
+        shell: bash
+        run: sccache --show-stats
       - name: Check provider registry drift
         if: needs.changes.outputs.heavy == 'true'
         run: python3 scripts/check-provider-registry.py
@@ -193,11 +232,28 @@ jobs:
           cache-bin: false
       - name: Run RLM cache workflow mock/replay tests
         run: cargo test -p codewhale-whaleflow --locked rlm_cache_change
+      - name: sccache stats
+        continue-on-error: true
+        shell: bash
+        run: sccache --show-stats
 
   test:
     name: Test
     needs: changes
-    runs-on: ${{ matrix.os }}
+    # Required contexts "Test (ubuntu-latest)", "Test (macos-latest)",
+    # "Test (windows-latest)" derive from job name + matrix.os and are
+    # INDEPENDENT of runs-on. For light changes, run the macOS/Windows legs on
+    # an ubuntu runner (they only echo the skip step) so we stop allocating
+    # scarce macOS/Windows minutes for shell/docs-only PRs. For heavy changes,
+    # real macOS/Windows runners are used exactly as before.
+    #
+    # Ternary safety: `heavy == 'true' && matrix.os || 'ubuntu-latest'`.
+    #   - heavy true : yields matrix.os, always one of the three non-empty
+    #                  enumerated strings (truthy) -> real OS runner.
+    #   - heavy false / empty / unset : left side false -> 'ubuntu-latest'.
+    #   matrix.os can never be empty and the fallback is a literal non-empty
+    #   string, so runs-on can NEVER evaluate to empty.
+    runs-on: ${{ needs.changes.outputs.heavy == 'true' && matrix.os || 'ubuntu-latest' }}
     strategy:
       matrix:
         # Linux workspace tests moved to CNB; GitHub keeps the platform
@@ -232,6 +288,11 @@ jobs:
       - name: Run Offline Eval Harness
         if: needs.changes.outputs.heavy == 'true' && runner.os != 'Linux'
         run: cargo run -p codewhale-tui --all-features -- eval
+      - name: sccache stats
+        if: needs.changes.outputs.heavy == 'true' && runner.os != 'Linux'
+        continue-on-error: true
+        shell: bash
+        run: sccache --show-stats
       - name: Linux test location
         if: needs.changes.outputs.heavy == 'true' && runner.os == 'Linux'
         run: echo "Linux workspace tests run on CNB for mirrored first-party branches."
@@ -240,7 +301,13 @@ jobs:
     name: npm wrapper smoke
     needs: changes
     if: github.event_name != 'schedule'
-    runs-on: ${{ matrix.os }}
+    # Same ternary safety as the Test job. On pull_request the matrix is
+    # ubuntu-only, so the required "npm wrapper smoke (ubuntu-latest)" context
+    # always runs on ubuntu regardless. On push (3-OS matrix) light changes now
+    # run the non-required macOS/Windows legs on ubuntu instead of allocating
+    # real macOS/Windows runners for legs that only echo. Heavy push behavior is
+    # unchanged.
+    runs-on: ${{ needs.changes.outputs.heavy == 'true' && matrix.os || 'ubuntu-latest' }}
     strategy:
       matrix:
         os: ${{ fromJSON(github.event_name == 'pull_request' && '["ubuntu-latest"]' || '["ubuntu-latest","macos-latest","windows-latest"]') }}
@@ -274,6 +341,11 @@ jobs:
       - name: Smoke wrapper install and delegated entrypoints
         if: needs.changes.outputs.heavy == 'true' && runner.os != 'Linux'
         run: node scripts/release/npm-wrapper-smoke.js
+      - name: sccache stats
+        if: needs.changes.outputs.heavy == 'true' && runner.os != 'Linux'
+        continue-on-error: true
+        shell: bash
+        run: sccache --show-stats
       - name: Linux smoke location
         if: needs.changes.outputs.heavy == 'true' && runner.os == 'Linux'
         run: echo "Linux npm wrapper smoke runs on CNB for mirrored first-party branches."
@@ -305,6 +377,10 @@ jobs:
           cache-bin: false
       - name: Run mobile smoke tests
         run: ./scripts/mobile-smoke.sh
+      - name: sccache stats
+        continue-on-error: true
+        shell: bash
+        run: sccache --show-stats
 
   # Check documentation builds without warnings
   docs:
