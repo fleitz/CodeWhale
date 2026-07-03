@@ -8,6 +8,11 @@
 //! - `CLAUDE.md` - Claude-style instructions (compat)
 //! - `.codewhale/instructions.md` - Hidden instructions file (compat)
 //! - `.deepseek/instructions.md` - Hidden instructions file (legacy)
+//! - `.cursorrules` - Cursor IDE rules file (compat)
+//! - `.clinerules` - Cline AI rules file (compat)
+//! - `.github/copilot-instructions.md` - GitHub Copilot instructions (compat)
+//! - `.windsurf/rules/` - Windsurf rules directory (compat)
+//! - `.gemini/` - Gemini instructions directory (compat)
 //!
 //! CodeWhale-specific repo authority/prioritization policy lives separately in
 //! `.codewhale/constitution.json` and is rendered as its own higher-authority
@@ -37,6 +42,9 @@ const PROJECT_CONTEXT_FILES: &[&str] = &[
     "CLAUDE.md",
     ".codewhale/instructions.md",
     ".deepseek/instructions.md",
+    ".cursorrules",
+    ".clinerules",
+    ".github/copilot-instructions.md",
 ];
 
 /// Rules directories auto-discovered at workspace level, in priority order.
@@ -44,7 +52,12 @@ const PROJECT_CONTEXT_FILES: &[&str] = &[
 /// All `.md` files in these directories are loaded as project rules in filename order.
 /// Security model: same trust class as AGENTS.md — workspace-contained content only,
 /// no absolute-path escape. Does not require #417 project-config relaxation.
-const RULES_DIRS: &[&str] = &[".codewhale/rules", ".claude/rules"];
+const RULES_DIRS: &[&str] = &[
+    ".codewhale/rules",
+    ".claude/rules",
+    ".windsurf/rules",
+    ".gemini",
+];
 
 /// File name of the deprecated CodeWhale-native instructions file.
 const DEPRECATED_WHALE_FILENAME: &str = "WHALE.md";
