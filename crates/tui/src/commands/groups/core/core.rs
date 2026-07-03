@@ -478,11 +478,7 @@ pub fn deepseek_links(app: &mut App) -> CommandResult {
             active_marker
         );
         if let Some(key_url) = links.key_url {
-            let _ = writeln!(
-                message,
-                "  {}",
-                tr(locale, MessageId::LinksDashboard)
-            );
+            let _ = writeln!(message, "  {}", tr(locale, MessageId::LinksDashboard));
             let _ = writeln!(message, "    {key_url}");
         } else {
             let _ = writeln!(
@@ -492,11 +488,7 @@ pub fn deepseek_links(app: &mut App) -> CommandResult {
                 links.note
             );
         }
-        let _ = writeln!(
-            message,
-            "  {}",
-            tr(locale, MessageId::LinksDocs)
-        );
+        let _ = writeln!(message, "  {}", tr(locale, MessageId::LinksDocs));
         let _ = writeln!(message, "    {}", links.docs_url);
         let env_vars = provider.env_vars();
         if env_vars.is_empty() {
@@ -642,6 +634,8 @@ mod tests {
     use crate::models::Message;
     use crate::tui::app::{App, AppMode, TuiOptions, TurnCacheRecord};
     use crate::tui::history::HistoryCell;
+    use crate::tui::history::TranscriptRenderOptions;
+    use crate::tui::osc8;
     use std::ffi::OsString;
     use std::path::PathBuf;
     use std::time::Instant;
@@ -1298,6 +1292,47 @@ mod tests {
         assert!(msg.contains("XIAOMI_MIMO_TOKEN_PLAN_API_KEY"));
         assert!(!msg.contains("https://codewhale.dev/docs/providers"));
         assert!(result.action.is_none());
+    }
+
+    #[test]
+    fn deepseek_links_keeps_wrapped_urls_copyable_at_narrow_width() {
+        let _lock = crate::test_support::lock_test_env();
+        let previous_osc8 = osc8::enabled();
+        osc8::set_enabled(true);
+
+        let mut app = create_test_app();
+        let msg = deepseek_links(&mut app)
+            .message
+            .expect("links command should return message");
+        let urls = [
+            "https://platform.xiaomimimo.com/token-plan",
+            "https://docs.z.ai/api-reference/introduction",
+        ];
+        let rendered = HistoryCell::System { content: msg }
+            .lines_with_copy_metadata(40, TranscriptRenderOptions::default());
+        let joined = rendered
+            .iter()
+            .flat_map(|line| line.line.spans.iter())
+            .map(|span| span.content.as_ref())
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        osc8::set_enabled(previous_osc8);
+
+        for url in urls {
+            assert!(
+                joined.contains(url),
+                "rendered narrow /links output should keep the visible URL {url}: {joined:?}"
+            );
+            assert!(
+                joined.matches(&format!("\x1b]8;;{url}\x1b\\")).count() > 1,
+                "wrapped URL chunks should preserve the full OSC 8 target for {url}: {joined:?}"
+            );
+            assert!(
+                !joined.contains(&format!("{url} ")),
+                "URL should remain on its own copyable line, not run into labels or notes: {joined:?}"
+            );
+        }
     }
 
     #[test]
