@@ -2699,6 +2699,42 @@ mod tests {
     }
 
     #[test]
+    fn rival_instruction_files_and_rules_dirs_are_compat_loaded() {
+        for (path, content) in [
+            (".cursorrules", "Cursor rule"),
+            (".clinerules", "Cline rule"),
+            (".github/copilot-instructions.md", "Copilot rule"),
+        ] {
+            let tmp = tempdir().expect("tempdir");
+            if let Some(parent) = std::path::Path::new(path).parent() {
+                fs::create_dir_all(tmp.path().join(parent)).expect("mkdir parent");
+            }
+            fs::write(tmp.path().join(path), content).expect("write compat instruction");
+
+            let ctx = load_project_context(tmp.path());
+            let instructions = ctx.instructions.as_ref().expect("instructions should load");
+            assert!(
+                instructions.contains(content),
+                "expected {path} content to load"
+            );
+        }
+
+        let tmp = tempdir().expect("tempdir");
+        let windsurf_rules = tmp.path().join(".windsurf/rules");
+        let gemini_rules = tmp.path().join(".gemini");
+        fs::create_dir_all(&windsurf_rules).expect("mkdir windsurf rules");
+        fs::create_dir_all(&gemini_rules).expect("mkdir gemini rules");
+        fs::write(windsurf_rules.join("style.md"), "Windsurf rule").expect("write windsurf");
+        fs::write(gemini_rules.join("project.md"), "Gemini rule").expect("write gemini");
+
+        let ctx = load_project_context(tmp.path());
+        let rules = ctx.rules_block.as_ref().expect("rules should load");
+
+        assert!(rules.contains("Windsurf rule"));
+        assert!(rules.contains("Gemini rule"));
+    }
+
+    #[test]
     fn rules_directory_missing_does_not_crash() {
         let tmp = tempdir().expect("tempdir");
         // No .codewhale/rules/ or .claude/rules/ directories exist
