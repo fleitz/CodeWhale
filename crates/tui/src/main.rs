@@ -2788,10 +2788,7 @@ async fn run_doctor(config: &Config, workspace: &Path, config_path_override: Opt
     // State root (v0.8.44)
     println!();
     println!("{}", "State Root:".bold());
-    let code_home =
-        codewhale_config::codewhale_home().unwrap_or_else(|_| PathBuf::from("~/.codewhale"));
-    let legacy_home =
-        codewhale_config::legacy_deepseek_home().unwrap_or_else(|_| PathBuf::from("~/.deepseek"));
+    let (code_home, legacy_home) = doctor_state_roots();
     let active_root = if code_home.exists() {
         &code_home
     } else if legacy_home.exists() {
@@ -3633,6 +3630,17 @@ fn doctor_legacy_state_status(
     }
 }
 
+fn doctor_state_roots() -> (PathBuf, PathBuf) {
+    let code_home =
+        codewhale_config::codewhale_home().unwrap_or_else(|_| PathBuf::from("~/.codewhale"));
+    let legacy_home = if codewhale_config::codewhale_home_is_explicit() {
+        code_home.join(codewhale_config::LEGACY_APP_DIR)
+    } else {
+        codewhale_config::legacy_deepseek_home().unwrap_or_else(|_| PathBuf::from("~/.deepseek"))
+    };
+    (code_home, legacy_home)
+}
+
 fn doctor_legacy_state_report(
     primary_root: &Path,
     legacy_root: &Path,
@@ -4331,10 +4339,7 @@ fn run_doctor_json(
     let api_target = doctor_api_target(config);
     let strict_tool_mode = doctor_strict_tool_mode_status(config);
     let tls_status = doctor_tls_status(config);
-    let code_home =
-        codewhale_config::codewhale_home().unwrap_or_else(|_| PathBuf::from("~/.codewhale"));
-    let legacy_home =
-        codewhale_config::legacy_deepseek_home().unwrap_or_else(|_| PathBuf::from("~/.deepseek"));
+    let (code_home, legacy_home) = doctor_state_roots();
     let legacy_state_report = doctor_legacy_state_report(&code_home, &legacy_home);
 
     let report = json!({
@@ -8060,8 +8065,36 @@ mod serve_bind_host_tests {
 #[cfg(test)]
 mod doctor_legacy_state_tests {
     use super::*;
+    use std::env;
+    use std::ffi::OsString;
     use std::fs;
     use tempfile::TempDir;
+
+    struct EnvVarRestore {
+        key: &'static str,
+        previous: Option<OsString>,
+    }
+
+    impl EnvVarRestore {
+        fn set(key: &'static str, value: impl AsRef<std::ffi::OsStr>) -> Self {
+            let previous = env::var_os(key);
+            unsafe {
+                env::set_var(key, value);
+            }
+            Self { key, previous }
+        }
+    }
+
+    impl Drop for EnvVarRestore {
+        fn drop(&mut self) {
+            unsafe {
+                match &self.previous {
+                    Some(value) => env::set_var(self.key, value),
+                    None => env::remove_var(self.key),
+                }
+            }
+        }
+    }
 
     fn roots(tmp: &TempDir) -> (PathBuf, PathBuf) {
         (tmp.path().join(".codewhale"), tmp.path().join(".deepseek"))
@@ -8170,6 +8203,37 @@ mod doctor_legacy_state_tests {
         assert_eq!(json["needs_attention"], false);
         assert_eq!(json["legacy_only_count"], 0);
         assert_eq!(json["dual_present_count"], 0);
+    }
+
+    #[test]
+    fn doctor_state_roots_ignore_ambient_legacy_home_when_codewhale_home_is_explicit() {
+        let tmp = TempDir::new().expect("tempdir");
+        let explicit_home = tmp.path().join("isolated-codewhale");
+        let ambient_legacy = tmp.path().join(".deepseek");
+        fs::create_dir_all(&ambient_legacy).expect("ambient legacy root");
+        fs::write(
+            ambient_legacy.join("config.toml"),
+            "provider = 'deepseek'\n",
+        )
+        .expect("ambient legacy config");
+        let _home = EnvVarRestore::set("HOME", tmp.path());
+        let _codewhale_home = EnvVarRestore::set("CODEWHALE_HOME", &explicit_home);
+
+        let (primary_root, legacy_root) = doctor_state_roots();
+        let report = doctor_legacy_state_report(&primary_root, &legacy_root);
+
+        assert_eq!(primary_root, explicit_home);
+        assert_eq!(
+            legacy_root,
+            primary_root.join(codewhale_config::LEGACY_APP_DIR)
+        );
+        assert!(
+            report
+                .iter()
+                .all(|entry| entry.status == DoctorLegacyStateStatus::Absent),
+            "doctor must not report ambient legacy state when CODEWHALE_HOME is explicit"
+        );
+        assert!(!report.iter().any(legacy_state_needs_attention));
     }
 }
 

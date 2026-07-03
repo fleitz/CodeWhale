@@ -583,9 +583,14 @@ pub(crate) fn config_toml_path(config_path: Option<&Path>) -> anyhow::Result<Pat
             return Ok(PathBuf::from(trimmed));
         }
     }
+    let codewhale_home = codewhale_config::codewhale_home()
+        .context("failed to resolve CodeWhale home for config.toml path")?;
+    let primary = codewhale_home.join("config.toml");
+    if codewhale_config::codewhale_home_is_explicit() {
+        return Ok(primary);
+    }
     let home =
         effective_home_dir().context("failed to resolve home directory for config.toml path")?;
-    let primary = home.join(".codewhale").join("config.toml");
     if primary.exists() {
         return Ok(primary);
     }
@@ -627,6 +632,7 @@ mod tests {
     struct EnvGuard {
         home: Option<OsString>,
         userprofile: Option<OsString>,
+        codewhale_home: Option<OsString>,
         codewhale_config_path: Option<OsString>,
         deepseek_config_path: Option<OsString>,
         _lock: std::sync::MutexGuard<'static, ()>,
@@ -640,6 +646,7 @@ mod tests {
             let config_str = OsString::from(config_path.as_os_str());
             let home_prev = env::var_os("HOME");
             let userprofile_prev = env::var_os("USERPROFILE");
+            let codewhale_home_prev = env::var_os("CODEWHALE_HOME");
             let codewhale_config_prev = env::var_os("CODEWHALE_CONFIG_PATH");
             let deepseek_config_prev = env::var_os("DEEPSEEK_CONFIG_PATH");
 
@@ -647,6 +654,7 @@ mod tests {
             unsafe {
                 env::set_var("HOME", &home_str);
                 env::set_var("USERPROFILE", &home_str);
+                env::remove_var("CODEWHALE_HOME");
                 env::remove_var("CODEWHALE_CONFIG_PATH");
                 env::set_var("DEEPSEEK_CONFIG_PATH", &config_str);
             }
@@ -654,6 +662,7 @@ mod tests {
             Self {
                 home: home_prev,
                 userprofile: userprofile_prev,
+                codewhale_home: codewhale_home_prev,
                 codewhale_config_path: codewhale_config_prev,
                 deepseek_config_path: deepseek_config_prev,
                 _lock: lock,
@@ -684,6 +693,18 @@ mod tests {
                 // Safety: test-only environment mutation guarded by a global mutex.
                 unsafe {
                     env::remove_var("USERPROFILE");
+                }
+            }
+
+            if let Some(value) = self.codewhale_home.take() {
+                // Safety: test-only environment mutation guarded by a global mutex.
+                unsafe {
+                    env::set_var("CODEWHALE_HOME", value);
+                }
+            } else {
+                // Safety: test-only environment mutation guarded by a global mutex.
+                unsafe {
+                    env::remove_var("CODEWHALE_HOME");
                 }
             }
 
@@ -773,6 +794,26 @@ mod tests {
         }
 
         assert_eq!(config_toml_path(None).unwrap(), legacy_config);
+    }
+
+    #[test]
+    fn config_toml_path_ignores_legacy_config_when_codewhale_home_is_explicit() {
+        let temp_root = temp_root("codewhale-config-path-explicit-home");
+        let explicit_home = temp_root.join("isolated-codewhale");
+        let legacy_config = temp_root.join(".deepseek").join("config.toml");
+        fs::create_dir_all(legacy_config.parent().unwrap()).unwrap();
+        fs::write(&legacy_config, "").unwrap();
+        let _guard = EnvGuard::new(&temp_root);
+
+        unsafe {
+            env::remove_var("DEEPSEEK_CONFIG_PATH");
+            env::set_var("CODEWHALE_HOME", &explicit_home);
+        }
+
+        assert_eq!(
+            config_toml_path(None).unwrap(),
+            explicit_home.join("config.toml")
+        );
     }
 
     #[test]

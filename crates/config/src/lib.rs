@@ -3296,6 +3296,14 @@ fn codewhale_home_env_override() -> Option<PathBuf> {
     }
 }
 
+/// Whether `$CODEWHALE_HOME` is set to a non-empty value.
+///
+/// An explicit CodeWhale home is an isolation boundary: state/config resolvers
+/// must not fall back to ambient legacy `~/.deepseek` data outside that root.
+pub fn codewhale_home_is_explicit() -> bool {
+    codewhale_home_env_override().is_some()
+}
+
 /// Resolve the legacy DeepSeek home directory (`$HOME/.deepseek`).
 ///
 /// Always returns the legacy path regardless of whether it exists.
@@ -3715,7 +3723,7 @@ pub fn default_config_path() -> Result<PathBuf> {
     // Prefer ~/.codewhale/config.toml when it exists (fresh install or
     // migrated), otherwise fall back to ~/.deepseek/config.toml.
     let primary = codewhale_home()?.join(CONFIG_FILE_NAME);
-    if primary.exists() {
+    if codewhale_home_is_explicit() || primary.exists() {
         return Ok(primary);
     }
     let legacy = legacy_deepseek_home()?.join(CONFIG_FILE_NAME);
@@ -3747,6 +3755,9 @@ impl ConfigMigration {
 /// is loaded; copies the legacy file if the primary doesn't exist yet.
 /// Never overwrites an existing primary config.
 pub fn migrate_config_if_needed() -> Result<Option<ConfigMigration>> {
+    if codewhale_home_is_explicit() {
+        return Ok(None);
+    }
     let primary = codewhale_home()?.join(CONFIG_FILE_NAME);
     if primary.exists() {
         return Ok(None);

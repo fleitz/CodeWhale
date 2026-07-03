@@ -115,6 +115,11 @@ impl TuiPrefs {
         let primary = codewhale_config::codewhale_home()
             .ok()
             .map(|home| home.join(TUI_PREFS_FILE_NAME));
+        if codewhale_config::codewhale_home_is_explicit() {
+            return primary.ok_or_else(|| {
+                anyhow::anyhow!("Failed to resolve tui.toml path: no CodeWhale home found.")
+            });
+        }
         let legacy_home = codewhale_config::legacy_deepseek_home()
             .ok()
             .map(|home| home.join(TUI_PREFS_FILE_NAME));
@@ -1219,6 +1224,9 @@ fn settings_path_candidates() -> (Option<PathBuf>, Option<PathBuf>, Option<PathB
     let primary = codewhale_config::codewhale_home()
         .ok()
         .map(|home| home.join(SETTINGS_FILE_NAME));
+    if codewhale_config::codewhale_home_is_explicit() {
+        return (primary, None, None);
+    }
     let legacy_home = codewhale_config::legacy_deepseek_home()
         .ok()
         .map(|home| home.join(SETTINGS_FILE_NAME));
@@ -2763,7 +2771,7 @@ mod tests {
     }
 
     #[test]
-    fn settings_load_migrates_legacy_deepseek_home_into_codewhale_home() {
+    fn settings_load_migrates_legacy_deepseek_home_into_codewhale_home_without_explicit_home() {
         let _g = config_path_test_guard();
         let tmp = tempfile::tempdir().expect("tempdir");
         let primary = tmp.path().join(".codewhale").join("settings.toml");
@@ -2772,7 +2780,7 @@ mod tests {
         std::fs::create_dir_all(&legacy_dir).expect("legacy dir");
         std::fs::write(&legacy_home, "low_motion = true\n").expect("legacy settings");
         let _config_override = EnvVarRestore::remove("DEEPSEEK_CONFIG_PATH");
-        let _codewhale_home = EnvVarRestore::set("CODEWHALE_HOME", tmp.path().join(".codewhale"));
+        let _codewhale_home = EnvVarRestore::remove("CODEWHALE_HOME");
         let _home = EnvVarRestore::set("HOME", tmp.path());
 
         let loaded = Settings::load().expect("load settings");
@@ -2790,12 +2798,12 @@ mod tests {
     }
 
     #[test]
-    fn settings_load_migrates_platform_legacy_fallback_into_codewhale_home() {
+    fn settings_load_migrates_platform_legacy_fallback_into_codewhale_home_without_explicit_home() {
         let _g = config_path_test_guard();
         let tmp = tempfile::tempdir().expect("tempdir");
         let primary = tmp.path().join(".codewhale").join("settings.toml");
         let _config_override = EnvVarRestore::remove("DEEPSEEK_CONFIG_PATH");
-        let _codewhale_home = EnvVarRestore::set("CODEWHALE_HOME", tmp.path().join(".codewhale"));
+        let _codewhale_home = EnvVarRestore::remove("CODEWHALE_HOME");
         let _home = EnvVarRestore::set("HOME", tmp.path());
         let _xdg = EnvVarRestore::set("XDG_CONFIG_HOME", tmp.path().join("platform-config"));
         #[cfg(windows)]
@@ -2819,6 +2827,42 @@ mod tests {
         assert!(
             display.contains(&format!("Config file: {}", primary.display())),
             "settings display should surface the canonical codewhale path:\n{display}"
+        );
+    }
+
+    #[test]
+    fn settings_load_ignores_legacy_files_when_codewhale_home_is_explicit() {
+        let _g = config_path_test_guard();
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let explicit_home = tmp.path().join("isolated-codewhale");
+        let legacy_dir = tmp.path().join(".deepseek");
+        std::fs::create_dir_all(&legacy_dir).expect("legacy dir");
+        std::fs::write(
+            legacy_dir.join("settings.toml"),
+            "theme = \"dracula\"\ncomposer_density = \"spacious\"\nsidebar_width_percent = 42\n",
+        )
+        .expect("legacy settings");
+        let _config_override = EnvVarRestore::remove("DEEPSEEK_CONFIG_PATH");
+        let _codewhale_home = EnvVarRestore::set("CODEWHALE_HOME", &explicit_home);
+        let _home = EnvVarRestore::set("HOME", tmp.path());
+
+        let loaded = Settings::load().expect("load settings");
+
+        assert_eq!(
+            loaded.theme, "system",
+            "explicit CODEWHALE_HOME must not inherit ambient legacy settings"
+        );
+        assert_eq!(
+            loaded.composer_density, "comfortable",
+            "explicit CODEWHALE_HOME must not inherit ambient legacy settings"
+        );
+        assert_eq!(
+            loaded.sidebar_width_percent, 28,
+            "explicit CODEWHALE_HOME must not inherit ambient legacy settings"
+        );
+        assert!(
+            !explicit_home.join("settings.toml").exists(),
+            "ambient legacy settings must not be migrated into explicit CODEWHALE_HOME"
         );
     }
 
@@ -2867,6 +2911,23 @@ mod tests {
         let got = TuiPrefs::path().expect("tui prefs path");
 
         assert_eq!(got, tmp.path().join(".codewhale").join("tui.toml"));
+    }
+
+    #[test]
+    fn tui_prefs_path_ignores_legacy_home_when_codewhale_home_is_explicit() {
+        let _g = config_path_test_guard();
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let explicit_home = tmp.path().join("isolated-codewhale");
+        let legacy_dir = tmp.path().join(".deepseek");
+        std::fs::create_dir_all(&legacy_dir).expect("legacy dir");
+        std::fs::write(legacy_dir.join("tui.toml"), "theme = \"light\"\n").expect("legacy prefs");
+        let _config_override = EnvVarRestore::remove("DEEPSEEK_CONFIG_PATH");
+        let _codewhale_home = EnvVarRestore::set("CODEWHALE_HOME", &explicit_home);
+        let _home = EnvVarRestore::set("HOME", tmp.path());
+
+        let got = TuiPrefs::path().expect("tui prefs path");
+
+        assert_eq!(got, explicit_home.join("tui.toml"));
     }
 
     #[test]

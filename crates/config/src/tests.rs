@@ -2219,39 +2219,13 @@ fn list_values_redacts_unicode_api_key_without_byte_slicing() {
 #[test]
 fn app_homes_prefer_home_env_before_platform_home_fallback() {
     let _lock = env_lock();
-    struct HomeEnvGuard {
-        home: Option<OsString>,
-        userprofile: Option<OsString>,
-        codewhale_home: Option<OsString>,
-    }
-
-    impl Drop for HomeEnvGuard {
-        fn drop(&mut self) {
-            // Safety: test-only environment mutation is serialized by env_lock().
-            unsafe {
-                match self.home.take() {
-                    Some(value) => env::set_var("HOME", value),
-                    None => env::remove_var("HOME"),
-                }
-                match self.userprofile.take() {
-                    Some(value) => env::set_var("USERPROFILE", value),
-                    None => env::remove_var("USERPROFILE"),
-                }
-                match self.codewhale_home.take() {
-                    Some(value) => env::set_var("CODEWHALE_HOME", value),
-                    None => env::remove_var("CODEWHALE_HOME"),
-                }
-            }
-        }
-    }
-
     let home =
         std::env::temp_dir().join(format!("codewhale-config-home-env-{}", std::process::id()));
     let userprofile = std::env::temp_dir().join(format!(
         "codewhale-config-userprofile-{}",
         std::process::id()
     ));
-    let _env = HomeEnvGuard {
+    let _env = StateEnvRestore {
         home: env::var_os("HOME"),
         userprofile: env::var_os("USERPROFILE"),
         codewhale_home: env::var_os("CODEWHALE_HOME"),
@@ -2286,32 +2260,6 @@ fn app_homes_prefer_home_env_before_platform_home_fallback() {
 #[test]
 fn migrate_config_reports_copied_legacy_path() {
     let _lock = env_lock();
-    struct HomeEnvGuard {
-        home: Option<OsString>,
-        userprofile: Option<OsString>,
-        codewhale_home: Option<OsString>,
-    }
-
-    impl Drop for HomeEnvGuard {
-        fn drop(&mut self) {
-            // Safety: test-only environment mutation is serialized by env_lock().
-            unsafe {
-                match self.home.take() {
-                    Some(value) => env::set_var("HOME", value),
-                    None => env::remove_var("HOME"),
-                }
-                match self.userprofile.take() {
-                    Some(value) => env::set_var("USERPROFILE", value),
-                    None => env::remove_var("USERPROFILE"),
-                }
-                match self.codewhale_home.take() {
-                    Some(value) => env::set_var("CODEWHALE_HOME", value),
-                    None => env::remove_var("CODEWHALE_HOME"),
-                }
-            }
-        }
-    }
-
     struct LegacyConfigGuard {
         path: PathBuf,
         original: Option<Vec<u8>>,
@@ -2352,7 +2300,7 @@ fn migrate_config_reports_copied_legacy_path() {
     let legacy_config = legacy_dir.join(CONFIG_FILE_NAME);
     let _legacy = LegacyConfigGuard::install(legacy_config.clone(), b"provider = \"deepseek\"\n");
 
-    let _env = HomeEnvGuard {
+    let _env = StateEnvRestore {
         home: env::var_os("HOME"),
         userprofile: env::var_os("USERPROFILE"),
         codewhale_home: env::var_os("CODEWHALE_HOME"),
@@ -2361,7 +2309,7 @@ fn migrate_config_reports_copied_legacy_path() {
     unsafe {
         env::set_var("HOME", &home);
         env::set_var("USERPROFILE", &home);
-        env::set_var("CODEWHALE_HOME", &primary_dir);
+        env::remove_var("CODEWHALE_HOME");
     }
 
     let migration = migrate_config_if_needed()
@@ -2378,6 +2326,53 @@ fn migrate_config_reports_copied_legacy_path() {
     assert_eq!(
         fs::read_to_string(primary_dir.join(CONFIG_FILE_NAME)).expect("primary config"),
         "provider = \"deepseek\"\n"
+    );
+
+    let _ = fs::remove_dir_all(home);
+}
+
+#[test]
+fn explicit_codewhale_home_bypasses_legacy_config_fallback_and_migration() {
+    let _lock = env_lock();
+    let unique = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("clock")
+        .as_nanos();
+    let home = std::env::temp_dir().join(format!(
+        "codewhale-config-explicit-isolation-{}-{unique}",
+        std::process::id()
+    ));
+    let legacy_config = home.join(LEGACY_APP_DIR).join(CONFIG_FILE_NAME);
+    fs::create_dir_all(legacy_config.parent().expect("legacy config parent")).expect("legacy dir");
+    fs::write(&legacy_config, b"provider = \"deepseek\"\n").expect("legacy config");
+
+    let explicit_home = home.join("isolated-codewhale");
+    let _env = StateEnvRestore {
+        home: env::var_os("HOME"),
+        userprofile: env::var_os("USERPROFILE"),
+        codewhale_home: env::var_os("CODEWHALE_HOME"),
+    };
+    // Safety: test-only environment mutation is serialized by env_lock().
+    unsafe {
+        env::set_var("HOME", &home);
+        env::set_var("USERPROFILE", &home);
+        env::set_var("CODEWHALE_HOME", &explicit_home);
+    }
+
+    assert_eq!(
+        default_config_path().expect("default config path"),
+        explicit_home.join(CONFIG_FILE_NAME),
+        "explicit CODEWHALE_HOME must not read ambient legacy config"
+    );
+    assert!(
+        migrate_config_if_needed()
+            .expect("migration check")
+            .is_none(),
+        "explicit CODEWHALE_HOME must not migrate ambient legacy config"
+    );
+    assert!(
+        !explicit_home.join(CONFIG_FILE_NAME).exists(),
+        "legacy config must not be copied into explicit CODEWHALE_HOME"
     );
 
     let _ = fs::remove_dir_all(home);
