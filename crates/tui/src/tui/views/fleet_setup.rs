@@ -677,7 +677,7 @@ fn render_choice_step(
         return;
     }
 
-    let (list_area, detail_area) = if area.width >= 56 {
+    let (list_area, detail_area) = if area.width >= 80 {
         let cols = Layout::default()
             .direction(Direction::Horizontal)
             .constraints([Constraint::Length(22), Constraint::Min(20)])
