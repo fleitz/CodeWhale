@@ -662,13 +662,20 @@ fn subagent_mailbox_best_effort_send_permitted(
 }
 
 impl Engine {
-    fn mode_runtime_instructions(mode: AppMode) -> &'static str {
-        match mode {
+    fn mode_runtime_instructions(&self, mode: AppMode) -> String {
+        let base = match mode {
             AppMode::Agent | AppMode::Auto => prompts::AGENT_MODE,
             AppMode::Plan => prompts::PLAN_MODE,
             AppMode::Yolo => prompts::YOLO_MODE,
         }
-        .trim()
+        .trim();
+        let policy = ToolSurfacePolicy::for_prompt_mode(
+            mode,
+            self.session.allow_shell,
+            self.config.allowed_tools.as_deref(),
+            self.config.disallowed_tools.as_deref(),
+        );
+        policy.render_mode_instructions(base)
     }
 
     pub(super) async fn emit_compaction_started(
@@ -1998,7 +2005,7 @@ impl Engine {
             "Current mode policy source: runtime".to_string(),
             format!(
                 "Current mode policy:\n{}",
-                Self::mode_runtime_instructions(self.current_mode)
+                self.mode_runtime_instructions(self.current_mode)
             ),
             format!("Input provenance: {}", provenance.as_str()),
             format!(
@@ -2602,24 +2609,21 @@ impl Engine {
                 self.api_config.api_provider(),
                 &self.config.model,
             );
-            let mut catalog = build_model_tool_catalog_with_surface(
-                registry.to_api_tools_with_cache(true),
-                mcp_tools,
+            let policy = ToolSurfacePolicy::for_turn(
                 input_policy.mode,
-                &self.config.tools_always_load,
+                self.session.allow_shell,
+                input_policy.approval_mode,
+                input_policy.auto_approve,
                 capability.tool_surface_budget,
-            );
-            for tool in &mut catalog {
-                if plugin_tool_names.contains(&tool.name) {
-                    tool.defer_loading = Some(false);
-                }
-            }
-            filter_tool_catalog_for_gates(
-                &mut catalog,
                 self.config.allowed_tools.as_deref(),
                 self.config.disallowed_tools.as_deref(),
             );
-            catalog
+            policy.build_catalog(
+                registry.to_api_tools_with_cache(true),
+                mcp_tools,
+                &self.config.tools_always_load,
+                &plugin_tool_names,
+            )
         });
         let tool_catalog_for_event = tools.clone();
         let base_url_for_event = self
@@ -3890,6 +3894,7 @@ mod lsp_hooks;
 mod streaming;
 mod token_estimate_cache;
 mod tool_catalog;
+mod tool_catalog_policy;
 mod tool_execution;
 mod tool_setup;
 mod turn_loop;
@@ -3899,19 +3904,6 @@ pub(super) const MAX_PARALLEL_SHELL_EXEC: usize = 4;
 
 pub(crate) fn default_active_native_tool_names() -> &'static [&'static str] {
     tool_catalog::DEFAULT_ACTIVE_NATIVE_TOOLS
-}
-
-/// Drop catalog entries the execution gates would reject (#3027): the model
-/// should never be advertised a tool it cannot call. Deny wins over allow.
-fn filter_tool_catalog_for_gates(
-    catalog: &mut Vec<Tool>,
-    allowed_tools: Option<&[String]>,
-    disallowed_tools: Option<&[String]>,
-) {
-    catalog.retain(|tool| {
-        !turn_loop::command_denies_tool(disallowed_tools, &tool.name)
-            && turn_loop::command_allows_tool(allowed_tools, &tool.name)
-    });
 }
 
 use self::approval::{ApprovalDecision, ApprovalResult, UserInputDecision};
@@ -3938,14 +3930,15 @@ use self::streaming::{
 };
 use self::tool_catalog::{
     CODE_EXECUTION_TOOL_NAME, JS_EXECUTION_TOOL_NAME, MULTI_TOOL_PARALLEL_NAME,
-    REQUEST_USER_INPUT_NAME, active_tools_for_step, build_model_tool_catalog_with_surface,
-    ensure_advanced_tooling, execute_code_execution_tool, execute_tool_search,
-    initial_active_tools, is_tool_search_tool, maybe_hydrate_requested_deferred_tool,
-    missing_tool_error_message, tool_catalog_consistency_issues,
+    REQUEST_USER_INPUT_NAME, ToolSurfacePolicy, active_tools_for_step, ensure_advanced_tooling,
+    execute_code_execution_tool, execute_tool_search, initial_active_tools, is_tool_search_tool,
+    maybe_hydrate_requested_deferred_tool, missing_tool_error_message,
+    tool_catalog_consistency_issues,
 };
 #[cfg(test)]
 use self::tool_catalog::{
-    TOOL_SEARCH_NAME, build_model_tool_catalog, maybe_activate_requested_deferred_tool,
+    TOOL_SEARCH_NAME, build_model_tool_catalog, build_model_tool_catalog_with_surface,
+    filter_tool_catalog_for_gates, maybe_activate_requested_deferred_tool,
     preflight_requested_deferred_tool, should_default_defer_tool,
 };
 use self::tool_execution::emit_tool_audit;

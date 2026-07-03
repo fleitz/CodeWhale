@@ -1,9 +1,10 @@
-//! Deferred tool catalog and built-in advanced tool helpers.
+//! Deferred tool catalog operational helpers.
 //!
 //! The streaming turn loop owns when tools are offered or executed. This module
-//! owns the catalog-level policy around deferred loading, tool search, missing
-//! tool suggestions, and the small set of built-in advanced tools that are not
-//! registered by the normal runtime tool registry.
+//! owns the operational side of the catalog — tool search, missing tool
+//! suggestions, deferred tool hydration, and catalog consistency checks.
+//! Catalog building, deferral, and filtering policy lives in
+//! `tool_catalog_policy`.
 
 use std::collections::HashSet;
 use std::path::Path;
@@ -11,285 +12,29 @@ use std::time::Duration;
 
 use serde_json::{Value, json};
 
+use crate::dependencies::ExternalTool;
 use crate::mcp::McpPool;
-use crate::model_profile::ToolSurfaceBudget;
 use crate::models::Tool;
 use crate::tools::spec::{ToolError, ToolResult, optional_str, optional_u64, required_str};
-use crate::tui::app::AppMode;
 
-use crate::dependencies::ExternalTool;
-
-pub(super) const MULTI_TOOL_PARALLEL_NAME: &str = "multi_tool_use.parallel";
-pub(super) const REQUEST_USER_INPUT_NAME: &str = "request_user_input";
-pub(super) const CODE_EXECUTION_TOOL_NAME: &str = "code_execution";
-const CODE_EXECUTION_TOOL_TYPE: &str = "code_execution_20250825";
-pub(super) use crate::tools::js_execution::JS_EXECUTION_TOOL_NAME;
-pub(super) const TOOL_SEARCH_NAME: &str = "tool_search";
-const TOOL_SEARCH_TYPE: &str = "tool_search_20251119";
-const LEGACY_TOOL_SEARCH_REGEX_NAME: &str = "tool_search_tool_regex";
-const LEGACY_TOOL_SEARCH_BM25_NAME: &str = "tool_search_tool_bm25";
-const TOOL_SEARCH_DEFAULT_MAX_RESULTS: usize = 20;
-const TOOL_SEARCH_MAX_RESULTS_LIMIT: usize = 100;
-
-pub(super) fn is_tool_search_tool(name: &str) -> bool {
-    matches!(
-        name,
-        TOOL_SEARCH_NAME | LEGACY_TOOL_SEARCH_REGEX_NAME | LEGACY_TOOL_SEARCH_BM25_NAME
-    )
-}
-
-pub(super) const DEFAULT_ACTIVE_NATIVE_TOOLS: &[&str] = &[
-    "agent",
-    "apply_patch",
-    "checklist_write",
-    "edit_file",
-    "exec_interact",
-    "exec_shell",
-    "exec_shell_interact",
-    "exec_shell_wait",
-    "exec_wait",
-    "fetch_url",
-    "file_search",
-    "git_diff",
-    "git_log",
-    "git_show",
-    "git_status",
-    "grep_files",
-    "list_dir",
-    "read_file",
-    "run_tests",
-    "run_verifiers",
-    "task_create",
-    "task_list",
-    "task_read",
-    "update_plan",
-    "wait_for_dev_server",
-    "web_search",
-    "write_file",
-];
-
-const CORE_ACTION_TOOL_FALLBACKS: &[CoreActionToolFallback] = &[
-    CoreActionToolFallback {
-        name: "exec_shell",
-        description: "Run shell commands in the workspace.",
-        unavailable_reason: "Not present in the current model-visible catalog. Interactive Agent sessions expose shell by default unless allow_shell = false; noninteractive and durable profiles require allow_shell = true. Plan mode hides shell, and command tool allow/deny gates can also block it.",
-    },
-    CoreActionToolFallback {
-        name: "write_file",
-        description: "Create or overwrite files in the workspace.",
-        unavailable_reason: "Not present in the current model-visible catalog. File writes require Agent or Yolo mode and no command tool allow/deny gate blocking write_file.",
-    },
-    CoreActionToolFallback {
-        name: "edit_file",
-        description: "Edit existing files by replacing text.",
-        unavailable_reason: "Not present in the current model-visible catalog. File edits require Agent or Yolo mode and no command tool allow/deny gate blocking edit_file.",
-    },
-    CoreActionToolFallback {
-        name: "apply_patch",
-        description: "Apply a patch to one or more workspace files.",
-        unavailable_reason: "Not present in the current model-visible catalog. Patches require Agent or Yolo mode, the apply_patch feature, and no command tool allow/deny gate blocking apply_patch.",
-    },
-];
-
-#[derive(Debug, Clone, Copy)]
-struct CoreActionToolFallback {
-    name: &'static str,
-    description: &'static str,
-    unavailable_reason: &'static str,
-}
-
-pub(super) fn should_default_defer_tool(name: &str, always_load: &HashSet<String>) -> bool {
-    if always_load.contains(name) {
-        return false;
-    }
-
-    if is_tool_search_tool(name) {
-        return false;
-    }
-
-    !DEFAULT_ACTIVE_NATIVE_TOOLS
-        .iter()
-        .any(|core_tool| core_tool == &name)
-}
-
-pub(super) fn apply_native_tool_deferral(catalog: &mut [Tool], always_load: &HashSet<String>) {
-    for tool in catalog {
-        tool.defer_loading = Some(should_default_defer_tool(&tool.name, always_load));
-    }
-}
-
-fn should_keep_mcp_tool_loaded(name: &str) -> bool {
-    matches!(
-        name,
-        "list_mcp_resources"
-            | "list_mcp_resource_templates"
-            | "mcp_read_resource"
-            | "read_mcp_resource"
-            | "mcp_get_prompt"
-    )
-}
-
-pub(super) fn apply_mcp_tool_deferral(catalog: &mut [Tool], mode: AppMode) {
-    for tool in catalog {
-        tool.defer_loading =
-            Some(mode != AppMode::Yolo && !should_keep_mcp_tool_loaded(&tool.name));
-    }
-}
-
-/// Build the model tool catalog from native and MCP tool lists.
-///
-/// **Catalog-head stability invariant.** The head of the catalog (all
-/// non-deferred tools) must remain byte-identical across mode toggles
-/// (Plan ↔ Agent ↔ YOLO) for tools that are common to both modes.
-/// Deferred tool activations append to the tail and never reorder the
-/// head. This invariant is critical for DeepSeek's KV prefix cache:
-/// the tools array is part of the immutable prefix, and any byte-level
-/// change in the head forces a full re-prefill on the next turn.
+// Re-export policy items so engine.rs and other callers continue to import
+// from `self::tool_catalog::*` unchanged (#3940).
+pub(super) use super::tool_catalog_policy::{
+    CODE_EXECUTION_TOOL_NAME, DEFAULT_ACTIVE_NATIVE_TOOLS, JS_EXECUTION_TOOL_NAME,
+    MULTI_TOOL_PARALLEL_NAME, REQUEST_USER_INPUT_NAME, TOOL_SEARCH_MAX_RESULTS_LIMIT,
+    TOOL_SEARCH_NAME, ToolSurfacePolicy, ensure_advanced_tooling, is_tool_search_tool,
+};
 #[cfg(test)]
-pub(super) fn build_model_tool_catalog(
-    native_tools: Vec<Tool>,
-    mcp_tools: Vec<Tool>,
-    mode: AppMode,
-    always_load: &HashSet<String>,
-) -> Vec<Tool> {
-    build_model_tool_catalog_with_surface(
-        native_tools,
-        mcp_tools,
-        mode,
-        always_load,
-        ToolSurfaceBudget::Standard,
-    )
-}
+pub(super) use super::tool_catalog_policy::{
+    build_model_tool_catalog, build_model_tool_catalog_with_surface, filter_tool_catalog_for_gates,
+    should_default_defer_tool,
+};
 
-pub(super) fn build_model_tool_catalog_with_surface(
-    mut native_tools: Vec<Tool>,
-    mut mcp_tools: Vec<Tool>,
-    mode: AppMode,
-    always_load: &HashSet<String>,
-    surface_budget: ToolSurfaceBudget,
-) -> Vec<Tool> {
-    apply_native_tool_deferral(&mut native_tools, always_load);
-    apply_mcp_tool_deferral(&mut mcp_tools, mode);
-    apply_tool_surface_budget(&mut native_tools, surface_budget, always_load);
-    apply_tool_surface_budget(&mut mcp_tools, surface_budget, always_load);
-    // Sort each partition by name for prefix-cache stability (#263). The
-    // upstream `to_api_tools()` already sorts the registry's HashMap output;
-    // this catalog is built from caller-supplied Vecs which the test harness
-    // and (future) caller refactors may not pre-sort. Built-ins stay as a
-    // contiguous prefix ahead of MCP tools so adding/removing an MCP tool
-    // never shifts a built-in's position.
-    native_tools.sort_by(|a, b| a.name.cmp(&b.name));
-    mcp_tools.sort_by(|a, b| a.name.cmp(&b.name));
-    native_tools.extend(mcp_tools);
-    native_tools
-}
-
-fn apply_tool_surface_budget(
-    catalog: &mut [Tool],
-    surface_budget: ToolSurfaceBudget,
-    always_load: &HashSet<String>,
-) {
-    if !matches!(surface_budget, ToolSurfaceBudget::Compact) {
-        return;
-    }
-    for tool in catalog {
-        if always_load.contains(&tool.name) {
-            continue;
-        }
-        if matches!(
-            tool.name.as_str(),
-            "agent" | "run_tests" | "run_verifiers" | "task_create" | "web_search"
-        ) {
-            tool.defer_loading = Some(true);
-        }
-    }
-}
-
-pub(super) fn ensure_advanced_tooling(
-    catalog: &mut Vec<Tool>,
-    mode: AppMode,
-    always_load: &HashSet<String>,
-) {
-    // code_execution depends on a locally-installed Python interpreter
-    // (python3 / python / py -3). Before v0.8.31, the tool was always
-    // advertised and would fail at execution time on Windows where
-    // `python3` isn't on PATH — the model treated the tool as reliable
-    // once it appeared in the catalog. We now probe at catalog-build
-    // time and only advertise when an interpreter resolves. See
-    // `crate::dependencies::resolve_python_interpreter` for the probe.
-    if mode != AppMode::Plan
-        && !catalog.iter().any(|t| t.name == CODE_EXECUTION_TOOL_NAME)
-        && crate::dependencies::resolve_python_interpreter().is_some()
-    {
-        catalog.push(Tool {
-            tool_type: Some(CODE_EXECUTION_TOOL_TYPE.to_string()),
-            name: CODE_EXECUTION_TOOL_NAME.to_string(),
-            description: "Execute Python code in a local sandboxed runtime and return stdout/stderr/return_code as JSON.".to_string(),
-            input_schema: json!({
-                "type": "object",
-                "properties": {
-                    "code": { "type": "string", "description": "Python source code to execute." }
-                },
-                "required": ["code"]
-            }),
-            allowed_callers: Some(vec!["direct".to_string()]),
-            defer_loading: Some(should_default_defer_tool(
-                CODE_EXECUTION_TOOL_NAME,
-                always_load,
-            )),
-            input_examples: None,
-            strict: None,
-            cache_control: None,
-        });
-    }
-
-    // js_execution mirrors code_execution: gate on Node.js being
-    // present locally so the model never sees a runtime it can't
-    // actually use. Plan mode hides shell/exec surfaces (including
-    // both interpreter tools) by construction; Agent / YOLO advertise
-    // the tool only when `resolve_node()` succeeds.
-    if mode != AppMode::Plan
-        && !catalog.iter().any(|t| t.name == JS_EXECUTION_TOOL_NAME)
-        && crate::dependencies::resolve_node().is_some()
-    {
-        let mut tool = crate::tools::js_execution::js_execution_tool_definition();
-        tool.defer_loading = Some(should_default_defer_tool(&tool.name, always_load));
-        catalog.push(tool);
-    }
-
-    if !catalog.iter().any(|t| t.name == TOOL_SEARCH_NAME) {
-        catalog.push(Tool {
-            tool_type: Some(TOOL_SEARCH_TYPE.to_string()),
-            name: TOOL_SEARCH_NAME.to_string(),
-            description: "Search deferred tool definitions and return matching tool references.".to_string(),
-            input_schema: json!({
-                "type": "object",
-                "properties": {
-                    "query": { "type": "string", "description": "Search query for tool discovery." },
-                    "match": {
-                        "type": "string",
-                        "enum": ["bm25", "regex"],
-                        "default": "bm25",
-                        "description": "Matching algorithm: bm25 for natural-language matching, regex for a regular expression over tool names/descriptions/schema."
-                    },
-                    "max_results": {
-                        "type": "integer",
-                        "minimum": 1,
-                        "maximum": TOOL_SEARCH_MAX_RESULTS_LIMIT,
-                        "default": TOOL_SEARCH_DEFAULT_MAX_RESULTS,
-                        "description": "Maximum number of matching tool references to return."
-                    }
-                },
-                "required": ["query"]
-            }),
-            allowed_callers: Some(vec!["direct".to_string()]),
-            defer_loading: Some(false),
-            input_examples: None,
-            strict: None,
-            cache_control: None,
-        });
-    }
-}
+// Items used within this module that are not re-exported to engine.rs.
+use super::tool_catalog_policy::{
+    CORE_ACTION_TOOL_FALLBACKS, CoreActionToolFallback, LEGACY_TOOL_SEARCH_BM25_NAME,
+    LEGACY_TOOL_SEARCH_REGEX_NAME, TOOL_SEARCH_DEFAULT_MAX_RESULTS,
+};
 
 pub(super) fn initial_active_tools(catalog: &[Tool]) -> HashSet<String> {
     let mut active = HashSet::new();
