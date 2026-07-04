@@ -509,7 +509,7 @@ impl Default for GuidedConstitutionDraft {
             evidence: GuidedEvidence::TestsAndReceipts,
             communication: GuidedCommunication::Concise,
             privacy: GuidedPrivacy::StandardCare,
-            principles: GuidedPrinciples::ScopedChanges,
+            principles: GuidedPrinciples::GroundTruthVerification,
         }
     }
 }
@@ -540,6 +540,7 @@ impl GuidedConstitutionDraft {
             ],
             priorities: vec![
                 authority_priority(locale).to_string(),
+                self.principles.priority(locale).to_string(),
                 autonomy_priority(self.autonomy, locale).to_string(),
                 self.privacy.escalation_rule(locale).to_string(),
             ],
@@ -552,7 +553,7 @@ impl GuidedConstitutionDraft {
     fn notes(self, locale: Locale) -> String {
         match locale {
             Locale::ZhHans => format!(
-                "引导式答案：用途={}；主动性={}；证据={}；沟通={}；隐私={}；原则={}。{} 自由文本原则只作为建议，不会改变审批、沙箱、Shell、网络、信任或 MCP 权限。",
+                "引导式答案：用途={}；主动性={}；证据={}；沟通={}；隐私={}；宪法焦点={}。{} 这些文章锚点只作为建议，不会改变审批、沙箱、Shell、网络、信任或 MCP 权限。",
                 self.purpose.label(locale),
                 autonomy_label(self.autonomy, locale),
                 self.evidence.label(locale),
@@ -562,7 +563,7 @@ impl GuidedConstitutionDraft {
                 self.principles.note(locale)
             ),
             _ => format!(
-                "Guided answers: purpose={}; initiative={}; evidence={}; communication={}; privacy={}; principles={}. {} Freeform principles are advisory and do not change approval, sandbox, shell, network, trust, or MCP permissions.",
+                "Guided answers: purpose={}; initiative={}; evidence={}; communication={}; privacy={}; constitution_focus={}. {} Article anchors are advisory and do not change approval, sandbox, shell, network, trust, or MCP permissions.",
                 self.purpose.label(locale),
                 autonomy_label(self.autonomy, locale),
                 self.evidence.label(locale),
@@ -827,50 +828,73 @@ impl GuidedPrivacy {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum GuidedPrinciples {
-    ScopedChanges,
-    UserVoice,
-    ReversibleOps,
+    GroundTruthVerification,
+    MomentumLegacy,
+    PriorityInquiry,
 }
 
 impl GuidedPrinciples {
     fn next(self) -> Self {
         match self {
-            Self::ScopedChanges => Self::UserVoice,
-            Self::UserVoice => Self::ReversibleOps,
-            Self::ReversibleOps => Self::ScopedChanges,
+            Self::GroundTruthVerification => Self::MomentumLegacy,
+            Self::MomentumLegacy => Self::PriorityInquiry,
+            Self::PriorityInquiry => Self::GroundTruthVerification,
         }
     }
 
     fn label(self, locale: Locale) -> &'static str {
         match (locale, self) {
-            (Locale::ZhHans, Self::ScopedChanges) => "小范围改动",
-            (Locale::ZhHans, Self::UserVoice) => "保留用户语气",
-            (Locale::ZhHans, Self::ReversibleOps) => "可逆步骤",
-            (_, Self::ScopedChanges) => "scoped changes",
-            (_, Self::UserVoice) => "user voice",
-            (_, Self::ReversibleOps) => "reversible steps",
+            (Locale::ZhHans, Self::GroundTruthVerification) => "事实与验证",
+            (Locale::ZhHans, Self::MomentumLegacy) => "行动与克制",
+            (Locale::ZhHans, Self::PriorityInquiry) => "优先级与探询",
+            (_, Self::GroundTruthVerification) => "ground truth + verification",
+            (_, Self::MomentumLegacy) => "momentum + legacy",
+            (_, Self::PriorityInquiry) => "priority + inquiry",
+        }
+    }
+
+    fn priority(self, locale: Locale) -> &'static str {
+        match (locale, self) {
+            (Locale::ZhHans, Self::GroundTruthVerification) => {
+                "强调《CodeWhale 宪法》第一条 Ground Truth 与第二条 Verification：用实时证据纠正记忆，并在宣称完成前检查。"
+            }
+            (Locale::ZhHans, Self::MomentumLegacy) => {
+                "强调《CodeWhale 宪法》第三条 Momentum、第四条 Legacy 与第五条 Help：能行动就行动，同时保持改动克制并在真正阻塞时询问。"
+            }
+            (Locale::ZhHans, Self::PriorityInquiry) => {
+                "强调《CodeWhale 宪法》第六条 Priority、第七条 Domain Context 与第八条 Inquiry：冲突时按层级裁决，并在预测失败时转入探询。"
+            }
+            (_, Self::GroundTruthVerification) => {
+                "Emphasize CodeWhale Constitution Article I Ground Truth and Article II Verification: live evidence corrects memory, and completion claims need checks."
+            }
+            (_, Self::MomentumLegacy) => {
+                "Emphasize CodeWhale Constitution Article III Momentum, Article IV Legacy, and Article V Help: act when evidence is enough, keep changes restrained, and ask when truly blocked."
+            }
+            (_, Self::PriorityInquiry) => {
+                "Emphasize CodeWhale Constitution Article VI Priority, Article VII Domain Context, and Article VIII Inquiry: resolve conflicts by authority, adapt to the domain, and investigate failed predictions."
+            }
         }
     }
 
     fn note(self, locale: Locale) -> &'static str {
         match (locale, self) {
-            (Locale::ZhHans, Self::ScopedChanges) => {
-                "自由原则：优先采用小范围、可审查的改动；除非明确要求，不做无关重构。"
+            (Locale::ZhHans, Self::GroundTruthVerification) => {
+                "文章锚点：I Ground Truth 与 II Verification。要求 CodeWhale 把工具结果、文件、测试和截图当作判断依据，而不是旧交接或猜测。"
             }
-            (Locale::ZhHans, Self::UserVoice) => {
-                "自由原则：保留用户的语气、品牌和约束；不把偏好推断成权限扩大。"
+            (Locale::ZhHans, Self::MomentumLegacy) => {
+                "文章锚点：III Momentum、IV Legacy 与 V Help。要求 CodeWhale 主动推进可逆工作，避免无关重构，并在缺少关键价值判断时询问。"
             }
-            (Locale::ZhHans, Self::ReversibleOps) => {
-                "自由原则：先选择可逆步骤、检查点和回滚说明，再进行高影响操作。"
+            (Locale::ZhHans, Self::PriorityInquiry) => {
+                "文章锚点：VI Priority、VII Domain Context 与 VIII Inquiry。要求 CodeWhale 明确指令层级、尊重领域约束，并在失败预测出现时先查因再修。"
             }
-            (_, Self::ScopedChanges) => {
-                "Freeform principle: prefer small, reviewable changes and avoid unrelated refactors unless explicitly requested."
+            (_, Self::GroundTruthVerification) => {
+                "Article anchors: I Ground Truth and II Verification. CodeWhale should let tool results, files, tests, and screenshots correct memory or stale handoffs."
             }
-            (_, Self::UserVoice) => {
-                "Freeform principle: preserve the user's voice, brand, and constraints without treating preferences as permission expansion."
+            (_, Self::MomentumLegacy) => {
+                "Article anchors: III Momentum, IV Legacy, and V Help. CodeWhale should move reversible work forward, avoid unrelated refactors, and ask when a real value judgment is missing."
             }
-            (_, Self::ReversibleOps) => {
-                "Freeform principle: favor reversible steps, checkpoints, and rollback notes before high-impact operations."
+            (_, Self::PriorityInquiry) => {
+                "Article anchors: VI Priority, VII Domain Context, and VIII Inquiry. CodeWhale should name instruction priority, respect domain constraints, and investigate failed predictions before patching."
             }
         }
     }
@@ -2594,8 +2618,8 @@ mod tests {
         assert!(content.contains("release evidence"));
         assert!(content.contains("learn the system"));
         assert!(content.contains("sensitive data"));
-        assert!(content.contains("user voice"));
-        assert!(content.contains("preserve the user's voice"));
+        assert!(content.contains("momentum + legacy"));
+        assert!(content.contains("Article III Momentum"));
 
         let action = view.handle_key(key(KeyCode::Char('g')));
 
@@ -2616,7 +2640,8 @@ mod tests {
         assert!(body.contains("release evidence"));
         assert!(body.contains("learn the system"));
         assert!(body.contains("sensitive data"));
-        assert!(body.contains("preserve the user's voice"));
+        assert!(body.contains("Article III Momentum"));
+        assert!(body.contains("Article IV Legacy"));
         assert_eq!(
             state.constitution_preview_hash.as_deref(),
             Some(constitution.preview_hash().as_str())
@@ -2642,7 +2667,7 @@ mod tests {
         let ViewAction::Emit(ViewEvent::OpenTextPager { content, .. }) = second_preview else {
             panic!("changed guided answer should preview again before saving");
         };
-        assert!(content.contains("preserve the user's voice"));
+        assert!(content.contains("Article III Momentum"));
 
         let action = view.handle_key(key(KeyCode::Char('g')));
         let ViewAction::EmitAndClose(ViewEvent::SetupConstitutionCommitRequested {
@@ -2656,11 +2681,7 @@ mod tests {
             constitution.autonomy_preference,
             AutonomyPreference::Balanced
         );
-        assert!(
-            constitution
-                .render_body()
-                .contains("preserve the user's voice")
-        );
+        assert!(constitution.render_body().contains("Article III Momentum"));
     }
 
     fn ready_facts(model: &str) -> SetupRuntimeFacts {
@@ -2890,7 +2911,11 @@ mod tests {
         let zh_hans = guided_constitution_template(Locale::ZhHans).render_body();
 
         assert!(english.contains("evidence-first coding workbench"));
+        assert!(english.contains("Article I Ground Truth"));
+        assert!(english.contains("Article II Verification"));
         assert!(zh_hans.contains("重证据"));
+        assert!(zh_hans.contains("第一条 Ground Truth"));
+        assert!(zh_hans.contains("第二条 Verification"));
         assert_ne!(english, zh_hans);
     }
 
@@ -2960,8 +2985,8 @@ mod tests {
         assert!(english_text.contains("coding workbench"));
         assert!(english_text.contains("Initiative:"));
         assert!(english_text.contains("balanced"));
-        assert!(english_text.contains("Principles:"));
-        assert!(english_text.contains("scoped changes"));
+        assert!(english_text.contains("Constitution focus:"));
+        assert!(english_text.contains("ground truth + verification"));
 
         let zh_hans = SetupWizardView::new(SetupState::default(), Locale::ZhHans);
         let zh_hans_text = lines_to_text(zh_hans.constitution_detail_lines());
@@ -2969,8 +2994,8 @@ mod tests {
         assert!(zh_hans_text.contains("编码工作台"));
         assert!(zh_hans_text.contains("主动性："));
         assert!(zh_hans_text.contains("平衡"));
-        assert!(zh_hans_text.contains("原则："));
-        assert!(zh_hans_text.contains("小范围改动"));
+        assert!(zh_hans_text.contains("宪法焦点："));
+        assert!(zh_hans_text.contains("事实与验证"));
     }
 
     #[test]

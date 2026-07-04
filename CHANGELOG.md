@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.8.67] - 2026-07-04
+
 ### Added
 
 - Added a website localization matrix with a locale registry and drift checks.
@@ -14,6 +16,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- Anchored the guided user-constitution creator to the shipped CodeWhale
+  Constitution articles, so the configurable focus axis now maps to Ground
+  Truth/Verification, Momentum/Legacy/Help, or Priority/Domain Context/Inquiry
+  instead of generic preference prose.
 - Documented the Homebrew rollout strategy and added a distribution-channel
   check to the release checklist. Harvested from #3760 by @idling11.
 
@@ -2626,7 +2632,8 @@ overflow report and `/theme` picker edge-wrapping patch in #1814.
 
 Older releases (v0.8.39 and earlier) are archived in [docs/CHANGELOG_ARCHIVE.md](docs/CHANGELOG_ARCHIVE.md).
 
-[Unreleased]: https://github.com/Hmbown/CodeWhale/compare/v0.8.66...HEAD
+[Unreleased]: https://github.com/Hmbown/CodeWhale/compare/v0.8.67...HEAD
+[0.8.67]: https://github.com/Hmbown/CodeWhale/compare/v0.8.66...v0.8.67
 [0.8.66]: https://github.com/Hmbown/CodeWhale/compare/v0.8.65...v0.8.66
 [0.8.65]: https://github.com/Hmbown/CodeWhale/compare/v0.8.64...v0.8.65
 [0.8.64]: https://github.com/Hmbown/CodeWhale/compare/v0.8.63...v0.8.64
