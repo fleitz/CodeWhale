@@ -20,6 +20,7 @@ use crate::tools::subagent::{
 pub struct WorkflowAgentSpawn {
     pub agent_id: String,
     pub status: WorkflowRunStatus,
+    pub recoverable: bool,
     pub output: Option<String>,
     pub artifacts: Vec<String>,
 }
@@ -34,6 +35,7 @@ pub trait WorkflowAgentSpawner {
 
 pub struct AgentWorkflowExecutor<S> {
     spawner: S,
+    max_retries: u8,
 }
 
 impl<S> AgentWorkflowExecutor<S>
@@ -41,7 +43,15 @@ where
     S: WorkflowAgentSpawner,
 {
     pub fn new(spawner: S) -> Self {
-        Self { spawner }
+        Self {
+            spawner,
+            max_retries: 0,
+        }
+    }
+
+    pub fn with_max_retries(mut self, max_retries: u8) -> Self {
+        self.max_retries = max_retries;
+        self
     }
 
     pub fn run(
@@ -61,8 +71,17 @@ where
         spec: &LeafSpec,
         inputs: &[(String, Option<String>)],
     ) -> Result<LeafResult, WorkflowExecutionError> {
-        let prompt = leaf_prompt_with_inputs(spec, inputs);
-        let spawn = self.spawner.spawn_leaf(spec, prompt)?;
+        let mut prompt = leaf_prompt_with_inputs(spec, inputs);
+        let mut spawn = self.spawner.spawn_leaf(spec, prompt.clone())?;
+        let mut attempt = 0_u8;
+        while spawn.status == WorkflowRunStatus::Failed
+            && spawn.recoverable
+            && attempt < self.max_retries
+        {
+            attempt = attempt.saturating_add(1);
+            prompt = retry_prompt(spec, inputs, spawn.output.as_deref(), attempt);
+            spawn = self.spawner.spawn_leaf(spec, prompt.clone())?;
+        }
         Ok(LeafResult {
             leaf_id: spec.id.clone(),
             task_id: spawn.agent_id.clone(),
@@ -176,6 +195,7 @@ fn spawn_from_subagent_result(result: SubAgentResult) -> WorkflowAgentSpawn {
     WorkflowAgentSpawn {
         agent_id: result.agent_id,
         status,
+        recoverable: false,
         output,
         artifacts,
     }
@@ -200,10 +220,28 @@ fn leaf_execution_error(leaf: &LeafSpec, err: impl std::fmt::Display) -> Workflo
     }
 }
 
+fn retry_prompt(
+    leaf: &LeafSpec,
+    inputs: &[(String, Option<String>)],
+    failure_output: Option<&str>,
+    attempt: u8,
+) -> String {
+    let mut prompt = String::from("WhaleFlow retry context:\n");
+    prompt.push_str("- retry_attempt: ");
+    prompt.push_str(&attempt.to_string());
+    prompt.push_str("\n- previous_failure: ");
+    prompt.push_str(failure_output.unwrap_or("<no failure output recorded>"));
+    prompt.push_str("\n\n");
+    prompt.push_str(&leaf_prompt_with_inputs(leaf, inputs));
+    prompt
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use codewhale_whaleflow::{BudgetSpec, IsolationMode, ModelPolicy, PermissionSpec, TaskMode};
+    use codewhale_whaleflow::{
+        BranchSpec, BudgetSpec, IsolationMode, ModelPolicy, PermissionSpec, SequenceSpec, TaskMode,
+    };
 
     #[derive(Default)]
     struct RecordingSpawner {
@@ -220,6 +258,7 @@ mod tests {
             Ok(WorkflowAgentSpawn {
                 agent_id: format!("agent-{}", leaf.id),
                 status: WorkflowRunStatus::Succeeded,
+                recoverable: false,
                 output: Some(format!("output {}", leaf.id)),
                 artifacts: vec![format!("agent:agent-{}", leaf.id)],
             })
@@ -241,6 +280,18 @@ mod tests {
         })
     }
 
+    fn leaf_depending_on(id: &str, dependencies: &[&str]) -> WorkflowNode {
+        let mut node = leaf(id);
+        let WorkflowNode::Leaf(spec) = &mut node else {
+            panic!("expected leaf");
+        };
+        spec.depends_on_results = dependencies
+            .iter()
+            .map(|dependency| dependency.to_string())
+            .collect();
+        node
+    }
+
     fn workflow(nodes: Vec<WorkflowNode>) -> WorkflowSpec {
         WorkflowSpec {
             id: Some("agent-workflow".to_string()),
@@ -255,12 +306,79 @@ mod tests {
     }
 
     #[test]
+    fn executor_dispatches_three_leaf_fanout() {
+        let mut executor = AgentWorkflowExecutor::new(RecordingSpawner::default());
+        let execution = executor
+            .run(&workflow(vec![WorkflowNode::BranchSet(BranchSpec {
+                id: "fanout".to_string(),
+                description: None,
+                parallel: true,
+                budget: BudgetSpec::default(),
+                permissions: PermissionSpec::default(),
+                model_policy: ModelPolicy::default(),
+                children: vec![leaf("scan-a"), leaf("scan-b"), leaf("scan-c")],
+            })]))
+            .expect("workflow should execute");
+
+        assert_eq!(
+            executor
+                .spawner
+                .calls
+                .iter()
+                .map(|(id, _)| id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["scan-a", "scan-b", "scan-c"]
+        );
+        assert_eq!(
+            execution.branch_results[0].status,
+            WorkflowRunStatus::Succeeded
+        );
+    }
+
+    #[test]
+    fn executor_routes_diamond_outputs_to_integrator() {
+        let mut executor = AgentWorkflowExecutor::new(RecordingSpawner::default());
+        let execution = executor
+            .run(&workflow(vec![WorkflowNode::Sequence(SequenceSpec {
+                id: "diamond".to_string(),
+                children: vec![
+                    WorkflowNode::BranchSet(BranchSpec {
+                        id: "scouts".to_string(),
+                        description: None,
+                        parallel: true,
+                        budget: BudgetSpec::default(),
+                        permissions: PermissionSpec::default(),
+                        model_policy: ModelPolicy::default(),
+                        children: vec![leaf("scan-a"), leaf("scan-b"), leaf("scan-c")],
+                    }),
+                    leaf_depending_on("integrate", &["scan-a", "scan-b", "scan-c"]),
+                ],
+            })]))
+            .expect("workflow should execute");
+
+        let integrate_prompt = executor
+            .spawner
+            .calls
+            .iter()
+            .find(|(id, _)| id == "integrate")
+            .map(|(_, prompt)| prompt.as_str())
+            .expect("integrator should run");
+        assert!(integrate_prompt.contains("--- upstream result: scan-a ---\noutput scan-a"));
+        assert!(integrate_prompt.contains("--- upstream result: scan-b ---\noutput scan-b"));
+        assert!(integrate_prompt.contains("--- upstream result: scan-c ---\noutput scan-c"));
+        assert_eq!(
+            execution
+                .leaf_results
+                .iter()
+                .map(|result| result.leaf_id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["scan-a", "scan-b", "scan-c", "integrate"]
+        );
+    }
+
+    #[test]
     fn executor_passes_declared_upstream_outputs_to_leaf_prompt() {
-        let mut downstream = leaf("summarize");
-        let WorkflowNode::Leaf(spec) = &mut downstream else {
-            panic!("expected leaf");
-        };
-        spec.depends_on_results = vec!["scan".to_string()];
+        let downstream = leaf_depending_on("summarize", &["scan"]);
 
         let mut executor = AgentWorkflowExecutor::new(RecordingSpawner::default());
         let execution = executor
@@ -332,6 +450,7 @@ mod tests {
 
         assert_eq!(spawn.agent_id, "agent-123");
         assert_eq!(spawn.status, WorkflowRunStatus::Running);
+        assert!(!spawn.recoverable);
         assert_eq!(
             spawn.output.as_deref(),
             Some("agent_id=agent-123 status=running")
@@ -359,5 +478,56 @@ mod tests {
 
         assert!(err.to_string().contains("leaf `scan` execution failed"));
         assert!(err.to_string().contains("manager busy"));
+    }
+
+    #[derive(Default)]
+    struct RetrySpawner {
+        calls: Vec<String>,
+    }
+
+    impl WorkflowAgentSpawner for RetrySpawner {
+        fn spawn_leaf(
+            &mut self,
+            leaf: &LeafSpec,
+            prompt: String,
+        ) -> Result<WorkflowAgentSpawn, WorkflowExecutionError> {
+            self.calls.push(prompt);
+            let first_attempt = self.calls.len() == 1;
+            Ok(WorkflowAgentSpawn {
+                agent_id: format!("agent-{}", leaf.id),
+                status: if first_attempt {
+                    WorkflowRunStatus::Failed
+                } else {
+                    WorkflowRunStatus::Succeeded
+                },
+                recoverable: first_attempt,
+                output: Some(if first_attempt {
+                    "compile failed: missing import".to_string()
+                } else {
+                    "retry passed".to_string()
+                }),
+                artifacts: vec![format!("agent:agent-{}", leaf.id)],
+            })
+        }
+    }
+
+    #[test]
+    fn executor_retries_recoverable_failure_with_failure_output() {
+        let mut executor = AgentWorkflowExecutor::new(RetrySpawner::default()).with_max_retries(1);
+        let execution = executor
+            .run(&workflow(vec![leaf("fix")]))
+            .expect("workflow should execute");
+
+        assert_eq!(executor.spawner.calls.len(), 2);
+        assert_eq!(executor.spawner.calls[0], "run fix");
+        assert!(
+            executor.spawner.calls[1]
+                .contains("- previous_failure: compile failed: missing import")
+        );
+        assert_eq!(execution.status, WorkflowRunStatus::Succeeded);
+        assert_eq!(
+            execution.leaf_results[0].output.as_deref(),
+            Some("retry passed")
+        );
     }
 }
