@@ -1056,6 +1056,7 @@ impl Engine {
                 turn_id: turn_id.clone(),
             })
             .await;
+        crate::tools::advisor::start_turn(&self.session.workspace, &turn_id);
 
         if self.config.snapshots_enabled {
             let pre_workspace = self.session.workspace.clone();
@@ -1076,6 +1077,11 @@ impl Engine {
                 input: tool_input.clone(),
             })
             .await;
+        crate::tools::advisor::record_tool_started(
+            &self.session.workspace,
+            &tool_name,
+            &tool_input,
+        );
 
         let tool_context = self.build_tool_context(mode, auto_approve);
         let registry = ToolRegistryBuilder::new()
@@ -1272,10 +1278,25 @@ impl Engine {
             .tx_event
             .send(Event::ToolCallComplete {
                 id: tool_id,
-                name: tool_name,
-                result,
+                name: tool_name.clone(),
+                result: result.clone(),
             })
             .await;
+        crate::tools::advisor::record_tool_completed(
+            &self.session.workspace,
+            &tool_name,
+            result.is_ok(),
+            match &result {
+                Ok(tool_result) => tool_result.content.clone(),
+                Err(err) => err.to_string(),
+            },
+        );
+
+        if let Some(note) =
+            crate::tools::advisor::finish_turn(&self.session.workspace, status, error.as_deref())
+        {
+            let _ = self.tx_event.send(Event::status(note)).await;
+        }
 
         let _ = self
             .tx_event
@@ -2314,6 +2335,7 @@ impl Engine {
                 turn_id: turn.id.clone(),
             })
             .await;
+        crate::tools::advisor::start_turn(&self.session.workspace, &turn.id);
 
         // Snapshot the workspace BEFORE we touch a single tool. Run the git
         // work on the blocking pool so the async runtime stays responsive;
@@ -2665,6 +2687,11 @@ impl Engine {
         // Emit turn complete event — after all post-turn bookkeeping so
         // the terminal is immediately responsive when the UI receives it.
         self.emit_goal_updated().await;
+        if let Some(note) =
+            crate::tools::advisor::finish_turn(&self.session.workspace, status, error.as_deref())
+        {
+            let _ = self.tx_event.send(Event::status(note)).await;
+        }
         let _ = self
             .tx_event
             .send(Event::TurnComplete {

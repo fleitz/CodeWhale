@@ -1093,12 +1093,18 @@ impl Engine {
                             // keeps the cell from rendering `<command>` /
                             // `<file>` placeholders during the brief window
                             // between block start and the last InputJsonDelta.
+                            let input = final_tool_input(tool_state);
+                            crate::tools::advisor::record_tool_started(
+                                &self.session.workspace,
+                                &tool_state.name,
+                                &input,
+                            );
                             let _ = self
                                 .tx_event
                                 .send(Event::ToolCallStarted {
                                     id: tool_state.id.clone(),
                                     name: tool_state.name.clone(),
-                                    input: final_tool_input(tool_state),
+                                    input,
                                 })
                                 .await;
                         }
@@ -1216,6 +1222,11 @@ impl Engine {
                 let parsed = tool_parser::parse_tool_calls(&current_text_raw);
                 final_text = parsed.clean_text;
                 for call in parsed.tool_calls {
+                    crate::tools::advisor::record_tool_started(
+                        &self.session.workspace,
+                        &call.name,
+                        &call.args,
+                    );
                     let _ = self
                         .tx_event
                         .send(Event::ToolCallStarted {
@@ -2447,6 +2458,15 @@ impl Engine {
                 }
             }
 
+            for outcome in outcomes.iter().flatten() {
+                crate::tools::advisor::record_tool_completed(
+                    &self.session.workspace,
+                    &outcome.name,
+                    outcome.result.is_ok(),
+                    advisor_tool_result_summary(&outcome.result),
+                );
+            }
+
             let mut step_error_count = 0usize;
             // Categorized tool errors collected this step. Feeds the capacity
             // controller's error-escalation checkpoint so it can distinguish
@@ -2844,6 +2864,19 @@ fn plan_mode_blocks_write_capable_tool(tool_name: &str, read_only: bool) -> bool
 /// step's error counters or trip error-escalation.
 fn interrupted_tool_result() -> ToolResult {
     ToolResult::error("Tool not executed: the request was cancelled before this tool ran.")
+}
+
+fn advisor_tool_result_summary(result: &Result<ToolResult, ToolError>) -> String {
+    match result {
+        Ok(tool_result) => {
+            if tool_result.success {
+                format!("ok: {}", tool_result.content)
+            } else {
+                format!("reported failure: {}", tool_result.content)
+            }
+        }
+        Err(err) => format!("error: {err}"),
+    }
 }
 
 #[cfg(test)]

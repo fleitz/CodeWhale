@@ -608,6 +608,13 @@ impl ToolRegistryBuilder {
         self.with_tool(Arc::new(DiagnosticsTool))
     }
 
+    /// Include optional advisor watcher configuration.
+    #[must_use]
+    pub fn with_advisor_tool(self) -> Self {
+        use super::advisor::AdvisorTool;
+        self.with_tool(Arc::new(AdvisorTool))
+    }
+
     /// Include the `pandoc_convert` tool only when the `pandoc`
     /// binary is present on this host. Same probe-then-decide
     /// pattern v0.8.31 introduced for Python — when pandoc is
@@ -981,6 +988,7 @@ impl ToolRegistryBuilder {
             .with_git_tools()
             .with_git_history_tools()
             .with_diagnostics_tool()
+            .with_advisor_tool()
             .with_project_tools()
             .with_skill_tools()
             .with_test_runner_tool()
