@@ -589,22 +589,30 @@ fn read_ipynb(
                         }
                         let output_text = render_notebook_output(output);
                         if !output_text.is_empty() {
-                            let truncated = if total_output_bytes + output_text.len()
+                            let output_len = output_text.len();
+                            let (truncated, omitted_bytes) = if total_output_bytes + output_len
                                 > NOTEBOOK_MAX_OUTPUT_BYTES
                             {
                                 let remaining =
                                     NOTEBOOK_MAX_OUTPUT_BYTES.saturating_sub(total_output_bytes);
-                                let mut snippet = output_text;
-                                snippet.truncate(remaining);
-                                snippet
+                                let snippet = truncate_bytes(&output_text, remaining).to_string();
+                                let omitted_bytes = output_len.saturating_sub(snippet.len());
+                                (snippet, omitted_bytes)
                             } else {
-                                output_text
+                                (output_text, 0)
                             };
                             total_output_bytes += truncated.len();
                             rendered.push_str("Output:\n");
                             rendered.push_str(&truncated);
                             if !truncated.ends_with('\n') {
                                 rendered.push('\n');
+                            }
+                            if omitted_bytes > 0 {
+                                rendered.push_str(&format!(
+                                    "[... {omitted_bytes} bytes omitted; notebook output limit {NOTEBOOK_MAX_OUTPUT_BYTES} bytes reached]\n"
+                                ));
+                                total_output_bytes = NOTEBOOK_MAX_OUTPUT_BYTES;
+                                break;
                             }
                         }
                     }
@@ -686,8 +694,9 @@ fn render_notebook_output(output: &serde_json::Value) -> String {
             }
             let truncated = truncate_bytes(&text, CELL_MAX_OUTPUT_BYTES);
             if truncated.len() < text.len() {
+                let omitted_bytes = text.len() - truncated.len();
                 format!(
-                    "[{name}]:\n{truncated}\n[... truncated at {CELL_MAX_OUTPUT_BYTES} bytes]\n"
+                    "[{name}]:\n{truncated}\n[... {omitted_bytes} bytes omitted; truncated at {CELL_MAX_OUTPUT_BYTES} bytes]\n"
                 )
             } else {
                 format!("[{name}]:\n{truncated}\n")
@@ -717,8 +726,9 @@ fn render_notebook_output(output: &serde_json::Value) -> String {
                     }
                     let truncated = truncate_bytes(&text, CELL_MAX_OUTPUT_BYTES);
                     if truncated.len() < text.len() {
+                        let omitted_bytes = text.len() - truncated.len();
                         return format!(
-                            "{truncated}\n[... truncated at {CELL_MAX_OUTPUT_BYTES} bytes]\n"
+                            "{truncated}\n[... {omitted_bytes} bytes omitted; truncated at {CELL_MAX_OUTPUT_BYTES} bytes]\n"
                         );
                     }
                     return format!("{text}\n");
@@ -754,7 +764,10 @@ fn render_notebook_output(output: &serde_json::Value) -> String {
             let text = format!("{ename}: {evalue}\n{traceback}");
             let truncated = truncate_bytes(&text, CELL_MAX_OUTPUT_BYTES);
             if truncated.len() < text.len() {
-                format!("{truncated}\n[... truncated at {CELL_MAX_OUTPUT_BYTES} bytes]\n")
+                let omitted_bytes = text.len() - truncated.len();
+                format!(
+                    "{truncated}\n[... {omitted_bytes} bytes omitted; truncated at {CELL_MAX_OUTPUT_BYTES} bytes]\n"
+                )
             } else {
                 format!("{text}\n")
             }
@@ -1601,6 +1614,7 @@ fn list_dir_timeout(timeout: Duration) -> ToolError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::Write as _;
     use tempfile::tempdir;
 
     async fn read_before_edit(ctx: &ToolContext, path: &str) {
@@ -1886,6 +1900,197 @@ mod tests {
             err.to_string()
                 .contains("Failed to validate input: missing required field 'path'")
         );
+    }
+
+    #[tokio::test]
+    async fn read_file_notebook_renders_markdown_code_cells_and_outputs() {
+        let tmp = tempdir().expect("tempdir");
+        let ctx = ToolContext::new(tmp.path().to_path_buf());
+        fs::write(
+            tmp.path().join("analysis.ipynb"),
+            json!({
+                "cells": [
+                    {
+                        "cell_type": "markdown",
+                        "source": ["# Title\n", "Some notes.\n"]
+                    },
+                    {
+                        "cell_type": "code",
+                        "execution_count": 1,
+                        "source": ["print('hi')\n"],
+                        "outputs": [
+                            {
+                                "output_type": "stream",
+                                "name": "stdout",
+                                "text": ["hi\n"]
+                            }
+                        ]
+                    }
+                ],
+                "metadata": {},
+                "nbformat": 4,
+                "nbformat_minor": 5
+            })
+            .to_string(),
+        )
+        .expect("write notebook");
+
+        let result = ReadFileTool
+            .execute(json!({"path": "analysis.ipynb"}), &ctx)
+            .await
+            .expect("read notebook");
+
+        assert!(result.success);
+        assert!(result.content.contains("<file path=\"analysis.ipynb\""));
+        assert!(result.content.contains("## Cell 0 [markdown]"));
+        assert!(result.content.contains("# Title"));
+        assert!(result.content.contains("## Cell 1 [code]"));
+        assert!(result.content.contains("print('hi')"));
+        assert!(result.content.contains("[stdout]:\nhi"));
+    }
+
+    #[tokio::test]
+    async fn read_file_notebook_large_outputs_report_omitted_bytes_and_cells() {
+        let tmp = tempdir().expect("tempdir");
+        let ctx = ToolContext::new(tmp.path().to_path_buf());
+        let large_text = "x".repeat(CELL_MAX_OUTPUT_BYTES + 1024);
+        let cells: Vec<Value> = (0..10)
+            .map(|i| {
+                json!({
+                    "cell_type": "code",
+                    "source": [format!("print({i})\n")],
+                    "outputs": [
+                        {
+                            "output_type": "stream",
+                            "name": "stdout",
+                            "text": large_text
+                        }
+                    ]
+                })
+            })
+            .collect();
+        fs::write(
+            tmp.path().join("large.ipynb"),
+            json!({
+                "cells": cells,
+                "metadata": {},
+                "nbformat": 4,
+                "nbformat_minor": 5
+            })
+            .to_string(),
+        )
+        .expect("write notebook");
+
+        let result = ReadFileTool
+            .execute(json!({"path": "large.ipynb"}), &ctx)
+            .await
+            .expect("read notebook");
+
+        assert!(result.success);
+        assert!(
+            result.content.contains("bytes omitted"),
+            "large notebook output must report omitted bytes: {}",
+            result.content
+        );
+        assert!(
+            result.content.contains("cells omitted"),
+            "notebook output limit must report omitted cells: {}",
+            result.content
+        );
+        assert!(result.content.contains("notebook output limit"));
+    }
+
+    fn write_zip_fixture(path: &Path) {
+        let file = fs::File::create(path).expect("create zip");
+        let mut zip = zip::ZipWriter::new(file);
+        let options = zip::write::SimpleFileOptions::default();
+        zip.add_directory("src/", options).expect("add directory");
+        zip.start_file("src/main.rs", options).expect("start file");
+        zip.write_all(b"fn main() {}\n").expect("write entry");
+        zip.start_file("README.md", options).expect("start readme");
+        zip.write_all(b"# Bundle\n").expect("write readme");
+        zip.finish().expect("finish zip");
+    }
+
+    fn write_tar_fixture(path: &Path) {
+        let file = fs::File::create(path).expect("create tar");
+        let mut builder = tar::Builder::new(file);
+        let contents = b"safe contents\n";
+        let mut header = tar::Header::new_gnu();
+        header.set_size(contents.len() as u64);
+        header.set_mode(0o644);
+        header.set_cksum();
+        builder
+            .append_data(&mut header, "safe/entry.txt", &contents[..])
+            .expect("append tar entry");
+        builder.finish().expect("finish tar");
+    }
+
+    #[tokio::test]
+    async fn read_file_zip_archive_lists_entries_and_reads_named_entry() {
+        let tmp = tempdir().expect("tempdir");
+        let ctx = ToolContext::new(tmp.path().to_path_buf());
+        write_zip_fixture(&tmp.path().join("bundle.zip"));
+
+        let listing = ReadFileTool
+            .execute(json!({"path": "bundle.zip"}), &ctx)
+            .await
+            .expect("list zip");
+        assert!(listing.success);
+        assert!(
+            listing
+                .content
+                .contains("<archive_listing path=\"bundle.zip\">")
+        );
+        assert!(listing.content.contains("src/main.rs"));
+        assert!(listing.content.contains("README.md"));
+
+        let entry = ReadFileTool
+            .execute(json!({"path": "bundle.zip", "entry": "src/main.rs"}), &ctx)
+            .await
+            .expect("read zip entry");
+        assert!(entry.success);
+        assert!(
+            entry
+                .content
+                .contains("<archive_entry path=\"bundle.zip\" entry=\"src/main.rs\">")
+        );
+        assert!(entry.content.contains("fn main() {}"));
+    }
+
+    #[tokio::test]
+    async fn read_file_tar_archive_reads_named_entry_and_rejects_traversal() {
+        let tmp = tempdir().expect("tempdir");
+        let ctx = ToolContext::new(tmp.path().to_path_buf());
+        write_tar_fixture(&tmp.path().join("bundle.tar"));
+
+        let listing = ReadFileTool
+            .execute(json!({"path": "bundle.tar"}), &ctx)
+            .await
+            .expect("list tar");
+        assert!(listing.success);
+        assert!(listing.content.contains("safe/entry.txt"));
+
+        let entry = ReadFileTool
+            .execute(
+                json!({"path": "bundle.tar", "entry": "safe/entry.txt"}),
+                &ctx,
+            )
+            .await
+            .expect("read tar entry");
+        assert!(entry.success);
+        assert!(entry.content.contains("safe contents"));
+
+        let err = ReadFileTool
+            .execute(
+                json!({"path": "bundle.tar", "entry": "../secret.txt"}),
+                &ctx,
+            )
+            .await
+            .expect_err("path traversal must be rejected");
+        let message = err.to_string();
+        assert!(message.contains("path traversal"), "{message}");
+        assert!(message.contains("rejected"), "{message}");
     }
 
     #[test]
