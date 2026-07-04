@@ -38,12 +38,20 @@ the environment. `DEEPSEEK_MEMORY_PATH` wins over the config file when
 both are set. Existing `~/.deepseek/memory.md` files remain supported as a
 legacy fallback when no `.codewhale` memory file exists.
 
+CodeWhale also keeps a small project-scoped memory seed under the same
+state root: `~/.codewhale/memory/projects/<workspace-key>.md`. The key
+combines a readable workspace slug with a hash of the canonical workspace
+path, so two repos with the same directory name do not share project
+memory.
+
 ## Quick examples
 
 ```text
 # remember that this repo prefers cargo fmt before commits
 /memory
 /memory path
+/memory project
+/memory status
 /memory edit
 /memory help
 ```
@@ -52,6 +60,7 @@ legacy fallback when no `.codewhale` memory file exists.
   the composer to append a timestamped bullet without firing a turn.
 - Run `/memory` to confirm where the feature is writing and what is
   currently stored.
+- Run `/memory project` to inspect the workspace-local memory file.
 - Run `/memory edit` when you want to groom the file manually in your
   editor.
 
@@ -75,6 +84,18 @@ or external editors land on the next turn, no restart needed.
 
 Files larger than 100 KiB are loaded but truncated, with a marker
 appended so you can see the cut.
+
+Project memory is injected as a separate bounded block:
+
+```xml
+<project_memory workspace="/Users/you/src/app" source="/Users/you/.codewhale/memory/projects/app-1234abcd5678.md" max_bytes="32768">
+- (2026-07-03 18:22 UTC) this repo runs cargo fmt before commits
+</project_memory>
+```
+
+Only the file for the active workspace is read. The project block is
+bounded to 32 KiB so local recall cannot silently dominate the system
+prompt.
 
 ## Three ways to add to memory
 
@@ -106,6 +127,10 @@ Inspect, clear, or get hints about editing the file:
 | `/memory path`      | Print just the resolved path                          |
 | `/memory clear`     | Replace the file with an empty marker                 |
 | `/memory edit`      | Print the `${VISUAL:-${EDITOR:-vi}} <path>` shell line |
+| `/memory project`   | Show project-scoped memory for the active workspace   |
+| `/memory project-path` | Print just the project-scoped memory path          |
+| `/memory project-clear` | Replace the project file with an empty marker     |
+| `/memory status`    | Show both memory paths and whether each exists        |
 | `/memory help`      | Show command-specific help and the current path       |
 
 The `/memory edit` form intentionally just prints the command rather
@@ -131,6 +156,7 @@ shape:
     "type": "object",
     "properties": {
       "note": { "type": "string", ... }
+      "scope": { "enum": ["user", "project"], ... }
     },
     "required": ["note"]
   }
@@ -138,8 +164,10 @@ shape:
 ```
 
 The model uses this when it notices a durable preference, convention,
-or fact worth keeping across sessions. The tool is auto-approved
-because writes are scoped to the user's own memory file — gating
+or fact worth keeping across sessions. `scope` defaults to `user`.
+Use `scope: "project"` for repo conventions or decisions that should
+recall only in the active workspace. The tool is auto-approved
+because writes are scoped to CodeWhale memory files — gating
 them behind the standard write-approval flow would defeat the point
 of automatic memory capture.
 
@@ -163,15 +191,26 @@ about the timestamp format; it just reads the whole file as the
 memory block. The timestamp is convention so you can tell when each
 note was added when grooming the file.
 
+## Project memory and Moraine
+
+Project memory is a local bridge toward the longer-term Moraine recall
+direction tracked in #3495. It is intentionally small: plain Markdown,
+path-keyed by workspace identity, and injected as a bounded prompt
+slice. It is not a vector store, not a session search engine, and not
+the final external-memory backend. When Moraine is active via
+`moraine_fallback`, the legacy memory injection path, including project
+memory, is skipped.
+
 ## Hierarchy and imports
 
-Memory is intentionally **user-scoped** rather than repo-scoped. It
-sits alongside — not inside — project instruction sources such as
-`AGENTS.md`, `.codewhale/instructions.md`, legacy `.deepseek/instructions.md`,
-and `instructions = [...]`.
+Memory sits alongside — not inside — project instruction sources such
+as `AGENTS.md`, `.codewhale/instructions.md`, legacy
+`.deepseek/instructions.md`, and `instructions = [...]`.
 
 - Use **memory** for durable personal preferences that should follow
   you across repos and sessions.
+- Use **project memory** for workspace-local conventions that should
+  stay off the repo but recall only in this checkout.
 - Use **project instructions** for repo-specific conventions that
   should travel with the codebase.
 
@@ -203,11 +242,11 @@ receives, and only when memory is enabled. If you switch providers
 (DeepSeek / NVIDIA NIM / Fireworks / etc.) the same memory file is
 used; the file is provider-agnostic.
 
-The file is per-user, not per-project. If you want project-specific
-memory, use the project-level `AGENTS.md` or
-`.codewhale/instructions.md` files instead. Legacy
-`.deepseek/instructions.md` files are still loaded for compatibility. These are
-loaded by `project_context` and live in the repo (or wherever you commit them).
+The user memory file is per-user. Project memory is per-workspace and
+lives under the user's CodeWhale state directory, not inside the repo.
+Project instruction files such as `AGENTS.md`, `.codewhale/instructions.md`,
+and legacy `.deepseek/instructions.md` are still the right place for
+conventions that should travel with the codebase.
 
 ## Configuration reference
 

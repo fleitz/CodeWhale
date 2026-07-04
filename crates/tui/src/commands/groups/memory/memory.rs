@@ -9,6 +9,7 @@
 //! - `/memory show` — alias for the no-arg form
 //! - `/memory clear` — replace the file contents with an empty marker
 //! - `/memory path` — show only the resolved path
+//! - `/memory project` — show project-scoped memory for this workspace
 //! - `/memory help` — show command-specific help and the resolved path
 //!
 //! Editor integration (`/memory edit`) is intentionally minimal: the
@@ -23,24 +24,42 @@ use std::path::Path;
 use crate::commands::CommandResult;
 use crate::tui::app::App;
 
-const MEMORY_USAGE: &str = "/memory [show|path|clear|edit|help]";
+const MEMORY_USAGE: &str =
+    "/memory [show|path|clear|edit|project|project-path|project-clear|status|help]";
 
-fn memory_help(path: &Path) -> String {
+fn memory_help(path: &Path, project_path: &Path) -> String {
     format!(
-        "Inspect or manage your persistent user-memory file.\n\n\
+        "Inspect or manage persistent memory files.\n\n\
          Usage: {MEMORY_USAGE}\n\n\
-         Current path: {}\n\n\
+         User path: {}\n\
+         Project path: {}\n\n\
          Subcommands:\n\
-           /memory          Show the resolved path and current contents\n\
-           /memory show     Alias for the no-arg form\n\
-           /memory path     Print just the resolved path\n\
-           /memory clear    Replace the file contents with an empty marker\n\
-           /memory edit     Print the editor command for this file\n\
-           /memory help     Show this help\n\n\
+           /memory                Show the user-memory path and contents\n\
+           /memory show           Alias for the no-arg form\n\
+           /memory path           Print just the user-memory path\n\
+           /memory clear          Replace the user-memory file with an empty marker\n\
+           /memory edit           Print the editor command for the user-memory file\n\
+           /memory project        Show project memory for this workspace\n\
+           /memory project-path   Print just the project-memory path\n\
+           /memory project-clear  Replace the project-memory file with an empty marker\n\
+           /memory status         Show both memory paths and file states\n\
+           /memory help           Show this help\n\n\
          Quick capture: type `# foo` in the composer to append a timestamped\n\
-         bullet without firing a turn.",
-        path.display()
+         user-memory bullet without firing a turn. The `remember` tool can use\n\
+         `scope: \"project\"` for workspace-local conventions.",
+        path.display(),
+        project_path.display(),
     )
+}
+
+fn read_memory_body(path: &Path, empty_hint: &str, missing_hint: &str) -> String {
+    match fs::read_to_string(path) {
+        Ok(text) if text.trim().is_empty() => {
+            format!("{}\n({empty_hint})", path.display())
+        }
+        Ok(text) => format!("{}\n\n{}", path.display(), text.trim_end()),
+        Err(_) => format!("{}\n({missing_hint})", path.display()),
+    }
 }
 
 fn memory(app: &mut App, arg: Option<&str>) -> CommandResult {
@@ -51,36 +70,62 @@ fn memory(app: &mut App, arg: Option<&str>) -> CommandResult {
     }
 
     let path = app.memory_path.clone();
+    let project_path = crate::memory::project_memory_path(&path, &app.workspace);
     let sub = arg.unwrap_or("show").trim();
 
     match sub {
         "" | "show" => {
-            let body = match fs::read_to_string(&path) {
-                Ok(text) if text.trim().is_empty() => format!(
-                    "{}\n(empty — add via `# foo` from the composer or have the model use the `remember` tool)",
-                    path.display()
-                ),
-                Ok(text) => format!("{}\n\n{}", path.display(), text.trim_end()),
-                Err(_) => format!(
-                    "{}\n(file does not exist yet — add via `# foo` from the composer to create it)",
-                    path.display()
-                ),
-            };
+            let body = read_memory_body(
+                &path,
+                "empty — add via `# foo` from the composer or have the model use the `remember` tool",
+                "file does not exist yet — add via `# foo` from the composer to create it",
+            );
             CommandResult::message(body)
         }
         "path" => CommandResult::message(path.display().to_string()),
+        "project" => {
+            let body = read_memory_body(
+                &project_path,
+                "empty — have the model use `remember` with `scope: \"project\"`",
+                "file does not exist yet — have the model use `remember` with `scope: \"project\"` to create it",
+            );
+            CommandResult::message(body)
+        }
+        "project-path" => CommandResult::message(project_path.display().to_string()),
         "clear" => match fs::write(&path, "") {
             Ok(()) => CommandResult::message(format!("memory cleared: {}", path.display())),
             Err(err) => CommandResult::error(format!("failed to clear {}: {err}", path.display())),
+        },
+        "project-clear" => match fs::write(&project_path, "") {
+            Ok(()) => CommandResult::message(format!(
+                "project memory cleared: {}",
+                project_path.display()
+            )),
+            Err(err) => {
+                CommandResult::error(format!("failed to clear {}: {err}", project_path.display()))
+            }
         },
         "edit" => CommandResult::message(format!(
             "to edit your memory file, run:\n\n  ${{VISUAL:-${{EDITOR:-vi}}}} {}",
             path.display()
         )),
-        "help" => CommandResult::message(memory_help(&path)),
+        "status" => {
+            let user_state = if path.exists() { "present" } else { "missing" };
+            let project_state = if project_path.exists() {
+                "present"
+            } else {
+                "missing"
+            };
+            CommandResult::message(format!(
+                "user memory: {} ({user_state})\nproject memory: {} ({project_state})",
+                path.display(),
+                project_path.display()
+            ))
+        }
+        "help" => CommandResult::message(memory_help(&path, &project_path)),
         _ => CommandResult::error(format!(
             "unknown subcommand `{sub}`. Try `/memory help`.\n\n{}",
-            memory_help(&path)
+            memory_help(&path, &project_path)
         )),
     }
 }
@@ -89,7 +134,7 @@ pub(in crate::commands) const COMMAND_INFO: crate::commands::traits::CommandInfo
     crate::commands::traits::CommandInfo {
         name: "memory",
         aliases: &[],
-        usage: "/memory [show|path|clear|edit|help]",
+        usage: MEMORY_USAGE,
         description_id: crate::localization::MessageId::CmdMemoryDescription,
     };
 
@@ -146,8 +191,9 @@ mod tests {
         let mut app = create_test_app_with_memory(&tmpdir, true);
         let result = memory(&mut app, Some("help"));
         let msg = result.message.expect("help should return text");
-        assert!(msg.contains("Usage: /memory [show|path|clear|edit|help]"));
+        assert!(msg.contains("Usage: /memory [show|path|clear|edit|project"));
         assert!(msg.contains("/memory edit"));
+        assert!(msg.contains("/memory project"));
         assert!(msg.contains(app.memory_path.to_string_lossy().as_ref()));
     }
 
@@ -171,5 +217,35 @@ mod tests {
         let msg = result.message.expect("disabled memory should return text");
         assert!(msg.contains("user memory is disabled"));
         assert!(msg.contains("DEEPSEEK_MEMORY=on"));
+    }
+
+    #[test]
+    fn memory_project_subcommand_reads_project_scoped_file() {
+        let tmpdir = TempDir::new().expect("tempdir");
+        let mut app = create_test_app_with_memory(&tmpdir, true);
+        let project_path = crate::memory::project_memory_path(&app.memory_path, &app.workspace);
+        crate::memory::append_project_entry(
+            &app.memory_path,
+            &app.workspace,
+            "this workspace runs cargo fmt",
+        )
+        .expect("append project memory");
+
+        let result = memory(&mut app, Some("project"));
+        let msg = result.message.expect("project memory should return text");
+        assert!(msg.contains(project_path.to_string_lossy().as_ref()));
+        assert!(msg.contains("cargo fmt"));
+    }
+
+    #[test]
+    fn memory_status_reports_user_and_project_paths() {
+        let tmpdir = TempDir::new().expect("tempdir");
+        let mut app = create_test_app_with_memory(&tmpdir, true);
+        let project_path = crate::memory::project_memory_path(&app.memory_path, &app.workspace);
+
+        let result = memory(&mut app, Some("status"));
+        let msg = result.message.expect("status should return text");
+        assert!(msg.contains(app.memory_path.to_string_lossy().as_ref()));
+        assert!(msg.contains(project_path.to_string_lossy().as_ref()));
     }
 }

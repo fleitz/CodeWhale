@@ -140,6 +140,7 @@ pub enum SourceKind {
     RuntimePolicy,
     EnvironmentBlock,
     UserMemory,
+    ProjectMemory,
     SessionGoal,
     HandoffRelay,
     ToolSchemas,
@@ -257,6 +258,35 @@ pub fn build_headless_context_report(config: &Config, workspace: &Path) -> Promp
             SourceKind::UserMemory,
             "User memory",
             Some(memory_path.display().to_string()),
+            Some(6),
+            if moraine_fallback && memory_enabled {
+                "disabled by moraine_fallback"
+            } else {
+                "disabled, missing, or empty"
+            },
+        ));
+    }
+
+    let project_memory_path = crate::memory::project_memory_path(&memory_path, workspace);
+    if let Some(memory_block) = crate::memory::compose_project_block(
+        memory_enabled && !moraine_fallback,
+        &memory_path,
+        workspace,
+    ) {
+        builder.push(SourceEntry::text(
+            SourceKind::ProjectMemory,
+            "Project memory",
+            Some(project_memory_path.display().to_string()),
+            ActivationReason::ConfigEnabled,
+            &memory_block,
+            CountingConfidence::High,
+            Some(6),
+        ));
+    } else {
+        builder.push(SourceEntry::omitted(
+            SourceKind::ProjectMemory,
+            "Project memory",
+            Some(project_memory_path.display().to_string()),
             Some(6),
             if moraine_fallback && memory_enabled {
                 "disabled by moraine_fallback"
@@ -496,6 +526,35 @@ fn add_app_runtime_entries(builder: &mut ReportBuilder, app: &App) {
             SourceKind::UserMemory,
             "User memory",
             Some(app.memory_path.display().to_string()),
+            Some(6),
+            if app.moraine_fallback && app.use_memory {
+                "disabled by moraine_fallback"
+            } else {
+                "disabled, missing, or empty"
+            },
+        ));
+    }
+
+    let project_memory_path = crate::memory::project_memory_path(&app.memory_path, &app.workspace);
+    if let Some(memory_block) = crate::memory::compose_project_block(
+        app.use_memory && !app.moraine_fallback,
+        &app.memory_path,
+        &app.workspace,
+    ) {
+        builder.push(SourceEntry::text(
+            SourceKind::ProjectMemory,
+            "Project memory",
+            Some(project_memory_path.display().to_string()),
+            ActivationReason::ConfigEnabled,
+            &memory_block,
+            CountingConfidence::High,
+            Some(6),
+        ));
+    } else {
+        builder.push(SourceEntry::omitted(
+            SourceKind::ProjectMemory,
+            "Project memory",
+            Some(project_memory_path.display().to_string()),
             Some(6),
             if app.moraine_fallback && app.use_memory {
                 "disabled by moraine_fallback"
@@ -985,6 +1044,45 @@ mod tests {
             Some("disabled by moraine_fallback")
         );
         assert!(!context_report_json(&report).contains("private legacy memory"));
+    }
+
+    #[test]
+    fn headless_context_report_surfaces_project_memory_separately() {
+        let tmp = tempdir().expect("tempdir");
+        let memory_path = tmp.path().join("memory.md");
+        crate::memory::append_project_entry(
+            &memory_path,
+            tmp.path(),
+            "workspace-local testing convention",
+        )
+        .expect("write project memory");
+        let mut config: Config = toml::from_str(
+            r#"
+            [memory]
+            enabled = true
+            "#,
+        )
+        .expect("parse config");
+        config.memory_path = Some(memory_path.to_string_lossy().into_owned());
+
+        let report = build_headless_context_report(&config, tmp.path());
+        let project_entry = report
+            .entries
+            .iter()
+            .find(|entry| entry.source_kind == SourceKind::ProjectMemory)
+            .expect("project memory source entry");
+
+        assert_eq!(
+            project_entry.activation_reason,
+            ActivationReason::ConfigEnabled
+        );
+        assert!(project_entry.estimated_tokens > 0);
+        assert!(
+            project_entry
+                .source_path
+                .as_deref()
+                .is_some_and(|path| path.contains("memory/projects"))
+        );
     }
 
     #[test]

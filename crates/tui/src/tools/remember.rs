@@ -14,7 +14,8 @@ use async_trait::async_trait;
 use serde_json::{Value, json};
 
 use super::spec::{
-    ApprovalRequirement, ToolCapability, ToolContext, ToolError, ToolResult, ToolSpec, required_str,
+    ApprovalRequirement, ToolCapability, ToolContext, ToolError, ToolResult, ToolSpec,
+    optional_str, required_str,
 };
 
 /// Tool that appends one bullet to the user memory file.
@@ -43,6 +44,11 @@ impl ToolSpec for RememberTool {
                 "note": {
                     "type": "string",
                     "description": "The single-sentence durable note to remember."
+                },
+                "scope": {
+                    "type": "string",
+                    "enum": ["user", "project"],
+                    "description": "Where to retain the note. Use user for preferences that should follow the person across workspaces. Use project for repo conventions or decisions that should only recall in this workspace. Defaults to user."
                 }
             },
             "required": ["note"]
@@ -69,13 +75,35 @@ impl ToolSpec for RememberTool {
             )
         })?;
 
-        crate::memory::append_entry(path, note).map_err(|err| {
-            ToolError::execution_failed(format!("failed to append to {}: {err}", path.display()))
-        })?;
+        let scope = optional_str(&input, "scope").unwrap_or("user");
+        let written_path = match scope {
+            "user" => {
+                crate::memory::append_entry(path, note).map_err(|err| {
+                    ToolError::execution_failed(format!(
+                        "failed to append to {}: {err}",
+                        path.display()
+                    ))
+                })?;
+                path.clone()
+            }
+            "project" => crate::memory::append_project_entry(path, &context.workspace, note)
+                .map_err(|err| {
+                    ToolError::execution_failed(format!(
+                        "failed to append project memory for {}: {err}",
+                        context.workspace.display()
+                    ))
+                })?,
+            other => {
+                return Err(ToolError::invalid_input(format!(
+                    "invalid memory scope `{other}`; expected `user` or `project`"
+                )));
+            }
+        };
 
         Ok(ToolResult::success(format!(
-            "remembered: {}",
-            note.trim_start_matches('#').trim()
+            "remembered ({scope}) in {}: {}",
+            written_path.display(),
+            note.trim_start_matches('#').trim(),
         )))
     }
 }
@@ -123,6 +151,48 @@ mod tests {
         let body = std::fs::read_to_string(&path).expect("read");
         assert!(body.contains("4 spaces"));
         assert!(body.starts_with("- ("), "{body}");
+    }
+
+    #[tokio::test]
+    async fn appends_project_scoped_bullet_to_project_memory_file() {
+        let tmp = tempdir().unwrap();
+        let workspace = tmp.path().join("workspace");
+        std::fs::create_dir_all(&workspace).unwrap();
+        let path = tmp.path().join("memory.md");
+        let mut ctx = ToolContext::new(&workspace);
+        ctx.memory_path = Some(path.clone());
+
+        let tool = RememberTool;
+        let result = tool
+            .execute(
+                json!({"note": "run cargo fmt before commits", "scope": "project"}),
+                &ctx,
+            )
+            .await
+            .expect("ok");
+        assert!(result.success);
+        assert!(result.content.contains("project"));
+
+        let user_body = std::fs::read_to_string(&path).unwrap_or_default();
+        assert!(!user_body.contains("cargo fmt"));
+
+        let project_path = crate::memory::project_memory_path(&path, &workspace);
+        let project_body = std::fs::read_to_string(&project_path).expect("project memory");
+        assert!(project_body.contains("cargo fmt"));
+    }
+
+    #[tokio::test]
+    async fn rejects_unknown_memory_scope() {
+        let tmp = tempdir().unwrap();
+        let path = tmp.path().join("memory.md");
+        let ctx = ctx_with_memory(path);
+
+        let tool = RememberTool;
+        let err = tool
+            .execute(json!({"note": "x", "scope": "session"}), &ctx)
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("invalid memory scope"), "{err}");
     }
 
     #[tokio::test]

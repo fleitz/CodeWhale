@@ -44,7 +44,7 @@
 
 use std::fs;
 use std::io::{self, Write};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use chrono::Utc;
 
@@ -53,6 +53,10 @@ use chrono::Utc;
 /// marker so the user knows the model only saw a slice. Mirrors
 /// `project_context::MAX_CONTEXT_SIZE`.
 const MAX_MEMORY_SIZE: usize = 100 * 1024;
+/// Maximum project-scoped memory injected into the prompt. Project memory is a
+/// bridge toward Moraine-style recall, so it intentionally stays smaller than
+/// the legacy user-global block.
+const MAX_PROJECT_MEMORY_SIZE: usize = 32 * 1024;
 
 /// Read the user memory file at `path`, returning `None` when the file
 /// doesn't exist or is empty after trimming.
@@ -89,6 +93,23 @@ pub fn as_system_block(content: &str, source: &Path) -> Option<String> {
 
     Some(format!(
         "<user_memory source=\"{display}\">\n{payload}\n</user_memory>"
+    ))
+}
+
+/// Wrap a bounded project-memory recall slice in a `<project_memory>` block.
+#[must_use]
+pub fn as_project_system_block(content: &str, source: &Path, workspace: &Path) -> Option<String> {
+    let trimmed = content.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+
+    let display = source.display().to_string();
+    let workspace_display = workspace.display().to_string();
+    let payload = bounded_project_memory_payload(trimmed, &display);
+
+    Some(format!(
+        "<project_memory workspace=\"{workspace_display}\" source=\"{display}\" max_bytes=\"{MAX_PROJECT_MEMORY_SIZE}\">\n{payload}\n</project_memory>"
     ))
 }
 
@@ -136,6 +157,40 @@ pub fn compose_block(enabled: bool, path: &Path) -> Option<String> {
     as_system_block(&content, path)
 }
 
+/// Compose both legacy user-global memory and the bounded project-scoped
+/// memory seed. Returns `None` when both blocks are absent.
+#[must_use]
+pub fn compose_prompt_block(enabled: bool, user_path: &Path, workspace: &Path) -> Option<String> {
+    if !enabled {
+        return None;
+    }
+
+    let mut blocks = Vec::new();
+    if let Some(block) = compose_block(true, user_path) {
+        blocks.push(block);
+    }
+    if let Some(block) = compose_project_block(true, user_path, workspace) {
+        blocks.push(block);
+    }
+
+    if blocks.is_empty() {
+        None
+    } else {
+        Some(blocks.join("\n\n"))
+    }
+}
+
+/// Compose only the project-scoped memory block for `workspace`.
+#[must_use]
+pub fn compose_project_block(enabled: bool, user_path: &Path, workspace: &Path) -> Option<String> {
+    if !enabled {
+        return None;
+    }
+    let path = project_memory_path(user_path, workspace);
+    let content = load(&path)?;
+    as_project_system_block(&content, &path, workspace)
+}
+
 /// Append `entry` to the memory file at `path`, creating it (and its
 /// parent directory) if needed. The entry is timestamped so the user can
 /// later see when each note was added. The leading `#` from a `# foo`
@@ -162,6 +217,88 @@ pub fn append_entry(path: &Path, entry: &str) -> io::Result<()> {
         .open(path)?;
     writeln!(file, "- ({timestamp}) {trimmed}")?;
     Ok(())
+}
+
+/// Append a project-scoped memory entry under the CodeWhale memory state tree
+/// associated with `user_path`.
+pub fn append_project_entry(
+    user_path: &Path,
+    workspace: &Path,
+    entry: &str,
+) -> io::Result<PathBuf> {
+    let path = project_memory_path(user_path, workspace);
+    append_entry(&path, entry)?;
+    Ok(path)
+}
+
+/// Derive the memory file for `workspace` without storing anything inside the
+/// workspace. The readable slug helps humans inspect the directory; the hash
+/// prevents collisions between repos with the same basename.
+#[must_use]
+pub fn project_memory_path(user_path: &Path, workspace: &Path) -> PathBuf {
+    let base = user_path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    base.join("memory")
+        .join("projects")
+        .join(format!("{}.md", project_memory_key(workspace)))
+}
+
+#[must_use]
+pub fn project_memory_key(workspace: &Path) -> String {
+    let identity = fs::canonicalize(workspace).unwrap_or_else(|_| workspace.to_path_buf());
+    let identity = identity.to_string_lossy();
+    let slug = workspace
+        .file_name()
+        .and_then(|name| name.to_str())
+        .map(sanitize_project_memory_slug)
+        .filter(|slug| !slug.is_empty())
+        .unwrap_or_else(|| "workspace".to_string());
+    let digest = crate::hashing::sha256_hex(identity.as_bytes());
+    format!("{slug}-{}", &digest[..12])
+}
+
+fn sanitize_project_memory_slug(input: &str) -> String {
+    let mut slug = String::new();
+    for ch in input.chars() {
+        let normalized = if ch.is_ascii_alphanumeric() {
+            ch.to_ascii_lowercase()
+        } else {
+            '-'
+        };
+        if normalized == '-' && slug.ends_with('-') {
+            continue;
+        }
+        slug.push(normalized);
+        if slug.len() >= 48 {
+            break;
+        }
+    }
+    slug.trim_matches('-').to_string()
+}
+
+fn bounded_project_memory_payload(content: &str, source: &str) -> String {
+    if content.len() <= MAX_PROJECT_MEMORY_SIZE {
+        return content.to_string();
+    }
+
+    let mut cutoff = previous_char_boundary(content, content.len() - MAX_PROJECT_MEMORY_SIZE);
+    loop {
+        let omitted_bytes = cutoff;
+        let marker = project_truncation_marker(omitted_bytes, source);
+        let max_tail_len = MAX_PROJECT_MEMORY_SIZE.saturating_sub(marker.len() + 1);
+        let next_cutoff =
+            previous_char_boundary(content, content.len().saturating_sub(max_tail_len));
+        if next_cutoff == cutoff {
+            return format!("{marker}\n{}", content[cutoff..].trim_start());
+        }
+        cutoff = next_cutoff;
+    }
+}
+
+fn project_truncation_marker(omitted_bytes: usize, source: &str) -> String {
+    format!("<project_memory_truncated bytes={omitted_bytes} source=\"{source}\">")
 }
 
 #[cfg(test)]
@@ -203,6 +340,81 @@ mod tests {
     #[test]
     fn as_system_block_returns_none_for_empty_content() {
         assert!(as_system_block("   ", Path::new("/tmp/m.md")).is_none());
+    }
+
+    #[test]
+    fn project_memory_path_is_scoped_by_workspace_identity() {
+        let tmp = tempdir().unwrap();
+        let user_path = tmp.path().join("memory.md");
+        let workspace_a = tmp.path().join("same-name-a").join("repo");
+        let workspace_b = tmp.path().join("same-name-b").join("repo");
+        fs::create_dir_all(&workspace_a).unwrap();
+        fs::create_dir_all(&workspace_b).unwrap();
+
+        let path_a = project_memory_path(&user_path, &workspace_a);
+        let path_b = project_memory_path(&user_path, &workspace_b);
+
+        assert_ne!(path_a, path_b);
+        assert!(path_a.starts_with(tmp.path().join("memory").join("projects")));
+        assert!(
+            path_a
+                .file_name()
+                .unwrap()
+                .to_string_lossy()
+                .starts_with("repo-")
+        );
+    }
+
+    #[test]
+    fn project_memory_block_is_distinct_and_bounded() {
+        let big = "project note\n".repeat(4096);
+        let block = as_project_system_block(&big, Path::new("/tmp/project.md"), Path::new("/repo"))
+            .unwrap();
+
+        assert!(block.contains("<project_memory workspace=\"/repo\""));
+        assert!(block.contains("max_bytes=\"32768\""));
+        assert!(block.contains("<project_memory_truncated bytes="));
+        let payload = block
+            .strip_prefix("<project_memory workspace=\"/repo\" source=\"/tmp/project.md\" max_bytes=\"32768\">\n")
+            .unwrap()
+            .strip_suffix("\n</project_memory>")
+            .unwrap();
+        assert!(payload.len() <= MAX_PROJECT_MEMORY_SIZE);
+    }
+
+    #[test]
+    fn compose_prompt_block_keeps_user_and_project_memory_separate() {
+        let tmp = tempdir().unwrap();
+        let workspace = tmp.path().join("repo");
+        fs::create_dir_all(&workspace).unwrap();
+        let user_path = tmp.path().join("memory.md");
+        append_entry(&user_path, "prefer concise answers").unwrap();
+        append_project_entry(&user_path, &workspace, "run cargo fmt here").unwrap();
+
+        let block = compose_prompt_block(true, &user_path, &workspace).unwrap();
+
+        assert!(block.contains("<user_memory "));
+        assert!(block.contains("prefer concise answers"));
+        assert!(block.contains("<project_memory "));
+        assert!(block.contains("run cargo fmt here"));
+    }
+
+    #[test]
+    fn compose_project_block_does_not_leak_between_workspaces() {
+        let tmp = tempdir().unwrap();
+        let user_path = tmp.path().join("memory.md");
+        let workspace_a = tmp.path().join("a");
+        let workspace_b = tmp.path().join("b");
+        fs::create_dir_all(&workspace_a).unwrap();
+        fs::create_dir_all(&workspace_b).unwrap();
+        append_project_entry(&user_path, &workspace_a, "a-only convention").unwrap();
+
+        assert!(
+            compose_project_block(true, &user_path, &workspace_a)
+                .unwrap()
+                .contains("a-only convention")
+        );
+        assert!(compose_project_block(true, &user_path, &workspace_b).is_none());
     }
 
     #[test]
