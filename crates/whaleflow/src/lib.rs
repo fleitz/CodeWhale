@@ -641,7 +641,7 @@ impl WorkflowExecution {
         self.status = WorkflowRunStatus::ReplayDiverged;
     }
 
-    fn should_stop_mock_execution(&self) -> bool {
+    fn should_stop_workflow_execution(&self) -> bool {
         matches!(
             self.status,
             WorkflowRunStatus::Cancelled | WorkflowRunStatus::BudgetExceeded
@@ -691,6 +691,246 @@ impl MockLeafOutcome {
     pub fn with_memo_usage(mut self, memo_usage: WorkflowMemoUsage) -> Self {
         self.memo_usage = memo_usage;
         self
+    }
+}
+
+pub trait WorkflowLeafRunner {
+    fn run_leaf(&mut self, spec: &LeafSpec) -> Result<LeafResult, WorkflowExecutionError>;
+
+    fn evaluate_condition(
+        &mut self,
+        _node_id: &str,
+        _condition: &str,
+    ) -> Result<bool, WorkflowExecutionError> {
+        Ok(false)
+    }
+
+    fn expand_nodes(
+        &mut self,
+        _spec: &ExpandSpec,
+    ) -> Result<Vec<WorkflowNode>, WorkflowExecutionError> {
+        Ok(Vec::new())
+    }
+}
+
+pub struct WorkflowDriver<'runner, R> {
+    runner: &'runner mut R,
+}
+
+impl<'runner, R> WorkflowDriver<'runner, R>
+where
+    R: WorkflowLeafRunner,
+{
+    pub fn new(runner: &'runner mut R) -> Self {
+        Self { runner }
+    }
+
+    pub fn run(
+        &mut self,
+        spec: &WorkflowSpec,
+    ) -> Result<WorkflowExecution, WorkflowExecutionError> {
+        validate_workflow_nodes(&spec.nodes)?;
+        let mut execution = WorkflowExecution::default();
+        self.execute_nodes(&spec.nodes, &mut execution)?;
+        Ok(execution)
+    }
+
+    fn execute_nodes(
+        &mut self,
+        nodes: &[WorkflowNode],
+        execution: &mut WorkflowExecution,
+    ) -> Result<(), WorkflowExecutionError> {
+        for node in nodes {
+            if execution.should_stop_workflow_execution() {
+                break;
+            }
+            self.execute_node(node, execution)?;
+        }
+        Ok(())
+    }
+
+    fn execute_node(
+        &mut self,
+        node: &WorkflowNode,
+        execution: &mut WorkflowExecution,
+    ) -> Result<(), WorkflowExecutionError> {
+        match node {
+            WorkflowNode::BranchSet(spec) => self.execute_branch_set(spec, execution),
+            WorkflowNode::Leaf(spec) => self.execute_leaf(spec, execution),
+            WorkflowNode::Sequence(spec) => {
+                self.execute_nodes(&spec.children, execution)?;
+                execution.control_node_results.push(ControlNodeResult {
+                    node_id: spec.id.clone(),
+                    kind: ControlNodeKind::Sequence,
+                    status: execution.status,
+                    selected_children: spec.children.iter().map(node_id).collect(),
+                    summary: Some("sequence executed in declaration order".to_string()),
+                });
+                Ok(())
+            }
+            WorkflowNode::Reduce(spec) => {
+                execution.control_node_results.push(ControlNodeResult {
+                    node_id: spec.id.clone(),
+                    kind: ControlNodeKind::Reduce,
+                    status: WorkflowRunStatus::Succeeded,
+                    selected_children: spec.inputs.clone(),
+                    summary: Some(spec.prompt.clone()),
+                });
+                Ok(())
+            }
+            WorkflowNode::TeacherReview(spec) => {
+                execution.control_node_results.push(ControlNodeResult {
+                    node_id: spec.id.clone(),
+                    kind: ControlNodeKind::TeacherReview,
+                    status: WorkflowRunStatus::Succeeded,
+                    selected_children: spec.candidates.clone(),
+                    summary: Some(
+                        "teacher review scaffold selected declared candidates".to_string(),
+                    ),
+                });
+                Ok(())
+            }
+            WorkflowNode::LoopUntil(spec) => self.execute_loop_until(spec, execution),
+            WorkflowNode::Cond(spec) => self.execute_cond(spec, execution),
+            WorkflowNode::Expand(spec) => self.execute_expand(spec, execution),
+        }
+    }
+
+    fn execute_branch_set(
+        &mut self,
+        spec: &BranchSpec,
+        execution: &mut WorkflowExecution,
+    ) -> Result<(), WorkflowExecutionError> {
+        let before = execution.leaf_results.len();
+        self.execute_nodes(&spec.children, execution)?;
+        let status = aggregate_workflow_status(&execution.leaf_results[before..]);
+        let mut usage = WorkflowUsage::default();
+        let mut memo_usage = WorkflowMemoUsage::default();
+        for result in &execution.leaf_results[before..] {
+            usage.add_assign(result.usage);
+            memo_usage.add_assign(result.memo_usage);
+        }
+        mark_execution_for_status(execution, status);
+        execution.branch_results.push(BranchResult {
+            branch_id: spec.id.clone(),
+            task_id: spec.id.clone(),
+            status,
+            usage,
+            memo_usage,
+            artifacts: Vec::new(),
+            notes: Some("mock branch set executed without runtime fanout".to_string()),
+        });
+        execution.control_node_results.push(ControlNodeResult {
+            node_id: spec.id.clone(),
+            kind: ControlNodeKind::BranchSet,
+            status,
+            selected_children: spec.children.iter().map(node_id).collect(),
+            summary: Some("branch set scaffold executed children deterministically".to_string()),
+        });
+        Ok(())
+    }
+
+    fn execute_leaf(
+        &mut self,
+        spec: &LeafSpec,
+        execution: &mut WorkflowExecution,
+    ) -> Result<(), WorkflowExecutionError> {
+        let result = self.runner.run_leaf(spec)?;
+        mark_execution_for_status(execution, result.status);
+        execution.usage.add_assign(result.usage);
+        execution.memo_usage.add_assign(result.memo_usage);
+        execution.leaf_results.push(result);
+        Ok(())
+    }
+
+    fn execute_loop_until(
+        &mut self,
+        spec: &LoopUntilSpec,
+        execution: &mut WorkflowExecution,
+    ) -> Result<(), WorkflowExecutionError> {
+        let max_iterations = spec.max_iterations.unwrap_or(1).max(1);
+        let mut iterations = 0;
+        let mut passed = false;
+        while iterations < max_iterations {
+            if execution.should_stop_workflow_execution() {
+                break;
+            }
+            iterations += 1;
+            self.execute_nodes(&spec.children, execution)?;
+            if execution.should_stop_workflow_execution() {
+                break;
+            }
+            if self.runner.evaluate_condition(&spec.id, &spec.condition)? {
+                passed = true;
+                break;
+            }
+        }
+        let status = if execution.should_stop_workflow_execution() {
+            execution.status
+        } else if passed {
+            WorkflowRunStatus::Succeeded
+        } else {
+            WorkflowRunStatus::Failed
+        };
+        mark_execution_for_status(execution, status);
+        execution.control_node_results.push(ControlNodeResult {
+            node_id: spec.id.clone(),
+            kind: ControlNodeKind::LoopUntil,
+            status,
+            selected_children: spec.children.iter().map(node_id).collect(),
+            summary: Some(format!("loop_until iterations={iterations}")),
+        });
+        Ok(())
+    }
+
+    fn execute_cond(
+        &mut self,
+        spec: &CondSpec,
+        execution: &mut WorkflowExecution,
+    ) -> Result<(), WorkflowExecutionError> {
+        let passed = self.runner.evaluate_condition(&spec.id, &spec.condition)?;
+        let selected_nodes = if passed {
+            &spec.then_nodes
+        } else {
+            &spec.else_nodes
+        };
+        self.execute_nodes(selected_nodes, execution)?;
+        let status = if execution.should_stop_workflow_execution() {
+            execution.status
+        } else {
+            WorkflowRunStatus::Succeeded
+        };
+        execution.control_node_results.push(ControlNodeResult {
+            node_id: spec.id.clone(),
+            kind: ControlNodeKind::Cond,
+            status,
+            selected_children: selected_nodes.iter().map(node_id).collect(),
+            summary: Some(format!("predicate_result={passed}")),
+        });
+        Ok(())
+    }
+
+    fn execute_expand(
+        &mut self,
+        spec: &ExpandSpec,
+        execution: &mut WorkflowExecution,
+    ) -> Result<(), WorkflowExecutionError> {
+        let nodes = self.runner.expand_nodes(spec)?;
+        validate_workflow_node_shapes(&nodes)?;
+        self.execute_nodes(&nodes, execution)?;
+        let status = if execution.should_stop_workflow_execution() {
+            execution.status
+        } else {
+            WorkflowRunStatus::Succeeded
+        };
+        execution.control_node_results.push(ControlNodeResult {
+            node_id: spec.id.clone(),
+            kind: ControlNodeKind::Expand,
+            status,
+            selected_children: nodes.iter().map(node_id).collect(),
+            summary: Some(format!("expanded_from={}", spec.source)),
+        });
+        Ok(())
     }
 }
 
@@ -757,217 +997,7 @@ impl MockWorkflowExecutor {
         &mut self,
         spec: &WorkflowSpec,
     ) -> Result<WorkflowExecution, WorkflowExecutionError> {
-        validate_workflow_nodes(&spec.nodes)?;
-        let mut execution = WorkflowExecution::default();
-        self.execute_nodes(&spec.nodes, &mut execution)?;
-        Ok(execution)
-    }
-
-    fn execute_nodes(
-        &mut self,
-        nodes: &[WorkflowNode],
-        execution: &mut WorkflowExecution,
-    ) -> Result<(), WorkflowExecutionError> {
-        for node in nodes {
-            if execution.should_stop_mock_execution() {
-                break;
-            }
-            self.execute_node(node, execution)?;
-        }
-        Ok(())
-    }
-
-    fn execute_node(
-        &mut self,
-        node: &WorkflowNode,
-        execution: &mut WorkflowExecution,
-    ) -> Result<(), WorkflowExecutionError> {
-        match node {
-            WorkflowNode::BranchSet(spec) => self.execute_branch_set(spec, execution),
-            WorkflowNode::Leaf(spec) => {
-                self.execute_leaf(spec, execution);
-                Ok(())
-            }
-            WorkflowNode::Sequence(spec) => {
-                self.execute_nodes(&spec.children, execution)?;
-                execution.control_node_results.push(ControlNodeResult {
-                    node_id: spec.id.clone(),
-                    kind: ControlNodeKind::Sequence,
-                    status: execution.status,
-                    selected_children: spec.children.iter().map(node_id).collect(),
-                    summary: Some("sequence executed in declaration order".to_string()),
-                });
-                Ok(())
-            }
-            WorkflowNode::Reduce(spec) => {
-                execution.control_node_results.push(ControlNodeResult {
-                    node_id: spec.id.clone(),
-                    kind: ControlNodeKind::Reduce,
-                    status: WorkflowRunStatus::Succeeded,
-                    selected_children: spec.inputs.clone(),
-                    summary: Some(spec.prompt.clone()),
-                });
-                Ok(())
-            }
-            WorkflowNode::TeacherReview(spec) => {
-                execution.control_node_results.push(ControlNodeResult {
-                    node_id: spec.id.clone(),
-                    kind: ControlNodeKind::TeacherReview,
-                    status: WorkflowRunStatus::Succeeded,
-                    selected_children: spec.candidates.clone(),
-                    summary: Some(
-                        "teacher review scaffold selected declared candidates".to_string(),
-                    ),
-                });
-                Ok(())
-            }
-            WorkflowNode::LoopUntil(spec) => self.execute_loop_until(spec, execution),
-            WorkflowNode::Cond(spec) => self.execute_cond(spec, execution),
-            WorkflowNode::Expand(spec) => self.execute_expand(spec, execution),
-        }
-    }
-
-    fn execute_branch_set(
-        &mut self,
-        spec: &BranchSpec,
-        execution: &mut WorkflowExecution,
-    ) -> Result<(), WorkflowExecutionError> {
-        let before = execution.leaf_results.len();
-        self.execute_nodes(&spec.children, execution)?;
-        let status = aggregate_mock_status(&execution.leaf_results[before..]);
-        let mut usage = WorkflowUsage::default();
-        let mut memo_usage = WorkflowMemoUsage::default();
-        for result in &execution.leaf_results[before..] {
-            usage.add_assign(result.usage);
-            memo_usage.add_assign(result.memo_usage);
-        }
-        mark_execution_for_status(execution, status);
-        execution.branch_results.push(BranchResult {
-            branch_id: spec.id.clone(),
-            task_id: spec.id.clone(),
-            status,
-            usage,
-            memo_usage,
-            artifacts: Vec::new(),
-            notes: Some("mock branch set executed without runtime fanout".to_string()),
-        });
-        execution.control_node_results.push(ControlNodeResult {
-            node_id: spec.id.clone(),
-            kind: ControlNodeKind::BranchSet,
-            status,
-            selected_children: spec.children.iter().map(node_id).collect(),
-            summary: Some("branch set scaffold executed children deterministically".to_string()),
-        });
-        Ok(())
-    }
-
-    fn execute_leaf(&mut self, spec: &LeafSpec, execution: &mut WorkflowExecution) {
-        let outcome = self.mock_leaf_outcome(spec);
-        mark_execution_for_status(execution, outcome.status);
-        execution.usage.add_assign(outcome.usage);
-        execution.memo_usage.add_assign(outcome.memo_usage);
-        execution.leaf_results.push(LeafResult {
-            leaf_id: spec.id.clone(),
-            task_id: spec.id.clone(),
-            status: outcome.status,
-            usage: outcome.usage,
-            memo_usage: outcome.memo_usage,
-            output: outcome.output,
-            artifacts: outcome.artifacts,
-        });
-    }
-
-    fn execute_loop_until(
-        &mut self,
-        spec: &LoopUntilSpec,
-        execution: &mut WorkflowExecution,
-    ) -> Result<(), WorkflowExecutionError> {
-        let max_iterations = spec.max_iterations.unwrap_or(1).max(1);
-        let mut iterations = 0;
-        let mut passed = false;
-        while iterations < max_iterations {
-            if execution.should_stop_mock_execution() {
-                break;
-            }
-            iterations += 1;
-            self.execute_nodes(&spec.children, execution)?;
-            if execution.should_stop_mock_execution() {
-                break;
-            }
-            if self.next_predicate_result(&spec.id) {
-                passed = true;
-                break;
-            }
-        }
-        let status = if execution.should_stop_mock_execution() {
-            execution.status
-        } else if passed {
-            WorkflowRunStatus::Succeeded
-        } else {
-            WorkflowRunStatus::Failed
-        };
-        mark_execution_for_status(execution, status);
-        execution.control_node_results.push(ControlNodeResult {
-            node_id: spec.id.clone(),
-            kind: ControlNodeKind::LoopUntil,
-            status,
-            selected_children: spec.children.iter().map(node_id).collect(),
-            summary: Some(format!("loop_until iterations={iterations}")),
-        });
-        Ok(())
-    }
-
-    fn execute_cond(
-        &mut self,
-        spec: &CondSpec,
-        execution: &mut WorkflowExecution,
-    ) -> Result<(), WorkflowExecutionError> {
-        let passed = self.next_predicate_result(&spec.id);
-        let selected_nodes = if passed {
-            &spec.then_nodes
-        } else {
-            &spec.else_nodes
-        };
-        self.execute_nodes(selected_nodes, execution)?;
-        let status = if execution.should_stop_mock_execution() {
-            execution.status
-        } else {
-            WorkflowRunStatus::Succeeded
-        };
-        execution.control_node_results.push(ControlNodeResult {
-            node_id: spec.id.clone(),
-            kind: ControlNodeKind::Cond,
-            status,
-            selected_children: selected_nodes.iter().map(node_id).collect(),
-            summary: Some(format!("predicate_result={passed}")),
-        });
-        Ok(())
-    }
-
-    fn execute_expand(
-        &mut self,
-        spec: &ExpandSpec,
-        execution: &mut WorkflowExecution,
-    ) -> Result<(), WorkflowExecutionError> {
-        let mut nodes = self.generated_nodes.remove(&spec.id).unwrap_or_default();
-        if let Some(max_children) = spec.max_children {
-            nodes.truncate(max_children);
-        }
-        validate_workflow_node_shapes(&nodes)?;
-        self.execute_nodes(&nodes, execution)?;
-        let status = if execution.should_stop_mock_execution() {
-            execution.status
-        } else {
-            WorkflowRunStatus::Succeeded
-        };
-        execution.control_node_results.push(ControlNodeResult {
-            node_id: spec.id.clone(),
-            kind: ControlNodeKind::Expand,
-            status,
-            selected_children: nodes.iter().map(node_id).collect(),
-            summary: Some(format!("expanded_from={}", spec.source)),
-        });
-        Ok(())
+        WorkflowDriver::new(self).run(spec)
     }
 
     fn mock_leaf_outcome(&mut self, spec: &LeafSpec) -> MockLeafOutcome {
@@ -1037,7 +1067,41 @@ impl MockWorkflowExecutor {
     }
 }
 
-fn aggregate_mock_status(results: &[LeafResult]) -> WorkflowRunStatus {
+impl WorkflowLeafRunner for MockWorkflowExecutor {
+    fn run_leaf(&mut self, spec: &LeafSpec) -> Result<LeafResult, WorkflowExecutionError> {
+        let outcome = self.mock_leaf_outcome(spec);
+        Ok(LeafResult {
+            leaf_id: spec.id.clone(),
+            task_id: spec.id.clone(),
+            status: outcome.status,
+            usage: outcome.usage,
+            memo_usage: outcome.memo_usage,
+            output: outcome.output,
+            artifacts: outcome.artifacts,
+        })
+    }
+
+    fn evaluate_condition(
+        &mut self,
+        node_id: &str,
+        _condition: &str,
+    ) -> Result<bool, WorkflowExecutionError> {
+        Ok(self.next_predicate_result(node_id))
+    }
+
+    fn expand_nodes(
+        &mut self,
+        spec: &ExpandSpec,
+    ) -> Result<Vec<WorkflowNode>, WorkflowExecutionError> {
+        let mut nodes = self.generated_nodes.remove(&spec.id).unwrap_or_default();
+        if let Some(max_children) = spec.max_children {
+            nodes.truncate(max_children);
+        }
+        Ok(nodes)
+    }
+}
+
+fn aggregate_workflow_status(results: &[LeafResult]) -> WorkflowRunStatus {
     if results
         .iter()
         .any(|result| result.status == WorkflowRunStatus::Cancelled)
@@ -1956,6 +2020,7 @@ fn glob_prefix(scope: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::BTreeMap;
 
     fn task(id: &str) -> Task {
         Task {
@@ -2074,6 +2139,96 @@ mod tests {
             cost,
             diversity_key: Some(diversity_key.to_string()),
         }
+    }
+
+    #[derive(Default)]
+    struct RecordingLeafRunner {
+        leaves: Vec<String>,
+        conditions: BTreeMap<String, bool>,
+        expansions: BTreeMap<String, Vec<WorkflowNode>>,
+    }
+
+    impl WorkflowLeafRunner for RecordingLeafRunner {
+        fn run_leaf(&mut self, spec: &LeafSpec) -> Result<LeafResult, WorkflowExecutionError> {
+            self.leaves.push(spec.id.clone());
+            Ok(LeafResult {
+                leaf_id: spec.id.clone(),
+                task_id: spec.id.clone(),
+                status: WorkflowRunStatus::Succeeded,
+                usage: WorkflowUsage::default(),
+                memo_usage: WorkflowMemoUsage::default(),
+                output: Some(format!("recorded leaf {}", spec.id)),
+                artifacts: Vec::new(),
+            })
+        }
+
+        fn evaluate_condition(
+            &mut self,
+            node_id: &str,
+            _condition: &str,
+        ) -> Result<bool, WorkflowExecutionError> {
+            Ok(self.conditions.remove(node_id).unwrap_or(false))
+        }
+
+        fn expand_nodes(
+            &mut self,
+            spec: &ExpandSpec,
+        ) -> Result<Vec<WorkflowNode>, WorkflowExecutionError> {
+            let mut nodes = self.expansions.remove(&spec.id).unwrap_or_default();
+            if let Some(max_children) = spec.max_children {
+                nodes.truncate(max_children);
+            }
+            Ok(nodes)
+        }
+    }
+
+    #[test]
+    fn workflow_driver_delegates_leaves_predicates_and_expansion() {
+        let workflow = workflow_spec(vec![WorkflowNode::Sequence(SequenceSpec {
+            id: "orchestrate".to_string(),
+            children: vec![
+                WorkflowNode::Cond(CondSpec {
+                    id: "needs-patch".to_string(),
+                    condition: "finding requires a patch".to_string(),
+                    then_nodes: vec![leaf_node("patch")],
+                    else_nodes: vec![leaf_node("report-only")],
+                }),
+                WorkflowNode::Expand(ExpandSpec {
+                    id: "split".to_string(),
+                    source: "plan".to_string(),
+                    max_children: Some(1),
+                    template: None,
+                }),
+            ],
+        })]);
+        let mut runner = RecordingLeafRunner::default();
+        runner.conditions.insert("needs-patch".to_string(), true);
+        runner.expansions.insert(
+            "split".to_string(),
+            vec![leaf_node("worker-a"), leaf_node("worker-b")],
+        );
+
+        let execution = WorkflowDriver::new(&mut runner)
+            .run(&workflow)
+            .expect("custom runner should execute workflow");
+
+        assert_eq!(runner.leaves, vec!["patch", "worker-a"]);
+        assert_eq!(
+            execution
+                .leaf_results
+                .iter()
+                .map(|result| result.leaf_id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["patch", "worker-a"]
+        );
+        assert_eq!(
+            control_result(&execution, "needs-patch").selected_children,
+            vec!["patch"]
+        );
+        assert_eq!(
+            control_result(&execution, "split").selected_children,
+            vec!["worker-a"]
+        );
     }
 
     #[test]
