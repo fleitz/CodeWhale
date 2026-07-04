@@ -2488,12 +2488,24 @@ impl Engine {
             .build_turn_tool_registry_builder(input_policy.mode(), todo_list, plan_state)
             .with_dynamic_tools(&dynamic_tools);
 
-        let subagents_available =
-            self.config.subagents_enabled && self.config.features.enabled(Feature::Subagents);
+        let subagent_runtime_allow_shell =
+            self.session.allow_shell && !matches!(input_policy.mode(), AppMode::Plan);
+        let subagent_runtime_shell_policy =
+            shell_policy_for_mode(input_policy.mode(), subagent_runtime_allow_shell);
+        let subagent_policy = SubAgentPolicy::for_parent_turn(
+            self.config.subagents_enabled,
+            &self.config.features,
+            input_policy.mode(),
+            subagent_runtime_allow_shell,
+            subagent_runtime_shell_policy,
+            self.config.max_spawn_depth,
+            self.agent_tool_surface_options(subagent_runtime_shell_policy),
+        );
+        let subagents_available = subagent_policy.exposes_agent_tool();
 
         let fork_context_for_runtime = if subagents_available {
             let state = StructuredState::capture(
-                input_policy.mode().label(),
+                subagent_policy.parent_mode().label(),
                 self.config.workspace.clone(),
                 std::env::current_dir().ok(),
                 &self.session.working_set,
@@ -2565,15 +2577,11 @@ impl Engine {
 
         let mut tool_registry = if subagents_available {
             let runtime = if let Some(client) = self.deepseek_client.clone() {
-                let runtime_allow_shell =
-                    self.session.allow_shell && !matches!(input_policy.mode(), AppMode::Plan);
-                let runtime_shell_policy =
-                    shell_policy_for_mode(input_policy.mode(), runtime_allow_shell);
                 let mut rt = SubAgentRuntime::new(
                     client,
                     self.session.model.clone(),
                     tool_context.clone(),
-                    runtime_allow_shell,
+                    subagent_policy.runtime_allow_shell(),
                     Some(self.tx_event.clone()),
                     Arc::clone(&self.subagent_manager),
                 )
@@ -2583,18 +2591,14 @@ impl Engine {
                     self.session.reasoning_effort.clone(),
                     self.session.reasoning_effort_auto,
                 )
-                .with_agent_tool_surface_options(
-                    self.agent_tool_surface_options(runtime_shell_policy),
-                )
-                .with_max_spawn_depth(self.config.max_spawn_depth)
+                .with_agent_tool_surface_options(subagent_policy.child_surface_options().clone())
+                .with_max_spawn_depth(subagent_policy.max_spawn_depth())
                 .with_step_api_timeout(self.config.subagent_api_timeout)
                 .with_speech_output_dir(self.config.speech_output_dir.clone())
                 .with_mcp_pool(mcp_pool.clone())
                 .with_todos(self.config.todos.clone())
                 .with_parent_completion_tx(self.tx_subagent_completion.clone());
-                if matches!(input_policy.mode(), AppMode::Plan) {
-                    rt.worker_profile = WorkerRuntimeProfile::for_role(SubAgentType::Plan);
-                }
+                rt.worker_profile = subagent_policy.parent_profile().clone();
                 if let Some(context) = fork_context_for_runtime.clone() {
                     rt = rt.with_fork_context(context);
                 }
@@ -3846,6 +3850,7 @@ use context::{context_input_budget_for_provider, effective_max_output_tokens};
 mod dispatch;
 mod lsp_hooks;
 mod streaming;
+mod subagent_policy;
 mod token_estimate_cache;
 mod tool_catalog;
 mod tool_execution;
@@ -3895,6 +3900,7 @@ use self::streaming::{
     ToolUseState, contains_fake_tool_wrapper, filter_tool_call_delta, should_resume_after_sleep,
     should_transparently_retry_stream, sleep_gap_detected, stream_read_error_user_message,
 };
+use self::subagent_policy::SubAgentPolicy;
 use self::tool_catalog::{
     CODE_EXECUTION_TOOL_NAME, JS_EXECUTION_TOOL_NAME, MULTI_TOOL_PARALLEL_NAME,
     REQUEST_USER_INPUT_NAME, active_tools_for_step, build_model_tool_catalog_with_surface,
