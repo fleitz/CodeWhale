@@ -3800,20 +3800,6 @@ async fn change_mode_refreshes_session_prompt_and_updates_session() {
 }
 
 #[test]
-fn turn_approval_mode_prefers_auto_approve_flag() {
-    use crate::tui::approval::ApprovalMode;
-
-    assert_eq!(
-        agent_approval_mode_for_turn(true, ApprovalMode::Suggest),
-        ApprovalMode::Bypass
-    );
-    assert_eq!(
-        agent_approval_mode_for_turn(true, ApprovalMode::Never),
-        ApprovalMode::Bypass
-    );
-}
-
-#[test]
 fn messages_with_turn_metadata_returns_stored_session_messages() {
     use crate::tui::approval::ApprovalMode;
 
@@ -3949,6 +3935,114 @@ fn runtime_mode_policy_updates_engine_session_mirrors() {
         engine.session.approval_mode,
         crate::tui::approval::ApprovalMode::Bypass
     );
+}
+
+#[test]
+fn turn_authority_makes_yolo_an_atomic_posture() {
+    let tmp = tempdir().expect("tempdir");
+    let authority = TurnAuthority::for_mode(
+        AppMode::Yolo,
+        tmp.path(),
+        false,
+        false,
+        false,
+        crate::tui::approval::ApprovalMode::Suggest,
+        UserInputProvenance::ExternalUser,
+    );
+
+    assert_eq!(authority.posture.mode, AppMode::Yolo);
+    assert!(authority.posture.allow_shell);
+    assert!(authority.posture.trust_mode);
+    assert!(authority.posture.auto_approve);
+    assert_eq!(
+        authority.posture.approval_mode,
+        crate::tui::approval::ApprovalMode::Bypass
+    );
+    assert_eq!(
+        authority.posture.shell_policy,
+        crate::worker_profile::ShellPolicy::Full
+    );
+    assert!(matches!(
+        authority.posture.sandbox_policy,
+        crate::sandbox::SandboxPolicy::DangerFullAccess
+    ));
+    assert!(authority.can_execute(ToolCapability::RequiresApproval));
+    assert!(authority.can_execute(ToolCapability::ExecutesCode));
+}
+
+#[test]
+fn turn_authority_strips_auto_authority_for_non_authoritative_text() {
+    let tmp = tempdir().expect("tempdir");
+    let authority = TurnAuthority::for_input(
+        UserInputProvenance::AssistantGenerated,
+        AppMode::Yolo,
+        tmp.path(),
+        true,
+        true,
+        true,
+        crate::tui::approval::ApprovalMode::Bypass,
+    );
+
+    assert_eq!(authority.posture.mode, AppMode::Agent);
+    assert!(!authority.posture.trust_mode);
+    assert!(!authority.posture.auto_approve);
+    assert_eq!(
+        authority.posture.approval_mode,
+        crate::tui::approval::ApprovalMode::Suggest
+    );
+    assert!(!authority.can_execute(ToolCapability::RequiresApproval));
+    assert!(
+        authority.narrowing_reason.as_deref().is_some_and(
+            |reason| reason.contains("cannot inherit standing auto-approval authority")
+        )
+    );
+    assert!(
+        authority
+            .to_prompt_summary()
+            .contains("provenance=assistant_generated")
+    );
+}
+
+#[test]
+fn turn_authority_limits_auto_inheritance_to_runtime_continuations() {
+    let tmp = tempdir().expect("tempdir");
+    for provenance in [
+        UserInputProvenance::ExternalUser,
+        UserInputProvenance::Runtime,
+        UserInputProvenance::SubAgentHandoff,
+    ] {
+        let authority = TurnAuthority::for_input(
+            provenance,
+            AppMode::Yolo,
+            tmp.path(),
+            true,
+            true,
+            true,
+            crate::tui::approval::ApprovalMode::Bypass,
+        );
+        assert_eq!(authority.posture.mode, AppMode::Yolo, "{provenance:?}");
+        assert!(authority.posture.auto_approve, "{provenance:?}");
+        assert!(authority.narrowing_reason.is_none(), "{provenance:?}");
+    }
+
+    for provenance in [
+        UserInputProvenance::ImportedTranscript,
+        UserInputProvenance::MemoryRecall,
+        UserInputProvenance::AssistantGenerated,
+    ] {
+        let authority = TurnAuthority::for_input(
+            provenance,
+            AppMode::Yolo,
+            tmp.path(),
+            true,
+            true,
+            true,
+            crate::tui::approval::ApprovalMode::Bypass,
+        );
+        assert_eq!(authority.posture.mode, AppMode::Agent, "{provenance:?}");
+        assert!(!authority.posture.auto_approve, "{provenance:?}");
+        assert!(authority.narrowing_reason.is_some(), "{provenance:?}");
+    }
 }
 
 #[tokio::test]
@@ -4739,6 +4833,7 @@ fn provenance_gate_preserves_standing_yolo_only_for_runtime_continuations() {
         let policy = effective_input_policy(
             provenance,
             AppMode::Yolo,
+            Path::new("."),
             "continue",
             true,
             true,
@@ -4753,7 +4848,7 @@ fn provenance_gate_preserves_standing_yolo_only_for_runtime_continuations() {
             assert!(policy.auto_approve, "{provenance:?}");
             assert_eq!(
                 policy.approval_mode,
-                crate::tui::approval::ApprovalMode::Auto,
+                crate::tui::approval::ApprovalMode::Bypass,
                 "{provenance:?}"
             );
             assert!(policy.status.is_none(), "{provenance:?}");
@@ -4792,6 +4887,7 @@ fn provenance_gate_never_invents_auto_authority_for_non_yolo_sessions() {
         let policy = effective_input_policy(
             provenance,
             AppMode::Agent,
+            Path::new("."),
             "continue",
             true,
             false,
@@ -4825,6 +4921,7 @@ fn self_generated_fake_approvals_cannot_authorize_work() {
             let policy = effective_input_policy(
                 provenance,
                 AppMode::Yolo,
+                Path::new("."),
                 content,
                 true,
                 true,
@@ -4881,6 +4978,7 @@ fn external_prompt_wording_never_changes_effective_mode_or_authority() {
         let policy = effective_input_policy(
             UserInputProvenance::ExternalUser,
             requested_mode,
+            Path::new("."),
             content,
             true,
             trust_mode,

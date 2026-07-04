@@ -1306,13 +1306,22 @@ impl Engine {
         auto_approve: bool,
         approval_mode: crate::tui::approval::ApprovalMode,
     ) {
-        self.current_mode = mode;
-        self.session.allow_shell = allow_shell;
-        self.config.allow_shell = allow_shell;
-        self.session.trust_mode = trust_mode;
-        self.config.trust_mode = trust_mode;
-        self.session.auto_approve = auto_approve;
-        self.session.approval_mode = agent_approval_mode_for_turn(auto_approve, approval_mode);
+        let authority = TurnAuthority::for_mode(
+            mode,
+            &self.session.workspace,
+            allow_shell,
+            trust_mode,
+            auto_approve,
+            approval_mode,
+            UserInputProvenance::Runtime,
+        );
+        self.current_mode = authority.posture.mode;
+        self.session.allow_shell = authority.posture.allow_shell;
+        self.config.allow_shell = authority.posture.allow_shell;
+        self.session.trust_mode = authority.posture.trust_mode;
+        self.config.trust_mode = authority.posture.trust_mode;
+        self.session.auto_approve = authority.posture.auto_approve;
+        self.session.approval_mode = authority.posture.approval_mode;
     }
 
     /// Run the engine event loop
@@ -2275,6 +2284,7 @@ impl Engine {
         let input_policy = effective_input_policy(
             provenance,
             mode,
+            &self.session.workspace,
             &content,
             allow_shell,
             trust_mode,
@@ -3523,71 +3533,32 @@ struct EffectiveInputPolicy {
 fn effective_input_policy(
     provenance: UserInputProvenance,
     requested_mode: AppMode,
+    workspace: &Path,
     _content: &str,
     allow_shell: bool,
     trust_mode: bool,
     auto_approve: bool,
     approval_mode: crate::tui::approval::ApprovalMode,
 ) -> EffectiveInputPolicy {
-    let mut mode = requested_mode;
-    let mut trust_mode = trust_mode;
-    let mut auto_approve = auto_approve;
-    let mut approval_mode = approval_mode;
-    let dynamic_active_tools = Vec::new();
-    let mut status = None;
-
-    if !provenance_can_inherit_standing_auto_authority(provenance) {
-        let had_auto_authority = matches!(mode, AppMode::Yolo)
-            || trust_mode
-            || auto_approve
-            || matches!(approval_mode, crate::tui::approval::ApprovalMode::Bypass);
-        if matches!(mode, AppMode::Yolo) {
-            mode = AppMode::Agent;
-        }
-        trust_mode = false;
-        auto_approve = false;
-        if matches!(
-            approval_mode,
-            crate::tui::approval::ApprovalMode::Auto | crate::tui::approval::ApprovalMode::Bypass
-        ) {
-            approval_mode = crate::tui::approval::ApprovalMode::Suggest;
-        }
-        if had_auto_authority {
-            status = Some(format!(
-                "Input provenance '{}' cannot inherit standing auto-approval authority; continuing with approvals required.",
-                provenance.as_str()
-            ));
-        }
-    }
-
-    EffectiveInputPolicy {
-        mode,
+    let authority = TurnAuthority::for_input(
+        provenance,
+        requested_mode,
+        workspace,
         allow_shell,
         trust_mode,
         auto_approve,
         approval_mode,
+    );
+    let dynamic_active_tools = Vec::new();
+
+    EffectiveInputPolicy {
+        mode: authority.posture.mode,
+        allow_shell: authority.posture.allow_shell,
+        trust_mode: authority.posture.trust_mode,
+        auto_approve: authority.posture.auto_approve,
+        approval_mode: authority.posture.approval_mode,
         dynamic_active_tools,
-        status,
-    }
-}
-
-fn provenance_can_inherit_standing_auto_authority(provenance: UserInputProvenance) -> bool {
-    matches!(
-        provenance,
-        UserInputProvenance::ExternalUser
-            | UserInputProvenance::Runtime
-            | UserInputProvenance::SubAgentHandoff
-    )
-}
-
-fn agent_approval_mode_for_turn(
-    auto_approve: bool,
-    approval_mode: crate::tui::approval::ApprovalMode,
-) -> crate::tui::approval::ApprovalMode {
-    if auto_approve {
-        crate::tui::approval::ApprovalMode::Bypass
-    } else {
-        approval_mode
+        status: authority.narrowing_reason,
     }
 }
 
@@ -3915,6 +3886,7 @@ fn filter_tool_catalog_for_gates(
 }
 
 use self::approval::{ApprovalDecision, ApprovalResult, UserInputDecision};
+use self::authority::TurnAuthority;
 #[cfg(test)]
 use self::dispatch::should_parallelize_tool_batch;
 use self::dispatch::{
@@ -3952,5 +3924,6 @@ use self::tool_execution::emit_tool_audit;
 use self::tool_setup::{sandbox_policy_for_mode, shell_policy_for_mode};
 use crate::tools::js_execution::execute_js_execution_tool;
 
+mod authority;
 #[cfg(test)]
 mod tests;
