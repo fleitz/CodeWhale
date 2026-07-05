@@ -7,8 +7,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.8.67] - 2026-07-05
+
 ### Added
 
+- Added Meituan LongCat as a first-class OpenAI-compatible provider (`longcat`
+  with `long-cat`/`meituan-longcat`/`meituan` aliases), `LONGCAT_API_KEY`
+  discovery, the `LongCat-2.0` default model and the
+  `https://api.longcat.chat/openai/v1` endpoint, with provider-picker wiring,
+  model completions, and provider docs.
+- Surfaced every shipped UI locale in the first-run language picker: `es-419`
+  and `vi` are now offered (options 7–8) and the footer range is corrected to
+  "1-8", with guard tests that keep the picker in sync with `Locale::shipped()`
+  (#3929).
 - Added a website localization matrix with a locale registry and drift checks.
   Harvested from #3763 by @idling11.
 
@@ -19,6 +30,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Persisted `/plugin enable|disable` overrides across restarts so a disabled
+  (or enabled) plugin no longer resets on the next launch (#3918).
+- Unified the terminal display-width contract on a single helper, fixing the
+  pending-input preview's word-wrap on tab/control characters (#3924).
+- Made skill-name lookup reachable and warned on shadowing: discovered skill
+  names are normalized/slugified for dispatch, and duplicate normalized names —
+  across roots and within a single root — now warn instead of silently
+  shadowing (#3919).
+- Removed the unenforced skills trust / `allowed-tools` copy that implied
+  sandboxing that is not applied (#3920).
+- Repaired the onboarding Trust step so `Enter` no longer silently grants
+  workspace trust (it guides to the explicit keys), and fixed the API-key
+  step's `Esc` navigation (#3926, #3927).
+- Surfaced a visible notice when a gated custom Constitution override is
+  present but the opt-in flag is unset, instead of only a `tracing::warn`
+  (#3928).
 - Raised the streamed model-response idle timeout and matched the TUI stall
   watchdog to the configured stream budget so long reasoning pauses are not
   recovered as stalled turns (#2487).
@@ -1601,63 +1628,6 @@ Thanks to **@xyuai** for provider persistence, `/logout` scope clarification,
 provider picker key replacement, and MiMo auth cleanup work (#2714, #2715,
 #2717, #2718), and **@RefuseOdd** for configurable `path_suffix` support on
 OpenAI-compatible endpoints (#2558).
-
-## [0.8.52] - 2026-06-03
-
-### Added
-
-- **SiliconFlow China region provider.** Added the `siliconflow-CN` provider
-  variant for the China regional endpoint, sharing the existing
-  `[providers.siliconflow]` credentials and `SILICONFLOW_API_KEY` slot
-  instead of creating a second credential namespace; the provider picker and
-  registry docs now expose the regional route explicitly (#2588, #2615).
-- **Multimodal `/attach` image forwarding.** Attached images are now sent as
-  OpenAI-compatible `image_url` content blocks so multimodal providers can
-  actually see image attachments (#2584, #2587, #2607).
-- **Sub-agent lifecycle hooks and runtime metadata.** Sub-agent spawn/complete
-  hook events, mode-change runtime messages, mode metadata on turns, localized
-  context-inspector strings, and drag-to-resize sidebar width are included in
-  this release slice.
-
-### Fixed
-
-- **Sub-agents now auto-cancel after stale heartbeats.** Running sub-agents
-  track manager-visible progress and are auto-cancelled after the configurable
-  `[subagents] heartbeat_timeout_secs` window (default 300s), releasing their
-  concurrency slot and unblocking parent turns that would otherwise wait
-  forever (#2603, #2614, #2620).
-- **Work panel state survives transient lock misses.** The sidebar caches the
-  last successful Work summary so checklist and strategy progress no longer
-  disappear into "Work state updating..." while the engine briefly owns the
-  shared todo/plan locks (#2606, #2616).
-- **SiliconFlow-CN no longer breaks main.** Filled the missing CLI provider
-  exhaustiveness arms and removed the duplicate/unreachable TUI config arms
-  left by the #2615 landing; direct auth now stores the China-region variant in
-  the shared SiliconFlow provider table (#2616, #2618, #2619).
-- **v0.8.51 image-attach closure corrected.** The `/attach` multimodal fix
-  landed after the v0.8.51 tag, so this release is the first version that
-  actually contains it for users installing from the published release line
-  (#2584, #2607).
-- **Legacy SSE MCP reconnects are retryable again.** Closed or reset
-  `POST /messages` requests on stale legacy SSE sessions now trigger the same
-  reconnect-and-retry path as closed SSE streams, removing a release-gate flake
-  and matching the intended recovery behavior (#2597).
-- **Cache-hit cost accounting uses one telemetry source.** Mixed DeepSeek
-  `prompt_cache_hit_tokens` and OpenAI-style `cached_tokens` usage payloads no
-  longer infer cache misses from the wrong hit count, avoiding inflated TUI cost
-  estimates on cached DeepSeek turns (#2567, #2609).
-- **Cygwin/MSYS2 config paths honor exported `$HOME`.** CodeWhale and legacy
-  DeepSeek config roots now prefer a non-empty `$HOME` before falling back to the
-  platform home resolver, while `CODEWHALE_HOME` remains the strongest explicit
-  override (#2369, #2610).
-
-### Community
-
-Thanks to **@xyuai** (#2587), **@IcedOranges** (#2584), **@BH8GCJ** (#2588),
-**@shenjackyuanjie** (#2618, #2619), **@idling11** (#2606, #2616),
-**@AresNing** (#2578), **@caiyilian** (#2567), **@buko** (#2369),
-**@gordonlu**, **@encyc**, and **@simuusang** (#2603, #2620) for reports,
-patches, retesting, and release-stabilization signals that shaped this pass.
 
 ---
 

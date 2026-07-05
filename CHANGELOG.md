@@ -7,8 +7,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.8.67] - 2026-07-05
+
 ### Added
 
+- Added Meituan LongCat as a first-class OpenAI-compatible provider (`longcat`
+  with `long-cat`/`meituan-longcat`/`meituan` aliases), `LONGCAT_API_KEY`
+  discovery, the `LongCat-2.0` default model and the
+  `https://api.longcat.chat/openai/v1` endpoint, with provider-picker wiring,
+  model completions, and provider docs.
+- Surfaced every shipped UI locale in the first-run language picker: `es-419`
+  and `vi` are now offered (options 7–8) and the footer range is corrected to
+  "1-8", with guard tests that keep the picker in sync with `Locale::shipped()`
+  (#3929).
 - Added a website localization matrix with a locale registry and drift checks.
   Harvested from #3763 by @idling11.
 
@@ -19,6 +30,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Persisted `/plugin enable|disable` overrides across restarts so a disabled
+  (or enabled) plugin no longer resets on the next launch (#3918).
+- Unified the terminal display-width contract on a single helper, fixing the
+  pending-input preview's word-wrap on tab/control characters (#3924).
+- Made skill-name lookup reachable and warned on shadowing: discovered skill
+  names are normalized/slugified for dispatch, and duplicate normalized names —
+  across roots and within a single root — now warn instead of silently
+  shadowing (#3919).
+- Removed the unenforced skills trust / `allowed-tools` copy that implied
+  sandboxing that is not applied (#3920).
+- Repaired the onboarding Trust step so `Enter` no longer silently grants
+  workspace trust (it guides to the explicit keys), and fixed the API-key
+  step's `Esc` navigation (#3926, #3927).
+- Surfaced a visible notice when a gated custom Constitution override is
+  present but the opt-in flag is unset, instead of only a `tracing::warn`
+  (#3928).
 - Raised the streamed model-response idle timeout and matched the TUI stall
   watchdog to the configured stream budget so long reasoning pauses are not
   recovered as stalled turns (#2487).
@@ -2626,7 +2653,8 @@ overflow report and `/theme` picker edge-wrapping patch in #1814.
 
 Older releases (v0.8.39 and earlier) are archived in [docs/CHANGELOG_ARCHIVE.md](docs/CHANGELOG_ARCHIVE.md).
 
-[Unreleased]: https://github.com/Hmbown/CodeWhale/compare/v0.8.66...HEAD
+[Unreleased]: https://github.com/Hmbown/CodeWhale/compare/v0.8.67...HEAD
+[0.8.67]: https://github.com/Hmbown/CodeWhale/compare/v0.8.66...v0.8.67
 [0.8.66]: https://github.com/Hmbown/CodeWhale/compare/v0.8.65...v0.8.66
 [0.8.65]: https://github.com/Hmbown/CodeWhale/compare/v0.8.64...v0.8.65
 [0.8.64]: https://github.com/Hmbown/CodeWhale/compare/v0.8.63...v0.8.64
