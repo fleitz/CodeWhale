@@ -3694,7 +3694,7 @@ impl ToolSpec for AgentTool {
                 },
                 "fork_context": {
                     "type": "boolean",
-                    "description": "false (default): fresh child context. true: include the current parent context prefix when the child needs it."
+                    "description": "false (default): fresh child context. true: include the current parent context prefix when the child needs shared context or a byte-identical parent prefix for DeepSeek prefix-cache reuse."
                 },
                 "max_depth": {
                     "type": "integer",
