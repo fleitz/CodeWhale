@@ -4650,6 +4650,59 @@ mod tests {
     }
 
     #[test]
+    fn provider_model_detail_lines_cover_deepseek_cn_and_local_boundaries() {
+        let _guard = crate::test_support::lock_test_env();
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let workspace = tmp.path().join("workspace");
+        std::fs::create_dir_all(&workspace).expect("workspace dir");
+        let codewhale_home = tmp.path().join(".codewhale");
+        let _home = crate::test_support::EnvVarGuard::set("HOME", tmp.path());
+        let _userprofile = crate::test_support::EnvVarGuard::set("USERPROFILE", tmp.path());
+        let _codewhale_home =
+            crate::test_support::EnvVarGuard::set("CODEWHALE_HOME", &codewhale_home);
+        let _deepseek_key = crate::test_support::EnvVarGuard::remove("DEEPSEEK_API_KEY");
+        let _deepseek_source = crate::test_support::EnvVarGuard::remove("DEEPSEEK_API_KEY_SOURCE");
+
+        let cn_config = Config {
+            provider: Some("deepseek-cn".to_string()),
+            ..Config::default()
+        };
+        let cn_app = App::new(setup_test_options(workspace.clone()), &cn_config);
+        let cn_view = SetupWizardView::new_at_with_facts(
+            SetupState::default(),
+            Locale::En,
+            SetupStep::ProviderModel,
+            SetupRuntimeFacts::from_app_config(&cn_app, &cn_config),
+        );
+        let cn_text = lines_to_text(cn_view.provider_model_detail_lines());
+        assert!(cn_text.contains("DeepSeek (legacy alias)"), "{cn_text}");
+        assert!(
+            cn_text.contains("credentials: https://platform.deepseek.com/api_keys"),
+            "{cn_text}"
+        );
+        assert!(cn_text.contains("missing for active provider"), "{cn_text}");
+
+        let local_config = Config {
+            provider: Some("ollama".to_string()),
+            ..Config::default()
+        };
+        let local_app = App::new(setup_test_options(workspace), &local_config);
+        let local_view = SetupWizardView::new_at_with_facts(
+            SetupState::default(),
+            Locale::En,
+            SetupStep::ProviderModel,
+            SetupRuntimeFacts::from_app_config(&local_app, &local_config),
+        );
+        let local_text = lines_to_text(local_view.provider_model_detail_lines());
+        assert!(local_text.contains("Ollama"), "{local_text}");
+        assert!(
+            local_text.contains("present or local runtime"),
+            "{local_text}"
+        );
+        assert!(!local_text.contains("credentials:"), "{local_text}");
+    }
+
+    #[test]
     fn runtime_posture_step_hands_off_to_mode_and_config_surfaces() {
         let mut view = SetupWizardView::new_at_with_facts(
             SetupState::default(),

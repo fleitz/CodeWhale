@@ -2402,6 +2402,104 @@ mod tests {
     }
 
     #[test]
+    fn setup_provider_key_entry_matrix_keeps_hosted_codex_and_local_hints_distinct() {
+        let _guard = crate::test_support::lock_test_env();
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let codewhale_home = tmp.path().join(".codewhale");
+        let _home = crate::test_support::EnvVarGuard::set("HOME", tmp.path());
+        let _userprofile = crate::test_support::EnvVarGuard::set("USERPROFILE", tmp.path());
+        let _codewhale_home =
+            crate::test_support::EnvVarGuard::set("CODEWHALE_HOME", &codewhale_home);
+        let _deepseek_key = crate::test_support::EnvVarGuard::remove("DEEPSEEK_API_KEY");
+        let _deepseek_source = crate::test_support::EnvVarGuard::remove("DEEPSEEK_API_KEY_SOURCE");
+        let _codex_key = crate::test_support::EnvVarGuard::remove("OPENAI_CODEX_ACCESS_TOKEN");
+        let _codex_legacy_key = crate::test_support::EnvVarGuard::remove("CODEX_ACCESS_TOKEN");
+        let config = Config::default();
+
+        let hosted = ProviderPickerView::new_for_setup(
+            ApiProvider::Openai,
+            Some(ApiProvider::Deepseek),
+            &config,
+            None,
+        );
+        assert_eq!(hosted.stage, Stage::KeyEntry);
+        assert_eq!(hosted.selected_provider(), ApiProvider::Deepseek);
+        let hosted_text = render_text(&hosted, 120, 20);
+        assert!(hosted_text.contains("DEEPSEEK_API_KEY"), "{hosted_text}");
+        assert!(
+            hosted_text.contains("Credentials: https://platform.deepseek.com/api_keys"),
+            "{hosted_text}"
+        );
+        assert!(!hosted_text.contains("OAuth login"), "{hosted_text}");
+
+        let codex = ProviderPickerView::new_for_setup(
+            ApiProvider::Deepseek,
+            Some(ApiProvider::OpenaiCodex),
+            &config,
+            None,
+        );
+        assert_eq!(codex.stage, Stage::KeyEntry);
+        assert_eq!(codex.selected_provider(), ApiProvider::OpenaiCodex);
+        let codex_text = render_text(&codex, 120, 20);
+        assert!(codex_text.contains("OAuth login"), "{codex_text}");
+        assert!(
+            codex_text.contains("OPENAI_CODEX_ACCESS_TOKEN"),
+            "{codex_text}"
+        );
+        assert!(!codex_text.contains("Credentials:"), "{codex_text}");
+        assert!(!codex_text.contains("(paste key here)"), "{codex_text}");
+
+        let local = ProviderPickerView::new_for_setup(
+            ApiProvider::Deepseek,
+            Some(ApiProvider::Ollama),
+            &config,
+            None,
+        );
+        assert_eq!(local.stage, Stage::List);
+        assert_eq!(local.selected_provider(), ApiProvider::Ollama);
+        let local_text = render_text(&local, 120, 20);
+        assert!(!local_text.contains("Credentials:"), "{local_text}");
+
+        let mut custom = std::collections::HashMap::new();
+        custom.insert(
+            "my_thing".to_string(),
+            crate::config::ProviderConfig {
+                kind: Some("openai-compatible".to_string()),
+                base_url: Some("https://api.example.com/v1".to_string()),
+                model: Some("vendor/custom-model-v1".to_string()),
+                api_key_env: Some("EXAMPLE_API_KEY".to_string()),
+                ..Default::default()
+            },
+        );
+        let _custom_key = crate::test_support::EnvVarGuard::remove("EXAMPLE_API_KEY");
+        let custom_config = Config {
+            provider: Some("my_thing".to_string()),
+            providers: Some(crate::config::ProvidersConfig {
+                custom,
+                ..Default::default()
+            }),
+            ..Config::default()
+        };
+        let custom_picker =
+            ProviderPickerView::new_for_setup(ApiProvider::Custom, None, &custom_config, None);
+        let custom_row = &custom_picker.rows[custom_picker.selected_idx];
+        assert_eq!(custom_row.provider, ApiProvider::Custom);
+        assert_eq!(custom_row.provider_id, "my_thing");
+        assert!(
+            custom_row
+                .messages
+                .iter()
+                .any(|message| message.contains("EXAMPLE_API_KEY")),
+            "custom setup row should name its configured auth env var: {:?}",
+            custom_row.messages
+        );
+        let custom_text = render_text(&custom_picker, 120, 20);
+        assert!(custom_text.contains("my_thing"), "{custom_text}");
+        assert!(custom_text.contains("EXAMPLE_API_KEY"), "{custom_text}");
+        assert!(!custom_text.contains("Credentials:"), "{custom_text}");
+    }
+
+    #[test]
     fn provider_dashboard_row_models_local_readiness_without_rendering() {
         let config = Config::default();
         let row =

@@ -4120,6 +4120,7 @@ fn doctor_provider_model_report_json(config: &Config) -> serde_json::Value {
 
     let provider = config.api_provider();
     let auth_source = resolve_api_key_source(config);
+    let auth_present_or_local = crate::config::has_api_key_for(config, provider);
     let credential_url = provider.credential_url();
 
     json!({
@@ -4131,7 +4132,7 @@ fn doctor_provider_model_report_json(config: &Config) -> serde_json::Value {
             "resolved": config.default_model(),
         },
         "auth": {
-            "present_or_local": crate::config::has_api_key_for(config, provider),
+            "present_or_local": auth_present_or_local,
             "source": doctor_api_key_source_label(auth_source),
             "env_vars": provider.env_vars(),
             "credential_url": credential_url,
@@ -4139,10 +4140,10 @@ fn doctor_provider_model_report_json(config: &Config) -> serde_json::Value {
         },
         "health": {
             "live_validation": false,
-            "next_action": if auth_source == ApiKeySource::Missing {
-                "/setup provider or /provider setup <name>"
-            } else {
+            "next_action": if auth_present_or_local {
                 "/model"
+            } else {
+                "/setup provider or /provider setup <name>"
             },
         },
     })
@@ -8538,6 +8539,78 @@ mod doctor_setup_state_tests {
             "prompt"
         );
         assert_eq!(provider_step(&report)["status"], "needs_action");
+    }
+
+    #[test]
+    fn doctor_setup_provider_model_json_covers_cn_codex_and_local_matrix() {
+        let _guard = crate::test_support::lock_test_env();
+        let tmp = TempDir::new().expect("tempdir");
+        let (_home_guard, _codewhale_home) = prepare_env(&tmp);
+        let _home = crate::test_support::EnvVarGuard::set("HOME", tmp.path());
+        let _userprofile = crate::test_support::EnvVarGuard::set("USERPROFILE", tmp.path());
+        let _deepseek_key = crate::test_support::EnvVarGuard::remove("DEEPSEEK_API_KEY");
+        let _deepseek_source = crate::test_support::EnvVarGuard::remove("DEEPSEEK_API_KEY_SOURCE");
+        let _codex_key = crate::test_support::EnvVarGuard::remove("OPENAI_CODEX_ACCESS_TOKEN");
+        let _codex_legacy_key = crate::test_support::EnvVarGuard::remove("CODEX_ACCESS_TOKEN");
+        let workspace = tmp.path().join("workspace");
+        fs::create_dir_all(&workspace).expect("workspace");
+
+        let cn_config = Config {
+            provider: Some("deepseek-cn".to_string()),
+            ..Config::default()
+        };
+        let cn_report = doctor_setup_report_json(&cn_config, &workspace);
+        assert_eq!(cn_report["provider_model"]["provider"]["id"], "deepseek-cn");
+        assert_eq!(
+            cn_report["provider_model"]["provider"]["display"],
+            "DeepSeek (legacy alias)"
+        );
+        assert_eq!(
+            cn_report["provider_model"]["auth"]["env_vars"][0],
+            "DEEPSEEK_API_KEY"
+        );
+        assert_eq!(
+            cn_report["provider_model"]["auth"]["credential_url"],
+            "https://platform.deepseek.com/api_keys"
+        );
+        assert_eq!(cn_report["provider_model"]["auth"]["oauth_only"], false);
+        assert_eq!(
+            cn_report["provider_model"]["health"]["live_validation"],
+            false
+        );
+
+        let codex_config = Config {
+            provider: Some("openai-codex".to_string()),
+            ..Config::default()
+        };
+        let codex_report = doctor_setup_report_json(&codex_config, &workspace);
+        assert_eq!(
+            codex_report["provider_model"]["provider"]["id"],
+            crate::config::ApiProvider::OpenaiCodex.as_str()
+        );
+        assert!(codex_report["provider_model"]["auth"]["credential_url"].is_null());
+        assert_eq!(codex_report["provider_model"]["auth"]["oauth_only"], true);
+        assert_eq!(
+            codex_report["provider_model"]["health"]["next_action"],
+            "/setup provider or /provider setup <name>"
+        );
+
+        let local_config = Config {
+            provider: Some("ollama".to_string()),
+            ..Config::default()
+        };
+        let local_report = doctor_setup_report_json(&local_config, &workspace);
+        assert_eq!(local_report["provider_model"]["provider"]["id"], "ollama");
+        assert_eq!(
+            local_report["provider_model"]["auth"]["present_or_local"],
+            true
+        );
+        assert!(local_report["provider_model"]["auth"]["credential_url"].is_null());
+        assert_eq!(local_report["provider_model"]["auth"]["oauth_only"], false);
+        assert_eq!(
+            local_report["provider_model"]["health"]["next_action"],
+            "/model"
+        );
     }
 
     #[test]
