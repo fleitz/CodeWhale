@@ -78,7 +78,7 @@
 ## Release PR Integration
 
 - Use scratch integration branches when triaging a crowded release queue. A
-  branch such as `scratch/v0.8.59-pr-train-YYYYMMDD` may merge or cherry-pick
+  branch such as `scratch/vX.Y.Z-pr-train-YYYYMMDD` may merge or cherry-pick
   many PR heads to expose conflicts, missing tests, duplicate work, and hidden
   coupling quickly.
 - Treat scratch branches as evidence, not as the artifact to ship. Land work by

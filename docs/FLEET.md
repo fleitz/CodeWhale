@@ -41,13 +41,15 @@ logs and adapter logs are stored under `.codewhale/fleet/` and
 
 ## Authoring agent profiles (`/fleet setup`)
 
-`/fleet setup` (also `/fleet`, or the `roles`/`profiles`/`loadout`/`party`
-aliases) opens an in-TUI wizard for authoring a reusable agent-team profile.
-`/fleet status` opens the worker-status view instead; `/subagents` is a
+`/fleet setup` (also `/fleet setup edit` / `new`) opens an in-TUI wizard for
+authoring a reusable agent-team profile. Bare `/fleet` and the
+`roster`/`roles`/`profiles`/`loadout`/`party` aliases open the roster (the saved
+profiles). `/fleet status` opens the worker-status view; `/subagents` is a
 compatibility shortcut for that status view.
 
 The wizard is progressive: you make one focused choice at a time — a **role**,
-then a **model class** — and then review the full posture (model/route,
+then a **model** (`inherit`, or a concrete model from the active provider) — and
+then review the full posture (model/route,
 permissions, tools, workspace/org scope, and review policy) before doing
 anything. Pressing **Enter** ("start") on the review step inserts a safe
 profile-authoring prompt into the composer; it does not write a file itself.
