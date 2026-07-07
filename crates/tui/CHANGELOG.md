@@ -253,6 +253,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - New commit-range co-author checks reject bot/tool trailers on newly pushed
   commits; historical release-range cleanup remains a separate maintenance
   concern (#4075).
+- Fixed fuzzy `edit_file` matching so matches that begin with multibyte UTF-8
+  characters, including CJK text, advance on character boundaries instead of
+  panicking. Contributed by Nightt (@nightt5879), reported by Taixin Guo
+  (@taixinguo) (#3971, #4045).
+- Fixed Unix dispatcher output under early-closing pipes such as
+  `codewhale doctor | head` by restoring the default `SIGPIPE` handler before
+  printing. Contributed by @aznikline, reported by @BrathonBai (#4030, #4043).
 - Suppressed dead_code warnings in the unused plugin registry module and
   fixed formatting across the command-group files. Contributed by Paulo Aboim
   Pinto (@aboimpinto).
