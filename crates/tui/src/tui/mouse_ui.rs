@@ -1,6 +1,6 @@
 use std::time::{Duration, Instant};
 
-use crossterm::event::{MouseButton, MouseEvent, MouseEventKind};
+use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
 use ratatui::layout::Rect;
 use unicode_segmentation::UnicodeSegmentation;
 use unicode_width::UnicodeWidthStr;
@@ -1024,6 +1024,23 @@ pub(crate) fn ctrl_c_disposition(app: &App) -> CtrlCDisposition {
         CtrlCDisposition::ConfirmExit
     } else {
         CtrlCDisposition::ArmExit
+    }
+}
+
+/// Normalize the raw Ctrl+C control byte to canonical `Ctrl+C`.
+///
+/// In PTY/raw-mode the terminal driver delivers Ctrl+C as the literal byte
+/// `0x03` (the ETX control character). crossterm usually decodes that to
+/// `Char('c') + CONTROL`, but some terminal / kitty-keyboard-protocol
+/// combinations surface it as `Char('\u{3}')` instead, where it slips past the
+/// `Char('c') + CONTROL` arm of the key handler and never reaches the
+/// quit-arm flow (#4090). Rewriting every encoding of Ctrl+C to the canonical
+/// form here keeps the double-press-to-exit behavior consistent across PTY,
+/// raw-mode, and kitty-enhanced terminals.
+pub(crate) fn normalize_raw_ctrl_c(key: &mut KeyEvent) {
+    if matches!(key.code, KeyCode::Char('\u{3}')) {
+        key.code = KeyCode::Char('c');
+        key.modifiers.insert(KeyModifiers::CONTROL);
     }
 }
 

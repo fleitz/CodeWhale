@@ -6676,6 +6676,58 @@ fn ctrl_c_disposition_no_selection_means_no_copy() {
 }
 
 #[test]
+fn ctrl_c_raw_control_byte_routes_to_quit_arm_flow() {
+    // #4090: in PTY/raw-mode Ctrl+C can arrive as the raw ETX control byte
+    // (0x03) instead of `Char('c') + CONTROL`. The key handler must normalize
+    // every encoding so the quit-arm flow runs rather than silently absorbing
+    // the byte — this exercises the actual key-intake path, not only the pure
+    // disposition table.
+    use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+
+    // Plain PTY read delivers 0x03 with no modifiers.
+    let mut raw = KeyEvent::new(KeyCode::Char('\u{3}'), KeyModifiers::NONE);
+    normalize_raw_ctrl_c(&mut raw);
+    assert_eq!(raw.code, KeyCode::Char('c'));
+    assert!(raw.modifiers.contains(KeyModifiers::CONTROL));
+
+    // Kitty keyboard protocol may report the same byte with CONTROL already set.
+    let mut kitty = KeyEvent::new(KeyCode::Char('\u{3}'), KeyModifiers::CONTROL);
+    normalize_raw_ctrl_c(&mut kitty);
+    assert_eq!(kitty.code, KeyCode::Char('c'));
+    assert!(kitty.modifiers.contains(KeyModifiers::CONTROL));
+
+    // A plain 'c' with no modifiers must be left untouched — it is NOT Ctrl+C.
+    let mut plain = KeyEvent::new(KeyCode::Char('c'), KeyModifiers::NONE);
+    normalize_raw_ctrl_c(&mut plain);
+    assert_eq!(plain.code, KeyCode::Char('c'));
+    assert!(!plain.modifiers.contains(KeyModifiers::CONTROL));
+}
+
+#[test]
+fn ctrl_c_double_press_idle_exits_through_key_path() {
+    // #4090: drive the actual key → disposition → state-machine path for two
+    // consecutive Ctrl+C presses in the raw PTY form and assert the arm→confirm
+    // exit transition that the pure-table tests do not cover.
+    use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+
+    let mut app = create_test_app();
+    assert!(!app.is_loading);
+    assert!(!app.quit_is_armed());
+
+    // First press (raw 0x03 form): normalizes to Ctrl+C, disposition arms exit.
+    let mut first = KeyEvent::new(KeyCode::Char('\u{3}'), KeyModifiers::NONE);
+    normalize_raw_ctrl_c(&mut first);
+    assert_eq!(ctrl_c_disposition(&app), CtrlCDisposition::ArmExit);
+    app.arm_quit();
+    assert!(app.quit_is_armed());
+
+    // Second press within the window: must confirm exit, never re-arm.
+    let mut second = KeyEvent::new(KeyCode::Char('\u{3}'), KeyModifiers::NONE);
+    normalize_raw_ctrl_c(&mut second);
+    assert_eq!(ctrl_c_disposition(&app), CtrlCDisposition::ConfirmExit);
+}
+
+#[test]
 fn test_ctrl_d_exits_when_input_empty() {
     let mut app = create_test_app();
     app.input.clear();

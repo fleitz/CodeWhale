@@ -3895,6 +3895,11 @@ async fn run_event_loop(
             let mapped = crate::tui::composer_ui::normalize_macos_modifiers(key.modifiers);
             key.modifiers = mapped;
 
+            // Normalize the raw Ctrl+C control byte (0x03) delivered in
+            // PTY/raw-mode — and by some kitty-keyboard-protocol terminals —
+            // to canonical Ctrl+C so the quit-arm flow always runs (#4090).
+            normalize_raw_ctrl_c(&mut key);
+
             // Decision card keyboard routing (v0.8.43 truth-surface).
             // When a card is active, number keys 1-9 select options,
             // j/k or Up/Down navigate, and Enter confirms.
