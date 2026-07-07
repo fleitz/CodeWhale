@@ -4,9 +4,21 @@ This document tells autonomous agents how to systematically complete the v0.8.68
 release. It pairs with:
 
 - **Milestone:** `v0.8.68` (GitHub milestone #53)
+- **Architecture tracker:** issue [#4175](https://github.com/Hmbown/CodeWhale/issues/4175) (Fleet / Workflow / Lane / Runtime)
 - **Triage packet:** issue [#4092](https://github.com/Hmbown/CodeWhale/issues/4092)
 - **Master checklist:** `CODEWHALE_0_8_68.md` (harness workspace) or tracker in repo root after merge
 - **Workflow files:** `workflows/v0868_*.workflow.js`
+
+### Architecture phases (post-stopship product work)
+
+| Phase | Issue | Scope |
+|-------|-------|-------|
+| 1 | [#4176](https://github.com/Hmbown/CodeWhale/issues/4176) | Lane CLI + Runtime (tmux, worktrees, logs) |
+| 2 | [#4177](https://github.com/Hmbown/CodeWhale/issues/4177) | Workflow steps → Fleet roles |
+| 3 | [#4179](https://github.com/Hmbown/CodeWhale/issues/4179) | Gates and handoffs between roles |
+| Dogfood | [#4178](https://github.com/Hmbown/CodeWhale/issues/4178) | Stopship as fleet-backed lane |
+
+Vocabulary: **Fleet** = who · **Workflow** = what order · **Lane** = running instance · **Runtime** = where/how (tmux, VM, CI).
 
 ## Source of truth
 
@@ -15,8 +27,7 @@ release. It pairs with:
   `.cw-worktrees/v0867-pr4047`.
 - **`codex/0868-next`:** stale reference only. Cherry-pick from it only when a
   specific issue needs a specific commit — never treat it as the active dev branch.
-- **Playbook/workflow PR:** `codex/v0868-agent-workflows` (PR #4163) — docs and
-  workflow definitions only; implementation PRs branch from `main`.
+- **Playbook/workflow definitions:** merged in [PR #4163](https://github.com/Hmbown/CodeWhale/pull/4163) on `main`; implementation PRs branch from `main`.
 
 ## Defer policy (v0.8.69 / architecture refactors)
 
@@ -27,7 +38,7 @@ a stopship issue (#4090, #4093, #4094).
 |----------|------|-------|
 | Stopship (#4090, #4093, #4094) | **Now** | Wave 1 — release-blocking |
 | Dogfood regressions (#3986, #3990) | After stopship | Same lane, lower priority |
-| Catalog lane (Wave 2) | After stopship green | #4109, #4114–#4119, #4139–#4141 |
+| Catalog lane (Wave 2) | After stopship green | #4109, #4114–#4119, #4139–#4141, #4184–#4188 |
 | Workflow UI lane (Wave 3) | After stopship green | #4038, #4110, #4120–#4135 |
 | TUI copy lane (Wave 4) | After stopship green | #4112, #4142–#4148 |
 | v0.8.69 refactors / 0.9.0 architecture | **Deferred** | Unless required to fix #4090/#4093/#4094 |
@@ -71,10 +82,26 @@ is green** (#4090, #4093, #4094 closed or verified fixed on `main`).
 |------|---------------|-------|---------------|--------|
 | 0 | `v0868_issue_sweep.workflow.js` | Triage + release plan | all milestone | On demand |
 | 1 | `v0868_stopship_lane.workflow.js` | Release blockers + dogfood regressions | #4090, #4093, #4094, #3986, #3990 | **Active** |
-| 2 | `v0868_catalog_lane.workflow.js` | Model catalog consolidation | #4109, #4114–#4119, #4139–#4141 | Deferred |
+| 2 | `v0868_catalog_lane.workflow.js` | Model catalog + Models.dev live catalog | #4109, #4114–#4119, #4139–#4141, #4184–#4188 | Deferred |
 | 3 | `v0868_workflow_ui_lane.workflow.js` | Workflow orchestration UI | #4038, #4110, #4120–#4135 | Deferred |
 | 4 | `v0868_tui_copy_lane.workflow.js` | Transcript/copy polish | #4112, #4142–#4148 | Deferred |
 | 5 | `v0868_release_gate.workflow.js` | Final verification + handoff | milestone closeout | After Waves 1–4 |
+
+### Models.dev live catalog chain (Wave 2)
+
+Execute sequentially after stopship is green:
+
+**#4184 → #4185 → #4186 → #4187 → #4188**
+
+| Issue | Scope |
+|-------|-------|
+| [#4184](https://github.com/Hmbown/CodeWhale/issues/4184) | Models.dev as source of truth for provider/model metadata |
+| [#4185](https://github.com/Hmbown/CodeWhale/issues/4185) | Accept current live Models.dev schema in catalog parser |
+| [#4186](https://github.com/Hmbown/CodeWhale/issues/4186) | Normalize Models.dev provider IDs onto CodeWhale provider kinds |
+| [#4187](https://github.com/Hmbown/CodeWhale/issues/4187) | Fetch and cache live Models.dev catalog into ProviderLake |
+| [#4188](https://github.com/Hmbown/CodeWhale/issues/4188) | Demote curated bundled model data after live catalog lands |
+
+Parent tracker: [#4109](https://github.com/Hmbown/CodeWhale/issues/4109).
 
 ## How to launch a workflow
 
