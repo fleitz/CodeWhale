@@ -2834,11 +2834,23 @@ fn subagent_panel_rows(
         if lines.len() >= max_rows {
             break;
         }
-        // #3030: keep raw agent ids out of the compact detail line — the
-        // full id remains available in the hover text.
+        // Expanded detail: a compact but never-empty dossier for the worker
+        // (#4094). Status is always shown first so the expanded panel is never
+        // blank while a worker is active; objective/elapsed/model/steps/
+        // progress/branch follow when known. Raw ids stay out of the compact
+        // line (#3030) — the full id remains available in the hover text.
         let mut detail_parts = Vec::new();
+        detail_parts.push(row.status.clone());
+        if let Some(objective) = row.objective.as_deref()
+            && !objective.trim().is_empty()
+        {
+            detail_parts.push(summarize_tool_output(objective));
+        }
         if let Some(model) = row.model.as_deref() {
             detail_parts.push(format!("model {model}"));
+        }
+        if let Some(duration) = row.duration_ms {
+            detail_parts.push(format_duration_ms(duration));
         }
         if row.steps_taken > 0 {
             detail_parts.push(format!("{} step(s)", row.steps_taken));
@@ -2850,9 +2862,6 @@ fn subagent_panel_rows(
         }
         if let Some(branch) = row.git_branch.as_deref() {
             detail_parts.push(format!("branch {branch}"));
-        }
-        if detail_parts.is_empty() {
-            detail_parts.push(row.status.clone());
         }
         lines.push(Line::from(Span::styled(
             format!(
@@ -6020,6 +6029,163 @@ mod tests {
             text.iter().any(|line| line.contains("model kimi-k2.6")),
             "expanded detail line should surface the agent model: {text:?}"
         );
+    }
+
+    #[test]
+    fn subagent_expanded_detail_never_blank_for_sparse_worker() {
+        // #4094: expanding a running worker must show real activity, not a
+        // bare status string. A freshly-spawned worker with an objective and
+        // elapsed time but no model/steps/progress/branch previously rendered
+        // an essentially blank detail line.
+        let summary = SidebarSubagentSummary {
+            cached_total: 1,
+            cached_running: 1,
+            ..SidebarSubagentSummary::default()
+        };
+        let rows = vec![SidebarAgentRow {
+            id: "agent_sparse".to_string(),
+            parent_run_id: None,
+            spawn_depth: 1,
+            name: "scout".to_string(),
+            role: "worker".to_string(),
+            model: None,
+            status: "running".to_string(),
+            objective: Some("Audit TUI input-pump path for starvation".to_string()),
+            git_branch: None,
+            progress: None,
+            steps_taken: 0,
+            duration_ms: Some(4_000),
+            expanded: true,
+        }];
+
+        let (lines, _) =
+            subagent_panel_rows(&summary, &rows, Locale::En, 72, 8, &palette::UI_THEME);
+        let text = lines_to_text(&lines);
+        // The expanded detail line (the indented second row) carries the
+        // objective and elapsed time, not just "running". Elapsed time is
+        // unique to the detail line, so key off it.
+        let detail = text
+            .iter()
+            .find(|line| line.contains("4.0s"))
+            .expect("expanded detail should surface elapsed time: {text:?}");
+        assert!(
+            detail.contains("running"),
+            "detail should carry the status: {detail:?}"
+        );
+        assert!(
+            detail.contains("Audit TUI input-pump"),
+            "detail should surface the worker objective: {detail:?}"
+        );
+    }
+
+    #[test]
+    fn subagent_expanded_detail_shows_status_when_all_fields_empty() {
+        // #4094: a progress-only worker with no objective/model/duration must
+        // still render a non-empty detail line (the status), never a blank row.
+        let summary = SidebarSubagentSummary {
+            cached_total: 1,
+            cached_running: 1,
+            ..SidebarSubagentSummary::default()
+        };
+        let rows = vec![SidebarAgentRow {
+            id: "agent_progress_only".to_string(),
+            parent_run_id: None,
+            spawn_depth: 1,
+            name: "child".to_string(),
+            role: "agent".to_string(),
+            model: None,
+            status: "tool".to_string(),
+            objective: None,
+            git_branch: None,
+            progress: None,
+            steps_taken: 0,
+            duration_ms: None,
+            expanded: true,
+        }];
+
+        let (lines, _) =
+            subagent_panel_rows(&summary, &rows, Locale::En, 72, 8, &palette::UI_THEME);
+        let text = lines_to_text(&lines);
+        // No line should be blank, and at least one carries the status.
+        assert!(
+            text.iter().all(|line| !line.trim().is_empty()),
+            "no expanded detail line should be blank: {text:?}"
+        );
+        assert!(
+            text.iter().any(|line| line.trim().starts_with("tool")),
+            "expanded detail should show the status when no other fields exist: {text:?}"
+        );
+    }
+
+    #[test]
+    fn subagent_panel_stays_bounded_with_many_expanded_agents() {
+        // #4094 freeze guard: opening details on many concurrent running
+        // workers during active streaming must keep rendering bounded and
+        // width-safe (never overflow, never hang). Reaching the assertions
+        // proves the render path returns promptly under load.
+        let mut role_counts = std::collections::BTreeMap::new();
+        role_counts.insert("worker".to_string(), 25);
+        let summary = SidebarSubagentSummary {
+            cached_total: 25,
+            cached_running: 25,
+            role_counts,
+            ..SidebarSubagentSummary::default()
+        };
+        let rows: Vec<SidebarAgentRow> = (0..25)
+            .map(|i| SidebarAgentRow {
+                id: format!("agent_{i}"),
+                parent_run_id: None,
+                spawn_depth: 1,
+                name: format!("worker-{i}"),
+                role: "worker".to_string(),
+                model: Some("deepseek-v4-flash".to_string()),
+                status: "running".to_string(),
+                objective: Some(format!(
+                    "Investigate sub-system {i} for the v0.8.68 stopship fix"
+                )),
+                git_branch: None,
+                progress: Some(format!("step {i}: finished tool 'grep_files'")),
+                steps_taken: i + 1,
+                duration_ms: Some(1_000 + u64::from(i) * 500),
+                expanded: true,
+            })
+            .collect();
+
+        let content_width = 28usize;
+        let max_rows = 6usize;
+        let (lines, actions) = subagent_panel_rows(
+            &summary,
+            &rows,
+            Locale::En,
+            content_width,
+            max_rows,
+            &palette::UI_THEME,
+        );
+
+        // Header + role-mix precede the per-agent loop, which is capped by
+        // max_rows, so the total stays small and actions stay parallel.
+        assert!(
+            lines.len() <= max_rows + 2,
+            "panel must stay bounded under many expanded agents: {} lines",
+            lines.len()
+        );
+        assert_eq!(
+            lines.len(),
+            actions.len(),
+            "lines and actions must stay parallel"
+        );
+        // Narrow-width readability: no rendered line overflows content_width.
+        for line in &lines {
+            let display = lines_to_text(&vec![line.clone()]);
+            let width = display
+                .first()
+                .map(|s| unicode_width::UnicodeWidthStr::width(s.as_str()))
+                .unwrap_or(0);
+            assert!(
+                width <= content_width,
+                "line overflows narrow content_width {content_width}: {width} cells"
+            );
+        }
     }
 
     #[test]
