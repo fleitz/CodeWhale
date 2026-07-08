@@ -574,9 +574,14 @@ pub enum ViewEvent {
         previous_effort: crate::tui::app::ReasoningEffort,
     },
     /// Emitted by the `/model` picker on Esc so the next open can restore
-    /// the browsing context — view mode and highlighted row (#4109).
+    /// the browsing context — view mode and highlighted row (#4109 / #4115).
     ModelPickerDismissed {
+        /// True when the dismissed view browses beyond configured providers
+        /// (Catalog / Recent / Coding / Cheap / Long context).
         catalog_view: bool,
+        /// Named view key (`configured`, `catalog`, `recent`, `coding`,
+        /// `cheap`, `long_context`) for reopen restore (#4115).
+        view: String,
         selected_row_id: Option<String>,
     },
     /// Emitted by the `/provider` picker on Esc so the next open can restore

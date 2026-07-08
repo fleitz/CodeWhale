@@ -1236,6 +1236,7 @@ impl DeepSeekClient {
                     cost: None,
                     modalities: None,
                     reasoning: None,
+                    tool_call: None,
                     reasoning_options: Vec::new(),
                     source: CatalogSource::Live {
                         base_url_fingerprint: fingerprint.clone(),
@@ -1797,6 +1798,12 @@ fn openrouter_to_catalog_offering(
             .any(|p| p == "reasoning" || p == "include_reasoning" || p.contains("reasoning"))
     });
 
+    let tool_call = item.supported_parameters.as_ref().map(|params| {
+        params
+            .iter()
+            .any(|p| p == "tools" || p == "tool_choice" || p == "functions" || p.contains("tool"))
+    });
+
     let modalities = item.architecture.as_ref().map(|arch| {
         let mut input = arch.input_modalities.clone().unwrap_or_default();
         let mut output = arch.output_modalities.clone().unwrap_or_default();
@@ -1835,6 +1842,7 @@ fn openrouter_to_catalog_offering(
         cost,
         modalities,
         reasoning,
+        tool_call,
         reasoning_options: Vec::new(),
         source: CatalogSource::Live {
             base_url_fingerprint: base_url_fingerprint.to_string(),

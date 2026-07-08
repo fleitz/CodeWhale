@@ -17,11 +17,17 @@ use ratatui::{
     widgets::{Block, Borders, Paragraph, Widget},
 };
 
+use codewhale_config::catalog::CatalogSource;
+use codewhale_config::model_reference::ModelReferenceCard;
+use codewhale_config::pricing::OfferingPricing;
+
 use crate::config::{ApiProvider, Config};
 use crate::model_registry;
 use crate::models_dev_live::{self, ModelsDevFreshness};
 use crate::palette;
-use crate::provider_lake::{all_catalog_models_for_provider, configured_providers};
+use crate::provider_lake::{
+    all_catalog_models_for_provider, catalog_offering_for_model, configured_providers,
+};
 use crate::tui::app::{App, ReasoningEffort};
 use crate::tui::views::{
     ActionHint, ListDetailLayout, ModalKind, ModalView, ViewAction, ViewEvent, centered_modal_area,
@@ -44,10 +50,79 @@ const CODEX_PICKER_EFFORTS: &[ReasoningEffort] = &[
 ];
 const AUTO_MODEL_PICKER_EFFORTS: &[ReasoningEffort] = &[ReasoningEffort::Auto];
 
+/// `/model` catalog views (#4115).
+///
+/// Configured stays the conservative default. Discoverability views (Recent /
+/// Coding / Cheap / Long context) never auto-select a surprising route — the
+/// active model remains the selection until the operator moves.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ModelListView {
     Configured,
     Catalog,
+    Recent,
+    Coding,
+    Cheap,
+    LongContext,
+}
+
+impl ModelListView {
+    const ALL: [Self; 6] = [
+        Self::Configured,
+        Self::Catalog,
+        Self::Recent,
+        Self::Coding,
+        Self::Cheap,
+        Self::LongContext,
+    ];
+
+    fn next(self) -> Self {
+        let idx = Self::ALL.iter().position(|view| *view == self).unwrap_or(0);
+        Self::ALL[(idx + 1) % Self::ALL.len()]
+    }
+
+    fn from_memory_name(name: &str) -> Option<Self> {
+        match name {
+            "configured" => Some(Self::Configured),
+            "catalog" => Some(Self::Catalog),
+            "recent" => Some(Self::Recent),
+            "coding" => Some(Self::Coding),
+            "cheap" => Some(Self::Cheap),
+            "long_context" => Some(Self::LongContext),
+            _ => None,
+        }
+    }
+
+    fn memory_name(self) -> &'static str {
+        match self {
+            Self::Configured => "configured",
+            Self::Catalog => "catalog",
+            Self::Recent => "recent",
+            Self::Coding => "coding",
+            Self::Cheap => "cheap",
+            Self::LongContext => "long_context",
+        }
+    }
+
+    /// Short chrome / action label for this view.
+    fn title_label(self) -> &'static str {
+        match self {
+            Self::Configured => "configured",
+            Self::Catalog => "catalog",
+            Self::Recent => "recent",
+            Self::Coding => "coding",
+            Self::Cheap => "cheap",
+            Self::LongContext => "long ctx",
+        }
+    }
+
+    /// Views that browse beyond the conservative configured-provider set.
+    fn is_discoverability(self) -> bool {
+        !matches!(self, Self::Configured)
+    }
+
+    fn browses_all_providers(self) -> bool {
+        self.is_discoverability()
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -108,7 +183,7 @@ impl ModelPickerView {
             .iter()
             .filter(|row| {
                 model_row_visible_in_view(
-                    row.provider,
+                    row,
                     app.api_provider,
                     &configured_providers,
                     ModelListView::Configured,
@@ -152,14 +227,18 @@ impl ModelPickerView {
     }
 
     /// Restore the browsing context from the last dismissed picker (#4109):
-    /// the Configured/Catalog view mode and, when the remembered row still
-    /// exists in that view, the highlighted row. The active model remains the
-    /// selection when nothing was remembered or the row is gone.
+    /// the named catalog view and, when the remembered row still exists in
+    /// that view, the highlighted row. The active model remains the selection
+    /// when nothing was remembered or the row is gone.
     fn restore_memory(&mut self, memory: Option<&crate::tui::app::ModelPickerMemory>) {
         let Some(memory) = memory else {
             return;
         };
-        if memory.catalog_view {
+        if let Some(view_name) = memory.view.as_deref() {
+            if let Some(view) = ModelListView::from_memory_name(view_name) {
+                self.view = view;
+            }
+        } else if memory.catalog_view {
             self.view = ModelListView::Catalog;
         }
         if let Some(remembered_id) = memory.selected_row_id.as_deref() {
@@ -186,21 +265,30 @@ impl ModelPickerView {
 
     fn visible_model_rows(&self) -> Vec<&ModelPickerRow> {
         let query = self.query.trim();
-        self.model_rows
+        let mut rows: Vec<&ModelPickerRow> = self
+            .model_rows
             .iter()
             .filter(|row| {
                 if query.is_empty() {
+                    // Empty query: view scope only (Configured stays conservative).
                     model_row_visible_in_view(
-                        row.provider,
+                        row,
                         self.initial_provider,
                         &self.configured_providers,
                         self.view,
                     )
                 } else {
+                    // Typed filter searches the full lake so cross-provider
+                    // routes remain discoverable without leaving Configured.
                     model_row_matches_query(row, query, self.initial_provider)
                 }
             })
-            .collect()
+            .collect();
+        // Only re-rank when not filtering by text — keep match order stable while typing.
+        if query.is_empty() {
+            sort_model_rows_for_view(&mut rows, self.view);
+        }
+        rows
     }
 
     fn model_row_count(&self) -> usize {
@@ -289,7 +377,7 @@ impl ModelPickerView {
                 continue;
             };
             if provider != self.initial_provider
-                && self.view == ModelListView::Configured
+                && !self.view.browses_all_providers()
                 && !self.configured_providers.contains(&provider)
             {
                 continue;
@@ -385,10 +473,7 @@ impl ModelPickerView {
     }
 
     fn toggle_view(&mut self) {
-        self.view = match self.view {
-            ModelListView::Configured => ModelListView::Catalog,
-            ModelListView::Catalog => ModelListView::Configured,
-        };
+        self.view = self.view.next();
         let effort = self.resolved_effort();
         self.selected_model_idx = 0;
         self.clamp_model_selection();
@@ -622,9 +707,9 @@ fn push_provider_model_rows(
 ) {
     for id in model_ids {
         if id == "auto" {
-            push_model_row(rows, id, None, picker_model_hint("auto"));
+            push_model_row(rows, id, None, picker_model_hint("auto", None));
         } else {
-            let mut hint = picker_model_hint(&id);
+            let mut hint = picker_model_hint(&id, Some(provider));
             if provider != active_provider {
                 hint = format!("switch route · {hint}");
             }
@@ -753,18 +838,25 @@ fn model_row_label(row: &ModelPickerRow, initial_provider: ApiProvider) -> Strin
     }
 }
 
-/// Whether a model row shows up without the user typing a search query,
-/// respecting the configured-only vs full-catalog view (#3830).
+/// Whether a model row shows in the active catalog view (#3830 / #4115).
 fn model_row_visible_in_view(
-    row_provider: Option<ApiProvider>,
+    row: &ModelPickerRow,
     initial_provider: ApiProvider,
     configured_providers: &[ApiProvider],
     view: ModelListView,
 ) -> bool {
     match view {
-        ModelListView::Catalog => true,
         ModelListView::Configured => {
-            model_row_visible_by_default(row_provider, initial_provider, configured_providers)
+            model_row_visible_by_default(row.provider, initial_provider, configured_providers)
+        }
+        ModelListView::Catalog => true,
+        ModelListView::Recent
+        | ModelListView::Coding
+        | ModelListView::Cheap
+        | ModelListView::LongContext => {
+            // Discoverability views browse the full lake but hide the synthetic
+            // `auto` row — it is not a catalog offering.
+            row.provider.is_some() || row.id != "auto"
         }
     }
 }
@@ -784,30 +876,181 @@ fn model_row_visible_by_default(
     }
 }
 
-fn picker_model_hint(id: &str) -> String {
+fn sort_model_rows_for_view(rows: &mut [&ModelPickerRow], view: ModelListView) {
+    match view {
+        ModelListView::Configured | ModelListView::Catalog => {}
+        ModelListView::Recent => rows.sort_by(|left, right| {
+            offering_fetched_at(right)
+                .cmp(&offering_fetched_at(left))
+                .then_with(|| left.id.cmp(&right.id))
+        }),
+        ModelListView::Coding => rows.sort_by(|left, right| {
+            coding_score(right)
+                .cmp(&coding_score(left))
+                .then_with(|| left.id.cmp(&right.id))
+        }),
+        ModelListView::Cheap => rows.sort_by(|left, right| {
+            match (
+                input_price_per_million(left),
+                input_price_per_million(right),
+            ) {
+                (Some(l), Some(r)) => l
+                    .partial_cmp(&r)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+                    .then_with(|| left.id.cmp(&right.id)),
+                (Some(_), None) => std::cmp::Ordering::Less,
+                (None, Some(_)) => std::cmp::Ordering::Greater,
+                (None, None) => left.id.cmp(&right.id),
+            }
+        }),
+        ModelListView::LongContext => rows.sort_by(|left, right| {
+            context_tokens(right)
+                .cmp(&context_tokens(left))
+                .then_with(|| left.id.cmp(&right.id))
+        }),
+    }
+}
+
+fn offering_for_row(row: &ModelPickerRow) -> Option<codewhale_config::catalog::CatalogOffering> {
+    let provider = row.provider?;
+    catalog_offering_for_model(provider, &row.id)
+}
+
+fn offering_fetched_at(row: &ModelPickerRow) -> u64 {
+    match offering_for_row(row).map(|o| o.source) {
+        Some(CatalogSource::Live { fetched_at, .. }) => fetched_at,
+        _ => 0,
+    }
+}
+
+fn context_tokens(row: &ModelPickerRow) -> u64 {
+    if let Some(ctx) = offering_for_row(row)
+        .and_then(|offering| offering.limit)
+        .and_then(|limit| limit.context)
+    {
+        return ctx;
+    }
+    model_registry::lookup(&row.id)
+        .and_then(|meta| meta.context_window)
+        .map(u64::from)
+        .unwrap_or(0)
+}
+
+fn input_price_per_million(row: &ModelPickerRow) -> Option<f64> {
+    offering_for_row(row)
+        .and_then(|offering| OfferingPricing::from_catalog_offering(&offering))
+        .and_then(|pricing| pricing.input_per_million)
+}
+
+fn coding_score(row: &ModelPickerRow) -> u32 {
+    let mut score = 0_u32;
+    if let Some(offering) = offering_for_row(row) {
+        let text_ok = offering.modalities.as_ref().is_none_or(|modalities| {
+            modalities.output.is_empty()
+                || modalities
+                    .output
+                    .iter()
+                    .any(|m| m.eq_ignore_ascii_case("text"))
+        });
+        if text_ok {
+            score += 40;
+        }
+        if offering.tool_call == Some(true) {
+            score += 40;
+        }
+        if offering.reasoning == Some(true) {
+            score += 10;
+        }
+        if offering
+            .limit
+            .as_ref()
+            .and_then(|limit| limit.context)
+            .unwrap_or(0)
+            >= 100_000
+        {
+            score += 10;
+        }
+    } else if model_registry::lookup(&row.id).is_some_and(|meta| meta.supports_reasoning) {
+        score += 20;
+    }
+    score
+}
+
+fn picker_model_hint(id: &str, provider: Option<ApiProvider>) -> String {
     if id == "auto" {
         return "select per turn".to_string();
     }
-    let Some(metadata) = model_registry::lookup(id) else {
-        return "provider model".to_string();
-    };
+
+    let offering = provider.and_then(|p| catalog_offering_for_model(p, id));
+    let registry = model_registry::lookup(id);
+    let card = offering.as_ref().map(ModelReferenceCard::from_offering);
 
     let mut parts = Vec::new();
-    if let Some(context_window) = metadata.context_window {
+
+    let context = card
+        .as_ref()
+        .and_then(|c| c.context_window)
+        .map(|tokens| tokens.min(u64::from(u32::MAX)) as u32)
+        .or_else(|| registry.as_ref().and_then(|meta| meta.context_window));
+    if let Some(context_window) = context {
         parts.push(format!(
             "{} ctx",
             format_picker_context_window(context_window)
         ));
     }
-    if metadata.supports_reasoning {
+
+    let max_output = card
+        .as_ref()
+        .and_then(|c| c.max_output)
+        .map(|tokens| tokens.min(u64::from(u32::MAX)) as u32)
+        .or_else(|| registry.as_ref().and_then(|meta| meta.max_output));
+    if let Some(max_output) = max_output {
+        parts.push(format!("{} out", format_picker_context_window(max_output)));
+    }
+
+    match offering.as_ref().and_then(|o| o.tool_call) {
+        Some(true) => parts.push("tools".to_string()),
+        Some(false) => parts.push("no tools".to_string()),
+        None => {}
+    }
+
+    let reasoning = offering
+        .as_ref()
+        .and_then(|o| o.reasoning)
+        .unwrap_or_else(|| {
+            registry
+                .as_ref()
+                .is_some_and(|meta| meta.supports_reasoning)
+        });
+    if reasoning {
         parts.push("reasoning".to_string());
     }
-    parts.push(if crate::pricing::has_pricing_for_model(id) {
-        "priced".to_string()
+
+    if let Some(card) = card.as_ref() {
+        let price = card.price_label();
+        if price != "unknown" {
+            parts.push(price);
+        } else {
+            parts.push("price unknown".to_string());
+        }
+        match &card.source {
+            CatalogSource::Live { .. } => parts.push("live".to_string()),
+            CatalogSource::Bundled => parts.push("bundled".to_string()),
+            CatalogSource::UserOverride => parts.push("override".to_string()),
+        }
     } else {
-        "price unknown".to_string()
-    });
-    parts.join(" · ")
+        parts.push(if crate::pricing::has_pricing_for_model(id) {
+            "priced".to_string()
+        } else {
+            "price unknown".to_string()
+        });
+    }
+
+    if parts.is_empty() {
+        "provider model".to_string()
+    } else {
+        parts.join(" · ")
+    }
 }
 
 fn format_picker_context_window(tokens: u32) -> String {
@@ -841,7 +1084,8 @@ impl ModalView for ModelPickerView {
             // Esc carries the browsing context out so the next open can
             // restore it (#4109 picker memory).
             KeyCode::Esc => ViewAction::EmitAndClose(ViewEvent::ModelPickerDismissed {
-                catalog_view: self.view == ModelListView::Catalog,
+                catalog_view: self.view.browses_all_providers(),
+                view: self.view.memory_name().to_string(),
                 selected_row_id: {
                     let rows = self.visible_model_rows();
                     rows.get(self.selected_model_idx).map(|row| row.id.clone())
@@ -849,9 +1093,8 @@ impl ModalView for ModelPickerView {
             }),
             KeyCode::Enter if self.model_row_count() == 0 => ViewAction::None,
             KeyCode::Enter => ViewAction::EmitAndClose(self.build_event()),
-            // Toggle between configured-only and full-catalog views (#3830).
-            // Handled before the query-typing arm so `a`/`A` always toggles
-            // instead of filtering the model list.
+            // Cycle catalog views (#4115). Handled before the query-typing arm
+            // so `a`/`A` always advances the view instead of filtering.
             KeyCode::Char(c)
                 if key.modifiers.is_empty()
                     && self.query.is_empty()
@@ -961,17 +1204,11 @@ impl ModelPickerView {
         // wraps instead of clipping at narrow widths (#3732).
         let outer = Block::default()
             .title(Line::from(Span::styled(
-                match self.view {
-                    ModelListView::Configured => {
-                        format!(" Model & thinking{} ", catalog_freshness_title_suffix())
-                    }
-                    ModelListView::Catalog => {
-                        format!(
-                            " Model & thinking · all{} ",
-                            catalog_freshness_title_suffix()
-                        )
-                    }
-                },
+                format!(
+                    " Model & thinking · {}{} ",
+                    self.view.title_label(),
+                    catalog_freshness_title_suffix()
+                ),
                 Style::default()
                     .fg(palette::WHALE_INFO)
                     .add_modifier(Modifier::BOLD),
@@ -982,9 +1219,12 @@ impl ModelPickerView {
         let inner = outer.inner(popup_area);
         outer.render(popup_area, buf);
 
+        // Keep the long-standing "browse all" label on Configured so footer
+        // discoverability tests and muscle memory stay intact; other views
+        // preview the next named view (#4115).
         let view_action = match self.view {
             ModelListView::Configured => "browse all",
-            ModelListView::Catalog => "configured",
+            other => other.next().title_label(),
         };
         let content = render_modal_footer(
             inner,
@@ -1025,10 +1265,7 @@ impl ModelPickerView {
             model_rows.push((label, hint));
         }
         let model_title = if self.query.trim().is_empty() {
-            match self.view {
-                ModelListView::Configured => "Model".to_string(),
-                ModelListView::Catalog => "Model · all".to_string(),
-            }
+            format!("Model · {}", self.view.title_label())
         } else {
             format!("Model: {}", self.query.trim())
         };
@@ -1212,7 +1449,7 @@ mod tests {
 
     #[test]
     fn model_picker_hint_uses_model_registry_metadata() {
-        let hint = picker_model_hint("minimax/minimax-m3");
+        let hint = picker_model_hint("minimax/minimax-m3", None);
         assert!(
             hint.contains("1M ctx"),
             "hint should include registry context window: {hint}"
@@ -1222,7 +1459,7 @@ mod tests {
             "hint should include registry reasoning support: {hint}"
         );
         assert!(
-            hint.contains("priced"),
+            hint.contains("priced") || hint.contains("per Mtok") || hint.contains("$"),
             "hint should include pricing availability: {hint}"
         );
     }
@@ -2368,17 +2605,20 @@ mod tests {
         ));
         let ViewAction::EmitAndClose(ViewEvent::ModelPickerDismissed {
             catalog_view,
+            view,
             selected_row_id,
         }) = action
         else {
             panic!("expected ModelPickerDismissed, got something else");
         };
         assert!(catalog_view, "catalog view should be remembered");
+        assert_eq!(view, "catalog");
         assert_eq!(selected_row_id.as_deref(), Some(browsed_id.as_str()));
 
         // Reopen with the memory applied — same view, same highlighted row.
         app.model_picker_memory = Some(crate::tui::app::ModelPickerMemory {
             catalog_view,
+            view: Some(view),
             selected_row_id,
         });
         let reopened = ModelPickerView::new(&app, &config);
@@ -2391,6 +2631,7 @@ mod tests {
         let (mut app, config, _lock) = create_test_app();
         app.model_picker_memory = Some(crate::tui::app::ModelPickerMemory {
             catalog_view: false,
+            view: Some("configured".to_string()),
             selected_row_id: Some("model-that-no-longer-exists".to_string()),
         });
         let view = ModelPickerView::new(&app, &config);
@@ -2404,17 +2645,50 @@ mod tests {
     const BLOCKER_SIZES: [(u16, u16); 4] = [(80, 24), (100, 30), (120, 32), (160, 40)];
 
     #[test]
-    fn toggle_view_reveals_full_catalog_and_back() {
+    fn toggle_view_cycles_six_catalog_views() {
         use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
         let (app, config, _lock) = create_test_app();
         let mut view = ModelPickerView::new(&app, &config);
         let configured_count = view.visible_model_rows().len();
+        assert_eq!(view.view, ModelListView::Configured);
 
         view.handle_key(KeyEvent::new(KeyCode::Char('a'), KeyModifiers::empty()));
+        assert_eq!(view.view, ModelListView::Catalog);
         assert!(view.visible_model_rows().len() > configured_count);
 
-        view.handle_key(KeyEvent::new(KeyCode::Char('a'), KeyModifiers::empty()));
+        let expected = [
+            ModelListView::Recent,
+            ModelListView::Coding,
+            ModelListView::Cheap,
+            ModelListView::LongContext,
+            ModelListView::Configured,
+        ];
+        for expected_view in expected {
+            view.handle_key(KeyEvent::new(KeyCode::Char('a'), KeyModifiers::empty()));
+            assert_eq!(view.view, expected_view);
+        }
         assert_eq!(view.visible_model_rows().len(), configured_count);
+    }
+
+    #[test]
+    fn discoverability_views_do_not_auto_select_newest() {
+        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+        let (app, config, _lock) = create_test_app();
+        let mut view = ModelPickerView::new(&app, &config);
+        let active = view.resolved_model();
+        // Cycle to Recent — highlight resets to index 0, but apply still requires Enter.
+        for _ in 0..2 {
+            view.handle_key(KeyEvent::new(KeyCode::Char('a'), KeyModifiers::empty()));
+        }
+        assert_eq!(view.view, ModelListView::Recent);
+        assert_eq!(view.selected_model_idx, 0);
+        // Esc dismisses without applying a surprising newest route.
+        let action = view.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::empty()));
+        assert!(matches!(
+            action,
+            ViewAction::EmitAndClose(ViewEvent::ModelPickerDismissed { .. })
+        ));
+        assert_eq!(active, app.model);
     }
 
     #[test]

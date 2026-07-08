@@ -10706,10 +10706,12 @@ async fn handle_view_events(
             }
             ViewEvent::ModelPickerDismissed {
                 catalog_view,
+                view,
                 selected_row_id,
             } => {
                 app.model_picker_memory = Some(crate::tui::app::ModelPickerMemory {
                     catalog_view,
+                    view: Some(view),
                     selected_row_id,
                 });
             }

@@ -369,7 +369,14 @@ pub enum SidebarFocus {
 pub struct ModelPickerMemory {
     /// True when the user left the picker in the full-catalog view
     /// (`A` toggle), false for the configured-only default view.
+    ///
+    /// Kept for backward compatibility with older dismiss events; prefer
+    /// [`Self::view`] when present (#4115).
     pub catalog_view: bool,
+    /// Named catalog view left open (`configured` / `catalog` / `recent` /
+    /// `coding` / `cheap` / `long_context`). When `None`, [`Self::catalog_view`]
+    /// is the fallback.
+    pub view: Option<String>,
     /// Model row id highlighted at dismissal, if it was a real row.
     pub selected_row_id: Option<String>,
 }

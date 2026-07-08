@@ -135,6 +135,29 @@ pub fn all_catalog_models_for_provider(provider: ApiProvider) -> Vec<String> {
     models
 }
 
+/// Look up a merged-catalog offering for `(provider, wire_model_id)` (#4115).
+///
+/// Returns the live-over-bundled row when present so picker metadata (context,
+/// pricing, tools, reasoning, freshness) can be projected without a second
+/// catalog walk. `None` for CodeWhale-only / legacy-fallback ids that have no
+/// Models.dev row.
+#[must_use]
+pub fn catalog_offering_for_model(
+    provider: ApiProvider,
+    wire_model_id: &str,
+) -> Option<CatalogOffering> {
+    let catalog_id = catalog_provider_id(provider);
+    let needle = wire_model_id.trim();
+    if needle.is_empty() {
+        return None;
+    }
+    merged_snapshot()
+        .offerings_for_provider(catalog_id)
+        .into_iter()
+        .find(|row| row.wire_model_id.eq_ignore_ascii_case(needle))
+        .cloned()
+}
+
 /// Count of merged-catalog models for one provider (catalog view / dashboard).
 #[must_use]
 pub fn catalog_model_count_for_provider(provider: ApiProvider) -> usize {

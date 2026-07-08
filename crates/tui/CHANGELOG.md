@@ -25,6 +25,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   defaults when Models.dev has no rows.
 
 ### Added
+- `/model` picker cycles six catalog views with `A` (Configured → Catalog →
+  Recent → Coding → Cheap → Long context) and richer row metadata from the
+  live/bundled catalog (context, max output, tools, reasoning, price/M,
+  freshness). Discoverability views do not auto-apply a surprising route
+  (#4115).
 
 - Workflow runs are now durable: every run appends to a
   `.codewhale/workflow-runs.jsonl` journal and hydrates on startup, so

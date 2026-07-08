@@ -97,6 +97,9 @@ pub struct CatalogOffering {
     /// Whether this offering supports reasoning, when known.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reasoning: Option<bool>,
+    /// Whether tool calling is supported, when known (#4115).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tool_call: Option<bool>,
     /// Provider-scoped reasoning controls / accepted effort metadata. Kept as
     /// raw JSON so the same model family served through different gateways can
     /// expose different effort vocabularies without lossy collapsing.
@@ -262,6 +265,7 @@ fn offerings_from_models_dev(
                 cost: model.cost.clone(),
                 modalities: model.modalities.clone(),
                 reasoning: model.reasoning,
+                tool_call: model.tool_call,
                 reasoning_options: model.reasoning_options.clone(),
                 source: source.clone(),
             });
