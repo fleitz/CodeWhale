@@ -277,7 +277,10 @@ provider!(
     DEFAULT_NOVITA_MODEL,
     ["NOVITA_API_KEY"],
     "novita",
-    aliases: []
+    // `novita-ai` is the id Models.dev publishes for this provider; without it a
+    // live/full Models.dev catalog row keyed `novita-ai` would fail to normalize
+    // onto ProviderKind::Novita (Refs #4186).
+    aliases: ["novita-ai", "novita_ai"]
 );
 provider!(
     Fireworks,
@@ -393,7 +396,11 @@ provider!(
     DEFAULT_TOGETHER_MODEL,
     ["TOGETHER_API_KEY"],
     "together",
-    aliases: ["together-ai", "together_ai"]
+    // `togetherai` (no separator) is the id Models.dev publishes for Together;
+    // the hyphen/underscore spellings are legacy config aliases. All three must
+    // normalize onto ProviderKind::Together so live-catalog rows keyed
+    // `togetherai` resolve to the right kind (Refs #4186).
+    aliases: ["together-ai", "together_ai", "togetherai"]
 );
 provider!(
     Qianfan,

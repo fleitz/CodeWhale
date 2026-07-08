@@ -3367,6 +3367,105 @@ fn provider_kind_parses_openrouter_and_novita_aliases() {
     assert_eq!(parsed.provider, ProviderKind::Siliconflow);
 }
 
+/// Models.dev publishes provider ids that do not always match CodeWhale's
+/// canonical id (`fireworks-ai`, `togetherai`, `novita-ai`). These MUST
+/// normalize onto the right [`ProviderKind`] via [`ProviderKind::parse`], which
+/// is the seam `ModelReferenceCard::from_offering` uses to label a live-catalog
+/// row's provider kind. A miss here means Fireworks/Together/Novita models from
+/// the live Models.dev catalog land under an `unknown` kind (Refs #4186).
+#[test]
+fn provider_kind_normalizes_models_dev_provider_ids() {
+    let cases = [
+        ("fireworks-ai", ProviderKind::Fireworks),
+        ("togetherai", ProviderKind::Together),
+        ("together-ai", ProviderKind::Together),
+        ("together_ai", ProviderKind::Together),
+        ("novita-ai", ProviderKind::Novita),
+        ("novita_ai", ProviderKind::Novita),
+        ("deepinfra", ProviderKind::Deepinfra),
+        ("siliconflow", ProviderKind::Siliconflow),
+        // Models.dev spells the China endpoint `siliconflow-cn`; CodeWhale's
+        // canonical id is `siliconflow-CN` and `parse` is case-insensitive.
+        ("siliconflow-cn", ProviderKind::SiliconflowCN),
+        ("openrouter", ProviderKind::Openrouter),
+    ];
+    for (models_dev_id, expected) in cases {
+        assert_eq!(
+            ProviderKind::parse(models_dev_id),
+            Some(expected),
+            "Models.dev id {models_dev_id:?} must normalize onto {expected:?}"
+        );
+    }
+
+    // The separator-free Models.dev ids must also deserialize from config TOML,
+    // so a `provider = "togetherai"` / `"novita-ai"` line resolves identically.
+    for (alias, expected) in [
+        ("togetherai", ProviderKind::Together),
+        ("novita-ai", ProviderKind::Novita),
+        ("fireworks-ai", ProviderKind::Fireworks),
+    ] {
+        let parsed: ConfigToml =
+            toml::from_str(&format!("provider = \"{alias}\"")).expect("models.dev id alias");
+        assert_eq!(parsed.provider, expected, "toml provider = {alias:?}");
+    }
+}
+
+/// Pin the Fireworks and Together transport metadata against the real provider
+/// APIs: the OpenAI-compatible base URL and the canonical API-key env var. These
+/// are the two primary providers this audit targets, so a regression to a wrong
+/// base URL or env var name fails here.
+#[test]
+fn fireworks_and_together_base_url_and_auth_metadata() {
+    let fireworks = provider::provider_for_kind(ProviderKind::Fireworks);
+    assert_eq!(fireworks.id(), "fireworks");
+    assert_eq!(
+        fireworks.default_base_url(),
+        "https://api.fireworks.ai/inference/v1"
+    );
+    assert_eq!(fireworks.default_base_url(), DEFAULT_FIREWORKS_BASE_URL);
+    assert_eq!(fireworks.env_vars(), &["FIREWORKS_API_KEY"]);
+    // Fireworks wire model ids are namespaced `accounts/fireworks/models/<name>`.
+    assert!(
+        fireworks
+            .default_model()
+            .starts_with("accounts/fireworks/models/"),
+        "Fireworks default model must use the accounts/fireworks/models/ prefix, got {:?}",
+        fireworks.default_model()
+    );
+
+    let together = provider::provider_for_kind(ProviderKind::Together);
+    assert_eq!(together.id(), "together");
+    assert_eq!(together.default_base_url(), "https://api.together.xyz/v1");
+    assert_eq!(together.default_base_url(), DEFAULT_TOGETHER_BASE_URL);
+    assert_eq!(together.env_vars(), &["TOGETHER_API_KEY"]);
+    // Together wire model ids are `<org>/<Model>` (a slash-namespaced id).
+    assert!(
+        together.default_model().contains('/'),
+        "Together default model must be an <org>/<Model> id, got {:?}",
+        together.default_model()
+    );
+
+    // The env-based key resolver (secrets crate) must recognize both providers
+    // by canonical id; a shell-exported key would otherwise be ignored.
+    let _lock = env_lock();
+    unsafe {
+        std::env::set_var("FIREWORKS_API_KEY", "fw-test-key");
+        std::env::set_var("TOGETHER_API_KEY", "tg-test-key");
+    }
+    assert_eq!(
+        codewhale_secrets::env_for("fireworks").as_deref(),
+        Some("fw-test-key")
+    );
+    assert_eq!(
+        codewhale_secrets::env_for("together").as_deref(),
+        Some("tg-test-key")
+    );
+    unsafe {
+        std::env::remove_var("FIREWORKS_API_KEY");
+        std::env::remove_var("TOGETHER_API_KEY");
+    }
+}
+
 #[test]
 fn unknown_provider_error_lists_huggingface() {
     let mut config = ConfigToml::default();

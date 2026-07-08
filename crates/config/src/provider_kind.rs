@@ -44,7 +44,9 @@ pub enum ProviderKind {
     Openrouter,
     #[serde(alias = "mimo", alias = "xiaomi", alias = "xiaomi_mimo")]
     XiaomiMimo,
+    #[serde(alias = "novita-ai", alias = "novita_ai")]
     Novita,
+    #[serde(alias = "fireworks-ai", alias = "fireworks_ai")]
     Fireworks,
     #[serde(alias = "silicon-flow", alias = "silicon_flow")]
     Siliconflow,
@@ -58,7 +60,7 @@ pub enum ProviderKind {
     Ollama,
     #[serde(alias = "hugging-face", alias = "hugging_face", alias = "hf")]
     Huggingface,
-    #[serde(alias = "together-ai", alias = "together_ai")]
+    #[serde(alias = "together-ai", alias = "together_ai", alias = "togetherai")]
     Together,
     #[serde(alias = "baidu-qianfan", alias = "baidu_qianfan", alias = "baidu")]
     Qianfan,
