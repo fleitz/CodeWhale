@@ -658,6 +658,15 @@ const PRELUDE_TEMPLATE: &str = r#""use strict";
   globalThis.Date = BannedDate;
   Math.random = banned("Math.random()");
 
+  // Capture temporary host bindings into this closure, then strip them from
+  // globalThis so scripts only see the documented Workflow surface (#4129).
+  const hostTask = __workflow_task;
+  const hostLog = __workflow_log;
+  const hostPhase = __workflow_phase;
+  const hostBudgetTotal = __workflow_budget_total;
+  const hostBudgetSpent = __workflow_budget_spent;
+  const hostBudgetRemaining = __workflow_budget_remaining;
+
   const MAX_ITEMS = __MAX_ITEMS__;
   const isResponseSchemaError = (err) => String(err && err.message !== undefined ? err.message : err).includes("responseSchema");
 
@@ -665,7 +674,7 @@ const PRELUDE_TEMPLATE: &str = r#""use strict";
     if (opts === null || typeof opts !== "object") {
       throw new TypeError("task(): expected an options object");
     }
-    const envelope = JSON.parse(await __workflow_task(JSON.stringify(opts)));
+    const envelope = JSON.parse(await hostTask(JSON.stringify(opts)));
     if (envelope.error !== undefined) {
       throw new Error(envelope.error);
     }
@@ -683,12 +692,12 @@ const PRELUDE_TEMPLATE: &str = r#""use strict";
       try {
         return Promise.resolve(typeof thunk === "function" ? thunk() : thunk).catch((err) => {
           if (isResponseSchemaError(err)) throw err;
-          __workflow_log("parallel(): dropped a failed slot as null: " + String((err && err.message) || err));
+          hostLog("parallel(): dropped a failed slot as null: " + String((err && err.message) || err));
           return null;
         });
       } catch (err) {
         if (isResponseSchemaError(err)) return Promise.reject(err);
-        __workflow_log("parallel(): dropped a failed slot as null: " + String((err && err.message) || err));
+        hostLog("parallel(): dropped a failed slot as null: " + String((err && err.message) || err));
         return null;
       }
     }));
@@ -708,7 +717,7 @@ const PRELUDE_TEMPLATE: &str = r#""use strict";
           value = await stage(value, item, index);
         } catch (err) {
           if (isResponseSchemaError(err)) throw err;
-          __workflow_log("pipeline(): dropped item " + index + " as null: " + String((err && err.message) || err));
+          hostLog("pipeline(): dropped item " + index + " as null: " + String((err && err.message) || err));
           return null;
         }
       }
@@ -717,17 +726,32 @@ const PRELUDE_TEMPLATE: &str = r#""use strict";
   };
 
   globalThis.log = (message) => {
-    __workflow_log(typeof message === "string" ? message : (JSON.stringify(message) ?? String(message)));
+    hostLog(typeof message === "string" ? message : (JSON.stringify(message) ?? String(message)));
   };
   globalThis.phase = (title) => {
-    __workflow_phase(String(title));
+    hostPhase(String(title));
   };
 
-  const total = __workflow_budget_total();
+  const total = hostBudgetTotal();
   globalThis.budget = Object.freeze({
     total: Number.isNaN(total) ? null : total,
-    spent: () => __workflow_budget_spent(),
-    remaining: () => __workflow_budget_remaining(),
+    spent: () => hostBudgetSpent(),
+    remaining: () => hostBudgetRemaining(),
   });
+
+  for (const name of [
+    "__workflow_task",
+    "__workflow_log",
+    "__workflow_phase",
+    "__workflow_budget_total",
+    "__workflow_budget_spent",
+    "__workflow_budget_remaining",
+  ]) {
+    try {
+      delete globalThis[name];
+    } catch (_) {
+      // Non-configurable bindings stay; the inventory test will fail closed.
+    }
+  }
 })();
 "#;

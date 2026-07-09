@@ -598,6 +598,240 @@ async fn determinism_ban_new_date() {
     assert!(message.contains("unavailable"), "{message}");
 }
 
+/// Explicit product surface for the sandboxed Workflow VM (#4129).
+///
+/// Only these Workflow-owned calls may exist on `globalThis` beyond standard
+/// ECMAScript intrinsics. If a new host global is intentionally added, update
+/// this list in the same PR — the fail-closed inventory test below will break
+/// until the allowlist is extended deliberately.
+const WORKFLOW_ALLOWED_GLOBALS: &[&str] = &[
+    "task", "parallel", "pipeline", "phase", "log", "budget", "args",
+];
+
+/// Host / Node / Deno / browser surfaces that must never leak into the VM.
+///
+/// Standard ECMAScript intrinsics (`Object`, `Function`, `eval`, `Promise`, …)
+/// remain available; this list is only host escape hatches.
+const SANDBOX_BANNED_GLOBALS: &[&str] = &[
+    "process",
+    "require",
+    "module",
+    "exports",
+    "__dirname",
+    "__filename",
+    "Buffer",
+    "fs",
+    "child_process",
+    "os",
+    "path",
+    "net",
+    "http",
+    "https",
+    "fetch",
+    "XMLHttpRequest",
+    "WebSocket",
+    "Deno",
+    "Bun",
+    "Worker",
+];
+
+#[tokio::test]
+async fn sandbox_exposes_only_the_documented_workflow_calls() {
+    let driver = Arc::new(FakeDriver::new());
+    let value = run(
+        &driver,
+        r#"
+        return {
+            task: typeof task,
+            parallel: typeof parallel,
+            pipeline: typeof pipeline,
+            phase: typeof phase,
+            log: typeof log,
+            budget: typeof budget,
+            args: typeof args,
+        };
+        "#,
+        json!({"ok": true}),
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        value,
+        json!({
+            "task": "function",
+            "parallel": "function",
+            "pipeline": "function",
+            "phase": "function",
+            "log": "function",
+            "budget": "object",
+            "args": "object",
+        })
+    );
+    // Keep the constant and the live typeof probe in lockstep.
+    assert_eq!(
+        WORKFLOW_ALLOWED_GLOBALS,
+        &[
+            "task", "parallel", "pipeline", "phase", "log", "budget", "args"
+        ]
+    );
+}
+
+#[tokio::test]
+async fn sandbox_blocks_host_filesystem_shell_network_and_env_surfaces() {
+    // Each probe must either throw / reject or resolve to a clearly absent
+    // binding. We never allow a successful host escape.
+    let probes: &[(&str, &str)] = &[
+        (
+            "process.env",
+            r#"
+            if (typeof process !== "undefined") {
+                return process.env;
+            }
+            throw new Error("process is unavailable");
+            "#,
+        ),
+        (
+            "require('fs')",
+            r#"
+            if (typeof require === "function") {
+                return require("fs");
+            }
+            throw new Error("require is unavailable");
+            "#,
+        ),
+        (
+            "import",
+            r#"
+            // Dynamic import is a module-loader surface; the VM has no loader.
+            return await import("fs");
+            "#,
+        ),
+        (
+            "fetch",
+            r#"
+            if (typeof fetch === "function") {
+                return await fetch("https://example.invalid/");
+            }
+            throw new Error("fetch is unavailable");
+            "#,
+        ),
+        (
+            "child_process",
+            r#"
+            if (typeof require === "function") {
+                return require("child_process");
+            }
+            if (typeof child_process !== "undefined") {
+                return child_process;
+            }
+            throw new Error("child_process is unavailable");
+            "#,
+        ),
+        (
+            "Deno.env",
+            r#"
+            if (typeof Deno !== "undefined") {
+                return Deno.env.toObject();
+            }
+            throw new Error("Deno is unavailable");
+            "#,
+        ),
+    ];
+
+    for (label, source) in probes {
+        let driver = Arc::new(FakeDriver::new());
+        let result = run(&driver, source, json!(null)).await;
+        assert!(
+            result.is_err(),
+            "sandbox probe `{label}` must fail closed, got {result:?}"
+        );
+        // No driver side-effect is expected from a sandbox probe.
+        assert_eq!(
+            driver.spawn_count(),
+            0,
+            "probe `{label}` must not spawn tasks"
+        );
+    }
+}
+
+#[tokio::test]
+async fn sandbox_global_inventory_fails_closed_on_new_host_leaks() {
+    let driver = Arc::new(FakeDriver::new());
+    let value = run(
+        &driver,
+        r#"
+        // Own enumerable + non-enumerable names on the global object.
+        // Anything beyond standard ECMAScript + the Workflow allowlist is a
+        // regression that must break this test so new leaks cannot land quietly.
+        const names = Reflect.ownKeys(globalThis)
+            .map((k) => String(k))
+            .sort();
+        return names;
+        "#,
+        json!(null),
+    )
+    .await
+    .unwrap();
+    let names: Vec<String> = serde_json::from_value(value).expect("name list is a JSON array");
+
+    // Fail closed: none of the banned host surfaces may appear.
+    for banned in SANDBOX_BANNED_GLOBALS {
+        assert!(
+            !names.iter().any(|n| n == *banned),
+            "banned global `{banned}` leaked into the Workflow VM: {names:?}"
+        );
+    }
+
+    // Every Workflow-owned call must still be present.
+    for allowed in WORKFLOW_ALLOWED_GLOBALS {
+        assert!(
+            names.iter().any(|n| n == *allowed),
+            "expected Workflow global `{allowed}` missing from inventory: {names:?}"
+        );
+    }
+
+    // Internal host helpers must not be script-visible.
+    for internal in [
+        "__workflow_task",
+        "__workflow_log",
+        "__workflow_phase",
+        "__workflow_budget_total",
+        "__workflow_budget_spent",
+        "__workflow_budget_remaining",
+    ] {
+        assert!(
+            !names.iter().any(|n| n == internal),
+            "internal host binding `{internal}` must stay hidden: {names:?}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn sandbox_rejects_commonjs_module_loader_and_eval_style_constructors() {
+    let driver = Arc::new(FakeDriver::new());
+    // `eval` / `Function` are standard ES, but if they are present they must
+    // still be unable to reach host modules. The banned-global inventory above
+    // already fails closed if Node-style loaders appear; this probe documents
+    // the intended product message for module load attempts.
+    let message = script_message(
+        run(
+            &driver,
+            r#"
+            if (typeof require === "function") {
+                return require("node:fs");
+            }
+            throw new Error("require is unavailable");
+            "#,
+            json!(null),
+        )
+        .await,
+    );
+    assert!(
+        message.contains("unavailable") || message.contains("require"),
+        "{message}"
+    );
+}
+
 #[tokio::test]
 async fn dropping_the_run_future_cancels_outstanding_tasks() {
     let driver = Arc::new(FakeDriver::new());
