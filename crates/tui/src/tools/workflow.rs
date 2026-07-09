@@ -30,7 +30,8 @@ use crate::tools::spec::{
     optional_bool, optional_str, optional_u64,
 };
 use crate::tools::subagent::{
-    SharedSubAgentManager, SubAgentCompletion, SubAgentRuntime, SubAgentStatus, spawn_workflow_task,
+    SharedSubAgentManager, SubAgentCompletion, SubAgentRuntime, SubAgentStatus,
+    WorkflowTaskSpawnMetadata, spawn_workflow_task,
 };
 use crate::tools::verifier::run_workflow_completion_gates;
 use crate::utils::spawn_supervised;
@@ -97,6 +98,8 @@ struct WorkflowRunSummary {
     schema_error_count: usize,
     progress_count: usize,
     last_progress: Option<String>,
+    event_count: usize,
+    last_event_type: Option<String>,
     leaf_count: usize,
     branch_count: usize,
     control_count: usize,
@@ -111,6 +114,102 @@ struct WorkflowSchemaError {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+struct WorkflowUiEvent {
+    at_ms: u64,
+    #[serde(flatten)]
+    kind: WorkflowUiEventKind,
+}
+
+impl WorkflowUiEvent {
+    fn new(kind: WorkflowUiEventKind) -> Self {
+        Self {
+            at_ms: now_ms(),
+            kind,
+        }
+    }
+
+    fn at(at_ms: u64, kind: WorkflowUiEventKind) -> Self {
+        Self { at_ms, kind }
+    }
+
+    fn event_type(&self) -> &'static str {
+        self.kind.event_type()
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+enum WorkflowUiEventKind {
+    RunStarted {
+        workflow_id: Option<String>,
+        workflow_goal: Option<String>,
+        source_path: Option<PathBuf>,
+        token_budget: Option<u64>,
+    },
+    RunCompleted {
+        status: WorkflowRunStatus,
+        error: Option<String>,
+    },
+    RunCancelled {
+        reason: String,
+    },
+    PhaseStarted {
+        title: String,
+    },
+    TaskStarted(Box<WorkflowTaskStartedEvent>),
+    TaskCompleted {
+        task_id: String,
+        status: IrWorkflowRunStatus,
+    },
+    TaskSchemaValidationFailed {
+        task_id: String,
+        message: String,
+    },
+    BudgetUpdated {
+        total: Option<u64>,
+        spent: u64,
+        remaining: Option<u64>,
+    },
+    Log {
+        message: String,
+    },
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct WorkflowTaskStartedEvent {
+    task_id: String,
+    label: Option<String>,
+    profile: Option<String>,
+    model: Option<String>,
+    strength: Option<String>,
+    thinking: Option<String>,
+    resolved_provider: String,
+    resolved_model: String,
+    route_source: String,
+    worktree: bool,
+    workspace: Option<PathBuf>,
+    git_branch: Option<String>,
+    parent_task_id: Option<String>,
+    depth: u32,
+}
+
+impl WorkflowUiEventKind {
+    fn event_type(&self) -> &'static str {
+        match self {
+            Self::RunStarted { .. } => "run_started",
+            Self::RunCompleted { .. } => "run_completed",
+            Self::RunCancelled { .. } => "run_cancelled",
+            Self::PhaseStarted { .. } => "phase_started",
+            Self::TaskStarted(_) => "task_started",
+            Self::TaskCompleted { .. } => "task_completed",
+            Self::TaskSchemaValidationFailed { .. } => "task_schema_validation_failed",
+            Self::BudgetUpdated { .. } => "budget_updated",
+            Self::Log { .. } => "log",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 struct WorkflowRunRecord {
     run_id: String,
     status: WorkflowRunStatus,
@@ -122,6 +221,8 @@ struct WorkflowRunRecord {
     token_budget: Option<u64>,
     child_ids: Vec<String>,
     progress: Vec<String>,
+    #[serde(default)]
+    events: Vec<WorkflowUiEvent>,
     schema_errors: Vec<WorkflowSchemaError>,
     result: Option<Value>,
     execution: Option<IrWorkflowExecution>,
@@ -150,6 +251,7 @@ impl WorkflowRunRecord {
             token_budget,
             child_ids: Vec::new(),
             progress: Vec::new(),
+            events: Vec::new(),
             schema_errors: Vec::new(),
             result: None,
             execution: None,
@@ -173,6 +275,11 @@ impl WorkflowRunRecord {
             schema_error_count: self.schema_errors.len(),
             progress_count: self.progress.len(),
             last_progress: self.progress.last().cloned(),
+            event_count: self.events.len(),
+            last_event_type: self
+                .events
+                .last()
+                .map(|event| event.event_type().to_string()),
             leaf_count: self
                 .execution
                 .as_ref()
@@ -371,6 +478,15 @@ async fn start_workflow(
             source.spec.as_ref(),
         );
         record.verify_on_complete = verify_on_complete;
+        record.events.push(WorkflowUiEvent::at(
+            record.started_at_ms,
+            WorkflowUiEventKind::RunStarted {
+                workflow_id: record.workflow_id.clone(),
+                workflow_goal: record.workflow_goal.clone(),
+                source_path: record.source_path.clone(),
+                token_budget: record.token_budget,
+            },
+        ));
         runs_guard.insert(run_id.clone(), record.clone());
         state.record_snapshot(&record);
     }
@@ -455,7 +571,13 @@ async fn cancel_workflow(
         })?;
         record.status = WorkflowRunStatus::Cancelled;
         record.completed_at_ms = Some(now_ms());
-        record.error = Some("cancelled by workflow tool".to_string());
+        let reason = "cancelled by workflow tool".to_string();
+        record.error = Some(reason.clone());
+        record
+            .events
+            .push(WorkflowUiEvent::new(WorkflowUiEventKind::RunCancelled {
+                reason,
+            }));
         record.clone()
     };
     state.record_snapshot(&snapshot);
@@ -532,11 +654,26 @@ async fn run_workflow_vm(
             }
         }
     }
+    let final_budget = driver.current_budget_snapshot();
     let snapshot = state
         .runs
         .lock()
         .ok()
-        .and_then(|guard| guard.get(&run_id).cloned())
+        .and_then(|mut guard| {
+            let record = guard.get_mut(&run_id)?;
+            if record.status != WorkflowRunStatus::Cancelled {
+                record
+                    .events
+                    .push(WorkflowUiEvent::new(budget_event_kind(final_budget)));
+                record
+                    .events
+                    .push(WorkflowUiEvent::new(WorkflowUiEventKind::RunCompleted {
+                        status: record.status,
+                        error: record.error.clone(),
+                    }));
+            }
+            Some(record.clone())
+        })
         .unwrap_or(snapshot);
     state.record_snapshot(&snapshot);
     if let Ok(mut controllers_guard) = state.controllers.lock() {
@@ -563,6 +700,8 @@ fn workflow_result_for(
         "terminal": summary.status != WorkflowRunStatus::Running,
         "child_count": summary.child_count,
         "schema_error_count": summary.schema_error_count,
+        "event_count": summary.event_count,
+        "last_event_type": summary.last_event_type,
         "leaf_count": summary.leaf_count,
         "branch_count": summary.branch_count,
         "control_count": summary.control_count,
@@ -1066,6 +1205,7 @@ struct SubAgentWorkflowDriver {
     child_ids: Arc<Mutex<Vec<String>>>,
     task_records: Arc<Mutex<HashMap<String, RuntimeTaskRecord>>>,
     total_budget: Option<u64>,
+    last_budget_event: Arc<Mutex<Option<BudgetSnapshot>>>,
 }
 
 impl SubAgentWorkflowDriver {
@@ -1087,6 +1227,7 @@ impl SubAgentWorkflowDriver {
             child_ids: Arc::new(Mutex::new(Vec::new())),
             task_records: Arc::new(Mutex::new(HashMap::new())),
             total_budget,
+            last_budget_event: Arc::new(Mutex::new(None)),
         });
         spawn_completion_pump(driver.clone(), completion_rx);
         driver
@@ -1120,6 +1261,76 @@ impl SubAgentWorkflowDriver {
         }
     }
 
+    fn current_budget_snapshot(&self) -> BudgetSnapshot {
+        let spent = self
+            .manager
+            .try_read()
+            .ok()
+            .map(|manager| manager.budget_spent_for_scope(&self.run_id))
+            .unwrap_or(0);
+        BudgetSnapshot {
+            total: self.total_budget,
+            spent,
+        }
+    }
+
+    fn record_run_event(&self, event: WorkflowUiEvent) {
+        let recorded = if let Ok(mut runs) = self.state.runs.lock()
+            && let Some(record) = runs.get_mut(&self.run_id)
+        {
+            record.events.push(event.clone());
+            true
+        } else {
+            false
+        };
+        if recorded {
+            self.state.record_event(&self.run_id, &event);
+        }
+    }
+
+    fn record_budget_snapshot(&self, snapshot: BudgetSnapshot) {
+        let changed = if let Ok(mut last) = self.last_budget_event.lock() {
+            if last.as_ref() == Some(&snapshot) {
+                false
+            } else {
+                *last = Some(snapshot);
+                true
+            }
+        } else {
+            false
+        };
+        if changed {
+            self.record_run_event(WorkflowUiEvent::new(budget_event_kind(snapshot)));
+        }
+    }
+
+    fn record_task_started(
+        &self,
+        agent_id: &str,
+        request: &TaskRequest,
+        metadata: &WorkflowTaskSpawnMetadata,
+        result: &crate::tools::subagent::SubAgentResult,
+    ) {
+        self.record_run_event(WorkflowUiEvent::new(WorkflowUiEventKind::TaskStarted(
+            Box::new(WorkflowTaskStartedEvent {
+                task_id: agent_id.to_string(),
+                label: request.label.clone(),
+                profile: request.profile.clone(),
+                model: request.model.clone(),
+                strength: request.model_strength.clone(),
+                thinking: request.thinking.clone(),
+                resolved_provider: metadata.resolved_provider.clone(),
+                resolved_model: metadata.resolved_model.clone(),
+                route_source: metadata.route_source.clone(),
+                worktree: request.worktree,
+                workspace: result.workspace.clone(),
+                git_branch: result.git_branch.clone(),
+                parent_task_id: metadata.parent_task_id.clone(),
+                depth: metadata.depth,
+            }),
+        )));
+    }
+
     fn record_task_request(&self, agent_id: &str, request: &TaskRequest) {
         if let Ok(mut records) = self.task_records.lock() {
             records.insert(
@@ -1144,23 +1355,23 @@ impl SubAgentWorkflowDriver {
     }
 
     fn record_task_completion(&self, agent_id: &str, completion: &TaskCompletion) {
+        let mut terminal_event = None;
         if let Ok(mut records) = self.task_records.lock()
             && let Some(record) = records.get_mut(agent_id)
         {
-            let (status, output) = match completion {
-                TaskCompletion::Completed { text } => {
-                    (IrWorkflowRunStatus::Succeeded, Some(text.clone()))
-                }
-                TaskCompletion::Failed { message } => {
-                    (IrWorkflowRunStatus::Failed, Some(message.clone()))
-                }
-                TaskCompletion::Cancelled => (IrWorkflowRunStatus::Cancelled, None),
-                TaskCompletion::BudgetExhausted { message } => {
-                    (IrWorkflowRunStatus::BudgetExceeded, Some(message.clone()))
-                }
-            };
+            let was_running = record.status == IrWorkflowRunStatus::Running;
+            let (status, output) = task_completion_status(completion);
             record.status = status;
             record.output = output;
+            if was_running {
+                terminal_event = Some(WorkflowUiEvent::new(WorkflowUiEventKind::TaskCompleted {
+                    task_id: agent_id.to_string(),
+                    status,
+                }));
+            }
+        }
+        if let Some(event) = terminal_event {
+            self.record_run_event(event);
         }
     }
 
@@ -1224,8 +1435,9 @@ impl WorkflowDriver for SubAgentWorkflowDriver {
         let result = spawn_workflow_task(request, self.manager.clone(), runtime)
             .await
             .map_err(|err| DriverError::Rejected(err.to_string()))?;
-        let task_id = result.agent_id.clone();
+        let task_id = result.result.agent_id.clone();
         self.record_child(&task_id);
+        self.record_task_started(&task_id, &request_record, &result.metadata, &result.result);
         self.record_task_request(&task_id, &request_record);
         if let Some(limit) = self.total_budget {
             let mut manager = self.manager.write().await;
@@ -1244,41 +1456,67 @@ impl WorkflowDriver for SubAgentWorkflowDriver {
     }
 
     fn budget(&self) -> BudgetSnapshot {
-        let spent = self
-            .manager
-            .try_read()
-            .ok()
-            .map(|manager| manager.budget_spent_for_scope(&self.run_id))
-            .unwrap_or(0);
-        BudgetSnapshot {
-            total: self.total_budget,
-            spent,
-        }
+        let snapshot = self.current_budget_snapshot();
+        self.record_budget_snapshot(snapshot);
+        snapshot
     }
 
     fn progress(&self, event: ProgressEvent) {
         let mut schema_error = None;
-        let message = match event {
-            ProgressEvent::Log { message } => format!("log: {message}"),
-            ProgressEvent::Phase { title } => format!("phase: {title}"),
+        let (message, ui_event) = match event {
+            ProgressEvent::Log { message } => (
+                format!("log: {message}"),
+                WorkflowUiEvent::new(WorkflowUiEventKind::Log { message }),
+            ),
+            ProgressEvent::Phase { title } => (
+                format!("phase: {title}"),
+                WorkflowUiEvent::new(WorkflowUiEventKind::PhaseStarted { title }),
+            ),
             ProgressEvent::TaskSchemaValidationFailed { task_id, message } => {
                 self.record_schema_validation_failure(&task_id, message.clone());
                 schema_error = Some(WorkflowSchemaError {
                     task_id: task_id.clone(),
                     message: message.clone(),
                 });
-                format!("schema validation failed for {task_id}: {message}")
+                (
+                    format!("schema validation failed for {task_id}: {message}"),
+                    WorkflowUiEvent::new(WorkflowUiEventKind::TaskSchemaValidationFailed {
+                        task_id,
+                        message,
+                    }),
+                )
             }
         };
         if let Ok(mut runs) = self.state.runs.lock()
             && let Some(record) = runs.get_mut(&self.run_id)
         {
             record.progress.push(message.clone());
+            record.events.push(ui_event.clone());
             if let Some(schema_error) = schema_error {
                 record.schema_errors.push(schema_error);
             }
         }
         self.state.record_progress(&self.run_id, &message);
+        self.state.record_event(&self.run_id, &ui_event);
+    }
+}
+
+fn budget_event_kind(snapshot: BudgetSnapshot) -> WorkflowUiEventKind {
+    WorkflowUiEventKind::BudgetUpdated {
+        total: snapshot.total,
+        spent: snapshot.spent,
+        remaining: snapshot.remaining(),
+    }
+}
+
+fn task_completion_status(completion: &TaskCompletion) -> (IrWorkflowRunStatus, Option<String>) {
+    match completion {
+        TaskCompletion::Completed { text } => (IrWorkflowRunStatus::Succeeded, Some(text.clone())),
+        TaskCompletion::Failed { message } => (IrWorkflowRunStatus::Failed, Some(message.clone())),
+        TaskCompletion::Cancelled => (IrWorkflowRunStatus::Cancelled, None),
+        TaskCompletion::BudgetExhausted { message } => {
+            (IrWorkflowRunStatus::BudgetExceeded, Some(message.clone()))
+        }
     }
 }
 
@@ -1629,6 +1867,7 @@ fn now_ms() -> u64 {
 mod journal {
     use super::{
         SharedWorkflowControllers, SharedWorkflowRuns, WorkflowRunRecord, WorkflowRunStatus,
+        WorkflowUiEvent,
     };
     use serde::{Deserialize, Serialize};
     use std::collections::HashMap;
@@ -1670,6 +1909,12 @@ mod journal {
                 warn!("workflow journal progress failed: {err}");
             }
         }
+
+        pub fn record_event(&self, run_id: &str, event: &WorkflowUiEvent) {
+            if let Err(err) = self.journal.append_event(run_id, event) {
+                warn!("workflow journal event failed: {err}");
+            }
+        }
     }
 
     fn workspace_store() -> &'static Mutex<HashMap<PathBuf, Arc<WorkflowWorkspaceState>>> {
@@ -1696,8 +1941,17 @@ mod journal {
     enum WorkflowJournalRecord {
         // Boxed: a full run record dwarfs the progress variant
         // (clippy::large_enum_variant).
-        Snapshot { run: Box<WorkflowRunRecord> },
-        Progress { run_id: String, message: String },
+        Snapshot {
+            run: Box<WorkflowRunRecord>,
+        },
+        Progress {
+            run_id: String,
+            message: String,
+        },
+        Event {
+            run_id: String,
+            event: Box<WorkflowUiEvent>,
+        },
     }
 
     #[derive(Debug)]
@@ -1754,6 +2008,11 @@ mod journal {
                             run.progress.push(message);
                         }
                     }
+                    WorkflowJournalRecord::Event { run_id, event } => {
+                        if let Some(run) = runs.get_mut(&run_id) {
+                            run.events.push(*event);
+                        }
+                    }
                 }
             }
             // A run journaled as Running belongs to a process that is gone;
@@ -1795,10 +2054,18 @@ mod journal {
                 message: message.to_string(),
             })
         }
+
+        fn append_event(&self, run_id: &str, event: &WorkflowUiEvent) -> std::io::Result<()> {
+            self.append_record(&WorkflowJournalRecord::Event {
+                run_id: run_id.to_string(),
+                event: Box::new(event.clone()),
+            })
+        }
     }
 
     #[cfg(test)]
     mod tests {
+        use super::super::WorkflowUiEventKind;
         use super::*;
 
         fn sample_record(run_id: &str, status: WorkflowRunStatus) -> WorkflowRunRecord {
@@ -1813,6 +2080,7 @@ mod journal {
                 token_budget: None,
                 child_ids: Vec::new(),
                 progress: Vec::new(),
+                events: Vec::new(),
                 schema_errors: Vec::new(),
                 result: None,
                 execution: None,
@@ -1829,11 +2097,26 @@ mod journal {
             let running = sample_record("workflow_abc", WorkflowRunStatus::Running);
             state.record_snapshot(&running);
             state.record_progress("workflow_abc", "phase: scan");
+            state.record_event(
+                "workflow_abc",
+                &WorkflowUiEvent::at(
+                    5,
+                    WorkflowUiEventKind::PhaseStarted {
+                        title: "scan".to_string(),
+                    },
+                ),
+            );
 
             let completed = WorkflowRunRecord {
                 status: WorkflowRunStatus::Completed,
                 completed_at_ms: Some(99),
                 progress: vec!["phase: scan".to_string()],
+                events: vec![WorkflowUiEvent::at(
+                    5,
+                    WorkflowUiEventKind::PhaseStarted {
+                        title: "scan".to_string(),
+                    },
+                )],
                 ..sample_record("workflow_abc", WorkflowRunStatus::Completed)
             };
             state.record_snapshot(&completed);
@@ -1848,6 +2131,8 @@ mod journal {
                 .expect("hydrated run");
             assert_eq!(runs.status, WorkflowRunStatus::Completed);
             assert_eq!(runs.progress, vec!["phase: scan"]);
+            assert_eq!(runs.events.len(), 1);
+            assert_eq!(runs.events[0].event_type(), "phase_started");
             assert_eq!(runs.completed_at_ms, Some(99));
         }
 
@@ -2007,7 +2292,7 @@ mod tests {
             .execute(
                 json!({
                     "action": "run",
-                    "script": "const out = await task({ description: 'say done', type: 'explore', allowedTools: [] }); return { out };"
+                    "script": "phase('dispatch'); log('starting child'); const out = await task({ description: 'say done', type: 'explore', allowedTools: [], label: 'inspect-child', model: 'deepseek-v4-flash', modelStrength: 'same', thinking: 'low' }); return { out };"
                 }),
                 &ctx,
             )
@@ -2021,6 +2306,51 @@ mod tests {
         assert_eq!(calls.load(Ordering::SeqCst), 1);
 
         let child_id = payload["child_ids"][0].as_str().unwrap();
+        let events = payload["events"].as_array().expect("events array");
+        assert!(
+            events
+                .iter()
+                .any(|event| event["type"] == "phase_started" && event["title"] == "dispatch"),
+            "{events:#?}"
+        );
+        assert!(
+            events
+                .iter()
+                .any(|event| event["type"] == "log" && event["message"] == "starting child"),
+            "{events:#?}"
+        );
+        assert!(
+            events.iter().any(|event| event["type"] == "budget_updated"),
+            "{events:#?}"
+        );
+        let task_started = events
+            .iter()
+            .find(|event| event["type"] == "task_started")
+            .expect("task_started event");
+        assert_eq!(task_started["task_id"], child_id);
+        assert_eq!(task_started["label"], "inspect-child");
+        assert!(task_started["profile"].is_null());
+        assert_eq!(task_started["model"], "deepseek-v4-flash");
+        assert_eq!(task_started["strength"], "same");
+        assert_eq!(task_started["thinking"], "low");
+        assert_eq!(task_started["resolved_provider"], "deepseek");
+        assert_eq!(task_started["resolved_model"], "deepseek-v4-flash");
+        assert!(
+            task_started["route_source"]
+                .as_str()
+                .is_some_and(|source| source.contains("explicit model id")),
+            "{}",
+            task_started["route_source"]
+        );
+        assert_eq!(task_started["worktree"], false);
+        assert!(task_started["parent_task_id"].is_null());
+        assert_eq!(task_started["depth"], 1);
+        assert!(
+            events.iter().any(|event| event["type"] == "task_completed"
+                && event["task_id"] == child_id
+                && event["status"] == "succeeded"),
+            "{events:#?}"
+        );
         let child = manager
             .read()
             .await
@@ -2225,6 +2555,8 @@ mod tests {
         assert_eq!(summary["leaf_count"], 1);
         assert_eq!(summary["branch_count"], 0);
         assert_eq!(summary["control_count"], 0);
+        assert!(summary["event_count"].as_u64().unwrap_or_default() >= 3);
+        assert_eq!(summary["last_event_type"], "run_completed");
         assert!(summary.get("result").is_none());
         assert!(summary.get("execution").is_none());
     }
@@ -2344,6 +2676,17 @@ mod tests {
                     .as_str()
                     .is_some_and(|message| message.contains("schema validation failed"))),
             "schema validation error should be visible in the run receipt: {run_payload}"
+        );
+        assert!(
+            run_payload["events"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|event| event["type"] == "task_schema_validation_failed"
+                    && event["message"]
+                        .as_str()
+                        .is_some_and(|message| message.contains("responseSchema validation"))),
+            "schema validation event should be visible in the typed receipt: {run_payload}"
         );
     }
 

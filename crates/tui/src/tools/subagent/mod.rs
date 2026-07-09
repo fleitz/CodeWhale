@@ -1072,6 +1072,21 @@ pub(crate) struct SubAgentSpawnOptions {
     pub token_budget: Option<u64>,
 }
 
+#[derive(Debug, Clone)]
+pub(crate) struct WorkflowTaskSpawnResult {
+    pub result: SubAgentResult,
+    pub metadata: WorkflowTaskSpawnMetadata,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct WorkflowTaskSpawnMetadata {
+    pub resolved_provider: String,
+    pub resolved_model: String,
+    pub route_source: String,
+    pub parent_task_id: Option<String>,
+    pub depth: u32,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum SubAgentModelStrength {
     Same,
@@ -3818,7 +3833,7 @@ impl ToolSpec for AgentTool {
                 return cancel_agent_from_input(&input, self.manager.clone(), context).await;
             }
         }
-        let (snapshot, spawn_policy_note) =
+        let (snapshot, spawn_policy_note, _) =
             spawn_subagent_from_input(input, self.manager.clone(), self.runtime.clone()).await?;
         let worker_record = {
             let manager = self.manager.read().await;
@@ -4220,7 +4235,7 @@ async fn spawn_subagent_from_input(
     input: Value,
     manager: SharedSubAgentManager,
     runtime: SubAgentRuntime,
-) -> Result<(SubAgentResult, Option<String>), ToolError> {
+) -> Result<(SubAgentResult, Option<String>, WorkflowTaskSpawnMetadata), ToolError> {
     let mut spawn_request = parse_spawn_request(&input)?;
     let spawn_policy_note = apply_session_spawn_policy(&runtime, &mut spawn_request);
     let profile_member = apply_spawn_profile(&mut spawn_request, &runtime.fleet_roster)?;
@@ -4359,6 +4374,13 @@ async fn spawn_subagent_from_input(
     child_runtime.reasoning_effort = route.reasoning_effort.clone();
     child_runtime.reasoning_effort_auto = false;
     let model_route = route.model_route;
+    let spawn_metadata = WorkflowTaskSpawnMetadata {
+        resolved_provider: child_runtime.client.api_provider().as_str().to_string(),
+        resolved_model: effective_model.clone(),
+        route_source: route_source_label(&model_route),
+        parent_task_id: child_runtime.parent_agent_id.clone(),
+        depth: child_runtime.spawn_depth,
+    };
 
     let mut manager_guard = manager.write().await;
 
@@ -4392,7 +4414,7 @@ async fn spawn_subagent_from_input(
         }
     }
 
-    Ok((result, spawn_policy_note))
+    Ok((result, spawn_policy_note, spawn_metadata))
 }
 
 /// Mode-aware spawn defaults for the root orchestrator (Wave 7 M4/M5).
@@ -4424,7 +4446,7 @@ pub(crate) async fn spawn_workflow_task(
     request: codewhale_workflow_js::TaskRequest,
     manager: SharedSubAgentManager,
     runtime: SubAgentRuntime,
-) -> Result<SubAgentResult, ToolError> {
+) -> Result<WorkflowTaskSpawnResult, ToolError> {
     let mut input = json!({
         "prompt": request.description,
         "worktree": request.worktree,
@@ -4453,9 +4475,8 @@ pub(crate) async fn spawn_workflow_task(
     if let Some(value) = request.token_budget {
         input["token_budget"] = json!(value);
     }
-    spawn_subagent_from_input(input, manager, runtime)
-        .await
-        .map(|(result, _)| result)
+    let (result, _, metadata) = spawn_subagent_from_input(input, manager, runtime).await?;
+    Ok(WorkflowTaskSpawnResult { result, metadata })
 }
 
 // === Sub-agent Execution ===
