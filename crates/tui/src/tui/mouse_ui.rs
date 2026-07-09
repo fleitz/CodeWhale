@@ -207,6 +207,49 @@ fn move_composer_cursor_by_wrapped_rows(app: &mut App, inner: Rect, rows: isize)
     app.needs_redraw = true;
 }
 
+/// Click the WorkflowPanel header to toggle expand/collapse, or the trailing
+/// cancel affordance while a run is active (#4121).
+fn handle_workflow_panel_mouse(app: &mut App, mouse: MouseEvent) -> bool {
+    if !matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left)) {
+        return false;
+    }
+    let Some(area) = app.viewport.last_workflow_panel_area else {
+        return false;
+    };
+    if !mouse_hits_rect(mouse, Some(area)) {
+        return false;
+    }
+    if app.workflow_panel.is_none() {
+        return false;
+    }
+
+    if let Some(panel) = app.workflow_panel.as_mut() {
+        panel.keyboard_focus = true;
+    }
+
+    // Rightmost ~14 columns of the header row act as the cancel control.
+    let on_header_row = mouse.row == area.y;
+    let cancel_zone_start = area.x.saturating_add(area.width.saturating_sub(14));
+    let in_cancel_zone = on_header_row && mouse.column >= cancel_zone_start;
+    let running = app
+        .workflow_panel
+        .as_ref()
+        .is_some_and(|panel| panel.lifecycle.is_running());
+
+    if in_cancel_zone && running {
+        if let Some(run_id) = app.request_workflow_panel_cancel() {
+            app.status_message = Some(format!(
+                "Cancelling workflow {run_id}… (dispatch via /workflow cancel {run_id})"
+            ));
+            return true;
+        }
+    }
+
+    // Any other click on the panel toggles expand/collapse.
+    app.toggle_workflow_panel();
+    true
+}
+
 /// Handle mouse events within the composer area.
 /// Returns true if the event was consumed.
 pub(crate) fn handle_composer_mouse(app: &mut App, mouse: MouseEvent) -> bool {
@@ -283,6 +326,12 @@ pub(crate) fn handle_mouse_event(app: &mut App, mouse: MouseEvent) -> Vec<ViewEv
     // Sidebar resize handle — check before composer so it doesn't compete
     // with text selection / scrolling.
     if handle_sidebar_resize_mouse(app, mouse) {
+        return Vec::new();
+    }
+
+    // WorkflowPanel toggle / cancel (#4121) before composer so the strip
+    // above the input remains clickable.
+    if handle_workflow_panel_mouse(app, mouse) {
         return Vec::new();
     }
 

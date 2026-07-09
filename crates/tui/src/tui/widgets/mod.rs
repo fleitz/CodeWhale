@@ -14,6 +14,7 @@ pub mod decision_card;
 pub mod pending_input_preview;
 mod renderable;
 pub mod tool_card;
+pub mod workflow_panel;
 
 pub use footer::{
     FooterProps, FooterToast, FooterWidget, footer_agents_chip, footer_shell_label_chip,

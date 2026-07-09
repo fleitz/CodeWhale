@@ -544,6 +544,7 @@ pub(super) fn handle_tool_call_complete(
     let in_active = cell_index >= app.history.len();
 
     let status = tool_status_from_result(result);
+    let mut workflow_panel_output: Option<String> = None;
 
     if let Some(cell) = app.cell_at_virtual_index_mut(cell_index) {
         match cell {
@@ -709,10 +710,22 @@ pub(super) fn handle_tool_call_complete(
                         generic.is_diff = false;
                     }
                 }
+                // #4121: capture workflow JSON before releasing the cell borrow
+                // so we can hydrate the panel without overlapping borrows.
+                if generic.name == "workflow" {
+                    workflow_panel_output = generic.output.clone();
+                }
                 app.mark_history_updated();
             }
             _ => {}
         }
+    }
+
+    // #4121: feed typed workflow events into the panel so progress lives
+    // above the composer instead of flooding the chat transcript. Full
+    // routing + compact history-card convergence is #4122.
+    if let Some(output) = workflow_panel_output.as_deref() {
+        apply_workflow_output_to_panel(app, output);
     }
 
     // If the mutated cell lived inside the active group, bump the active-cell
@@ -763,6 +776,107 @@ pub(super) fn handle_tool_call_complete(
         tool_name: name.to_string(),
         summary: evidence_summary,
     });
+}
+
+/// Hydrate or advance the WorkflowPanel from a workflow tool JSON payload.
+/// Accepts a single run record (with optional `events` array) or a status
+/// list. Log-only events are filtered by the panel itself so the transcript
+/// stays free of progress spam (#4121).
+fn apply_workflow_output_to_panel(app: &mut App, output: &str) {
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(output) else {
+        return;
+    };
+
+    // Prefer the typed event stream when present.
+    if let Some(events) = value.get("events").and_then(|e| e.as_array()) {
+        // Ensure a panel exists before applying — seed from run_id/goal if needed.
+        if app.workflow_panel.is_none() {
+            let run_id = value
+                .get("run_id")
+                .and_then(|v| v.as_str())
+                .unwrap_or("workflow")
+                .to_string();
+            let label = value
+                .get("workflow_goal")
+                .and_then(|v| v.as_str())
+                .or_else(|| value.get("workflow_id").and_then(|v| v.as_str()))
+                .unwrap_or("workflow")
+                .to_string();
+            let at_ms = value
+                .get("started_at_ms")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(0);
+            app.workflow_panel = Some(crate::tui::widgets::workflow_panel::WorkflowPanel::new(
+                run_id, label, at_ms,
+            ));
+        }
+        if let Some(panel) = app.workflow_panel.as_mut() {
+            panel.apply_json_events(events);
+            app.needs_redraw = true;
+        }
+        return;
+    }
+
+    // Fallback: status list — show the most recent run as a shell panel.
+    if value.get("action").and_then(|v| v.as_str()) == Some("status") {
+        if let Some(runs) = value.get("runs").and_then(|r| r.as_array()) {
+            if let Some(run) = runs.last() {
+                apply_workflow_output_to_panel(app, &run.to_string());
+            }
+        }
+        return;
+    }
+
+    // Fallback: bare run record without events — at least surface header state.
+    if let Some(run_id) = value.get("run_id").and_then(|v| v.as_str()) {
+        use crate::tui::widgets::workflow_panel::{WorkflowPanelEvent, WorkflowPanelLifecycle};
+        let label = value
+            .get("workflow_goal")
+            .and_then(|v| v.as_str())
+            .or_else(|| value.get("workflow_id").and_then(|v| v.as_str()))
+            .unwrap_or(run_id)
+            .to_string();
+        let at_ms = value
+            .get("started_at_ms")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(0);
+        let status = value
+            .get("status")
+            .and_then(|v| v.as_str())
+            .unwrap_or("running");
+        app.apply_workflow_panel_event(WorkflowPanelEvent::RunStarted {
+            run_id: run_id.to_string(),
+            workflow_id: value
+                .get("workflow_id")
+                .and_then(|v| v.as_str())
+                .map(str::to_string),
+            workflow_goal: Some(label),
+            source_path: None,
+            token_budget: value.get("token_budget").and_then(|v| v.as_u64()),
+            at_ms,
+        });
+        if status != "running" {
+            let life = match status {
+                "completed" | "succeeded" => WorkflowPanelLifecycle::Succeeded,
+                "failed" => WorkflowPanelLifecycle::Failed,
+                "cancelled" | "canceled" => WorkflowPanelLifecycle::Cancelled,
+                _ => WorkflowPanelLifecycle::Running,
+            };
+            if life != WorkflowPanelLifecycle::Running {
+                app.apply_workflow_panel_event(WorkflowPanelEvent::RunCompleted {
+                    status: life,
+                    error: value
+                        .get("error")
+                        .and_then(|v| v.as_str())
+                        .map(str::to_string),
+                    at_ms: value
+                        .get("completed_at_ms")
+                        .and_then(|v| v.as_u64())
+                        .unwrap_or(at_ms),
+                });
+            }
+        }
+    }
 }
 
 fn refresh_active_tool_completion_timestamp(app: &mut App, cell_index: usize) {

@@ -4005,6 +4005,50 @@ async fn run_event_loop(
                 continue;
             }
 
+            // WorkflowPanel keyboard surface (#4121): after a click grants
+            // focus, t/space toggles expand, c/x cancels, j/k changes phase.
+            // Esc drops focus back to the composer without cancelling the run.
+            if app.view_stack.is_empty()
+                && app
+                    .workflow_panel
+                    .as_ref()
+                    .is_some_and(|panel| panel.keyboard_focus)
+            {
+                let mut handled = false;
+                match key.code {
+                    KeyCode::Esc => {
+                        if let Some(panel) = app.workflow_panel.as_mut() {
+                            panel.keyboard_focus = false;
+                        }
+                        app.needs_redraw = true;
+                        handled = true;
+                    }
+                    KeyCode::Char(ch)
+                        if key.modifiers == KeyModifiers::NONE
+                            || key.modifiers == KeyModifiers::SHIFT =>
+                    {
+                        if let Some(panel) = app.workflow_panel.as_mut() {
+                            if panel.handle_key(ch) {
+                                if matches!(ch, 'c' | 'C' | 'x' | 'X') {
+                                    if let Some(run_id) = panel.take_cancel_emit() {
+                                        app.status_message = Some(format!(
+                                            "Cancelling workflow {run_id}… (dispatch via /workflow cancel {run_id})"
+                                        ));
+                                    }
+                                }
+                                app.needs_redraw = true;
+                                handled = true;
+                            }
+                        }
+                    }
+                    _ => {}
+                }
+                if handled {
+                    submit_initial_input_if_ready(app, config, &engine_handle).await?;
+                    continue;
+                }
+            }
+
             // Handle onboarding flow
             if app.onboarding != OnboardingState::None {
                 match key.code {
@@ -9517,14 +9561,23 @@ fn render(f: &mut Frame, app: &mut App, config: &Config) {
     let pending_preview = build_pending_input_preview(app);
     let preview_height = pending_preview.desired_height(size.width);
 
+    // WorkflowPanel unified activity surface (#4121). Collapsed to one row
+    // while finished, expanded while running; zero height when no panel.
+    let workflow_panel_height = app
+        .workflow_panel
+        .as_ref()
+        .map(|panel| panel.desired_height(size.width))
+        .unwrap_or(0);
+
     let body_chunks = Layout::default()
         .direction(Direction::Vertical)
         .flex(ratatui::layout::Flex::Start)
         .constraints([
-            Constraint::Min(1),                  // Chat area
-            Constraint::Length(preview_height),  // Pending input preview (0 if empty)
-            Constraint::Length(composer_height), // Composer
-            Constraint::Length(footer_height),   // Footer
+            Constraint::Min(1),                        // Chat area
+            Constraint::Length(workflow_panel_height), // Workflow panel (#4121)
+            Constraint::Length(preview_height),        // Pending input preview (0 if empty)
+            Constraint::Length(composer_height),       // Composer
+            Constraint::Length(footer_height),         // Footer
         ])
         .split(body_area);
 
@@ -9784,10 +9837,22 @@ fn render(f: &mut Frame, app: &mut App, config: &Config) {
         }
     }
 
+    // Workflow panel between chat and pending-input preview (#4121).
+    if workflow_panel_height > 0 {
+        if let Some(panel) = app.workflow_panel.as_ref() {
+            let area = body_chunks[1];
+            app.viewport.last_workflow_panel_area = Some(area);
+            let buf = f.buffer_mut();
+            panel.render(area, buf);
+        }
+    } else {
+        app.viewport.last_workflow_panel_area = None;
+    }
+
     // Render pending-input preview (queued/steered messages, if any).
     if preview_height > 0 {
         let buf = f.buffer_mut();
-        pending_preview.render(body_chunks[1], buf);
+        pending_preview.render(body_chunks[2], buf);
     }
 
     // Render composer
@@ -9799,12 +9864,12 @@ fn render(f: &mut Frame, app: &mut App, config: &Config) {
             &mention_menu_entries,
         );
         let buf = f.buffer_mut();
-        composer_widget.render(body_chunks[2], buf);
-        composer_widget.cursor_pos(body_chunks[2])
+        composer_widget.render(body_chunks[3], buf);
+        composer_widget.cursor_pos(body_chunks[3])
     };
-    app.viewport.last_composer_area = Some(body_chunks[2]);
+    app.viewport.last_composer_area = Some(body_chunks[3]);
     {
-        let area = body_chunks[2];
+        let area = body_chunks[3];
         let has_panel = app.composer_border && area.height >= 3 && area.width >= 12;
         let inner = if has_panel {
             ratatui::widgets::Block::default()
@@ -9856,11 +9921,11 @@ fn render(f: &mut Frame, app: &mut App, config: &Config) {
     }
 
     // Render footer
-    render_footer(f, body_chunks[3], app);
+    render_footer(f, body_chunks[4], app);
     // Toast stack overlay (#439): when multiple status toasts are queued,
     // surface the older ones as a 1-2 line strip above the footer so a
     // burst of events isn't collapsed to a single visible message.
-    render_toast_stack_overlay(f, size, body_chunks[2], body_chunks[3], app);
+    render_toast_stack_overlay(f, size, body_chunks[3], body_chunks[4], app);
 
     // Decision card overlay (v0.8.43 truth-surface). When a decision card is
     // active, render it centered on top of the transcript.
