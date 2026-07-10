@@ -200,9 +200,9 @@ into bounded steps, can fan those steps out through Fleet workers, and records
 progress and verification in `.codewhale/workflow-runs.jsonl`:
 
 ```bash
-codewhale workflow run my-workflow.js --verify
-codewhale workflow status
-codewhale workflow logs <run-id>
+codewhale workflow run my-workflow.js --fleet <fleet-name> --runtime tmux --verify
+codewhale lane status <lane-id>
+codewhale lane logs <lane-id>
 ```
 
 Workflow is an overlay, not another permission mode: Plan / Act / Operate and

@@ -168,12 +168,12 @@ default_text_model = "openrouter/deepseek/deepseek-v4-pro"`}
       <>
         <ul className="list-disc pl-5 space-y-2 text-sm text-ink-soft">
           <li><strong>Plan</strong> — Read-only investigation. Can grep, read files, list directories, fetch URLs. Cannot write or execute shell.</li>
-          <li><strong>Agent</strong> — Default mode. Multi-step tool calling. Shell and side-effect tools require approval based on your approval_mode setting.</li>
-          <li><strong>YOLO</strong> — Auto-approves all operations and enables trust mode. Workspace boundaries lift. Use carefully.</li>
+          <li><strong>Act</strong> — Multi-step execution. Shell and side-effect tools require approval based on your approval_mode setting.</li>
+          <li><strong>Operate</strong> — Durable Fleet/Workflow orchestration for larger, staged jobs. It is still governed by the same approval posture.</li>
         </ul>
         <p className="mt-2">
           Press <kbd className="font-mono text-xs px-1.5 py-0.5 hairline-t hairline-b hairline-l hairline-r">Tab</kbd> to cycle modes.
-          Approval mode (suggest / auto / never) is orthogonal — you can be in Agent mode with auto-approval, for example.
+          Approval mode (suggest / auto / never) is orthogonal — you can be in Act mode with auto-approval, for example.
         </p>
       </>
     ),
@@ -512,12 +512,12 @@ default_text_model = "openrouter/deepseek/deepseek-v4-pro"`}
       <>
         <ul className="list-disc pl-5 space-y-2 text-sm text-ink-soft">
           <li><strong>Plan（计划）</strong> — 只读调查。可以 grep、读文件、列目录、抓取 URL。不能写入或执行 Shell。</li>
-          <li><strong>Agent（代理）</strong> — 默认模式。多步工具调用。Shell 和有副作用的工具根据 approval_mode 设置审批。</li>
-          <li><strong>YOLO（全权）</strong> — 自动批准所有操作并启用信任模式。工作区边界解除。请谨慎使用。</li>
+          <li><strong>Act（执行）</strong> — 多步执行。Shell 和有副作用的工具根据 approval_mode 设置审批。</li>
+          <li><strong>Operate（编排）</strong> — 面向较大、分阶段任务的持久 Fleet/Workflow 编排，仍受同一审批模式约束。</li>
         </ul>
         <p className="mt-2">
           按 <kbd className="font-mono text-xs px-1.5 py-0.5 hairline-t hairline-b hairline-l hairline-r">Tab</kbd> 切换模式。
-          审批模式（建议 / 自动 / 拒绝）是独立的——例如你可以在 Agent 模式下使用自动审批。
+          审批模式（建议 / 自动 / 拒绝）是独立的——例如你可以在 Act 模式下使用自动审批。
         </p>
       </>
     ),
