@@ -183,4 +183,3 @@ Explicitly deferred by their own documents: external workflow memory (boundary
 only), automatic harness evolution, hosted workrooms, `constitution_modules`
 (needs sign-off), permission profiles (#3211, needs design), and plan-ceiling
 probing (needs a product decision).
-
