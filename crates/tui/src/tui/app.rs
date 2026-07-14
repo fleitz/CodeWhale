@@ -988,8 +988,8 @@ impl AppMode {
     /// `Auto` remains an internal variant while the real implementation is
     /// redesigned; do not expose it through user-facing mode selection (#3733).
     /// `Yolo` is kept for parse/back-compat only and is not in the Tab cycle.
-    /// Operate joins the visible cycle because non-local turns are now gated to
-    /// Workflow execution with terminal receipts at the host boundary.
+    /// Operate joins the visible cycle because ordinary messages can now
+    /// coordinate background workers without requiring a Workflow definition.
     pub const CYCLE: [Self; 3] = [Self::Plan, Self::Agent, Self::Operate];
 
     #[must_use]

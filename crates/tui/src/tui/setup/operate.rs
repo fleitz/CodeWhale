@@ -42,14 +42,15 @@ impl SetupOperateFacts {
         let max_spawn_depth = config.subagent_max_spawn_depth_for_provider(app.api_provider);
         let runtime_configured =
             subagents_enabled && max_subagents > 0 && launch_concurrency > 0 && max_spawn_depth > 0;
-        // Non-local Operate turns are host-gated to Workflow run/wait and can
-        // complete only after a terminal run receipt is observed.
+        // Conversation and read-only discovery do not require a worker. This
+        // readiness fact describes whether Operate can also dispatch executable
+        // work in the background and report its lifecycle accurately.
         let runtime_ready = runtime_configured && provider_ready;
         let runtime_result = if let Some(reason) = runtime_disabled_reason {
             format!("worker runtime disabled ({reason})")
         } else if runtime_ready {
             format!(
-                "worker runtime ready for {}; max_subagents={}, launch_concurrency={}, admission={}, max_spawn_depth={}; Workflow dispatch and terminal receipts are host-enforced",
+                "worker runtime ready for {}; max_subagents={}, launch_concurrency={}, admission={}, max_spawn_depth={}; background dispatch and completion receipts are available",
                 app.api_provider.as_str(),
                 max_subagents,
                 launch_concurrency,
