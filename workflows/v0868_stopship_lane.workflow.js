@@ -11,7 +11,8 @@ export default workflow({
       "on_fail": "block",
       "blocks_role": "implementer",
       "max_retries": 0,
-      "artifact_kind": "source_evidence"
+      "artifact_kind": "source_evidence",
+      "require_explicit_verdict": true
     },
     {
       "id": "implementation-plan",
@@ -21,7 +22,8 @@ export default workflow({
       "on_fail": "block",
       "blocks_role": "reviewer",
       "max_retries": 0,
-      "artifact_kind": "verification_plan"
+      "artifact_kind": "verification_plan",
+      "require_explicit_verdict": true
     },
     {
       "id": "review-findings",
@@ -31,7 +33,8 @@ export default workflow({
       "on_fail": "block",
       "blocks_role": "verifier",
       "max_retries": 0,
-      "artifact_kind": "review_report"
+      "artifact_kind": "review_report",
+      "require_explicit_verdict": true
     },
     {
       "id": "verifier-evidence",
@@ -41,7 +44,8 @@ export default workflow({
       "on_fail": "block",
       "blocks_role": "release_lead",
       "max_retries": 0,
-      "artifact_kind": "verification_report"
+      "artifact_kind": "verification_report",
+      "require_explicit_verdict": true
     }
   ],
   "nodes": [

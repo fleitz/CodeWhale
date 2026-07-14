@@ -693,6 +693,10 @@ workflow({
             assert_eq!(gate.blocks_role.as_deref(), Some(blocked_role));
             assert_eq!(gate.max_retries, 0);
             assert!(gate.artifact_kind.is_some());
+            assert!(
+                gate.require_explicit_verdict,
+                "{role} gate must fail closed when its verdict is missing or malformed"
+            );
         }
 
         let mut board = LaneGateBoard::new("lane-fixture-contract");

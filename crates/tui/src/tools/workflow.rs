@@ -1669,8 +1669,9 @@ fn leaf_subagent_type(spec: &LeafSpec) -> Option<&'static str> {
     // A named Fleet profile owns the child's runtime type. Emitting the IR's
     // default `general` here makes role-only leaves look like an explicit type
     // override and can conflict with the resolved roster member (for example,
-    // scout -> explore). Keep type defaults only for non-roster leaves.
-    if spec.role.is_some() || spec.profile.is_some() {
+    // scout -> explore). Preserve non-General types because those represent an
+    // authored override and the spawn path must still validate compatibility.
+    if (spec.role.is_some() || spec.profile.is_some()) && spec.agent_type == AgentType::General {
         return None;
     }
     if spec.mode == TaskMode::ReadOnly && spec.agent_type == AgentType::General {
@@ -1807,6 +1808,35 @@ fn explicit_gate_verdict(output: Option<&str>) -> Option<ExplicitGateVerdict> {
         Some(ExplicitGateVerdict::Reject)
     } else {
         None
+    }
+}
+
+fn gate_outcome_for_completed_role(
+    record: &RuntimeTaskRecord,
+    require_explicit_verdict: bool,
+) -> GateOutcome {
+    match record.status {
+        IrWorkflowRunStatus::Succeeded => match explicit_gate_verdict(record.output.as_deref()) {
+            Some(ExplicitGateVerdict::Reject) => GateOutcome::Fail {
+                reason: record
+                    .output
+                    .clone()
+                    .unwrap_or_else(|| "child returned an explicit rejection verdict".into()),
+            },
+            Some(ExplicitGateVerdict::Approve) => GateOutcome::Pass,
+            None if require_explicit_verdict => GateOutcome::Fail {
+                reason: format!(
+                    "task {} completed without the required first-line gate verdict; expected exactly APPROVE, PASS, BLOCK, or FAIL",
+                    record.agent_id
+                ),
+            },
+            None => GateOutcome::Pass,
+        },
+        _ => GateOutcome::Fail {
+            reason: record.output.clone().unwrap_or_else(|| {
+                format!("task {} ended as {:?}", record.agent_id, record.status)
+            }),
+        },
     }
 }
 
@@ -2062,28 +2092,12 @@ impl SubAgentWorkflowDriver {
             return;
         }
 
-        let outcome = match record.status {
-            IrWorkflowRunStatus::Succeeded => {
-                match explicit_gate_verdict(record.output.as_deref()) {
-                    Some(ExplicitGateVerdict::Reject) => GateOutcome::Fail {
-                        reason: record.output.clone().unwrap_or_else(|| {
-                            "child returned an explicit rejection verdict".into()
-                        }),
-                    },
-                    Some(ExplicitGateVerdict::Approve) | None => GateOutcome::Pass,
-                }
-            }
-            _ => GateOutcome::Fail {
-                reason: record.output.clone().unwrap_or_else(|| {
-                    format!("task {} ended as {:?}", record.agent_id, record.status)
-                }),
-            },
-        };
-
         let mut events = Vec::new();
         let mut next_status = Vec::new();
         if let Ok(mut board) = self.gate_board.lock() {
             for spec in specs {
+                let outcome =
+                    gate_outcome_for_completed_role(record, spec.require_explicit_verdict);
                 if matches!(outcome, GateOutcome::Pass)
                     && let (Some(kind), Some(to_role)) =
                         (spec.artifact_kind.as_deref(), spec.blocks_role.as_deref())
@@ -3233,6 +3247,7 @@ name = "role-only-test"
 
 [roles]
 scout = "scout"
+reviewer = "reviewer"
 "#,
         )
         .expect("role-only fleet");
@@ -3272,6 +3287,27 @@ export default workflow({
             "non-role read-only leaves retain the review default:\n{}",
             non_role.source
         );
+        let explicit_type_source = r#"
+workflow({
+  "goal": "preserve an authored role type",
+  "nodes": [{
+    "agent": {
+      "id": "review-source",
+      "prompt": "Review the source without editing.",
+      "agent_type": "review",
+      "role": "reviewer",
+      "mode": "read_only"
+    }
+  }]
+});
+"#;
+        let explicit_type = adapt_workflow_source(explicit_type_source, None)
+            .expect("lower explicitly typed Fleet role");
+        assert!(
+            explicit_type.source.contains("type: \"review\""),
+            "an authored non-General type must remain a validated override:\n{}",
+            explicit_type.source
+        );
 
         let ctx = ToolContext::new(tmp.path().to_path_buf());
         let manager = new_shared_subagent_manager(tmp.path().to_path_buf(), 2);
@@ -3309,6 +3345,63 @@ export default workflow({
         assert_eq!(started["role"], "scout");
         assert_eq!(started["profile"], "scout");
         assert_eq!(started["resolved_profile"], "scout");
+
+        let explicit_result = tool
+            .execute(
+                json!({
+                    "action": "run",
+                    "script": explicit_type_source,
+                    "fleet": "role-only-test"
+                }),
+                &ctx,
+            )
+            .await
+            .expect("matching explicit role type should remain valid");
+        let explicit_payload: Value =
+            serde_json::from_str(&explicit_result.content).expect("workflow JSON");
+        assert_eq!(
+            explicit_payload["status"], "completed",
+            "{explicit_payload}"
+        );
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+
+        let conflicting_result = tool
+            .execute(
+                json!({
+                    "action": "run",
+                    "script": r#"workflow({
+                      "goal": "reject a conflicting authored type",
+                      "nodes": [{ "agent": {
+                        "id": "bad-scout",
+                        "prompt": "Review as a scout.",
+                        "agent_type": "review",
+                        "role": "scout",
+                        "mode": "read_only"
+                      } }]
+                    });"#,
+                    "fleet": "role-only-test"
+                }),
+                &ctx,
+            )
+            .await
+            .expect("conflicting type returns a terminal workflow record");
+        let conflicting_payload: Value =
+            serde_json::from_str(&conflicting_result.content).expect("workflow JSON");
+        assert_eq!(
+            conflicting_payload["status"], "failed",
+            "{conflicting_payload}"
+        );
+        assert!(
+            conflicting_payload["error"]
+                .as_str()
+                .is_some_and(|error| error.contains("conflicting explicit type")),
+            "{conflicting_payload}"
+        );
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            2,
+            "conflicting explicit type must fail before the provider"
+        );
     }
 
     #[test]
@@ -4170,6 +4263,7 @@ reviewer = "reviewer"
             blocks_role: Some("implementer".to_string()),
             max_retries: 0,
             artifact_kind: Some("findings".to_string()),
+            require_explicit_verdict: false,
         }];
         let spec = WorkflowSpec {
             id: Some("gate-fixture".to_string()),
@@ -4288,6 +4382,14 @@ reviewer = "reviewer"
             Some(ExplicitGateVerdict::Approve)
         );
         assert_eq!(
+            explicit_gate_verdict(Some("PASS\nverification complete")),
+            Some(ExplicitGateVerdict::Approve)
+        );
+        assert_eq!(
+            explicit_gate_verdict(Some("BLOCK\nmissing receipt")),
+            Some(ExplicitGateVerdict::Reject)
+        );
+        assert_eq!(
             explicit_gate_verdict(Some("\nFAIL\nmissing receipt")),
             Some(ExplicitGateVerdict::Reject)
         );
@@ -4301,6 +4403,39 @@ reviewer = "reviewer"
             None,
             "later verdict words must not override the first meaningful line"
         );
+    }
+
+    #[test]
+    fn required_explicit_gate_verdict_fails_closed_when_missing_or_malformed() {
+        let mut record = RuntimeTaskRecord {
+            agent_id: "reviewer-malformed".to_string(),
+            label: Some("reviewer".to_string()),
+            role: Some("reviewer".to_string()),
+            status: IrWorkflowRunStatus::Succeeded,
+            output: Some("Review result: BLOCK".to_string()),
+            schema_error: None,
+        };
+
+        match gate_outcome_for_completed_role(&record, true) {
+            GateOutcome::Fail { reason } => {
+                assert!(
+                    reason.contains("required first-line gate verdict"),
+                    "{reason}"
+                );
+            }
+            outcome => panic!("required malformed verdict must fail closed: {outcome:?}"),
+        }
+        assert_eq!(
+            gate_outcome_for_completed_role(&record, false),
+            GateOutcome::Pass,
+            "legacy gates retain pass-on-success behavior"
+        );
+
+        record.output = None;
+        assert!(matches!(
+            gate_outcome_for_completed_role(&record, true),
+            GateOutcome::Fail { .. }
+        ));
     }
 
     #[tokio::test]
@@ -4327,6 +4462,7 @@ reviewer = "reviewer"
             blocks_role: Some("verifier".to_string()),
             max_retries: 0,
             artifact_kind: Some("review_report".to_string()),
+            require_explicit_verdict: true,
         }];
         let spec = WorkflowSpec {
             id: Some("explicit-verdict-fixture".to_string()),

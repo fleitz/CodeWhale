@@ -175,7 +175,9 @@ role output as a lane-scoped handoff and block the next role if the upstream
 child fails or returns an exact first-line rejection verdict. Each fixture role
 must begin its response with standalone `APPROVE` or `BLOCK`; the host maps that
 first non-empty line to the gate outcome, while verdict words later in prose do
-not control admission. The host-emitted `gate_updated` receipt remains
+not control admission. Every fixture gate sets `require_explicit_verdict`, so a
+missing or malformed first-line verdict blocks the next role instead of passing
+on child completion alone. The host-emitted `gate_updated` receipt remains
 authoritative. Prompts require grep-first, bounded source reads, with per-role
 token caps of 16k/12k/12k/12k/8k from scout through release lead. Those caps
 are structural guardrails, not proof that a live provider run will complete.
