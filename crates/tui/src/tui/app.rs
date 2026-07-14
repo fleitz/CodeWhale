@@ -1297,22 +1297,6 @@ pub struct MentionCompletionCache {
     pub entries: Vec<String>,
 }
 
-/// Cached full candidate walk for @-mention completions. One workspace walk
-/// serves every subsequent keystroke of the same mention token — the
-/// per-keystroke synchronous re-walk was the dominant composer latency on
-/// large repos (#3757). Path-like partials (containing `/` or starting with
-/// `.`) bypass this cache because local path-reference completions are
-/// needle-dependent.
-#[derive(Debug, Clone)]
-pub struct MentionCandidateCache {
-    pub workspace: PathBuf,
-    pub cwd: Option<PathBuf>,
-    pub walk_depth: usize,
-    pub follow_links: bool,
-    pub collected_at: std::time::Instant,
-    pub candidates: Vec<String>,
-}
-
 /// Composer input state — grouped fields for the text input area.
 pub struct ComposerState {
     /// Current composer text content.
@@ -1344,9 +1328,12 @@ pub struct ComposerState {
     /// Cached @-mention completions to avoid re-walking the filesystem when
     /// the cursor moves inside the same mention token.
     pub mention_completion_cache: Option<MentionCompletionCache>,
-    /// Cached full candidate list so successive keystrokes inside one mention
-    /// token filter in memory instead of re-walking the workspace (#3757).
-    pub mention_candidate_cache: Option<MentionCandidateCache>,
+    /// Serialized background discovery and its bounded candidate cache. All
+    /// filesystem traversal for composer completions lives behind this owner.
+    pub(crate) mention_discovery: crate::tui::mention_completion::MentionDiscovery,
+    /// Launch directory captured once so rendering a completion popup never
+    /// needs to call `getcwd` on the UI thread.
+    pub(crate) mention_cwd: Option<PathBuf>,
     /// Whether vim modal editing is enabled for this composer.
     /// Sourced from `Settings::composer_vim_mode` at startup.
     pub vim_enabled: bool,
@@ -1383,7 +1370,8 @@ impl Default for ComposerState {
             mention_menu_selected: 0,
             mention_menu_hidden: false,
             mention_completion_cache: None,
-            mention_candidate_cache: None,
+            mention_discovery: crate::tui::mention_completion::MentionDiscovery::default(),
+            mention_cwd: std::env::current_dir().ok(),
             vim_enabled: false,
             vim_mode: VimMode::Normal,
             vim_pending_d: false,
@@ -2900,6 +2888,7 @@ impl App {
             Self::discover_cached_skills(&workspace, &skills_dir, skills_scan_codewhale_only);
 
         let input_history = crate::composer_history::load_history();
+        let mention_cwd = std::env::current_dir().ok();
         let (initial_input_text, initial_input_cursor, auto_submit_initial_input) =
             match initial_input {
                 // #451: pre-populate the composer when invoked via
@@ -2951,7 +2940,8 @@ impl App {
                 mention_menu_selected: 0,
                 mention_menu_hidden: false,
                 mention_completion_cache: None,
-                mention_candidate_cache: None,
+                mention_discovery: crate::tui::mention_completion::MentionDiscovery::default(),
+                mention_cwd,
                 vim_enabled: composer_vim_enabled,
                 vim_mode: VimMode::Normal,
                 vim_pending_d: false,

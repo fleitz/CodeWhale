@@ -50,8 +50,8 @@ pub struct PendingInputPreview {
 }
 
 /// Compact pre-send context row shown above the composer. `included=false`
-/// marks missing/skipped context distinctly from files/media that will be
-/// sent or inlined.
+/// marks unconfirmed, missing, or skipped context distinctly from files/media
+/// already known to be sent or inlined.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ContextPreviewItem {
     pub kind: String,

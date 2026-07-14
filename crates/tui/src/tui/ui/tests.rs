@@ -9140,6 +9140,29 @@ fn file_mention_completion_ranks_prefix_before_substring() {
     assert_eq!(matches.first().map(String::as_str), Some("README.md"));
 }
 
+fn await_visible_mention_entries(app: &mut App, limit: usize) -> Vec<String> {
+    let partial = partial_file_mention_at_cursor(&app.input, app.cursor_position)
+        .expect("test input should contain a mention")
+        .1;
+    let started = Instant::now();
+    loop {
+        let entries = visible_mention_menu_entries(app, limit);
+        let ready = app
+            .composer
+            .mention_completion_cache
+            .as_ref()
+            .is_some_and(|cache| cache.partial == partial && cache.limit == limit);
+        if ready {
+            return entries;
+        }
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "timed out waiting for background mention discovery"
+        );
+        std::thread::sleep(Duration::from_millis(2));
+    }
+}
+
 #[test]
 fn try_autocomplete_file_mention_unique_replaces_partial() {
     let tmpdir = TempDir::new().expect("tempdir");
@@ -9151,6 +9174,7 @@ fn try_autocomplete_file_mention_unique_replaces_partial() {
     app.input = "summarize @docs/de".to_string();
     app.cursor_position = app.input.chars().count();
 
+    let _ = await_visible_mention_entries(&mut app, 64);
     assert!(try_autocomplete_file_mention(&mut app));
     assert_eq!(app.input, "summarize @docs/deepseek_v4.pdf");
     assert_eq!(app.cursor_position, app.input.chars().count());
@@ -9168,6 +9192,7 @@ fn try_autocomplete_file_mention_extends_to_common_prefix() {
     app.input = "@crates/tui/".to_string();
     app.cursor_position = app.input.chars().count();
 
+    let _ = await_visible_mention_entries(&mut app, 64);
     assert!(try_autocomplete_file_mention(&mut app));
     // Both files share the `crates/tui/` prefix and one more letter is
     // not unique (`l` vs `m`), so the partial extends to the common prefix
@@ -9191,6 +9216,7 @@ fn try_autocomplete_file_mention_no_match_reports_status() {
     app.input = "@nonexistent_xyz".to_string();
     app.cursor_position = app.input.chars().count();
 
+    let _ = await_visible_mention_entries(&mut app, 64);
     assert!(try_autocomplete_file_mention(&mut app));
     assert_eq!(app.input, "@nonexistent_xyz");
     assert_eq!(
@@ -9209,6 +9235,7 @@ fn try_autocomplete_file_mention_no_match_mentions_depth_cap_for_path_like_parti
     app.input = "@a/b/c/d/e/f/g/target".to_string();
     app.cursor_position = app.input.chars().count();
 
+    let _ = await_visible_mention_entries(&mut app, 64);
     assert!(try_autocomplete_file_mention(&mut app));
     assert_eq!(
         app.status_message.as_deref(),
@@ -9228,6 +9255,7 @@ fn try_autocomplete_file_mention_no_match_skips_depth_hint_for_shallow_path() {
     app.input = "@shallow_missing/main.rs".to_string();
     app.cursor_position = app.input.chars().count();
 
+    let _ = await_visible_mention_entries(&mut app, 64);
     assert!(try_autocomplete_file_mention(&mut app));
     assert_eq!(
         app.status_message.as_deref(),
@@ -9245,6 +9273,7 @@ fn try_autocomplete_file_mention_no_match_skips_depth_hint_when_unlimited() {
     app.input = "@a/b/c/d/e/f/g/target".to_string();
     app.cursor_position = app.input.chars().count();
 
+    let _ = await_visible_mention_entries(&mut app, 64);
     assert!(try_autocomplete_file_mention(&mut app));
     assert_eq!(
         app.status_message.as_deref(),
@@ -9276,6 +9305,40 @@ fn mention_popup_is_empty_when_cursor_is_not_in_a_mention() {
 }
 
 #[test]
+fn plain_at_returns_immediately_while_discovery_is_stalled() {
+    let (started_tx, started_rx) = std::sync::mpsc::channel();
+    let (release_tx, release_rx) = std::sync::mpsc::channel();
+    let release_rx = std::sync::Mutex::new(release_rx);
+
+    let mut app = create_test_app();
+    app.input = "@".to_string();
+    app.cursor_position = 1;
+    app.composer.mention_discovery =
+        crate::tui::mention_completion::MentionDiscovery::with_scanner(move |_, _| {
+            let _ = started_tx.send(());
+            let _ = release_rx.lock().expect("release lock").recv();
+            vec!["README.md".to_string()]
+        });
+
+    let started = Instant::now();
+    let initial = visible_mention_menu_entries(&mut app, 6);
+    assert!(initial.is_empty());
+    assert!(
+        started.elapsed() < Duration::from_millis(50),
+        "plain @ waited for discovery instead of returning immediately"
+    );
+    started_rx
+        .recv_timeout(Duration::from_secs(1))
+        .expect("plain @ should start discovery in the background");
+
+    release_tx.send(()).unwrap();
+    assert_eq!(
+        await_visible_mention_entries(&mut app, 6),
+        vec!["README.md"]
+    );
+}
+
+#[test]
 fn mention_popup_lists_workspace_matches_for_cursor_partial() {
     let tmpdir = TempDir::new().expect("tempdir");
     std::fs::create_dir_all(tmpdir.path().join("docs")).unwrap();
@@ -9288,7 +9351,7 @@ fn mention_popup_lists_workspace_matches_for_cursor_partial() {
     app.input = "look at @docs/".to_string();
     app.cursor_position = app.input.chars().count();
 
-    let entries = visible_mention_menu_entries(&mut app, 6);
+    let entries = await_visible_mention_entries(&mut app, 6);
     assert!(!entries.is_empty(), "popup should surface docs/ entries");
     assert!(entries.iter().any(|e| e.starts_with("docs/")));
     // README.md doesn't match `docs/` — confirm we didn't dump every file.
@@ -9309,7 +9372,7 @@ fn mention_popup_browser_mode_lists_immediate_directory_children() {
     app.input = "look at @src/".to_string();
     app.cursor_position = app.input.chars().count();
 
-    let entries = visible_mention_menu_entries(&mut app, 8);
+    let entries = await_visible_mention_entries(&mut app, 8);
     assert_eq!(entries, vec!["src/lib.rs", "src/nested/"]);
 }
 
@@ -9324,7 +9387,7 @@ fn mention_popup_reuses_cache_when_cursor_moves_inside_same_token() {
     app.input = "look at @docs/".to_string();
     app.cursor_position = app.input.chars().count();
 
-    let entries = visible_mention_menu_entries(&mut app, 6);
+    let entries = await_visible_mention_entries(&mut app, 6);
     assert!(entries.iter().any(|e| e == "docs/alpha.md"));
 
     std::fs::write(tmpdir.path().join("docs/beta.md"), "x").unwrap();
@@ -9339,7 +9402,11 @@ fn mention_popup_reuses_cache_when_cursor_moves_inside_same_token() {
     app.input = "look at @docs/b".to_string();
     app.cursor_position = app.input.chars().count();
 
-    let entries_after_partial_change = visible_mention_menu_entries(&mut app, 6);
+    // The bounded background index is intentionally reused for the same
+    // workspace generation; filesystem mutations become visible on refresh.
+    app.composer.mention_discovery.invalidate();
+    app.composer.mention_completion_cache = None;
+    let entries_after_partial_change = await_visible_mention_entries(&mut app, 6);
     assert!(
         entries_after_partial_change
             .iter()
@@ -9377,7 +9444,7 @@ fn apply_mention_menu_selection_splices_selected_entry() {
     app.input = "open @crates/tui/m".to_string();
     app.cursor_position = app.input.chars().count();
 
-    let entries = visible_mention_menu_entries(&mut app, 6);
+    let entries = await_visible_mention_entries(&mut app, 6);
     assert!(!entries.is_empty(), "expected entries for @crates/tui/m");
     // Pick whichever entry appears at index 0; it's deterministic given the
     // workspace setup. Apply it.
@@ -12527,10 +12594,7 @@ fn accidental_queue_edit_while_loading_is_labeled_and_recoverable() {
 
 #[test]
 fn build_pending_input_preview_includes_current_context_chips() {
-    let tmpdir = TempDir::new().expect("tempdir");
-    std::fs::write(tmpdir.path().join("guide.md"), "hello").expect("write");
     let mut app = create_test_app();
-    app.workspace = tmpdir.path().to_path_buf();
     app.input = "Read @guide.md and @missing.md".to_string();
     app.cursor_position = app.input.chars().count();
 
@@ -12540,16 +12604,22 @@ fn build_pending_input_preview_includes_current_context_chips() {
         preview
             .context_items
             .iter()
-            .any(|item| item.kind == "file" && item.label == "guide.md" && item.included),
-        "file mention preview missing: {:?}",
+            .any(|item| item.kind == "mention"
+                && item.label == "guide.md"
+                && !item.included
+                && item.detail.as_deref() == Some("resolved on send")),
+        "neutral mention preview missing: {:?}",
         preview.context_items
     );
     assert!(
         preview
             .context_items
             .iter()
-            .any(|item| item.kind == "missing" && item.label == "missing.md" && !item.included),
-        "missing mention preview missing: {:?}",
+            .any(|item| item.kind == "mention"
+                && item.label == "missing.md"
+                && !item.included
+                && item.detail.as_deref() == Some("resolved on send")),
+        "unresolved mention preview missing: {:?}",
         preview.context_items
     );
 }

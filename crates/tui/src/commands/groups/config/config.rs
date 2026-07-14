@@ -1863,21 +1863,25 @@ pub fn set_config_value(app: &mut App, key: &str, value: &str, persist: bool) ->
         "mention_menu_limit" | "mention_limit" => {
             app.mention_menu_limit = settings.mention_menu_limit;
             app.composer.mention_completion_cache = None;
+            app.composer.mention_discovery.invalidate();
             app.needs_redraw = true;
         }
         "mention_menu_behavior" | "mention_behavior" | "mention_menu" => {
             app.mention_menu_behavior = settings.mention_menu_behavior.clone();
             app.composer.mention_completion_cache = None;
+            app.composer.mention_discovery.invalidate();
             app.needs_redraw = true;
         }
         "mention_walk_depth" | "mention_depth" | "completions_walk_depth" => {
             app.mention_walk_depth = settings.mention_walk_depth;
             app.composer.mention_completion_cache = None;
+            app.composer.mention_discovery.invalidate();
             app.needs_redraw = true;
         }
         "workspace_follow_symlinks" | "follow_symlinks" => {
             app.workspace_follow_symlinks = settings.workspace_follow_symlinks;
             app.composer.mention_completion_cache = None;
+            app.composer.mention_discovery.invalidate();
             app.needs_redraw = true;
             // Engine tools use EngineConfig which is fixed at startup
             return CommandResult::message(if persist {
