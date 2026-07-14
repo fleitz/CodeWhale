@@ -2327,6 +2327,91 @@ fn setup_runtime_preset_apply_persists_settings_config_and_state() {
 }
 
 #[test]
+fn setup_runtime_preset_rolls_back_durable_and_live_state_when_state_save_fails() {
+    let _home = SettingsHomeGuard::new();
+    let config_path = crate::config_persistence::config_toml_path(None).expect("config path");
+    std::fs::create_dir_all(config_path.parent().expect("config parent"))
+        .expect("config parent exists");
+    std::fs::write(
+        &config_path,
+        "# keep exact bytes\napproval_policy = \"auto\"\nallow_shell = true\nsandbox_mode = \"workspace-write\"\n",
+    )
+    .expect("seed config");
+    let original_settings = Settings {
+        default_mode: "agent".to_string(),
+        permission_posture: Some("auto-review".to_string()),
+        ..Settings::default()
+    };
+    original_settings.save().expect("seed settings");
+
+    let config_before = std::fs::read(&config_path).expect("read config snapshot");
+    let settings_path = Settings::path().expect("settings path");
+    let settings_before = std::fs::read(&settings_path).expect("read settings snapshot");
+
+    let mut app = create_test_app();
+    app.config_path = Some(config_path.clone());
+    app.set_agent_runtime_baseline(true, false, ApprovalMode::Auto);
+    app.set_mode(AppMode::Agent);
+    let app_before = (
+        app.mode,
+        app.allow_shell,
+        app.trust_mode,
+        app.approval_mode,
+        app.approval_policy_locked(),
+    );
+    let mut config = Config {
+        approval_policy: Some("auto".to_string()),
+        allow_shell: Some(true),
+        sandbox_mode: Some("workspace-write".to_string()),
+        ..Config::default()
+    };
+    let config_before_live = (
+        config.approval_policy.clone(),
+        config.allow_shell,
+        config.sandbox_mode.clone(),
+    );
+
+    // SetupState::save is atomic; an existing directory at the destination
+    // forces the final persist to fail after config and settings were staged.
+    let state_path = codewhale_config::SetupState::path().expect("state path");
+    std::fs::create_dir_all(&state_path).expect("state path directory");
+    let error = apply_setup_runtime_preset(
+        &mut app,
+        &mut config,
+        crate::tui::setup::SetupRuntimePreset::AskFirst,
+        codewhale_config::SetupState::default(),
+    )
+    .expect_err("state persistence must fail");
+
+    assert!(
+        error
+            .to_string()
+            .contains("failed to persist setup runtime posture state"),
+        "{error:#}"
+    );
+    assert_eq!(std::fs::read(config_path).unwrap(), config_before);
+    assert_eq!(std::fs::read(settings_path).unwrap(), settings_before);
+    assert_eq!(
+        (
+            app.mode,
+            app.allow_shell,
+            app.trust_mode,
+            app.approval_mode,
+            app.approval_policy_locked(),
+        ),
+        app_before
+    );
+    assert_eq!(
+        (
+            config.approval_policy,
+            config.allow_shell,
+            config.sandbox_mode,
+        ),
+        config_before_live
+    );
+}
+
+#[test]
 fn setup_high_trust_persists_full_access_without_legacy_yolo_mode() {
     let _home = SettingsHomeGuard::new();
     let config_path = crate::config_persistence::config_toml_path(None).expect("config path");
@@ -2424,6 +2509,101 @@ fn setup_high_trust_cannot_override_project_approval_policy() {
         std::fs::read_to_string(config_path)
             .expect("root config remains")
             .contains("approval_policy = \"on-request\"")
+    );
+}
+
+#[test]
+fn project_runtime_provenance_only_blocks_values_startup_would_accept() {
+    let _home = SettingsHomeGuard::new();
+    let settings = Settings {
+        permission_posture: Some("ask".to_string()),
+        ..Settings::default()
+    };
+    settings.save().expect("save settings");
+
+    let workspace = Settings::path()
+        .expect("settings path")
+        .parent()
+        .expect("Codewhale home")
+        .parent()
+        .expect("temporary home")
+        .join("project");
+    let project_dir = workspace.join(codewhale_config::CODEWHALE_APP_DIR);
+    std::fs::create_dir_all(&project_dir).expect("project config dir");
+    let project_path = project_dir.join("config.toml");
+    std::fs::write(
+        &project_path,
+        "approval_policy = \"auto\"\nsandbox_mode = \"danger-full-access\"\nallow_shell = true\n",
+    )
+    .expect("project config");
+
+    let config = Config {
+        sandbox_mode: Some("read-only".to_string()),
+        ..Config::default()
+    };
+    assert_eq!(
+        config.approval_policy_control(None, None, &workspace),
+        crate::config::ApprovalPolicyControl::Unset,
+        "project Auto would loosen saved Ask and must not claim provenance"
+    );
+    assert_eq!(
+        config.allow_shell_control(None, None, &workspace),
+        crate::config::ShellAccessControl::Unset,
+        "project allow_shell=true is ignored by startup"
+    );
+    assert_eq!(
+        config.runtime_preset_blocker(None, None, &workspace),
+        None,
+        "ignored project escalations must not create a phantom preset blocker"
+    );
+
+    std::fs::write(
+        &project_path,
+        "approval_policy = \"never\"\nsandbox_mode = \"read-only\"\nallow_shell = false\n",
+    )
+    .expect("tightening project config");
+    assert_eq!(
+        config.approval_policy_control(None, None, &workspace),
+        crate::config::ApprovalPolicyControl::ProjectConfig
+    );
+    assert_eq!(
+        config.allow_shell_control(None, None, &workspace),
+        crate::config::ShellAccessControl::ProjectConfig
+    );
+    assert_eq!(
+        config.runtime_preset_blocker(None, None, &workspace),
+        Some("project runtime configuration")
+    );
+}
+
+#[test]
+fn saved_full_access_baseline_allows_project_approval_tightening() {
+    let _home = SettingsHomeGuard::new();
+    let settings = Settings {
+        permission_posture: Some("full-access".to_string()),
+        ..Settings::default()
+    };
+    settings.save().expect("save settings");
+
+    let workspace = Settings::path()
+        .expect("settings path")
+        .parent()
+        .expect("Codewhale home")
+        .parent()
+        .expect("temporary home")
+        .join("project");
+    let project_dir = workspace.join(codewhale_config::CODEWHALE_APP_DIR);
+    std::fs::create_dir_all(&project_dir).expect("project config dir");
+    std::fs::write(
+        project_dir.join("config.toml"),
+        "approval_policy = \"on-request\"\n",
+    )
+    .expect("project config");
+
+    assert_eq!(
+        Config::default().approval_policy_control(None, None, &workspace),
+        crate::config::ApprovalPolicyControl::ProjectConfig,
+        "Ask is a tightening from saved Full Access and owns the effective policy"
     );
 }
 

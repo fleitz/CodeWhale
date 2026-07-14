@@ -1498,7 +1498,7 @@ pub fn set_config_value(app: &mut App, key: &str, value: &str, persist: bool) ->
                                 path.display(),
                                 saved_mode.permission_chip_label()
                             ),
-                            AppAction::ModeChanged(app.mode),
+                            AppAction::ApprovalPolicyPersisted { policy: None },
                         )
                     }
                     Err(err) => CommandResult::error(format!("Failed to save: {err}")),
@@ -1551,7 +1551,9 @@ pub fn set_config_value(app: &mut App, key: &str, value: &str, persist: bool) ->
                                         path.display(),
                                         saved
                                     ),
-                                    AppAction::ModeChanged(app.mode),
+                                    AppAction::ApprovalPolicyPersisted {
+                                        policy: Some(saved.to_string()),
+                                    },
                                 )
                             }
                             Err(err) => CommandResult::error(format!("Failed to save: {err}")),
@@ -3868,7 +3870,12 @@ max_concurrent = 4
         assert!(!restarted.approval_policy_requirements_managed());
         let changed = config_command(&mut restarted, Some("approval_mode auto --save"));
         assert!(!changed.is_error, "{:?}", changed.message);
-        assert!(matches!(changed.action, Some(AppAction::ModeChanged(_))));
+        assert_eq!(
+            changed.action,
+            Some(AppAction::ApprovalPolicyPersisted {
+                policy: Some("auto".to_string())
+            })
+        );
         assert_eq!(restarted.approval_mode, ApprovalMode::Auto);
         let reloaded = Config::load(Some(config_path), None).unwrap();
         assert_eq!(reloaded.approval_policy.as_deref(), Some("auto"));
@@ -3898,6 +3905,10 @@ max_concurrent = 4
         assert!(!result.is_error, "{:?}", result.message);
         assert_eq!(app.approval_mode, ApprovalMode::Bypass);
         assert!(!app.approval_policy_locked());
+        assert_eq!(
+            result.action,
+            Some(AppAction::ApprovalPolicyPersisted { policy: None })
+        );
         let saved = fs::read_to_string(config_path).unwrap();
         assert!(saved.contains("# keep"));
         assert!(!saved.contains("approval_policy"));

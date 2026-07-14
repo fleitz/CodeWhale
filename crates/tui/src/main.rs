@@ -7006,17 +7006,10 @@ fn merge_project_config_with_approval_baseline(
     if let Some(v) = table.get("approval_policy").and_then(toml::Value::as_str)
         && !v.is_empty()
     {
-        let saved_approval_baseline = saved_permission_posture.and_then(|posture| {
-            match posture.trim().to_ascii_lowercase().as_str() {
-                "ask" | "suggest" | "on-request" | "untrusted" => Some("on-request"),
-                "auto" | "auto-review" | "auto_review" => Some("auto"),
-                // Full Access is looser than every project policy accepted by
-                // the config crate. Use its loosest ranked value so any valid
-                // project policy is recognized as a tightening operation.
-                "full" | "full-access" | "full_access" | "bypass" => Some("auto"),
-                _ => None,
-            }
-        });
+        let saved_approval_baseline =
+            crate::config::approval_policy_baseline_from_permission_posture(
+                saved_permission_posture,
+            );
         let approval_baseline = config
             .approval_policy
             .as_deref()

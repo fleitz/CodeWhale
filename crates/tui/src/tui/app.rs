@@ -6705,6 +6705,11 @@ pub enum AppAction {
     OpenModePicker,
     /// Refresh the engine prompt after the UI operating mode changes.
     ModeChanged(AppMode),
+    /// Synchronize a saved top-level approval policy into the live Config,
+    /// then refresh the engine prompt from the App's updated permission mode.
+    ApprovalPolicyPersisted {
+        policy: Option<String>,
+    },
     /// Open the `/statusline` multi-select picker for footer items.
     OpenStatusPicker,
     /// Open the `/feedback` picker for GitHub issue/security destinations.

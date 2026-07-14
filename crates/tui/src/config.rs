@@ -2820,7 +2820,7 @@ impl ShellAccessControl {
     }
 }
 
-fn project_config_has_root_key(workspace: &Path, key: &str) -> bool {
+fn project_config_root_bool(workspace: &Path, key: &str) -> Option<bool> {
     [
         workspace
             .join(codewhale_config::CODEWHALE_APP_DIR)
@@ -2833,8 +2833,24 @@ fn project_config_has_root_key(workspace: &Path, key: &str) -> bool {
     .find(|path| path.exists())
     .and_then(|path| std::fs::read_to_string(path).ok())
     .and_then(|raw| toml::from_str::<toml::Value>(&raw).ok())
-    .and_then(|document| document.as_table().map(|table| table.contains_key(key)))
-    .unwrap_or(false)
+    .and_then(|document| document.get(key).and_then(toml::Value::as_bool))
+}
+
+/// Map the saved TUI permission posture onto the approval-policy ordering used
+/// by project config. Full Access is looser than every project policy, so its
+/// baseline is the loosest ranked policy (`auto`).
+#[must_use]
+pub(crate) fn approval_policy_baseline_from_permission_posture(
+    posture: Option<&str>,
+) -> Option<&'static str> {
+    posture.and_then(
+        |posture| match posture.trim().to_ascii_lowercase().as_str() {
+            "ask" | "suggest" | "on-request" | "untrusted" => Some("on-request"),
+            "auto" | "auto-review" | "auto_review" => Some("auto"),
+            "full" | "full-access" | "full_access" | "bypass" => Some("auto"),
+            _ => None,
+        },
+    )
 }
 
 // === Config Loading ===
@@ -2879,11 +2895,28 @@ impl Config {
             workspace == home
         });
         let project_controls_runtime = || {
+            let saved_approval_baseline = crate::settings::Settings::load_persisted()
+                .ok()
+                .and_then(|settings| settings.permission_posture)
+                .and_then(|posture| {
+                    approval_policy_baseline_from_permission_posture(Some(&posture))
+                });
+            let approval_baseline = self.approval_policy.as_deref().or(saved_approval_baseline);
             let parsed_controls =
                 codewhale_config::load_project_config(workspace).is_some_and(|project| {
-                    project.approval_policy.is_some() || project.sandbox_mode.is_some()
+                    project.approval_policy.as_deref().is_some_and(|policy| {
+                        codewhale_config::project_approval_policy_is_allowed(
+                            approval_baseline,
+                            policy,
+                        )
+                    }) || project.sandbox_mode.as_deref().is_some_and(|sandbox| {
+                        codewhale_config::project_sandbox_mode_is_allowed(
+                            self.sandbox_mode.as_deref(),
+                            sandbox,
+                        )
+                    })
                 });
-            parsed_controls || project_config_has_root_key(workspace, "allow_shell")
+            parsed_controls || project_config_root_bool(workspace, "allow_shell") == Some(false)
         };
         if !workspace_is_home && project_controls_runtime() {
             return Some("project runtime configuration");
@@ -2970,12 +3003,22 @@ impl Config {
             let home = home.canonicalize().unwrap_or(home);
             workspace == home
         });
-        if !workspace_is_home
-            && codewhale_config::load_project_config(workspace)
+        if !workspace_is_home {
+            let saved_approval_baseline = crate::settings::Settings::load_persisted()
+                .ok()
+                .and_then(|settings| settings.permission_posture)
+                .and_then(|posture| {
+                    approval_policy_baseline_from_permission_posture(Some(&posture))
+                });
+            let approval_baseline = self.approval_policy.as_deref().or(saved_approval_baseline);
+            if codewhale_config::load_project_config(workspace)
                 .and_then(|project| project.approval_policy)
-                .is_some_and(|policy| !policy.trim().is_empty())
-        {
-            return ApprovalPolicyControl::ProjectConfig;
+                .is_some_and(|policy| {
+                    codewhale_config::project_approval_policy_is_allowed(approval_baseline, &policy)
+                })
+            {
+                return ApprovalPolicyControl::ProjectConfig;
+            }
         }
 
         let managed_path = self
@@ -3051,7 +3094,7 @@ impl Config {
             let home = home.canonicalize().unwrap_or(home);
             workspace == home
         });
-        if !workspace_is_home && project_config_has_root_key(workspace, "allow_shell") {
+        if !workspace_is_home && project_config_root_bool(workspace, "allow_shell") == Some(false) {
             return ShellAccessControl::ProjectConfig;
         }
 

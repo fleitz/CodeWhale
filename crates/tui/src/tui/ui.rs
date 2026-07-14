@@ -8663,6 +8663,10 @@ async fn apply_command_result(
             AppAction::ModeChanged(_mode) => {
                 sync_mode_update(app, engine_handle).await;
             }
+            AppAction::ApprovalPolicyPersisted { policy } => {
+                config.approval_policy = policy;
+                sync_mode_update(app, engine_handle).await;
+            }
             AppAction::SendMessage(content) => {
                 let queued = build_queued_message(app, content);
                 submit_or_steer_message(app, config, engine_handle, queued).await?;
@@ -11066,27 +11070,14 @@ async fn handle_view_events(
                     commands::set_config_value(app, &key, &value, persist),
                     persist,
                 );
-                let update_succeeded = !result.is_error;
                 let normalized_value = value.trim().to_ascii_lowercase().replace([' ', '_'], "-");
-                let cleared_root_approval = update_succeeded
+                let cleared_root_approval = !result.is_error
                     && persist
                     && key == "approval_policy"
                     && matches!(
                         normalized_value.as_str(),
                         "default" | "tui-default" | "use-tui-default"
                     );
-                if cleared_root_approval {
-                    config.approval_policy = None;
-                } else if update_succeeded && persist && key == "approval_policy" {
-                    config.approval_policy = match normalized_value.as_str() {
-                        "ask" | "suggest" | "on-request" | "untrusted" => {
-                            Some("on-request".to_string())
-                        }
-                        "auto" | "auto-review" => Some("auto".to_string()),
-                        "never" | "deny" => Some("never".to_string()),
-                        _ => config.approval_policy.clone(),
-                    };
-                }
                 // Theme / background changes require a full terminal repaint
                 // because ratatui's incremental diff may miss color-only
                 // changes in cells that were rendered with theme-resolved
@@ -11703,6 +11694,58 @@ async fn apply_approval_decision(
     }
 }
 
+struct RuntimePresetFileSnapshot {
+    path: PathBuf,
+    contents: Option<Vec<u8>>,
+}
+
+impl RuntimePresetFileSnapshot {
+    fn capture(path: PathBuf) -> Result<Self> {
+        let contents = match std::fs::read(&path) {
+            Ok(contents) => Some(contents),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => None,
+            Err(error) => {
+                return Err(error)
+                    .with_context(|| format!("failed to snapshot {}", path.display()));
+            }
+        };
+        Ok(Self { path, contents })
+    }
+
+    fn restore(&self) -> Result<()> {
+        match &self.contents {
+            Some(contents) => crate::utils::write_atomic(&self.path, contents)
+                .with_context(|| format!("failed to restore {}", self.path.display())),
+            None => match std::fs::remove_file(&self.path) {
+                Ok(()) => Ok(()),
+                Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+                Err(error) => {
+                    Err(error).with_context(|| format!("failed to remove {}", self.path.display()))
+                }
+            },
+        }
+    }
+}
+
+fn runtime_preset_error_with_rollback(
+    error: anyhow::Error,
+    snapshots: &[&RuntimePresetFileSnapshot],
+) -> anyhow::Error {
+    let rollback_errors = snapshots
+        .iter()
+        .filter_map(|snapshot| snapshot.restore().err())
+        .map(|error| format!("{error:#}"))
+        .collect::<Vec<_>>();
+    if rollback_errors.is_empty() {
+        error
+    } else {
+        anyhow::anyhow!(
+            "{error:#}; runtime preset rollback also failed: {}",
+            rollback_errors.join("; ")
+        )
+    }
+}
+
 fn apply_setup_runtime_preset(
     app: &mut App,
     config: &mut Config,
@@ -11732,49 +11775,77 @@ fn apply_setup_runtime_preset(
         }
     }
 
+    let settings_path = Settings::path().context("failed to resolve settings path")?;
+    let settings_snapshot = RuntimePresetFileSnapshot::capture(settings_path)?;
     let mut settings = Settings::load_persisted().context("failed to load settings")?;
     settings.default_mode = preset.default_mode().to_string();
     settings.permission_posture = Some(preset.permission_posture().to_string());
-    settings.save().context("failed to save settings")?;
 
     // Persist into the same file Config::load actually selected. When an env
     // override names a missing file, reads intentionally fall back to an
     // existing home config; writing to the missing override would otherwise
     // leave the controlling key untouched and shadow the home config on the
     // next launch.
-    let config_path = crate::config::resolve_load_config_path(app.config_path.clone())
+    let selected_config_path = crate::config::resolve_load_config_path(app.config_path.clone())
         .or_else(|| app.config_path.clone());
+    let config_path = crate::config_persistence::config_toml_path(selected_config_path.as_deref())
+        .context("failed to resolve config path")?;
+    let config_snapshot = RuntimePresetFileSnapshot::capture(config_path.clone())?;
+    if let Err(error) =
+        crate::config_persistence::mutate_config_document(&config_path, |document| {
+            if let Some(policy) = preset.approval_policy() {
+                crate::config_persistence::set_document_value(
+                    document,
+                    &["approval_policy"],
+                    policy,
+                )?;
+            } else {
+                crate::config_persistence::unset_document_value(document, &["approval_policy"])?;
+            }
+            crate::config_persistence::set_document_value(
+                document,
+                &["allow_shell"],
+                preset.allow_shell(),
+            )?;
+            crate::config_persistence::set_document_value(
+                document,
+                &["sandbox_mode"],
+                preset.sandbox_mode(),
+            )
+        })
+        .context("failed to persist runtime posture")
+    {
+        return Err(runtime_preset_error_with_rollback(
+            error,
+            &[&settings_snapshot, &config_snapshot],
+        ));
+    }
+    if let Err(error) = settings.save().context("failed to save settings") {
+        return Err(runtime_preset_error_with_rollback(
+            error,
+            &[&settings_snapshot, &config_snapshot],
+        ));
+    }
+    if let Err(error) = state
+        .save()
+        .context("failed to persist setup runtime posture state")
+    {
+        return Err(runtime_preset_error_with_rollback(
+            error,
+            &[&settings_snapshot, &config_snapshot],
+        ));
+    }
+
+    // Durable writes succeeded as one transaction. Only now may live state
+    // move to the new posture.
     if let Some(policy) = preset.approval_policy() {
-        crate::config_persistence::persist_root_string_key(
-            config_path.as_deref(),
-            "approval_policy",
-            policy,
-        )
-        .context("failed to persist approval_policy")?;
         config.approval_policy = Some(policy.to_string());
         app.mark_approval_policy_locked();
     } else {
-        crate::config_persistence::persist_unset_root_key(
-            config_path.as_deref(),
-            "approval_policy",
-        )
-        .context("failed to remove approval_policy")?;
         config.approval_policy = None;
         app.clear_saved_approval_policy_lock();
     }
-    crate::config_persistence::persist_root_bool_key(
-        config_path.as_deref(),
-        "allow_shell",
-        preset.allow_shell(),
-    )
-    .context("failed to persist allow_shell")?;
     config.allow_shell = Some(preset.allow_shell());
-    crate::config_persistence::persist_root_string_key(
-        config_path.as_deref(),
-        "sandbox_mode",
-        preset.sandbox_mode(),
-    )
-    .context("failed to persist sandbox_mode")?;
     config.sandbox_mode = Some(preset.sandbox_mode().to_string());
 
     let approval_mode = ApprovalMode::from_config_value(
@@ -11792,10 +11863,6 @@ fn apply_setup_runtime_preset(
     let mode = AppMode::from_setting(preset.default_mode());
     app.set_mode(mode);
     app.needs_redraw = true;
-
-    state
-        .save()
-        .context("failed to persist setup runtime posture state")?;
 
     Ok(format!("Applied {}.", preset.result_summary()))
 }
