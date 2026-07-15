@@ -17,7 +17,9 @@ use crate::localization::{Locale, MessageId, tr};
 use crate::palette;
 use crate::settings::Settings;
 use crate::tools::UserInputResponse;
-use crate::tools::subagent::{SubAgentAssignment, SubAgentResult, SubAgentStatus, SubAgentType};
+use crate::tools::subagent::{
+    SubAgentAssignment, SubAgentResult, SubAgentStatus, SubAgentType, localized_whale_display_names,
+};
 use crate::tui::app::App;
 use crate::tui::approval::{ElevationOption, ReviewDecision};
 use crate::tui::history::{HistoryCell, SubAgentCell, summarize_tool_output};
@@ -3234,6 +3236,7 @@ pub(crate) fn subagent_view_agents(
     manager_agents: &[SubAgentResult],
 ) -> Vec<SubAgentResult> {
     let mut agents = manager_agents.to_vec();
+    let manager_agent_count = agents.len();
     let mut seen: std::collections::HashSet<String> =
         agents.iter().map(|agent| agent.agent_id.clone()).collect();
 
@@ -3287,6 +3290,22 @@ pub(crate) fn subagent_view_agents(
             }
             _ => {}
         }
+    }
+
+    let mut display_names = localized_whale_display_names(
+        agents[..manager_agent_count]
+            .iter()
+            .map(|agent| (agent.agent_id.as_str(), agent.nickname.as_deref())),
+        app.ui_locale.tag(),
+    );
+    for agent in &mut agents[..manager_agent_count] {
+        agent.nickname = display_names.remove(&agent.agent_id);
+    }
+    for agent in &mut agents[manager_agent_count..] {
+        // Progress and transcript rows can arrive before ListSubAgents. Keep
+        // their stable Agent-N placeholder until the manager snapshot supplies
+        // the locale-neutral identity needed for generated whale display.
+        agent.nickname = app.agent_label_map.get(&agent.agent_id).cloned();
     }
 
     agents
@@ -4102,6 +4121,7 @@ mod tests {
     #[test]
     fn subagent_view_agents_includes_progress_only_running_agent() {
         let mut app = create_test_app();
+        app.ensure_agent_label("agent_live");
         app.agent_progress
             .insert("agent_live".to_string(), "reading code".to_string());
 
@@ -4112,6 +4132,27 @@ mod tests {
         assert!(matches!(agents[0].status, SubAgentStatus::Running));
         assert_eq!(agents[0].assignment.role.as_deref(), Some("live"));
         assert!(agents[0].assignment.objective.contains("reading code"));
+        assert_eq!(agents[0].nickname.as_deref(), Some("Agent 1"));
+    }
+
+    #[test]
+    fn subagent_view_replaces_progress_placeholder_after_manager_snapshot() {
+        let mut app = create_test_app();
+        app.ui_locale = Locale::En;
+        app.ensure_agent_label("agent_live");
+        app.agent_progress
+            .insert("agent_live".to_string(), "reading code".to_string());
+
+        let progress_only = subagent_view_agents(&app, &[]);
+        assert_eq!(progress_only[0].nickname.as_deref(), Some("Agent 1"));
+
+        let mut manager = manager_agent("agent_live", SubAgentStatus::Running);
+        manager.nickname = Some("\u{30b7}\u{30e3}\u{30c1}".to_string());
+        let manager_backed = subagent_view_agents(&app, &[manager]);
+        assert_eq!(
+            manager_backed[0].nickname.as_deref(),
+            Some(crate::tools::subagent::whale_name_for_id_in_locale("agent_live", "en").as_str())
+        );
     }
 
     #[test]

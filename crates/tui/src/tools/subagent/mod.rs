@@ -475,6 +475,96 @@ pub fn assign_unique_whale_name_in_locale(
     format!("{base} ({})", id.get(..4).unwrap_or("?"))
 }
 
+/// Return the unsuffixed whale label when `name` is one of Codewhale's
+/// generated display names. Numeric collision suffixes are presentation-only
+/// and do not make the label user-authored.
+fn generated_whale_name_base(name: &str) -> Option<&str> {
+    let name = name.trim();
+    if name.is_empty() {
+        return None;
+    }
+    let base = name
+        .rsplit_once(" (")
+        .and_then(|(base, suffix)| {
+            suffix
+                .strip_suffix(')')
+                .filter(|number| !number.is_empty() && number.chars().all(|ch| ch.is_ascii_digit()))
+                .map(|_| base)
+        })
+        .unwrap_or(name);
+
+    WHALE_NICKNAMES
+        .iter()
+        .chain(WHALE_NICKNAMES_JA)
+        .chain(WHALE_NICKNAMES_ZH_HANT)
+        .chain(WHALE_NICKNAMES_PT_BR)
+        .chain(WHALE_NICKNAMES_ES_419)
+        .chain(WHALE_NICKNAMES_VI)
+        .chain(WHALE_NICKNAMES_KO)
+        .any(|candidate| *candidate == base)
+        .then_some(base)
+}
+
+/// Derive the generated whale labels shown for a set of workers from their
+/// locale-neutral ids and the active UI language.
+///
+/// Persisted `nickname` values predate locale-scoped naming and may contain a
+/// whale label chosen under another language. Those generated values are
+/// deliberately ignored here. A nickname outside every built-in whale pool is
+/// an explicit custom label and remains intact.
+#[must_use]
+pub(crate) fn localized_whale_display_names<'a>(
+    agents: impl IntoIterator<Item = (&'a str, Option<&'a str>)>,
+    locale_tag: &str,
+) -> std::collections::HashMap<String, String> {
+    let mut by_id = std::collections::BTreeMap::<String, Option<String>>::new();
+    for (agent_id, nickname) in agents {
+        if agent_id.trim().is_empty() {
+            continue;
+        }
+        let nickname = nickname
+            .map(str::trim)
+            .filter(|name| !name.is_empty())
+            .map(str::to_string);
+        by_id
+            .entry(agent_id.to_string())
+            .and_modify(|existing| {
+                if existing.is_none() && nickname.is_some() {
+                    *existing = nickname.clone();
+                }
+            })
+            .or_insert(nickname);
+    }
+
+    let mut names = std::collections::HashMap::with_capacity(by_id.len());
+    let mut active_names = std::collections::HashSet::new();
+
+    // Reserve explicit labels first so generated names never shadow them.
+    for (agent_id, nickname) in &by_id {
+        let Some(nickname) = nickname
+            .as_deref()
+            .filter(|name| generated_whale_name_base(name).is_none())
+        else {
+            continue;
+        };
+        active_names.insert(nickname.to_string());
+        names.insert(agent_id.clone(), nickname.to_string());
+    }
+
+    // BTreeMap iteration makes collision suffix ownership stable even when
+    // manager/progress event order changes between frames or session loads.
+    for agent_id in by_id.keys() {
+        if names.contains_key(agent_id) {
+            continue;
+        }
+        let name = assign_unique_whale_name_in_locale(agent_id, &active_names, locale_tag);
+        active_names.insert(name.clone());
+        names.insert(agent_id.clone(), name);
+    }
+
+    names
+}
+
 // === Types ===
 
 /// Assignment metadata for sub-agent orchestration.
@@ -1493,7 +1583,7 @@ struct PersistedSubAgent {
     assignment: SubAgentAssignment,
     #[serde(default)]
     model: String,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     nickname: Option<String>,
     status: SubAgentStatus,
     result: Option<String>,
@@ -2325,7 +2415,13 @@ impl SubAgentManager {
                 prompt: agent.prompt.clone(),
                 assignment: agent.assignment.clone(),
                 model: agent.model.clone(),
-                nickname: agent.nickname.clone(),
+                // Generated whale names are locale-derived presentation, not
+                // durable identity. Persist only an explicit custom nickname;
+                // legacy generated values are discarded again on load.
+                nickname: agent
+                    .nickname
+                    .clone()
+                    .filter(|name| generated_whale_name_base(name).is_none()),
                 status: agent.status.clone(),
                 result: agent.result.clone(),
                 steps_taken: agent.steps_taken,
@@ -2513,7 +2609,12 @@ impl SubAgentManager {
                 } else {
                     persisted.model
                 },
-                nickname: persisted.nickname,
+                // v0.8.68 and earlier persisted generated whale text. It may
+                // have been chosen under a different UI language, so never
+                // replay it into a new session. Explicit custom names survive.
+                nickname: persisted
+                    .nickname
+                    .filter(|name| generated_whale_name_base(name).is_none()),
                 status,
                 result: persisted.result,
                 steps_taken: persisted.steps_taken,

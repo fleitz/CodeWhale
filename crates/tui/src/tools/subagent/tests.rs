@@ -63,6 +63,38 @@ fn locale_matched_whale_collision_suffix_stays_in_language() {
     assert!(!unique.is_ascii());
 }
 
+#[test]
+fn localized_whale_displays_rederive_legacy_names_from_neutral_ids() {
+    let displays = localized_whale_display_names(
+        [
+            ("agent_english_a", Some("蓝鲸")),
+            ("agent_english_b", Some("シャチ")),
+            ("agent_english_c", Some("Cá voi xanh")),
+            ("agent_explicit", Some("docs-fixer")),
+        ],
+        "en",
+    );
+
+    for agent_id in ["agent_english_a", "agent_english_b", "agent_english_c"] {
+        let display = displays.get(agent_id).expect("generated display");
+        assert!(
+            display.is_ascii(),
+            "English UI leaked a prior-locale whale name: {display}"
+        );
+        let base = generated_whale_name_base(display).expect("English whale display");
+        let index = WHALE_NICKNAMES
+            .iter()
+            .position(|candidate| *candidate == base)
+            .expect("English display belongs to the paired pool");
+        assert_eq!(index % 2, 0, "English display selected a zh-Hans pair");
+    }
+    assert_eq!(
+        displays.get("agent_explicit").map(String::as_str),
+        Some("docs-fixer"),
+        "an explicit non-whale nickname remains user-owned"
+    );
+}
+
 fn make_assignment() -> SubAgentAssignment {
     SubAgentAssignment::new("prompt".to_string(), Some("worker".to_string()))
 }
@@ -3667,6 +3699,61 @@ fn test_persist_and_reload_marks_running_agent_as_interrupted() {
         SubAgentStatus::Interrupted(ref message)
             if message.contains(SUBAGENT_RESTART_REASON)
     ));
+}
+
+#[test]
+fn generated_whale_name_is_not_persisted_or_replayed_on_load() {
+    let tmp = tempdir().expect("tempdir");
+    let workspace = tmp.path().to_path_buf();
+    let state_path = default_state_path(tmp.path()).expect("default state path");
+    let mut manager =
+        SubAgentManager::new(workspace.clone(), 2).with_state_path(state_path.clone());
+    let (input_tx, _input_rx) = mpsc::unbounded_channel();
+    let mut agent = SubAgent::new(
+        "agent_locale_neutral".to_string(),
+        SubAgentType::General,
+        "work".to_string(),
+        make_assignment(),
+        "deepseek-v4-flash".to_string(),
+        Some("シャチ".to_string()),
+        Some(vec!["read_file".to_string()]),
+        input_tx,
+        PathBuf::from("."),
+        "boot_test".to_string(),
+    );
+    agent.session_name = "docs-worker".to_string();
+    manager.agents.insert(agent.id.clone(), agent);
+    manager
+        .persist_state()
+        .expect("persist state")
+        .join()
+        .expect("persist thread");
+
+    let mut persisted: Value =
+        serde_json::from_str(&std::fs::read_to_string(&state_path).expect("read persisted state"))
+            .expect("parse persisted state");
+    assert!(
+        persisted["agents"][0].get("nickname").is_none(),
+        "generated locale text is not durable identity"
+    );
+
+    // Recreate a pre-fix state file whose generated display came from a
+    // Japanese session. Loading under a later session must discard it.
+    persisted["agents"][0]["nickname"] = json!("シャチ");
+    std::fs::write(
+        &state_path,
+        serde_json::to_string_pretty(&persisted).expect("serialize legacy state"),
+    )
+    .expect("write legacy state");
+
+    let mut reloaded = SubAgentManager::new(workspace, 2).with_state_path(state_path);
+    reloaded.load_state().expect("load legacy state");
+    let snapshot = reloaded
+        .get_result("agent_locale_neutral")
+        .expect("neutral id survives load");
+    assert_eq!(snapshot.agent_id, "agent_locale_neutral");
+    assert_eq!(snapshot.name, "docs-worker");
+    assert_eq!(snapshot.nickname, None);
 }
 
 #[test]
