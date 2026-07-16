@@ -5068,6 +5068,10 @@ model = "qwen-2.5-7b"
         use codewhale_secrets::{InMemoryKeyringStore, KeyringStore};
         use std::sync::Arc;
 
+        // Runtime resolution reads process-global provider environment overrides.
+        // Serialize with the tests that temporarily set those overrides so this
+        // in-memory DeepSeek credential is not resolved against another provider.
+        let _lock = env_lock();
         let nanos = chrono::Utc::now().timestamp_nanos_opt().unwrap_or_default();
         let path = std::env::temp_dir().join(format!(
             "deepseek-cli-dispatch-keyring-heal-test-{}-{nanos}.toml",
