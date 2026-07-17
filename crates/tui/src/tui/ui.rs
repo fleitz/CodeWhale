@@ -9583,6 +9583,7 @@ async fn apply_command_result(
                             original,
                             app.ocean_treatment,
                             app.ui_locale,
+                            app.background_color_override,
                         ),
                     );
                 }

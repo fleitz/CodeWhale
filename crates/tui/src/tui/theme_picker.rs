@@ -19,7 +19,7 @@ use crossterm::event::{KeyEvent, MouseButton, MouseEvent, MouseEventKind};
 use ratatui::{
     buffer::Buffer,
     layout::Rect,
-    style::{Modifier, Style},
+    style::{Color, Modifier, Style},
     text::{Line, Span},
     widgets::{Paragraph, Widget},
 };
@@ -44,6 +44,10 @@ pub struct ThemePickerView {
     /// Effective session treatment, reported separately from theme so the
     /// picker never claims an ombre is active under Terminal or Flat.
     ocean_treatment: crate::tui::ocean::OceanTreatment,
+    /// User-configured background applied on top of every named-theme preview.
+    /// Without carrying this into the picker, a customized Solarized Light
+    /// session would render ombre behind the modal but report Flat inside it.
+    background_override: Option<Color>,
     row_hitboxes: RefCell<Vec<(Rect, usize)>>,
     last_mouse_selected: Option<usize>,
     /// UI locale captured from the app at construction (#4057 wave 2).
@@ -85,11 +89,21 @@ impl ThemePickerView {
         )
     }
 
+    #[cfg(test)]
     #[must_use]
     pub fn new_with_treatment(
         original_name: String,
         ocean_treatment: crate::tui::ocean::OceanTreatment,
         locale: Locale,
+    ) -> Self {
+        Self::new_with_treatment_and_background(original_name, ocean_treatment, locale, None)
+    }
+
+    fn new_with_treatment_and_background(
+        original_name: String,
+        ocean_treatment: crate::tui::ocean::OceanTreatment,
+        locale: Locale,
+        background_override: Option<Color>,
     ) -> Self {
         let options = theme_options(&original_name);
         let mut controller = SettingsPickerController::new(options, original_name.clone());
@@ -105,6 +119,7 @@ impl ThemePickerView {
             controller,
             system_ui_theme: UiTheme::detect(),
             ocean_treatment,
+            background_override,
             row_hitboxes: RefCell::new(Vec::new()),
             last_mouse_selected: None,
             locale,
@@ -119,11 +134,13 @@ impl ThemePickerView {
         original_name: String,
         ocean_treatment: crate::tui::ocean::OceanTreatment,
         locale: Locale,
+        background_override: Option<Color>,
     ) -> Box<dyn ModalView> {
-        Box::new(Self::new_with_treatment(
+        Box::new(Self::new_with_treatment_and_background(
             original_name,
             ocean_treatment,
             locale,
+            background_override,
         ))
     }
 
@@ -147,11 +164,13 @@ impl ThemePickerView {
     /// Resolve a theme to a `UiTheme`, returning the cached `System`
     /// resolution to avoid repeated env-var reads inside `render`.
     fn ui_theme_for(&self, id: ThemeId) -> UiTheme {
-        if matches!(id, ThemeId::System) {
+        let theme = if matches!(id, ThemeId::System) {
             self.system_ui_theme
         } else {
             id.ui_theme()
-        }
+        };
+        self.background_override
+            .map_or(theme, |background| theme.with_background_color(background))
     }
 
     fn preview_event(&self) -> ViewAction {
@@ -281,7 +300,9 @@ impl ModalView for ThemePickerView {
 
         let treatment = if matches!(self.current(), ThemeId::Terminal) {
             tr(self.locale, MessageId::ThemeTreatmentOmbreUnavailable)
-        } else if self.ocean_treatment.is_flat() {
+        } else if self.ocean_treatment.is_flat()
+            || crate::tui::ocean::OceanRamp::for_theme(&live).is_none()
+        {
             tr(self.locale, MessageId::ThemeTreatmentFlatActive)
         } else {
             tr(self.locale, MessageId::ThemeTreatmentOmbreActive)
@@ -587,6 +608,37 @@ mod tests {
             .collect::<String>();
         assert!(terminal_text.contains("Ombre unavailable"));
         assert!(terminal_text.contains("Terminal owns the background"));
+
+        let solarized = ThemePickerView::new_with_treatment(
+            "solarized-light".to_string(),
+            crate::tui::ocean::OceanTreatment::Ombre,
+            Locale::En,
+        );
+        let mut solarized_buf = ratatui::buffer::Buffer::empty(area);
+        solarized.render(area, &mut solarized_buf);
+        let solarized_text = solarized_buf
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect::<String>();
+        assert!(solarized_text.contains("Treatment  Flat — active"));
+        assert!(!solarized_text.contains("Treatment  Ombre — active"));
+
+        let solarized_custom = ThemePickerView::new_with_treatment_and_background(
+            "solarized-light".to_string(),
+            crate::tui::ocean::OceanTreatment::Ombre,
+            Locale::En,
+            Some(Color::Rgb(0x1a, 0x1b, 0x26)),
+        );
+        let mut solarized_custom_buf = ratatui::buffer::Buffer::empty(area);
+        solarized_custom.render(area, &mut solarized_custom_buf);
+        let solarized_custom_text = solarized_custom_buf
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect::<String>();
+        assert!(solarized_custom_text.contains("Treatment  Ombre — active"));
+        assert!(!solarized_custom_text.contains("Treatment  Flat — active"));
     }
 
     #[test]

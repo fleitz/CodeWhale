@@ -7,6 +7,7 @@ use std::time::{Duration, Instant};
 
 use chrono::{DateTime, Utc};
 use ratatui::layout::Rect;
+use ratatui::style::Color;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use thiserror::Error;
@@ -2032,6 +2033,11 @@ pub struct App {
     /// budget-only chatter is paced under fan-out (#4095 residual).
     pub last_workflow_budget_redraw: Option<Instant>,
     pub ui_theme: UiTheme,
+    /// Parsed `background_color` setting, kept separately from `ui_theme` so
+    /// an explicit override remains distinguishable even when it happens to
+    /// equal the current named theme's default surface and can still carry
+    /// into previews of other themes.
+    pub background_color_override: Option<Color>,
     /// Active named theme. Drives the cell-level color remap in
     /// `tui::color_compat::ColorCompatBackend` so community presets
     /// (Catppuccin, Tokyo Night, Dracula, Gruvbox) propagate to every
@@ -2767,11 +2773,11 @@ impl App {
         let theme_id =
             palette::ThemeId::from_name(&settings.theme).unwrap_or(palette::ThemeId::System);
         let mut ui_theme = theme_id.ui_theme();
-        if let Some(background) = settings
+        let background_color_override = settings
             .background_color
             .as_deref()
-            .and_then(palette::parse_hex_rgb_color)
-        {
+            .and_then(palette::parse_hex_rgb_color);
+        if let Some(background) = background_color_override {
             ui_theme = ui_theme.with_background_color(background);
         }
         let provider_models = settings.provider_models.clone().unwrap_or_default();
@@ -3143,6 +3149,7 @@ impl App {
             last_agent_progress_redraw: None,
             last_workflow_budget_redraw: None,
             ui_theme,
+            background_color_override,
             theme_id,
             onboarding,
             onboarding_needs_api_key: needs_api_key,
