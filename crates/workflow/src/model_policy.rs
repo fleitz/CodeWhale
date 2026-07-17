@@ -292,9 +292,10 @@ pub fn repair_json_text_once(raw: &str) -> String {
         .and_then(|value| value.strip_suffix("```"))
         .map(str::trim)
         .unwrap_or(trimmed);
-    let object = slice_json_payload(without_fence, '{', '}');
-    let array = slice_json_payload(without_fence, '[', ']');
-    object.or(array).unwrap_or(without_fence).to_string()
+
+    first_valid_json_payload(without_fence)
+        .unwrap_or(without_fence)
+        .to_string()
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -343,10 +344,66 @@ fn model_key(provider: &str, model: &str) -> String {
     format!("{provider}/{model}")
 }
 
-fn slice_json_payload(raw: &str, open: char, close: char) -> Option<&str> {
-    let start = raw.find(open)?;
-    let end = raw.rfind(close)?;
-    (end >= start).then_some(&raw[start..=end])
+// Repair scans untrusted model text once per possible container start. Keep the
+// fallback bounded when malformed output contains a long delimiter flood.
+const JSON_REPAIR_CANDIDATE_LIMIT: usize = 64;
+
+fn first_valid_json_payload(raw: &str) -> Option<&str> {
+    let mut attempted = 0;
+    for (start, open) in raw.char_indices() {
+        if !matches!(open, '{' | '[') {
+            continue;
+        }
+        attempted += 1;
+        if attempted > JSON_REPAIR_CANDIDATE_LIMIT {
+            break;
+        }
+
+        let Some(candidate) = balanced_json_payload(&raw[start..]) else {
+            continue;
+        };
+        if serde_json::from_str::<serde_json::Value>(candidate).is_ok() {
+            return Some(candidate);
+        }
+    }
+    None
+}
+
+fn balanced_json_payload(raw: &str) -> Option<&str> {
+    let mut stack = Vec::new();
+    let mut in_string = false;
+    let mut escaped = false;
+
+    for (offset, character) in raw.char_indices() {
+        if in_string {
+            if escaped {
+                escaped = false;
+            } else {
+                match character {
+                    '\\' => escaped = true,
+                    '"' => in_string = false,
+                    _ => {}
+                }
+            }
+            continue;
+        }
+
+        match character {
+            '"' => in_string = true,
+            '{' | '[' => stack.push(character),
+            '}' | ']' => {
+                let expected_open = if character == '}' { '{' } else { '[' };
+                if stack.pop() != Some(expected_open) {
+                    return None;
+                }
+                if stack.is_empty() {
+                    return Some(&raw[..offset + character.len_utf8()]);
+                }
+            }
+            _ => {}
+        }
+    }
+    None
 }
 
 #[cfg(test)]
@@ -491,5 +548,107 @@ mod tests {
         assert_eq!(provider.provider(), "mock");
         assert_eq!(provider.model(), "fast");
         assert_eq!(response.text, "mock response");
+    }
+
+    #[test]
+    fn repair_json_text_once_extracts_supported_payloads() {
+        // Plain JSON object
+        assert_eq!(
+            repair_json_text_once(r#"{"key": "value"}"#),
+            r#"{"key": "value"}"#
+        );
+
+        // Plain JSON array
+        assert_eq!(repair_json_text_once(r#"[1, 2, 3]"#), r#"[1, 2, 3]"#);
+
+        // Markdown fenced JSON object
+        assert_eq!(
+            repair_json_text_once("```json\n{\"key\": \"value\"}\n```"),
+            r#"{"key": "value"}"#
+        );
+
+        // Markdown fenced JSON array
+        assert_eq!(
+            repair_json_text_once("```json\n[1, 2, 3]\n```"),
+            r#"[1, 2, 3]"#
+        );
+
+        // Generic markdown fence
+        assert_eq!(
+            repair_json_text_once("```\n{\"key\": \"value\"}\n```"),
+            r#"{"key": "value"}"#
+        );
+
+        // JSON object embedded in text
+        assert_eq!(
+            repair_json_text_once("Here is the JSON:\n\n{\"key\": \"value\"}\n\nHope this helps!"),
+            r#"{"key": "value"}"#
+        );
+
+        // JSON array embedded in text
+        assert_eq!(
+            repair_json_text_once("Some text before [1, 2, 3] and some text after"),
+            r#"[1, 2, 3]"#
+        );
+
+        // Nested structures (object containing array)
+        assert_eq!(
+            repair_json_text_once(r#"{"key": [1, 2, 3]}"#),
+            r#"{"key": [1, 2, 3]}"#
+        );
+
+        // Nested structures (array containing object)
+        assert_eq!(
+            repair_json_text_once(r#"[{"key": "value"}]"#),
+            r#"[{"key": "value"}]"#
+        );
+
+        // Fenced JSON embedded in text
+        assert_eq!(
+            repair_json_text_once("Here is the JSON:\n```json\n{\"key\": \"value\"}\n```\nDone."),
+            r#"{"key": "value"}"#
+        );
+
+        // No valid JSON, fallback to trimmed text
+        assert_eq!(
+            repair_json_text_once("Just some plain text without json"),
+            "Just some plain text without json"
+        );
+
+        // Fenced plain text, falls back to stripped and trimmed text
+        assert_eq!(
+            repair_json_text_once("```json\nJust some plain text\n```"),
+            "Just some plain text"
+        );
+
+        // An unmatched opening bracket must not block a later valid object.
+        assert_eq!(repair_json_text_once("[note {\"ok\":1}"), r#"{"ok":1}"#);
+
+        // Delimiters inside strings must not terminate the outer object.
+        assert_eq!(
+            repair_json_text_once(r#"Prefix text {"data": "[nested]"} postfix text"#),
+            r#"{"data": "[nested]"}"#
+        );
+
+        // The earliest balanced candidate may still be invalid JSON. Keep scanning
+        // until a balanced candidate also parses successfully.
+        assert_eq!(
+            repair_json_text_once(r#"[not-json] then {"ok":true}"#),
+            r#"{"ok":true}"#
+        );
+
+        // Escaped quotes and backslashes stay inside the JSON string.
+        assert_eq!(
+            repair_json_text_once(
+                r#"prefix {"value":"a \"quoted\" [item]","path":"C:\\tmp"} suffix"#
+            ),
+            r#"{"value":"a \"quoted\" [item]","path":"C:\\tmp"}"#
+        );
+
+        // A mismatched outer delimiter must not consume a later valid payload.
+        assert_eq!(
+            repair_json_text_once(r#"[broken} then [1,{"ok":true}]"#),
+            r#"[1,{"ok":true}]"#
+        );
     }
 }
