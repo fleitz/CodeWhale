@@ -50,8 +50,10 @@ use crate::seam_manager::{SeamConfig, SeamManager};
 use crate::tools::goal::{GoalSnapshot, GoalStatus, SharedGoalState, new_shared_goal_state};
 use crate::tools::plan::{PlanSnapshot, SharedPlanState, new_shared_plan_state};
 use crate::tools::shell::{SharedShellManager, new_shared_shell_manager};
-use crate::tools::spec::RuntimeToolServices;
 use crate::tools::spec::{ApprovalRequirement, ToolError, ToolResult};
+use crate::tools::spec::{
+    RuntimeToolServices, SharedFileReadTracker, new_shared_file_read_tracker,
+};
 use crate::tools::subagent::{
     Mailbox, MailboxMessage, SharedSubAgentManager, SubAgentCompletion, SubAgentForkContext,
     SubAgentResult, SubAgentRuntime, SubAgentStatus, SubAgentThinking, SubAgentType,
@@ -616,6 +618,9 @@ pub struct Engine {
     session: Session,
     subagent_manager: SharedSubAgentManager,
     shell_manager: SharedShellManager,
+    /// Read-before-edit snapshots live for the session, not for one turn's
+    /// transient `ToolContext` (#4475).
+    file_read_tracker: SharedFileReadTracker,
     mcp_pool: Option<Arc<AsyncMutex<McpPool>>>,
     api_provider: ApiProvider,
     /// Exact configured route key. Named custom providers share the `Custom`
@@ -1071,6 +1076,7 @@ impl Engine {
             .shell_manager
             .clone()
             .unwrap_or_else(|| new_shared_shell_manager(config.workspace.clone()));
+        let file_read_tracker = new_shared_file_read_tracker();
         // Create Flash seam manager for layered context (#159). v0.7.5 keeps
         // this opt-in until the prefix-cache audit proves when seam production
         // is worth the extra request and transcript mutation.
@@ -1145,6 +1151,7 @@ impl Engine {
             session,
             subagent_manager,
             shell_manager,
+            file_read_tracker,
             mcp_pool: None,
             api_provider,
             api_provider_identity,
@@ -3450,6 +3457,7 @@ impl Engine {
         .with_state_namespace(self.session.id.clone())
         .with_features(self.config.features.clone())
         .with_shell_manager(self.shell_manager.clone())
+        .with_file_read_tracker(self.file_read_tracker.clone())
         .with_runtime_services(self.config.runtime_services.clone())
         .with_skills_config(
             self.config.skills_dir.clone(),

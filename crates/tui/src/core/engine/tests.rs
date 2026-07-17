@@ -5207,6 +5207,32 @@ fn agent_mode_can_build_auto_approved_tool_context() {
 }
 
 #[test]
+fn build_tool_context_preserves_read_snapshots_across_turns() {
+    let workspace = tempdir().expect("tempdir");
+    let path = workspace.path().join("observed.txt");
+    fs::write(&path, "before\n").expect("write fixture");
+    let config = EngineConfig {
+        workspace: workspace.path().to_path_buf(),
+        ..EngineConfig::default()
+    };
+    let (engine, _handle) = Engine::new(config, &Config::default());
+
+    let read_turn = engine.build_tool_context(AppMode::Agent, false);
+    read_turn.note_file_read(&path);
+
+    let later_turn = engine.build_tool_context(AppMode::Agent, false);
+    later_turn
+        .require_fresh_file_read(&path, "observed.txt")
+        .expect("a later turn should retain the session's fresh read snapshot");
+
+    fs::write(&path, "changed contents\n").expect("change fixture");
+    let err = later_turn
+        .require_fresh_file_read(&path, "observed.txt")
+        .expect_err("a retained snapshot must still reject stale edits");
+    assert!(err.to_string().contains("changed since the last read_file"));
+}
+
+#[test]
 fn build_tool_context_uses_typed_shell_policy_per_mode() {
     let mut config = EngineConfig {
         allow_shell: true,

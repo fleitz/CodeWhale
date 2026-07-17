@@ -118,7 +118,7 @@ pub struct FileReadTracker {
 
 pub type SharedFileReadTracker = Arc<Mutex<FileReadTracker>>;
 
-fn new_shared_file_read_tracker() -> SharedFileReadTracker {
+pub(crate) fn new_shared_file_read_tracker() -> SharedFileReadTracker {
     Arc::new(Mutex::new(FileReadTracker::default()))
 }
 
@@ -742,6 +742,14 @@ impl ToolContext {
     /// Override the shared shell manager.
     pub fn with_shell_manager(mut self, shell_manager: SharedShellManager) -> Self {
         self.shell_manager = shell_manager;
+        self
+    }
+
+    /// Reuse the engine's session-scoped read snapshots across tool-context
+    /// rebuilds. A fresh context is assembled for each turn, but successful
+    /// reads must remain authoritative until the observed file changes.
+    pub fn with_file_read_tracker(mut self, tracker: SharedFileReadTracker) -> Self {
+        self.file_read_tracker = tracker;
         self
     }
 
