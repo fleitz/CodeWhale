@@ -159,66 +159,67 @@ export async function runPrReview(env: AgentEnv): Promise<Record<string, unknown
     );
     const prs = (await res.json()) as { number: number; title: string; body?: string; updated_at: string; html_url: string; changed_files?: number; additions?: number; deletions?: number; user: { login: string } }[];
 
-    let processed = 0;
-    let skipped = 0;
+    const results = await Promise.all(
+      prs.slice(0, 10).map(async (pr) => {
+        if (await hasFreshDraft(env.CURATED_KV, "pr", String(pr.number), pr.updated_at)) {
+          return { type: "skipped" };
+        }
 
-    for (const pr of prs.slice(0, 10)) {
-      if (await hasFreshDraft(env.CURATED_KV, "pr", String(pr.number), pr.updated_at)) {
-        skipped++;
-        continue;
-      }
+        // Fetch diff stats if not included
+        let diffStats = { changed_files: pr.changed_files ?? 0, additions: pr.additions ?? 0, deletions: pr.deletions ?? 0 };
+        if (!pr.changed_files) {
+          try {
+            const diffRes = await fetch(`https://api.github.com/repos/${repo}/pulls/${pr.number}`, {
+              headers: {
+                Accept: "application/vnd.github+json",
+                "X-GitHub-Api-Version": "2022-11-28",
+                "User-Agent": "codewhale-web",
+                ...(env.GITHUB_TOKEN ? { Authorization: `Bearer ${env.GITHUB_TOKEN}` } : {}),
+              },
+            });
+            const diffData = (await diffRes.json()) as { changed_files?: number; additions?: number; deletions?: number };
+            diffStats = { changed_files: diffData.changed_files ?? 0, additions: diffData.additions ?? 0, deletions: diffData.deletions ?? 0 };
+          } catch { /* use defaults */ }
+        }
 
-      // Fetch diff stats if not included
-      let diffStats = { changed_files: pr.changed_files ?? 0, additions: pr.additions ?? 0, deletions: pr.deletions ?? 0 };
-      if (!pr.changed_files) {
-        try {
-          const diffRes = await fetch(`https://api.github.com/repos/${repo}/pulls/${pr.number}`, {
-            headers: {
-              Accept: "application/vnd.github+json",
-              "X-GitHub-Api-Version": "2022-11-28",
-              "User-Agent": "codewhale-web",
-              ...(env.GITHUB_TOKEN ? { Authorization: `Bearer ${env.GITHUB_TOKEN}` } : {}),
-            },
-          });
-          const diffData = (await diffRes.json()) as { changed_files?: number; additions?: number; deletions?: number };
-          diffStats = { changed_files: diffData.changed_files ?? 0, additions: diffData.additions ?? 0, deletions: diffData.deletions ?? 0 };
-        } catch { /* use defaults */ }
-      }
-
-      const payload = {
-        number: pr.number,
-        title: pr.title,
-        body: (pr.body ?? "").slice(0, 3000),
-        author: pr.user.login,
-        url: pr.html_url,
-        ...diffStats,
-      };
-
-      try {
-        const { content, usage } = await agentChat(
-          [{ role: "system", content: PR_REVIEW_PROMPT }, { role: "user", content: JSON.stringify(payload) }],
-          env.DEEPSEEK_API_KEY!,
-          true,
-          dsEnv(env)
-        );
-        const parsed = JSON.parse(content) as { bodyEn: string; bodyZh: string };
-        const draft: AgentDraft = {
-          id: String(pr.number),
-          type: "pr-review",
-          targetNumber: pr.number,
-          targetUrl: pr.html_url,
-          bodyEn: parsed.bodyEn,
-          bodyZh: parsed.bodyZh,
-          generatedAt: new Date().toISOString(),
-          posted: false,
+        const payload = {
+          number: pr.number,
+          title: pr.title,
+          body: (pr.body ?? "").slice(0, 3000),
+          author: pr.user.login,
+          url: pr.html_url,
+          ...diffStats,
         };
-        await saveDraft(env.CURATED_KV, draft);
-        await logUsage(env.CURATED_KV, usage.input, usage.output);
-        processed++;
-      } catch {
-        skipped++;
-      }
-    }
+
+        try {
+          const { content, usage } = await agentChat(
+            [{ role: "system", content: PR_REVIEW_PROMPT }, { role: "user", content: JSON.stringify(payload) }],
+            env.DEEPSEEK_API_KEY!,
+            true,
+            dsEnv(env)
+          );
+          const parsed = JSON.parse(content) as { bodyEn: string; bodyZh: string };
+          const draft: AgentDraft = {
+            id: String(pr.number),
+            type: "pr-review",
+            targetNumber: pr.number,
+            targetUrl: pr.html_url,
+            bodyEn: parsed.bodyEn,
+            bodyZh: parsed.bodyZh,
+            generatedAt: new Date().toISOString(),
+            posted: false,
+          };
+          await saveDraft(env.CURATED_KV, draft);
+          await logUsage(env.CURATED_KV, usage.input, usage.output);
+          return { type: "processed" };
+        } catch {
+          return { type: "skipped" };
+        }
+      })
+    );
+
+    const processed = results.filter((r) => r.type === "processed").length;
+    const skipped = results.filter((r) => r.type === "skipped").length;
 
     return { ok: true, processed, skipped };
   } catch (e) {
