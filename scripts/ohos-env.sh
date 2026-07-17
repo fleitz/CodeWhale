@@ -29,6 +29,19 @@ if [ ! -d "$sysroot" ]; then
     return 1 2>/dev/null || exit 1
 fi
 
+libclang_path=
+for directory in "$sdk/llvm/lib" "$sdk/llvm/lib64" "$sdk/llvm/bin"; do
+    if [ -f "$directory/libclang.so" ] || [ -f "$directory/libclang.dylib" ]; then
+        libclang_path=$directory
+        break
+    fi
+done
+
+if [ -z "$libclang_path" ]; then
+    echo "error: required OpenHarmony SDK libclang shared library is missing under: $sdk/llvm" >&2
+    return 1 2>/dev/null || exit 1
+fi
+
 export CARGO_TARGET_AARCH64_UNKNOWN_LINUX_OHOS_LINKER=$clang
 export AR_aarch64_unknown_linux_ohos=$ar
 export CC_aarch64_unknown_linux_ohos=$clang
@@ -37,6 +50,8 @@ export CC_SHELL_ESCAPED_FLAGS=1
 export CFLAGS_aarch64_unknown_linux_ohos="-target aarch64-linux-ohos --sysroot=\"$sysroot\" -D__MUSL__"
 export CXXFLAGS_aarch64_unknown_linux_ohos="-target aarch64-linux-ohos --sysroot=\"$sysroot\" -D__MUSL__"
 export CMAKE_TOOLCHAIN_FILE_aarch64_unknown_linux_ohos=$cmake_toolchain
+export LIBCLANG_PATH=$libclang_path
+export BINDGEN_EXTRA_CLANG_ARGS_aarch64_unknown_linux_ohos="-target aarch64-linux-ohos --sysroot=\"$sysroot\" -D__MUSL__"
 
 sep=$(printf '\037')
 export CARGO_ENCODED_RUSTFLAGS="-Clink-arg=-target${sep}-Clink-arg=aarch64-linux-ohos${sep}-Clink-arg=--sysroot=$sysroot${sep}-Clink-arg=-D__MUSL__"

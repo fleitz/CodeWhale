@@ -53,6 +53,7 @@ pub mod spec;
 pub mod speech;
 pub mod subagent;
 pub mod tasks;
+#[cfg(not(target_env = "ohos"))]
 pub mod terminal_session;
 pub mod test_runner;
 pub mod todo;

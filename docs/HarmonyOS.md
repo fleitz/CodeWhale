@@ -42,7 +42,9 @@ cargo build --target aarch64-unknown-linux-ohos -p codewhale-cli
 
 The setup scripts export Cargo's target-specific `linker`, `AR`, `CC`, `CXX`,
 `CFLAGS`, `CXXFLAGS`, `CARGO_ENCODED_RUSTFLAGS`, `CC_SHELL_ESCAPED_FLAGS`, and
-CMake toolchain variables for `aarch64-unknown-linux-ohos`.
+CMake toolchain variables for `aarch64-unknown-linux-ohos`. They also point
+`bindgen` at the SDK's `libclang` and sysroot so `rquickjs-sys` can generate
+the OpenHarmony bindings that it does not ship pre-generated.
 
 ## Compiler Wrappers
 
@@ -90,3 +92,8 @@ The guard resolves the `codewhale-tui` dependency graph for
 the target graph: `nix` 0.28/0.29, `portable-pty`, `starlark`, `arboard`, or
 `keyring`. This does not replace a real SDK/sysroot build, but it catches the
 known `starlark -> rustyline -> nix` and PTY/keyring regressions before release.
+
+Because `portable-pty` is intentionally absent from the OpenHarmony graph, the
+persistent `terminal/*` PTY tools are not registered on that target. The
+ordinary `exec_shell` tools remain available through their non-PTY process
+implementation.

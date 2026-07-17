@@ -578,6 +578,7 @@ impl ToolRegistryBuilder {
 
     /// Include the stateful PTY terminal tools. Like `exec_shell`, these are
     /// only exposed when the active shell policy allows shell access.
+    #[cfg(not(target_env = "ohos"))]
     #[must_use]
     pub fn with_terminal_tools(self) -> Self {
         use super::terminal_session::{
@@ -589,6 +590,14 @@ impl ToolRegistryBuilder {
             .with_tool(Arc::new(TerminalWaitTool))
             .with_tool(Arc::new(TerminalCancelTool))
             .with_tool(Arc::new(TerminalResetTool))
+    }
+
+    /// OpenHarmony does not include the `portable-pty` dependency, so keep the
+    /// ordinary shell tools without advertising unavailable persistent PTYs.
+    #[cfg(target_env = "ohos")]
+    #[must_use]
+    pub fn with_terminal_tools(self) -> Self {
+        self
     }
 
     /// Include search tools (`grep_files`).

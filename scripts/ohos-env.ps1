@@ -19,10 +19,11 @@ $sdk = (Resolve-Path -LiteralPath $env:OHOS_NATIVE_SDK -ErrorAction Stop).Path
 $clang = [System.IO.Path]::Combine($sdk, "llvm", "bin", "clang.exe")
 $clangxx = [System.IO.Path]::Combine($sdk, "llvm", "bin", "clang++.exe")
 $ar = [System.IO.Path]::Combine($sdk, "llvm", "bin", "llvm-ar.exe")
+$libclang = [System.IO.Path]::Combine($sdk, "llvm", "bin", "libclang.dll")
 $sysroot = [System.IO.Path]::Combine($sdk, "sysroot")
 $cmakeToolchain = [System.IO.Path]::Combine($sdk, "build", "cmake", "ohos.toolchain.cmake")
 
-$requiredFiles = @($clang, $clangxx, $ar, $cmakeToolchain)
+$requiredFiles = @($clang, $clangxx, $ar, $libclang, $cmakeToolchain)
 foreach ($path in $requiredFiles) {
     if (-not (Test-Path -LiteralPath $path -PathType Leaf -ErrorAction SilentlyContinue)) {
         Stop-OhosEnv "required OpenHarmony SDK file is missing: $path"
@@ -45,6 +46,8 @@ $env:CC_SHELL_ESCAPED_FLAGS = "1"
 Set-Item -Path "Env:CFLAGS_$target" -Value $commonFlags
 Set-Item -Path "Env:CXXFLAGS_$target" -Value $commonFlags
 Set-Item -Path "Env:CMAKE_TOOLCHAIN_FILE_$target" -Value $cmakeToolchain
+$env:LIBCLANG_PATH = [System.IO.Path]::GetDirectoryName($libclang)
+Set-Item -Path "Env:BINDGEN_EXTRA_CLANG_ARGS_$target" -Value $commonFlags
 
 $separator = [char]0x1f
 $env:CARGO_ENCODED_RUSTFLAGS = @(
