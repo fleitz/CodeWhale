@@ -1,4 +1,6 @@
 #!/usr/bin/env sh
+# The exit fallbacks are reached when this file is executed instead of sourced.
+# shellcheck disable=SC2317
 
 if [ -z "${OHOS_NATIVE_SDK:-}" ]; then
     echo "error: set OHOS_NATIVE_SDK to the OpenHarmony native SDK directory." >&2
@@ -29,14 +31,16 @@ if [ ! -d "$sysroot" ]; then
     return 1 2>/dev/null || exit 1
 fi
 
-export CARGO_TARGET_AARCH64_UNKNOWN_LINUX_OHOS_LINKER=$clang
-export AR_aarch64_unknown_linux_ohos=$ar
-export CC_aarch64_unknown_linux_ohos=$clang
-export CXX_aarch64_unknown_linux_ohos=$clangxx
+export CARGO_TARGET_AARCH64_UNKNOWN_LINUX_OHOS_LINKER="$clang"
+export AR_aarch64_unknown_linux_ohos="$ar"
+export CC_aarch64_unknown_linux_ohos="$clang"
+export CXX_aarch64_unknown_linux_ohos="$clangxx"
 export CC_SHELL_ESCAPED_FLAGS=1
-export CFLAGS_aarch64_unknown_linux_ohos="-target aarch64-linux-ohos --sysroot=\"$sysroot\" -D__MUSL__"
-export CXXFLAGS_aarch64_unknown_linux_ohos="-target aarch64-linux-ohos --sysroot=\"$sysroot\" -D__MUSL__"
-export CMAKE_TOOLCHAIN_FILE_aarch64_unknown_linux_ohos=$cmake_toolchain
+common_flags="-target aarch64-linux-ohos --sysroot=\"$sysroot\" -D__MUSL__"
+export CFLAGS_aarch64_unknown_linux_ohos="$common_flags"
+export CXXFLAGS_aarch64_unknown_linux_ohos="$common_flags"
+export BINDGEN_EXTRA_CLANG_ARGS_aarch64_unknown_linux_ohos="$common_flags"
+export CMAKE_TOOLCHAIN_FILE_aarch64_unknown_linux_ohos="$cmake_toolchain"
 
 sep=$(printf '\037')
 export CARGO_ENCODED_RUSTFLAGS="-Clink-arg=-target${sep}-Clink-arg=aarch64-linux-ohos${sep}-Clink-arg=--sysroot=$sysroot${sep}-Clink-arg=-D__MUSL__"

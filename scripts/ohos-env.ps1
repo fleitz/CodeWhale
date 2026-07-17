@@ -44,6 +44,7 @@ $env:CXX_aarch64_unknown_linux_ohos = $clangxx
 $env:CC_SHELL_ESCAPED_FLAGS = "1"
 Set-Item -Path "Env:CFLAGS_$target" -Value $commonFlags
 Set-Item -Path "Env:CXXFLAGS_$target" -Value $commonFlags
+Set-Item -Path "Env:BINDGEN_EXTRA_CLANG_ARGS_$target" -Value $commonFlags
 Set-Item -Path "Env:CMAKE_TOOLCHAIN_FILE_$target" -Value $cmakeToolchain
 
 $separator = [char]0x1f

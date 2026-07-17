@@ -142,6 +142,7 @@ jobs:
       - name: Check release helper contracts
         run: |
           bash .github/scripts/agent-task-metadata.test.sh
+          bash scripts/ohos-env.test.sh
           bash scripts/release/generate-release-body.test.sh
           bash scripts/release/prepare-release.test.sh
           bash scripts/release/require-release-tag-checkout.test.sh
@@ -300,6 +301,10 @@ jobs:
           echo "SCCACHE_GHA_ENABLED=true" >> "${GITHUB_ENV}"
           echo "RUSTC_WRAPPER=sccache" >> "${GITHUB_ENV}"
           echo "SCCACHE_IGNORE_SERVER_IO_ERROR=1" >> "${GITHUB_ENV}"
+      - name: Check OHOS PowerShell environment helper
+        if: needs.changes.outputs.heavy == 'true' && matrix.os == 'windows-latest'
+        shell: pwsh
+        run: ./scripts/ohos-env.test.ps1
       - uses: Swatinem/rust-cache@v2
         if: needs.changes.outputs.heavy == 'true' && matrix.os != 'ubuntu-latest'
         with:

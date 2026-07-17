@@ -40,9 +40,25 @@ rustup target add aarch64-unknown-linux-ohos
 cargo build --target aarch64-unknown-linux-ohos -p codewhale-cli
 ```
 
+For the JavaScript Workflow runtime, which generates QuickJS bindings on OHOS,
+also verify the target crate directly:
+
+```bash
+cargo check --locked --target aarch64-unknown-linux-ohos -p codewhale-workflow-js
+```
+
 The setup scripts export Cargo's target-specific `linker`, `AR`, `CC`, `CXX`,
-`CFLAGS`, `CXXFLAGS`, `CARGO_ENCODED_RUSTFLAGS`, `CC_SHELL_ESCAPED_FLAGS`, and
-CMake toolchain variables for `aarch64-unknown-linux-ohos`.
+`CFLAGS`, `CXXFLAGS`, `BINDGEN_EXTRA_CLANG_ARGS`,
+`CARGO_ENCODED_RUSTFLAGS`, `CC_SHELL_ESCAPED_FLAGS`, and CMake toolchain
+variables for `aarch64-unknown-linux-ohos`. The bindgen variable carries the
+OHOS target and sysroot into rquickjs's build script; compiler flags alone do
+not configure bindgen.
+
+Bindgen runs on the build host and must be able to load a host-compatible
+`libclang`. The setup scripts intentionally do not guess a host LLVM install.
+If bindgen cannot locate `libclang`, install it for the host or set
+`LIBCLANG_PATH` to the directory containing that host library before running
+the Cargo command.
 
 ## Compiler Wrappers
 
