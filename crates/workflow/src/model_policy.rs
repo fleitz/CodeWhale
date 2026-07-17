@@ -362,6 +362,13 @@ mod tests {
     }
 
     #[test]
+    fn provider_registry_new_is_empty() {
+        let registry = ProviderRegistry::new();
+        assert!(registry.models.is_empty());
+        assert!(registry.role_policies.is_empty());
+    }
+
+    #[test]
     fn provider_capability_fallback() {
         let registry = ProviderRegistry::new()
             .with_model(model("mock", "plain", ModelCapabilities::default()))
