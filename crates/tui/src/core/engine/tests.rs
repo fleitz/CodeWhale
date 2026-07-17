@@ -3416,8 +3416,12 @@ fn model_catalog_exposes_work_update_as_sole_progress_surface() {
     );
     for hidden in [
         "checklist_write",
+        "checklist_add",
+        "checklist_update",
         "checklist_list",
         "todo_write",
+        "todo_add",
+        "todo_update",
         "todo_list",
     ] {
         assert!(
@@ -4640,7 +4644,11 @@ fn turn_tool_registry_builder_keeps_plan_mode_read_only_for_files() {
     assert!(registry.contains("task_read"));
     assert!(registry.contains("handle_read"));
     let plan_state_tools = [
+        "checklist_add",
+        "checklist_update",
         "checklist_write",
+        "todo_add",
+        "todo_update",
         "todo_write",
         "work_update",
         "update_plan",
