@@ -162,10 +162,10 @@ export async function runPrReview(env: AgentEnv): Promise<Record<string, unknown
     let processed = 0;
     let skipped = 0;
 
-    for (const pr of prs.slice(0, 10)) {
+    await Promise.all(prs.slice(0, 10).map(async (pr) => {
       if (await hasFreshDraft(env.CURATED_KV, "pr", String(pr.number), pr.updated_at)) {
         skipped++;
-        continue;
+        return;
       }
 
       // Fetch diff stats if not included
@@ -218,7 +218,7 @@ export async function runPrReview(env: AgentEnv): Promise<Record<string, unknown
       } catch {
         skipped++;
       }
-    }
+    }));
 
     return { ok: true, processed, skipped };
   } catch (e) {
