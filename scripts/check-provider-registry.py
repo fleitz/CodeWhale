@@ -51,6 +51,9 @@ SENSITIVE_BEARER_RE = re.compile(r"(?i)(authorization:\s*bearer\s+)\S+")
 SENSITIVE_ASSIGNMENT_RE = re.compile(
     r"(?i)\b(api[_-]?key|token|secret|password|credential)(\s*[:=]\s*)\S+"
 )
+DEFAULT_STRINGS_RE = re.compile(
+    r'const\s+(DEFAULT_[A-Z0-9_]+(?:MODEL|BASE_URL)):\s*&str\s*=\s*"([^"]+)"'
+)
 
 
 def read(path: Path) -> str:
@@ -216,10 +219,8 @@ def default_strings(tui_config_rs: str) -> set[str]:
     # alongside config.rs so the check follows the leaf split.
     sources = tui_config_rs + "\n" + read(TUI_CONFIG_MODELS_RS)
     defaults = set()
-    for name, value in re.findall(
-        r'const\s+(DEFAULT_[A-Z0-9_]+(?:MODEL|BASE_URL)):\s*&str\s*=\s*"([^"]+)"',
-        sources,
-    ):
+    for match in DEFAULT_STRINGS_RE.finditer(sources):
+        name, value = match.group(1), match.group(2)
         if name == "DEFAULT_DEEPSEEKCN_BASE_URL":
             continue
         defaults.add(value)
