@@ -50,6 +50,14 @@ notes, and relevant issue/PR comments.
 - **[shenyongqing](https://github.com/shenyongqing)** — the original HarmonyOS
   workflow-js bindgen approach (PR #4384), carried into the landed
   implementation with credit
+- **[Lu Shihan / Angel-Hair](https://github.com/Angel-Hair)** — session-owned
+  read-before-edit tracking and the explicit, backwards-compatible
+  `apply_patch` replacement contract (PRs #4475 and #4476)
+- **[dmitri-0](https://github.com/dmitri-0)** — configurable cache-hit
+  visibility in the phase strip (PR #4474)
+- **[Sh1Zuku / SparkofSpike](https://github.com/SparkofSpike)** — exact
+  Vim-space regression reproduction and verification that the v0.9.1 input
+  path already contains the needed global binding (PR #4477)
 
 </details>
 

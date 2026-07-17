@@ -26,10 +26,13 @@ export const RELEASE_CONTRIBUTORS: string[] = [
   "@sternelee",
   "@nightt5879",
   "@zhangweiii",
+  "@Angel-Hair",
+  "@dmitri-0",
 ];
 
 /** Contributors who helped with reports, reproductions, and verification. */
 export const RELEASE_HELPERS: string[] = [
   "@AiurArtanis",
   "@seanthefuturegorilla",
+  "@SparkofSpike",
 ];
