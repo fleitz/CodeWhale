@@ -51,7 +51,7 @@ Editing the message you're about to send.
 | `Ctrl-S`                    | Stash current draft; with queued follow-ups during a running turn, send the next queued item now |
 | `Alt-R`                    | Search prompt history (Alt-R to exit)                  |
 | `Tab`                       | Slash-command / `@`-mention completion (popup-aware)    |
-| `Ctrl-Shift-O`              | Open the composer draft in `$VISUAL` / `$EDITOR` |
+| `Ctrl-Shift-O` / `F4`       | Open the composer draft in `$VISUAL` / `$EDITOR`; F4 works when the terminal cannot distinguish Ctrl-Shift-O from Ctrl-O |
 | `! command`                 | Run a shell command through normal approval, sandbox, and output surfaces |
 
 ### Hotbar

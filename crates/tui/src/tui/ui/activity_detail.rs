@@ -829,6 +829,7 @@ pub(super) fn open_turn_inspector_pager(app: &mut App) -> bool {
     let handoff = turn_handoff_markdown(app);
     app.view_stack.push(
         PagerView::from_text("Turn Inspector", &text, width.saturating_sub(2))
+            .with_copy_text(text)
             .with_export_markdown(handoff),
     );
     true

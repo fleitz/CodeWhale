@@ -5845,10 +5845,10 @@ async fn run_event_loop(
                 }
                 _ if handle_composer_alt_word_motion_key(app, key) => {}
                 _ if key_shortcuts::is_external_editor_shortcut(&key) => {
-                    // Ctrl+Shift+O: spawn $EDITOR on the composer contents
+                    // Ctrl+Shift+O (or F4 on terminals that cannot report the
+                    // shifted chord): spawn $EDITOR on the composer contents
                     // (#91). Plain Ctrl+O belongs exclusively to the Turn
-                    // Inspector, even while the composer holds a draft
-                    // (#4482).
+                    // Inspector, even while the composer holds a draft (#4482).
                     // Only fires when no modal is active (the !view_stack
                     // branch above already returns early in that case) and
                     // the composer is the focused input target. We accept the

@@ -74,7 +74,7 @@ pub(super) fn activity_shortcut_label() -> &'static str {
 /// remain available to the external editor and a draft never changes where
 /// plain Ctrl+O routes (#4482).
 pub(super) fn is_turn_inspector_shortcut(key: &KeyEvent) -> bool {
-    matches!(key.code, KeyCode::Char('o'))
+    matches!(key.code, KeyCode::Char('o') | KeyCode::Char('O'))
         && key.modifiers.contains(KeyModifiers::CONTROL)
         && !key
             .modifiers
@@ -82,16 +82,18 @@ pub(super) fn is_turn_inspector_shortcut(key: &KeyEvent) -> bool {
 }
 
 /// Open the composer draft in `$VISUAL` / `$EDITOR` without colliding with
-/// the Turn Inspector. Windows console events can report either an uppercase
-/// character or a lowercase character plus SHIFT, so accept both shapes.
+/// the Turn Inspector. Enhanced protocols can report either character case,
+/// but SHIFT must be explicit so Windows Caps Lock cannot misroute Ctrl+O.
+/// F4 is the fallback for legacy protocols that cannot encode Ctrl+Shift+O.
 pub(super) fn is_external_editor_shortcut(key: &KeyEvent) -> bool {
-    let is_shifted_o = matches!(key.code, KeyCode::Char('O'))
-        || (matches!(key.code, KeyCode::Char('o')) && key.modifiers.contains(KeyModifiers::SHIFT));
-    is_shifted_o
+    let ctrl_shift_o = matches!(key.code, KeyCode::Char('o') | KeyCode::Char('O'))
         && key.modifiers.contains(KeyModifiers::CONTROL)
+        && key.modifiers.contains(KeyModifiers::SHIFT)
         && !key
             .modifiers
-            .intersects(KeyModifiers::ALT | KeyModifiers::SUPER)
+            .intersects(KeyModifiers::ALT | KeyModifiers::SUPER);
+    let f4 = matches!(key.code, KeyCode::F(4)) && key.modifiers.is_empty();
+    ctrl_shift_o || f4
 }
 
 /// Modifier predicate for the v0.8.30 family of `Alt+<key>` transcript-
@@ -188,6 +190,9 @@ mod tests {
     #[test]
     fn ctrl_o_and_ctrl_shift_o_have_stable_distinct_routes() {
         let inspector = KeyEvent::new(KeyCode::Char('o'), KeyModifiers::CONTROL);
+        // Crossterm's native Windows decoder applies Caps Lock to the
+        // character but does not expose Caps Lock as a modifier.
+        let inspector_caps_lock = KeyEvent::new(KeyCode::Char('O'), KeyModifiers::CONTROL);
         let editor_lower = KeyEvent::new(
             KeyCode::Char('o'),
             KeyModifiers::CONTROL | KeyModifiers::SHIFT,
@@ -197,11 +202,16 @@ mod tests {
             KeyModifiers::CONTROL | KeyModifiers::SHIFT,
         );
 
-        assert!(is_turn_inspector_shortcut(&inspector));
-        assert!(!is_external_editor_shortcut(&inspector));
+        for inspector in [&inspector, &inspector_caps_lock] {
+            assert!(is_turn_inspector_shortcut(inspector));
+            assert!(!is_external_editor_shortcut(inspector));
+        }
         for editor in [&editor_lower, &editor_upper] {
             assert!(!is_turn_inspector_shortcut(editor));
             assert!(is_external_editor_shortcut(editor));
         }
+
+        let editor_legacy_fallback = KeyEvent::new(KeyCode::F(4), KeyModifiers::NONE);
+        assert!(is_external_editor_shortcut(&editor_legacy_fallback));
     }
 }

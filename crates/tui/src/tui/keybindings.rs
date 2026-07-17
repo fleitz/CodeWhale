@@ -221,7 +221,7 @@ pub const KEYBINDINGS: &[KeybindingEntry] = &[
         section: KeybindingSection::Submission,
     },
     KeybindingEntry {
-        chord: "Ctrl+Shift+O",
+        chord: "Ctrl+Shift+O / F4",
         description_id: crate::localization::MessageId::KbExternalEditor,
         section: KeybindingSection::Editing,
     },
@@ -474,7 +474,7 @@ mod tests {
 
         let editor = KEYBINDINGS
             .iter()
-            .find(|entry| entry.chord == "Ctrl+Shift+O")
+            .find(|entry| entry.chord == "Ctrl+Shift+O / F4")
             .expect("external-editor keybinding should be documented");
         assert_eq!(
             crate::localization::tr(crate::localization::Locale::En, editor.description_id,),
