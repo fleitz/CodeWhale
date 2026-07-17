@@ -1692,18 +1692,13 @@ fn build_app_system_prompt_with_goal(
     goal_objective: Option<&str>,
 ) -> SystemPrompt {
     let instructions = configured_instruction_sources(config);
-    let memory_path = config.memory_path();
-    let user_memory_block = crate::memory::compose_block(
-        config.memory_enabled() && !config.moraine_fallback(),
-        &memory_path,
-    );
     prompts::system_prompt_for_mode_with_context_skills_and_session(
         &app.workspace,
         None,
         Some(&app.skills_dir),
         Some(&instructions),
         prompts::PromptSessionContext {
-            user_memory_block: user_memory_block.as_deref(),
+            user_memory_block: None,
             goal_objective,
             project_context_pack_enabled: config.project_context_pack_enabled(),
             locale_tag: app.ui_locale.tag(),

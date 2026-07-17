@@ -1011,10 +1011,6 @@ impl Engine {
         // Set up stable system prompt with project context (default to agent mode).
         // Per-turn working-set metadata is injected into the latest user
         // message at request time so file churn does not rewrite this prefix.
-        let user_memory_block = crate::memory::compose_block(
-            config.memory_enabled && !config.moraine_fallback, // TODO(v0.8.71): remove when Moraine recall stable; see #3490, #3495
-            &config.memory_path,
-        );
         let prompt_goal_objective =
             goal_objective_for_prompt(config.goal_objective.as_deref(), &config.goal_state);
         let system_prompt =
@@ -1024,7 +1020,7 @@ impl Engine {
                 Some(&config.skills_dir),
                 Some(&config.instructions),
                 prompts::PromptSessionContext {
-                    user_memory_block: user_memory_block.as_deref(),
+                    user_memory_block: None,
                     goal_objective: prompt_goal_objective.as_deref(),
                     project_context_pack_enabled: config.project_context_pack_enabled,
                     locale_tag: &config.locale_tag,
@@ -3662,10 +3658,6 @@ impl Engine {
     }
     /// Refresh the stable system prompt based on current non-mode context.
     fn refresh_system_prompt(&mut self) {
-        let user_memory_block = crate::memory::compose_block(
-            self.config.memory_enabled && !self.config.moraine_fallback, // TODO(v0.8.71): remove when Moraine recall stable; see #3490, #3495
-            &self.config.memory_path,
-        );
         let prompt_goal_objective = goal_objective_for_prompt(
             self.config.goal_objective.as_deref(),
             &self.config.goal_state,
@@ -3676,7 +3668,7 @@ impl Engine {
             Some(&self.config.skills_dir),
             Some(&self.config.instructions),
             prompts::PromptSessionContext {
-                user_memory_block: user_memory_block.as_deref(),
+                user_memory_block: None,
                 goal_objective: prompt_goal_objective.as_deref(),
                 project_context_pack_enabled: self.config.project_context_pack_enabled,
                 locale_tag: &self.config.locale_tag,
