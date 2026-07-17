@@ -274,6 +274,11 @@ pub const KEYBINDINGS: &[KeybindingEntry] = &[
         // Keep both terminal-client families visible: the TUI may be running
         // on Linux while the user's SSH terminal is on macOS (or vice versa).
         chord: "Cmd+V / Ctrl+Shift+V",
+        description_id: crate::localization::MessageId::KbTerminalPaste,
+        section: KeybindingSection::Clipboard,
+    },
+    KeybindingEntry {
+        chord: "Ctrl+V",
         description_id: crate::localization::MessageId::KbPasteAttach,
         section: KeybindingSection::Clipboard,
     },
@@ -352,18 +357,33 @@ mod tests {
     }
 
     #[test]
-    fn clipboard_help_distinguishes_terminal_paste_from_in_app_copy() {
-        let paste = KEYBINDINGS
+    fn clipboard_help_distinguishes_terminal_text_graphical_image_and_in_app_copy() {
+        let terminal_paste = KEYBINDINGS
+            .iter()
+            .find(|entry| entry.description_id == crate::localization::MessageId::KbTerminalPaste)
+            .expect("terminal paste binding should be documented");
+        let graphical_paste = KEYBINDINGS
             .iter()
             .find(|entry| entry.description_id == crate::localization::MessageId::KbPasteAttach)
-            .expect("paste binding should be documented");
+            .expect("graphical paste binding should be documented");
         let copy = KEYBINDINGS
             .iter()
             .find(|entry| entry.description_id == crate::localization::MessageId::KbCopySelection)
             .expect("copy binding should be documented");
 
-        assert!(paste.chord.contains("Cmd+V"));
-        assert!(paste.chord.contains("Ctrl+Shift+V"));
+        assert!(terminal_paste.chord.contains("Cmd+V"));
+        assert!(terminal_paste.chord.contains("Ctrl+Shift+V"));
+        assert_eq!(graphical_paste.chord, "Ctrl+V");
+        let terminal_description = crate::localization::tr(
+            crate::localization::Locale::En,
+            crate::localization::MessageId::KbTerminalPaste,
+        );
+        let graphical_description = crate::localization::tr(
+            crate::localization::Locale::En,
+            crate::localization::MessageId::KbPasteAttach,
+        );
+        assert!(!terminal_description.to_ascii_lowercase().contains("image"));
+        assert!(graphical_description.to_ascii_lowercase().contains("image"));
         assert_eq!(copy.chord, "Ctrl+C (selection)");
         assert!(!copy.chord.contains("Cmd+C"));
         assert!(!copy.chord.contains("Ctrl+Shift+C"));

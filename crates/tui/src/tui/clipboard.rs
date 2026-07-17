@@ -117,8 +117,9 @@ impl TerminalClipboardContext {
         };
 
         Self {
-            // OpenSSH normally exports SSH_CLIENT and SSH_CONNECTION. SSH_TTY
-            // is limited to PTY sessions, so it cannot be the only signal.
+            // OpenSSH normally exports SSH_CLIENT and SSH_CONNECTION.
+            // SSH_TTY is an additional PTY-only marker and is independently
+            // sufficient when wrappers preserve it without the other two.
             endpoint: match (in_ssh_session, use_graphical_display) {
                 (false, _) => ClipboardEndpoint::NativeHost,
                 (true, true) => ClipboardEndpoint::ForwardedDisplay,
@@ -878,9 +879,11 @@ exit 42
         assert!(err.to_string().contains("clipboard denied"));
     }
 
-    #[cfg(unix)]
+    #[cfg(all(unix, not(target_env = "ohos")))]
     #[test]
-    fn tmux_load_buffer_w_works_with_default_passthrough_disabled() {
+    fn tmux_load_buffer_w_reaches_attached_client_with_default_passthrough_disabled() {
+        use std::io::Read as _;
+
         let version = match Command::new("tmux").arg("-V").output() {
             Ok(output) if output.status.success() => output,
             _ => return,
@@ -932,18 +935,110 @@ exit 42
         assert_eq!(option("allow-passthrough"), "off");
         assert_eq!(option("set-clipboard"), "external");
 
-        write_text_with_tmux_using_argv(
-            "tmux",
-            &["-L", server.0.as_str()],
-            "copy through default tmux",
-        )
-        .expect("tmux-native clipboard request");
+        let pty_system = portable_pty::native_pty_system();
+        let pair = pty_system
+            .openpty(portable_pty::PtySize {
+                rows: 24,
+                cols: 80,
+                pixel_width: 0,
+                pixel_height: 0,
+            })
+            .expect("open attached-client PTY");
+        let mut attach = portable_pty::CommandBuilder::new("tmux");
+        for arg in ["-L", server.0.as_str(), "attach-session", "-t", "0"] {
+            attach.arg(arg);
+        }
+        attach.env("TERM", "xterm-256color");
+        let mut attached_client = pair
+            .slave
+            .spawn_command(attach)
+            .expect("attach tmux client to PTY");
+        drop(pair.slave);
+
+        let mut reader = pair
+            .master
+            .try_clone_reader()
+            .expect("clone attached-client PTY reader");
+        let (output_tx, output_rx) = std::sync::mpsc::channel();
+        let reader_thread = std::thread::spawn(move || {
+            let mut chunk = [0_u8; 4096];
+            loop {
+                match reader.read(&mut chunk) {
+                    Ok(0) | Err(_) => break,
+                    Ok(len) => {
+                        if output_tx.send(chunk[..len].to_vec()).is_err() {
+                            break;
+                        }
+                    }
+                }
+            }
+        });
+
+        let attach_deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+        loop {
+            let clients = Command::new("tmux")
+                .args(["-L", server.0.as_str(), "list-clients"])
+                .output()
+                .expect("list attached tmux clients");
+            if clients.status.success() && !clients.stdout.is_empty() {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < attach_deadline,
+                "tmux client did not attach to the test PTY"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(25));
+        }
+        while output_rx.try_recv().is_ok() {}
+
+        let copied_text = "copy through default tmux";
+        write_text_with_tmux_using_argv("tmux", &["-L", server.0.as_str()], copied_text)
+            .expect("tmux-native clipboard request");
+
+        let encoded = base64::engine::general_purpose::STANDARD.encode(copied_text.as_bytes());
+        let expected_receipts = [
+            format!("\x1b]52;;{encoded}\x07").into_bytes(),
+            format!("\x1b]52;c;{encoded}\x07").into_bytes(),
+            format!("\x1b]52;;{encoded}\x1b\\").into_bytes(),
+            format!("\x1b]52;c;{encoded}\x1b\\").into_bytes(),
+        ];
+        let receipt_deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+        let mut attached_output = Vec::new();
+        let receipt_received = loop {
+            if expected_receipts.iter().any(|receipt| {
+                attached_output
+                    .windows(receipt.len())
+                    .any(|window| window == receipt)
+            }) {
+                break true;
+            }
+            if std::time::Instant::now() >= receipt_deadline {
+                break false;
+            }
+            match output_rx.recv_timeout(std::time::Duration::from_millis(50)) {
+                Ok(bytes) => attached_output.extend_from_slice(&bytes),
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
+                Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break false,
+            }
+        };
+
         let buffer = Command::new("tmux")
             .args(["-L", server.0.as_str(), "show-buffer"])
             .output()
             .expect("read tmux buffer");
         assert!(buffer.status.success(), "tmux buffer should be readable");
-        assert_eq!(buffer.stdout, b"copy through default tmux");
+        assert_eq!(buffer.stdout, copied_text.as_bytes());
+
+        let _ = attached_client.kill();
+        let _ = attached_client.wait();
+        drop(pair.master);
+        drop(output_rx);
+        let _ = reader_thread.join();
+
+        assert!(
+            receipt_received,
+            "attached tmux client did not receive the OSC 52 clipboard request: {attached_output:?}"
+        );
     }
 
     #[cfg(unix)]
