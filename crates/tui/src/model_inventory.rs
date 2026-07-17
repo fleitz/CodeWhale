@@ -17,6 +17,7 @@ pub(crate) enum ModelAuthSource {
     Config,
     Env,
     OAuthCli,
+    ImportedToken,
     NoAuth,
     KeylessLocal,
 }
@@ -195,6 +196,13 @@ fn provider_default_model(config: &Config, provider: ApiProvider) -> String {
             return model;
         }
     }
+    if provider == ApiProvider::Moonshot
+        && config
+            .provider_config_for(provider)
+            .is_some_and(crate::config::provider_config_uses_kimi_imported_token)
+    {
+        return crate::config::DEFAULT_KIMI_CODE_MODEL.to_string();
+    }
     all_catalog_models_for_provider(provider)
         .first()
         .map(|model| model.as_str())
@@ -216,6 +224,9 @@ fn auth_source_for_provider(config: &Config, provider: ApiProvider) -> Option<Mo
         }
         crate::provider_readiness::CredentialState::Local => {
             return Some(ModelAuthSource::KeylessLocal);
+        }
+        crate::provider_readiness::CredentialState::ImportedToken => {
+            return Some(ModelAuthSource::ImportedToken);
         }
         crate::provider_readiness::CredentialState::MissingKey
         | crate::provider_readiness::CredentialState::MissingLogin
@@ -265,13 +276,6 @@ fn provider_uses_oauth_cli(config: &Config, provider: ApiProvider) -> bool {
     }
     match provider {
         ApiProvider::OpenaiCodex => true,
-        ApiProvider::Moonshot => config
-            .provider_config_for(provider)
-            .and_then(|entry| entry.auth_mode.as_deref())
-            .is_some_and(|mode| {
-                let mode = mode.trim().to_ascii_lowercase().replace('-', "_");
-                matches!(mode.as_str(), "kimi" | "kimi_oauth" | "kimi_cli" | "oauth")
-            }),
         ApiProvider::Xai => config
             .provider_config_for(provider)
             .and_then(|entry| entry.auth_mode.as_deref())
@@ -344,6 +348,52 @@ mod tests {
                 .any(|candidate| candidate.provider == ApiProvider::Ollama
                     && candidate.auth_source == ModelAuthSource::KeylessLocal)
         );
+    }
+
+    #[test]
+    fn inventory_labels_explicit_unexpired_kimi_cli_import_separately() {
+        let _env_lock = crate::test_support::lock_test_env();
+        let temp = tempfile::tempdir().expect("Kimi import fixture root");
+        let kimi_home = temp.path().join("kimi-code");
+        std::fs::create_dir_all(kimi_home.join("credentials")).expect("Kimi credential directory");
+        let expires_at = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock after epoch")
+            .as_secs_f64()
+            + 3600.0;
+        std::fs::write(
+            kimi_home.join("credentials/kimi-code.json"),
+            serde_json::json!({
+                "access_token": "unexpired-user-owned-token",
+                "refresh_token": "must-not-be-used",
+                "expires_at": expires_at,
+            })
+            .to_string(),
+        )
+        .expect("write Kimi import fixture");
+        let _kimi_home = crate::test_support::EnvVarGuard::set(
+            "KIMI_CODE_HOME",
+            kimi_home.to_str().expect("utf8 path"),
+        );
+        let config = Config {
+            provider: Some("moonshot".to_string()),
+            providers: Some(crate::config::ProvidersConfig {
+                moonshot: crate::config::ProviderConfig {
+                    auth_mode: Some("kimi_oauth".to_string()),
+                    ..Default::default()
+                },
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+
+        let inventory = ModelInventory::from_config(&config);
+        assert!(inventory.candidates.iter().any(|candidate| {
+            candidate.provider == ApiProvider::Moonshot
+                && candidate.auth_source == ModelAuthSource::ImportedToken
+                && candidate.readiness
+                    == crate::provider_readiness::ResolvedProviderReadiness::ImportedTokenUnchecked
+        }));
     }
 
     #[test]

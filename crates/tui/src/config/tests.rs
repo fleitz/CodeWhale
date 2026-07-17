@@ -1192,8 +1192,6 @@ struct EnvGuard {
     kimi_model_name: Option<OsString>,
     kimi_code_home: Option<OsString>,
     kimi_share_dir: Option<OsString>,
-    kimi_code_oauth_host: Option<OsString>,
-    kimi_oauth_host: Option<OsString>,
     sglang_api_key: Option<OsString>,
     sglang_base_url: Option<OsString>,
     sglang_model: Option<OsString>,
@@ -1296,8 +1294,6 @@ impl EnvGuard {
         let kimi_model_name_prev = env::var_os("KIMI_MODEL_NAME");
         let kimi_code_home_prev = env::var_os("KIMI_CODE_HOME");
         let kimi_share_dir_prev = env::var_os("KIMI_SHARE_DIR");
-        let kimi_code_oauth_host_prev = env::var_os("KIMI_CODE_OAUTH_HOST");
-        let kimi_oauth_host_prev = env::var_os("KIMI_OAUTH_HOST");
         let sglang_api_key_prev = env::var_os("SGLANG_API_KEY");
         let sglang_base_url_prev = env::var_os("SGLANG_BASE_URL");
         let sglang_model_prev = env::var_os("SGLANG_MODEL");
@@ -1395,8 +1391,6 @@ impl EnvGuard {
             env::remove_var("KIMI_MODEL_NAME");
             env::remove_var("KIMI_CODE_HOME");
             env::remove_var("KIMI_SHARE_DIR");
-            env::remove_var("KIMI_CODE_OAUTH_HOST");
-            env::remove_var("KIMI_OAUTH_HOST");
             env::remove_var("SGLANG_API_KEY");
             env::remove_var("SGLANG_BASE_URL");
             env::remove_var("SGLANG_MODEL");
@@ -1494,8 +1488,6 @@ impl EnvGuard {
             kimi_model_name: kimi_model_name_prev,
             kimi_code_home: kimi_code_home_prev,
             kimi_share_dir: kimi_share_dir_prev,
-            kimi_code_oauth_host: kimi_code_oauth_host_prev,
-            kimi_oauth_host: kimi_oauth_host_prev,
             sglang_api_key: sglang_api_key_prev,
             sglang_base_url: sglang_base_url_prev,
             sglang_model: sglang_model_prev,
@@ -1617,8 +1609,6 @@ impl Drop for EnvGuard {
             Self::restore_var("KIMI_MODEL_NAME", self.kimi_model_name.take());
             Self::restore_var("KIMI_CODE_HOME", self.kimi_code_home.take());
             Self::restore_var("KIMI_SHARE_DIR", self.kimi_share_dir.take());
-            Self::restore_var("KIMI_CODE_OAUTH_HOST", self.kimi_code_oauth_host.take());
-            Self::restore_var("KIMI_OAUTH_HOST", self.kimi_oauth_host.take());
             Self::restore_var("SGLANG_API_KEY", self.sglang_api_key.take());
             Self::restore_var("SGLANG_BASE_URL", self.sglang_base_url.take());
             Self::restore_var("SGLANG_MODEL", self.sglang_model.take());
@@ -7182,7 +7172,7 @@ api_key = "novita-table-key"
 }
 
 #[test]
-fn moonshot_kimi_oauth_reads_kimi_code_home_credential() -> Result<()> {
+fn moonshot_kimi_import_reads_unexpired_token_without_mutation() -> Result<()> {
     let _lock = lock_test_env();
     let nanos = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -7213,10 +7203,9 @@ fn moonshot_kimi_oauth_reads_kimi_code_home_credential() -> Result<()> {
         "scope": "openid profile email",
         "token_type": "Bearer",
     });
-    fs::write(
-        credential_dir.join(KIMI_CODE_CREDENTIAL_FILE),
-        serde_json::to_string(&credential)?,
-    )?;
+    let credential_path = credential_dir.join(KIMI_CODE_CREDENTIAL_FILE);
+    let credential_raw = serde_json::to_string(&credential)?;
+    fs::write(&credential_path, &credential_raw)?;
 
     let config_path = temp_root.join(".deepseek").join("config.toml");
     ensure_parent_dir(&config_path)?;
@@ -7236,11 +7225,16 @@ api_key = "stale-api-key"
     assert_eq!(config.default_model(), DEFAULT_KIMI_CODE_MODEL);
     assert_eq!(config.deepseek_api_key()?, "fresh-kimi-code-oauth-token");
     assert!(has_api_key_for(&config, ApiProvider::Moonshot));
+    assert_eq!(
+        fs::read_to_string(credential_path)?,
+        credential_raw,
+        "CodeWhale must never rewrite imported Kimi CLI credentials"
+    );
     Ok(())
 }
 
 #[test]
-fn moonshot_kimi_oauth_falls_back_to_legacy_share_dir_credential() -> Result<()> {
+fn moonshot_kimi_import_falls_back_to_legacy_share_dir_credential() -> Result<()> {
     let _lock = lock_test_env();
     let nanos = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -7294,6 +7288,58 @@ api_key = "stale-api-key"
     assert_eq!(config.default_model(), DEFAULT_KIMI_CODE_MODEL);
     assert_eq!(config.deepseek_api_key()?, "fresh-oauth-token");
     assert!(has_api_key_for(&config, ApiProvider::Moonshot));
+    Ok(())
+}
+
+#[test]
+fn moonshot_kimi_import_expired_token_fails_closed_without_refresh_or_mutation() -> Result<()> {
+    let _lock = lock_test_env();
+    let temp_root = tempfile::tempdir()?;
+    let _guard = EnvGuard::new(temp_root.path());
+
+    let kimi_code_home = temp_root.path().join(".kimi-code");
+    let credential_dir = kimi_code_home.join("credentials");
+    fs::create_dir_all(&credential_dir)?;
+    unsafe { env::set_var("KIMI_CODE_HOME", &kimi_code_home) };
+
+    let credential = json!({
+        "access_token": "expired-imported-token",
+        "refresh_token": "must-never-be-used",
+        "expires_at": SystemTime::now()
+            .duration_since(UNIX_EPOCH)?
+            .as_secs_f64()
+            - 3600.0,
+        "token_type": "Bearer",
+    });
+    let credential_path = credential_dir.join(KIMI_CODE_CREDENTIAL_FILE);
+    let credential_raw = serde_json::to_string(&credential)?;
+    fs::write(&credential_path, &credential_raw)?;
+
+    let config_path = temp_root.path().join(".deepseek").join("config.toml");
+    ensure_parent_dir(&config_path)?;
+    fs::write(
+        &config_path,
+        r#"provider = "moonshot"
+
+[providers.moonshot]
+auth_mode = "kimi_oauth"
+"#,
+    )?;
+
+    let config = Config::load(None, None)?;
+    let err = config
+        .deepseek_api_key()
+        .expect_err("an expired imported token must not refresh");
+    let message = err.to_string();
+    assert!(message.contains("cannot refresh Kimi OAuth"));
+    assert!(message.contains("Kimi Code API key"));
+    assert!(message.contains("#4417"));
+    assert!(!has_api_key_for(&config, ApiProvider::Moonshot));
+    assert_eq!(
+        fs::read_to_string(credential_path)?,
+        credential_raw,
+        "the unusable import must remain read-only"
+    );
     Ok(())
 }
 

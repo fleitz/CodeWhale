@@ -747,11 +747,6 @@ pub enum ViewEvent {
         model: Option<String>,
         api_key_env: Option<String>,
     },
-    /// Emitted by the `/provider` picker when Kimi CLI OAuth credentials can
-    /// be reused for Moonshot/Kimi dispatch.
-    ProviderPickerKimiOAuthEnabled {
-        provider: crate::config::ApiProvider,
-    },
     /// Emitted by provider/setup UI when xAI device-code OAuth is requested.
     ProviderPickerXaiOAuthRequested,
     /// Emitted by the `/provider` picker (the `M` action) to jump straight to

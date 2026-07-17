@@ -43,6 +43,14 @@ site's draft, feed, login, and content-watch boundaries.
 
 ### Fixed
 
+- Fail closed on legacy Kimi CLI credential imports: remove Codewhale's
+  hard-coded first-party-client impersonation and refresh request, never
+  auto-enable or rewrite imported credentials, and label the compatibility
+  route as a read-only imported token. An explicitly configured, still-valid
+  access token remains usable until expiry; missing, malformed, and expired
+  imports recover through the supported Kimi Code API-key route while
+  first-class OAuth awaits Codewhale's own vendor registration (#4417,
+  partially addressed).
 - Restore xAI/Grok device-code OAuth login against the live xAI OIDC
   contract: discovery with issuer/endpoint validation and documented
   fallbacks, user-principal scope set, RFC 8628 `slow_down` backoff capped at

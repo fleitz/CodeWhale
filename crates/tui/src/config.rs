@@ -5,7 +5,6 @@ use std::fs;
 #[cfg(unix)]
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
-use std::time::Duration;
 
 use anyhow::{Context, Result};
 use codewhale_execpolicy::ExecPolicyEngine;
@@ -4392,7 +4391,7 @@ impl Config {
             .then(|| self.provider_config())
             .flatten();
         let moonshot_uses_kimi_code = moonshot_config.is_some_and(|config| {
-            provider_config_uses_kimi_oauth(config)
+            provider_config_uses_kimi_imported_token(config)
                 || config
                     .base_url
                     .as_deref()
@@ -4557,7 +4556,7 @@ impl Config {
                         ApiProvider::Moonshot => {
                             if self
                                 .provider_config()
-                                .is_some_and(provider_config_uses_kimi_oauth)
+                                .is_some_and(provider_config_uses_kimi_imported_token)
                             {
                                 DEFAULT_KIMI_CODE_BASE_URL
                             } else {
@@ -4740,7 +4739,7 @@ impl Config {
 
     /// Read the API key.
     ///
-    /// Precedence: **route-specific OAuth → source-marked explicit CLI key →
+    /// Precedence: **route-specific imported/OAuth token → source-marked explicit CLI key →
     /// provider/root config → configured custom-provider environment →
     /// secret store → ambient provider environment**.
     ///
@@ -4790,9 +4789,9 @@ impl Config {
             && !custom_endpoint
             && self
                 .provider_config_for(provider)
-                .is_some_and(provider_config_uses_kimi_oauth)
+                .is_some_and(provider_config_uses_kimi_imported_token)
         {
-            return kimi_cli_oauth_access_token();
+            return kimi_imported_access_token();
         }
 
         // xAI / Grok OAuth reuses ~/.grok/auth.json (Grok CLI) or a device-code
@@ -6983,14 +6982,14 @@ fn moonshot_base_url_uses_kimi_code(base_url: &str) -> bool {
         || normalized.starts_with("https://api.kimi.com/coding/")
 }
 
-fn provider_config_uses_kimi_oauth(config: &ProviderConfig) -> bool {
+pub(crate) fn provider_config_uses_kimi_imported_token(config: &ProviderConfig) -> bool {
     config
         .auth_mode
         .as_deref()
-        .is_some_and(auth_mode_uses_kimi_oauth)
+        .is_some_and(auth_mode_uses_kimi_imported_token)
 }
 
-fn auth_mode_uses_kimi_oauth(mode: &str) -> bool {
+pub(crate) fn auth_mode_uses_kimi_imported_token(mode: &str) -> bool {
     matches!(
         normalize_auth_mode(mode).as_str(),
         "kimi" | "kimi_oauth" | "kimi_cli" | "oauth"
@@ -7896,7 +7895,7 @@ fn provider_uses_oauth_credentials(config: &Config, provider: ApiProvider) -> bo
             || (provider == ApiProvider::Moonshot
                 && config
                     .provider_config_for(provider)
-                    .is_some_and(provider_config_uses_kimi_oauth))
+                    .is_some_and(provider_config_uses_kimi_imported_token))
             || (provider == ApiProvider::Xai
                 && config
                     .provider_config_for(provider)
@@ -7929,9 +7928,9 @@ pub fn active_provider_has_config_api_key(config: &Config) -> bool {
         && !custom_endpoint
         && config
             .provider_config_for(provider)
-            .is_some_and(provider_config_uses_kimi_oauth)
+            .is_some_and(provider_config_uses_kimi_imported_token)
     {
-        return kimi_cli_credentials_present();
+        return kimi_imported_access_token_valid();
     }
     if provider == ApiProvider::OpenaiCodex && !custom_endpoint {
         // The persistent Codex login is the OAuth credential file, analogous to
@@ -8017,7 +8016,7 @@ pub fn has_api_key_for(config: &Config, provider: ApiProvider) -> bool {
     }
 
     if provider == ApiProvider::Moonshot && provider_uses_oauth_credentials(config, provider) {
-        return kimi_cli_credentials_present();
+        return kimi_imported_access_token_valid();
     }
     if provider == ApiProvider::OpenaiCodex && !config.provider_uses_custom_endpoint(provider) {
         // Token env overrides are checked above; also honor the Codex CLI OAuth
@@ -8220,6 +8219,21 @@ pub(crate) fn save_api_key_for_identity(
     } else {
         provider_config_key(provider).context("provider api key table")?
     };
+    // A legacy, manually-selected Kimi CLI import implicitly routed Moonshot
+    // traffic to Kimi Code. Once the user replaces that import with the
+    // supported API-key route, persist the endpoint before changing auth_mode
+    // so the key is not silently sent to the ordinary Moonshot endpoint.
+    // Respect an explicit user-owned endpoint.
+    let pin_kimi_code_base_url = provider == ApiProvider::Moonshot
+        && route_config
+            .provider_config_for(provider)
+            .is_some_and(|entry| {
+                provider_config_uses_kimi_imported_token(entry)
+                    && entry
+                        .base_url
+                        .as_deref()
+                        .is_none_or(|base_url| base_url.trim().is_empty())
+            });
 
     if !route_config.should_skip_secret_store_for_provider(provider)
         && let Some(secrets) = credential_secret_store_for_save()
@@ -8227,6 +8241,13 @@ pub(crate) fn save_api_key_for_identity(
         match secrets.set(provider_secret_store_slot(provider), api_key) {
             Ok(()) => {
                 crate::config_persistence::mutate_config_document(&config_path, |doc| {
+                    if pin_kimi_code_base_url {
+                        crate::config_persistence::set_document_value(
+                            doc,
+                            &["providers", key_inside, "base_url"],
+                            DEFAULT_KIMI_CODE_BASE_URL,
+                        )?;
+                    }
                     crate::config_persistence::set_document_value(
                         doc,
                         &["providers", key_inside, "auth_mode"],
@@ -8263,6 +8284,13 @@ pub(crate) fn save_api_key_for_identity(
     // Edit the `[providers.<name>]` table in place so unrelated sections,
     // comments, and formatting survive the write.
     crate::config_persistence::mutate_config_document(&config_path, |doc| {
+        if pin_kimi_code_base_url {
+            crate::config_persistence::set_document_value(
+                doc,
+                &["providers", key_inside, "base_url"],
+                DEFAULT_KIMI_CODE_BASE_URL,
+            )?;
+        }
         crate::config_persistence::set_document_value(
             doc,
             &["providers", key_inside, "auth_mode"],
@@ -8468,52 +8496,46 @@ fn missing_provider_api_key_message(provider: ApiProvider) -> Result<String> {
     ))
 }
 
-const KIMI_CODE_CLIENT_ID: &str = "17e5f671-d194-4dfb-9706-5516cb48c098";
 const KIMI_CODE_CREDENTIAL_FILE: &str = "kimi-code.json";
 
-#[derive(Debug, Clone, Deserialize, Serialize)]
-struct KimiOAuthCredential {
+#[derive(Debug, Clone, Deserialize)]
+struct KimiImportedCredential {
     access_token: Option<String>,
-    refresh_token: Option<String>,
     expires_at: Option<f64>,
-    expires_in: Option<f64>,
-    scope: Option<String>,
-    token_type: Option<String>,
 }
 
-fn kimi_cli_oauth_access_token() -> Result<String> {
-    let path = kimi_cli_oauth_credentials_path()?;
+fn kimi_imported_access_token() -> Result<String> {
+    let path = kimi_imported_credential_path()?;
     let raw = fs::read_to_string(&path).with_context(|| {
         format!(
-            "Kimi OAuth credentials not found at {}. Run `kimi login`, then set \
-             [providers.moonshot] auth_mode = \"kimi_oauth\".",
+            "Imported Kimi CLI credentials were not found at {}. CodeWhale does not provide \
+             Kimi OAuth login or refresh; configure a Kimi Code API key at \
+             https://api.kimi.com/coding/v1 instead. First-class OAuth remains tracked in #4417.",
             path.display()
         )
     })?;
-    let mut credential: KimiOAuthCredential =
-        serde_json::from_str(&raw).context("Failed to parse Kimi OAuth credentials")?;
+    let credential: KimiImportedCredential = serde_json::from_str(&raw).context(
+        "Failed to parse imported Kimi CLI credentials. CodeWhale will not repair or refresh \
+         that file; configure a Kimi Code API key at https://api.kimi.com/coding/v1 instead \
+         (#4417)",
+    )?;
 
-    if kimi_oauth_access_token_is_fresh(&credential) {
+    if kimi_imported_access_token_is_fresh(&credential) {
         return credential
             .access_token
             .filter(|token| !token.trim().is_empty())
-            .context("Kimi OAuth access token is empty");
+            .context("Imported Kimi CLI access token is empty");
     }
 
-    let refresh_token = credential
-        .refresh_token
-        .as_deref()
-        .filter(|token| !token.trim().is_empty())
-        .context("Kimi OAuth refresh token is empty. Run `kimi login` again.")?;
-    credential = refresh_kimi_oauth_token(refresh_token)?;
-    write_kimi_oauth_credential(&path, &credential)?;
-    credential
-        .access_token
-        .filter(|token| !token.trim().is_empty())
-        .context("Kimi OAuth refresh returned an empty access token")
+    anyhow::bail!(
+        "Imported Kimi CLI access token is expired or expires within 60 seconds. CodeWhale \
+         cannot refresh Kimi OAuth without its own vendor-registered client identity. Remove \
+         auth_mode = \"kimi_oauth\" and configure a Kimi Code API key at \
+         https://api.kimi.com/coding/v1; first-class OAuth remains tracked in #4417."
+    )
 }
 
-fn kimi_oauth_access_token_is_fresh(credential: &KimiOAuthCredential) -> bool {
+fn kimi_imported_access_token_is_fresh(credential: &KimiImportedCredential) -> bool {
     let Some(now) = now_unix_secs() else {
         return false;
     };
@@ -8527,61 +8549,24 @@ fn kimi_oauth_access_token_is_fresh(credential: &KimiOAuthCredential) -> bool {
             .is_some_and(|expires_at| expires_at - now > 60.0)
 }
 
-fn refresh_kimi_oauth_token(refresh_token: &str) -> Result<KimiOAuthCredential> {
-    let oauth_host = std::env::var("KIMI_CODE_OAUTH_HOST")
-        .or_else(|_| std::env::var("KIMI_OAUTH_HOST"))
-        .unwrap_or_else(|_| "https://auth.kimi.com".to_string());
-    let url = format!("{}/api/oauth/token", oauth_host.trim_end_matches('/'));
-    let client = crate::tls::reqwest_blocking_client_builder()
-        .timeout(Duration::from_secs(15))
-        .build()
-        .context("Failed to build Kimi OAuth refresh client")?;
-    let params = [
-        ("client_id", KIMI_CODE_CLIENT_ID),
-        ("grant_type", "refresh_token"),
-        ("refresh_token", refresh_token),
-    ];
-    let response = client
-        .post(url)
-        .header("X-Msh-Platform", "kimi_cli")
-        .header("X-Msh-Version", env!("CARGO_PKG_VERSION"))
-        .form(&params)
-        .send()
-        .context("Kimi OAuth refresh request failed")?;
-    let status = response.status();
-    if !status.is_success() {
-        anyhow::bail!("Kimi OAuth refresh failed with HTTP {status}. Run `kimi login` again.");
-    }
-
-    let mut refreshed: KimiOAuthCredential = response
-        .json()
-        .context("Failed to parse Kimi OAuth refresh response")?;
-    if let Some(expires_in) = refreshed.expires_in
-        && let Some(now) = now_unix_secs()
-    {
-        refreshed.expires_at = Some(now + expires_in);
-    }
-    Ok(refreshed)
-}
-
-fn kimi_cli_oauth_credentials_path() -> Result<PathBuf> {
+fn kimi_imported_credential_path() -> Result<PathBuf> {
     if let Some(kimi_code_home) = kimi_code_home_override() {
-        return Ok(kimi_oauth_credential_path(kimi_code_home));
+        return Ok(kimi_cli_credential_path(kimi_code_home));
     }
 
     let modern_path = effective_home_dir()
-        .map(|home| kimi_oauth_credential_path(home.join(".kimi-code")))
+        .map(|home| kimi_cli_credential_path(home.join(".kimi-code")))
         .context("Failed to resolve Kimi Code home directory")?;
     if modern_path.exists() {
         return Ok(modern_path);
     }
 
     if let Some(legacy_share_dir) = kimi_legacy_share_dir_override() {
-        return Ok(kimi_oauth_credential_path(legacy_share_dir));
+        return Ok(kimi_cli_credential_path(legacy_share_dir));
     }
 
     if let Some(legacy_path) = effective_home_dir()
-        .map(|home| kimi_oauth_credential_path(home.join(".kimi")))
+        .map(|home| kimi_cli_credential_path(home.join(".kimi")))
         .filter(|path| path.exists())
     {
         return Ok(legacy_path);
@@ -8602,29 +8587,8 @@ fn kimi_legacy_share_dir_override() -> Option<PathBuf> {
         .map(PathBuf::from)
 }
 
-fn kimi_oauth_credential_path(home: PathBuf) -> PathBuf {
+fn kimi_cli_credential_path(home: PathBuf) -> PathBuf {
     home.join("credentials").join(KIMI_CODE_CREDENTIAL_FILE)
-}
-
-fn write_kimi_oauth_credential(path: &Path, credential: &KimiOAuthCredential) -> Result<()> {
-    let serialized = serde_json::to_vec_pretty(credential)
-        .context("Failed to serialize Kimi OAuth credentials")?;
-    crate::utils::write_atomic(path, &serialized).with_context(|| {
-        format!(
-            "Failed to write Kimi OAuth credentials to {}",
-            path.display()
-        )
-    })?;
-    #[cfg(unix)]
-    if let Err(err) = fs::set_permissions(path, fs::Permissions::from_mode(0o600)) {
-        tracing::warn!(
-            target: "codewhale::config",
-            path = %path.display(),
-            error = %err,
-            "could not enforce 0o600 on Kimi OAuth credentials; relying on host ACLs"
-        );
-    }
-    Ok(())
 }
 
 fn now_unix_secs() -> Option<f64> {
@@ -8634,30 +8598,21 @@ fn now_unix_secs() -> Option<f64> {
         .ok()
 }
 
+/// Prompt-free check for an imported Kimi CLI access token that CodeWhale may
+/// use without impersonating or refreshing the official client. Refresh-only,
+/// expired, malformed, and empty credentials are deliberately unusable.
 #[must_use]
-pub fn kimi_cli_credentials_present() -> bool {
-    kimi_cli_oauth_credentials_path().is_ok_and(|path| path.exists())
-}
-
-/// Prompt-free structural check for Kimi CLI OAuth material. This deliberately
-/// performs no refresh: a fresh access token or a non-empty refresh token is
-/// enough to say login material is saved, while malformed/empty files are not.
-#[must_use]
-pub fn kimi_cli_credentials_valid() -> bool {
-    let Ok(path) = kimi_cli_oauth_credentials_path() else {
+pub fn kimi_imported_access_token_valid() -> bool {
+    let Ok(path) = kimi_imported_credential_path() else {
         return false;
     };
     let Ok(raw) = fs::read_to_string(path) else {
         return false;
     };
-    let Ok(credential) = serde_json::from_str::<KimiOAuthCredential>(&raw) else {
+    let Ok(credential) = serde_json::from_str::<KimiImportedCredential>(&raw) else {
         return false;
     };
-    kimi_oauth_access_token_is_fresh(&credential)
-        || credential
-            .refresh_token
-            .as_deref()
-            .is_some_and(|token| !token.trim().is_empty())
+    kimi_imported_access_token_is_fresh(&credential)
 }
 
 /// Clear the API key from config-file storage.

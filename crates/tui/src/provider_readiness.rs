@@ -15,6 +15,7 @@ pub(crate) enum CredentialState {
     MissingKey,
     MissingLogin,
     Saved,
+    ImportedToken,
     NoAuth,
     Local,
     Legacy,
@@ -23,11 +24,12 @@ pub(crate) enum CredentialState {
 /// Credential route whose observed health may be reused. A provider can
 /// expose more than one auth route (notably xAI and Moonshot), so provider id
 /// alone is not a safe cache key: a successful API-key request must not make a
-/// newly selected OAuth login appear verified.
+/// newly selected imported-token or OAuth route appear verified.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum ProviderAuthClass {
     ApiKey,
     OAuth,
+    ImportedToken,
     NoAuth,
     Local,
     Legacy,
@@ -68,7 +70,20 @@ pub(crate) fn route_identity_for_model(
             .and_then(|entry| entry.base_url.as_deref())
             .map(str::trim)
             .filter(|value| !value.is_empty())
-            .unwrap_or_else(|| provider.default_base_url())
+            .unwrap_or_else(|| {
+                if provider == ApiProvider::Moonshot
+                    && configured.is_some_and(|entry| {
+                        entry
+                            .auth_mode
+                            .as_deref()
+                            .is_some_and(crate::config::auth_mode_uses_kimi_imported_token)
+                    })
+                {
+                    crate::config::DEFAULT_KIMI_CODE_BASE_URL
+                } else {
+                    provider.default_base_url()
+                }
+            })
             .to_string()
     }
     .trim_end_matches('/')
@@ -96,9 +111,11 @@ pub(crate) fn auth_class_for_provider(
     }
     if provider == ApiProvider::Moonshot
         && official_endpoint
-        && auth_mode.as_deref().is_some_and(auth_mode_uses_kimi_oauth)
+        && auth_mode
+            .as_deref()
+            .is_some_and(crate::config::auth_mode_uses_kimi_imported_token)
     {
-        return ProviderAuthClass::OAuth;
+        return ProviderAuthClass::ImportedToken;
     }
     if provider == ApiProvider::Xai
         && official_endpoint
@@ -220,14 +237,19 @@ pub(crate) fn credential_state_for_provider(
         };
     }
 
-    let uses_kimi_oauth = provider == ApiProvider::Moonshot
+    let uses_kimi_imported_token = provider == ApiProvider::Moonshot
         && official_endpoint
-        && auth_mode.as_deref().is_some_and(auth_mode_uses_kimi_oauth);
-    if uses_kimi_oauth {
-        return if crate::config::kimi_cli_credentials_valid() {
-            CredentialState::Saved
+        && auth_mode
+            .as_deref()
+            .is_some_and(crate::config::auth_mode_uses_kimi_imported_token);
+    if uses_kimi_imported_token {
+        return if crate::config::kimi_imported_access_token_valid() {
+            CredentialState::ImportedToken
         } else {
-            CredentialState::MissingLogin
+            // CodeWhale cannot refresh or create Kimi OAuth credentials without
+            // its own vendor registration. The actionable supported recovery is
+            // a Kimi Code API key, not another CodeWhale login attempt (#4417).
+            CredentialState::MissingKey
         };
     }
     if provider == ApiProvider::OpenaiCodex && official_endpoint {
@@ -288,16 +310,6 @@ fn explicit_provider_credential_present(
                             std::env::var(name).is_ok_and(|value| !value.trim().is_empty())
                         })
             }))
-}
-
-fn auth_mode_uses_kimi_oauth(mode: &str) -> bool {
-    matches!(
-        mode.trim()
-            .to_ascii_lowercase()
-            .replace(['-', ' '], "_")
-            .as_str(),
-        "kimi" | "kimi_oauth" | "kimi_cli" | "oauth"
-    )
 }
 
 /// Validate the configured provider/model/endpoint route without making a
@@ -369,6 +381,7 @@ pub(crate) enum ResolvedProviderReadiness {
     MissingKey,
     MissingLogin,
     SavedUnchecked,
+    ImportedTokenUnchecked,
     NoAuthUnchecked,
     LocalUnchecked,
     Ready,
@@ -386,6 +399,7 @@ impl ResolvedProviderReadiness {
             Self::MissingKey => Cow::Borrowed("missing key"),
             Self::MissingLogin => Cow::Borrowed("missing login"),
             Self::SavedUnchecked => Cow::Borrowed("key saved · not checked"),
+            Self::ImportedTokenUnchecked => Cow::Borrowed("imported token · not checked"),
             Self::NoAuthUnchecked => Cow::Borrowed("no auth · not checked"),
             Self::LocalUnchecked => Cow::Borrowed("local · not checked"),
             Self::Ready => Cow::Borrowed("ready"),
@@ -410,6 +424,7 @@ impl ResolvedProviderReadiness {
             Self::SavedUnchecked
                 | Self::NoAuthUnchecked
                 | Self::LocalUnchecked
+                | Self::ImportedTokenUnchecked
                 | Self::Ready
                 | Self::SavedLastCheckFailed { .. }
         )
@@ -497,24 +512,28 @@ pub(crate) fn resolve_with_identity(
         CredentialState::Legacy => ResolvedProviderReadiness::Legacy,
         CredentialState::MissingKey => ResolvedProviderReadiness::MissingKey,
         CredentialState::MissingLogin => ResolvedProviderReadiness::MissingLogin,
-        CredentialState::Saved | CredentialState::NoAuth | CredentialState::Local => {
-            match checks.last(identity) {
-                Some(LastProviderCheck::Passed) => ResolvedProviderReadiness::Ready,
-                Some(LastProviderCheck::Failed { category, message }) => {
-                    ResolvedProviderReadiness::SavedLastCheckFailed {
-                        category: *category,
-                        message: message.clone(),
-                    }
+        CredentialState::Saved
+        | CredentialState::ImportedToken
+        | CredentialState::NoAuth
+        | CredentialState::Local => match checks.last(identity) {
+            Some(LastProviderCheck::Passed) => ResolvedProviderReadiness::Ready,
+            Some(LastProviderCheck::Failed { category, message }) => {
+                ResolvedProviderReadiness::SavedLastCheckFailed {
+                    category: *category,
+                    message: message.clone(),
                 }
-                None if credentials == CredentialState::NoAuth => {
-                    ResolvedProviderReadiness::NoAuthUnchecked
-                }
-                None if credentials == CredentialState::Local => {
-                    ResolvedProviderReadiness::LocalUnchecked
-                }
-                None => ResolvedProviderReadiness::SavedUnchecked,
             }
-        }
+            None if credentials == CredentialState::NoAuth => {
+                ResolvedProviderReadiness::NoAuthUnchecked
+            }
+            None if credentials == CredentialState::Local => {
+                ResolvedProviderReadiness::LocalUnchecked
+            }
+            None if credentials == CredentialState::ImportedToken => {
+                ResolvedProviderReadiness::ImportedTokenUnchecked
+            }
+            None => ResolvedProviderReadiness::SavedUnchecked,
+        },
     }
 }
 
@@ -891,7 +910,7 @@ mod tests {
     }
 
     #[test]
-    fn malformed_oauth_files_are_missing_login_not_ready() {
+    fn malformed_import_and_oauth_files_are_not_ready() {
         let _lock = crate::test_support::lock_test_env();
         let temp = tempfile::tempdir().expect("oauth fixture root");
         let kimi_home = temp.path().join("kimi");
@@ -926,7 +945,8 @@ mod tests {
 
         assert_eq!(
             credential_state_for_provider(&config, ApiProvider::Moonshot),
-            CredentialState::MissingLogin
+            CredentialState::MissingKey,
+            "an unusable Kimi import must recover through the supported API-key route"
         );
         assert_eq!(
             credential_state_for_provider(&config, ApiProvider::Xai),

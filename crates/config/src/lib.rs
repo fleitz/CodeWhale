@@ -2278,7 +2278,10 @@ impl ConfigToml {
                 ProviderKind::SiliconflowCN => DEFAULT_SILICONFLOW_CN_BASE_URL.to_string(),
                 ProviderKind::Arcee => DEFAULT_ARCEE_BASE_URL.to_string(),
                 ProviderKind::Moonshot => {
-                    if auth_mode.as_deref().is_some_and(auth_mode_uses_kimi_oauth) {
+                    if auth_mode
+                        .as_deref()
+                        .is_some_and(auth_mode_uses_kimi_imported_token)
+                    {
                         DEFAULT_KIMI_CODE_BASE_URL.to_string()
                     } else {
                         DEFAULT_MOONSHOT_BASE_URL.to_string()
@@ -2316,15 +2319,17 @@ impl ConfigToml {
         // OpenRouter key must never follow `provider = "openrouter"` to an
         // unrelated custom gateway merely because the provider id stayed the
         // same.
-        let uses_kimi_oauth = provider == ProviderKind::Moonshot
-            && auth_mode.as_deref().is_some_and(auth_mode_uses_kimi_oauth);
+        let uses_kimi_imported_token = provider == ProviderKind::Moonshot
+            && auth_mode
+                .as_deref()
+                .is_some_and(auth_mode_uses_kimi_imported_token);
         let auth_disabled = auth_mode_disables_api_key(auth_mode.as_deref());
         let custom_endpoint = provider_preserves_custom_base_url_model(provider, &base_url);
         let (api_key, api_key_source) = if auth_disabled {
             (None, None)
         } else if let Some(value) = cli.api_key.clone() {
             (Some(value), Some(RuntimeApiKeySource::Cli))
-        } else if uses_kimi_oauth && !custom_endpoint {
+        } else if uses_kimi_imported_token && !custom_endpoint {
             (None, None)
         } else if (!custom_endpoint || base_url_from_file)
             && let Some(value) = from_file.clone().filter(|v| !v.trim().is_empty())
@@ -2374,7 +2379,9 @@ impl ConfigToml {
             .or_else(|| self.model.clone())
             .unwrap_or_else(|| {
                 if provider == ProviderKind::Moonshot
-                    && (auth_mode.as_deref().is_some_and(auth_mode_uses_kimi_oauth)
+                    && (auth_mode
+                        .as_deref()
+                        .is_some_and(auth_mode_uses_kimi_imported_token)
                         || moonshot_base_url_uses_kimi_code(&base_url))
                 {
                     DEFAULT_KIMI_CODE_MODEL.to_string()
@@ -3248,7 +3255,7 @@ pub fn auth_mode_disables_api_key(auth_mode: Option<&str>) -> bool {
     )
 }
 
-fn auth_mode_uses_kimi_oauth(auth_mode: &str) -> bool {
+fn auth_mode_uses_kimi_imported_token(auth_mode: &str) -> bool {
     matches!(
         auth_mode
             .trim()

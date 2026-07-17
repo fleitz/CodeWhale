@@ -157,6 +157,8 @@ pub enum ProviderAuthStatus {
     Optional,
     OAuthReady,
     OAuthMissing,
+    ImportedToken,
+    ImportedTokenUnavailable,
     Local,
     Legacy,
 }
@@ -390,12 +392,20 @@ impl ProviderDashboardRow {
             .map(str::trim)
             .filter(|value| !value.is_empty())
             .map(str::to_string);
-        let configured_model = configured
+        let uses_kimi_imported_token = provider == ApiProvider::Moonshot
+            && configured.is_some_and(crate::config::provider_config_uses_kimi_imported_token);
+        let configured_base_url = configured_base_url.or_else(|| {
+            uses_kimi_imported_token.then(|| crate::config::DEFAULT_KIMI_CODE_BASE_URL.to_string())
+        });
+        let explicitly_configured_model = configured
             .and_then(|entry| entry.model.as_deref())
             .map(str::trim)
             .filter(|value| !value.is_empty())
             .map(str::to_string);
-        let has_configured_model = configured_model.is_some();
+        let has_configured_model = explicitly_configured_model.is_some();
+        let configured_model = explicitly_configured_model.or_else(|| {
+            uses_kimi_imported_token.then(|| crate::config::DEFAULT_KIMI_CODE_MODEL.to_string())
+        });
         let model_origin = ProviderModelOrigin::for_provider(provider, has_configured_model);
         let has_key = if provider == ApiProvider::Custom {
             custom_provider_has_auth(configured)
@@ -414,7 +424,14 @@ impl ProviderDashboardRow {
             api_key_required,
             official_endpoint,
         );
-        let usage_meter = usage_meter_for(provider);
+        let usage_meter = if matches!(
+            auth_status,
+            ProviderAuthStatus::ImportedToken | ProviderAuthStatus::ImportedTokenUnavailable
+        ) {
+            "usage: Kimi imported token".to_string()
+        } else {
+            usage_meter_for(provider)
+        };
         let provider_id = provider_id_override
             .map(str::to_string)
             .unwrap_or_else(|| provider.as_str().to_string());
@@ -547,10 +564,20 @@ impl ProviderDashboardRow {
                 )
             }
         };
+        let resolved_pricing = if matches!(
+            auth_status,
+            ProviderAuthStatus::ImportedToken | ProviderAuthStatus::ImportedTokenUnavailable
+        ) {
+            usage_meter
+        } else {
+            resolved_pricing
+        };
 
         if matches!(
             auth_status,
-            ProviderAuthStatus::Missing | ProviderAuthStatus::OAuthMissing
+            ProviderAuthStatus::Missing
+                | ProviderAuthStatus::OAuthMissing
+                | ProviderAuthStatus::ImportedTokenUnavailable
         ) {
             messages.push(missing_auth_message(provider, configured, &provider_id));
         }
@@ -811,6 +838,8 @@ impl ProviderAuthStatus {
             Self::Optional => "key:optional",
             Self::OAuthReady => "auth:oauth-ready",
             Self::OAuthMissing => "auth:oauth-missing",
+            Self::ImportedToken => "auth:imported-token",
+            Self::ImportedTokenUnavailable => "auth:imported-token-unavailable",
             Self::Local => "local",
             Self::Legacy => "legacy",
         }
@@ -1008,12 +1037,12 @@ fn auth_status_for(
     }
     if provider == ApiProvider::Moonshot
         && official_endpoint
-        && configured.is_some_and(config_uses_kimi_oauth)
+        && configured.is_some_and(crate::config::provider_config_uses_kimi_imported_token)
     {
-        return if crate::config::kimi_cli_credentials_valid() {
-            ProviderAuthStatus::OAuthReady
+        return if crate::config::kimi_imported_access_token_valid() {
+            ProviderAuthStatus::ImportedToken
         } else {
-            ProviderAuthStatus::OAuthMissing
+            ProviderAuthStatus::ImportedTokenUnavailable
         };
     }
     if provider == ApiProvider::OpenaiCodex && official_endpoint {
@@ -1105,6 +1134,11 @@ fn missing_auth_message(
     configured: Option<&crate::config::ProviderConfig>,
     provider_id: &str,
 ) -> String {
+    if provider == ApiProvider::Moonshot
+        && configured.is_some_and(crate::config::provider_config_uses_kimi_imported_token)
+    {
+        return "imported Kimi token unavailable; configure a Kimi Code API key".to_string();
+    }
     if provider == ApiProvider::Custom {
         if let Some(env_name) = configured
             .and_then(|entry| entry.api_key_env.as_deref())
@@ -1116,16 +1150,6 @@ fn missing_auth_message(
         return format!("missing custom provider auth for {provider_id}");
     }
     format!("missing {}", provider.env_vars_label())
-}
-
-fn config_uses_kimi_oauth(config: &crate::config::ProviderConfig) -> bool {
-    config.auth_mode.as_deref().is_some_and(|mode| {
-        let normalized = mode.trim().to_ascii_lowercase().replace(['-', ' '], "_");
-        matches!(
-            normalized.as_str(),
-            "kimi" | "kimi_oauth" | "kimi_cli" | "oauth"
-        )
-    })
 }
 
 fn readiness_for(
@@ -1141,9 +1165,6 @@ fn usage_meter_for(provider: ApiProvider) -> String {
     match provider {
         ApiProvider::Ollama | ApiProvider::Sglang | ApiProvider::Vllm => "cost: local".to_string(),
         ApiProvider::OpenaiCodex => "usage: Codex OAuth quota".to_string(),
-        ApiProvider::Moonshot if crate::config::kimi_cli_credentials_valid() => {
-            "usage: Kimi OAuth quota".to_string()
-        }
         ApiProvider::XiaomiMimo => "cost: token-plan".to_string(),
         _ => "cost: unknown".to_string(),
     }
@@ -1461,6 +1482,7 @@ impl ProviderPickerView {
         matches!(
             self.rows[self.selected_idx].credential_state,
             CredentialState::Saved
+                | CredentialState::ImportedToken
                 | CredentialState::NoAuth
                 | CredentialState::Local
                 | CredentialState::Legacy
@@ -1824,6 +1846,7 @@ impl ProviderPickerView {
             let has_usable_auth = matches!(
                 row.credential_state,
                 CredentialState::Saved
+                    | CredentialState::ImportedToken
                     | CredentialState::NoAuth
                     | CredentialState::Local
                     | CredentialState::Legacy
@@ -2437,12 +2460,6 @@ impl ModalView for ProviderPickerView {
                         ViewAction::EmitAndClose(ViewEvent::ProviderPickerApplied {
                             provider,
                             provider_id,
-                        })
-                    } else if provider == ApiProvider::Moonshot
-                        && crate::config::kimi_cli_credentials_valid()
-                    {
-                        ViewAction::EmitAndClose(ViewEvent::ProviderPickerKimiOAuthEnabled {
-                            provider,
                         })
                     } else {
                         self.enter_key_entry();
@@ -4764,6 +4781,113 @@ mod tests {
         );
         assert_eq!(xai_oauth_status(None, true), None);
         assert_eq!(xai_oauth_status(None, false), None);
+    }
+
+    #[test]
+    fn kimi_cli_token_is_never_auto_enabled_without_explicit_legacy_auth_mode() {
+        let _env = crate::test_support::lock_test_env();
+        let temp = tempfile::tempdir().expect("Kimi import fixture root");
+        let kimi_home = temp.path().join("kimi-code");
+        std::fs::create_dir_all(kimi_home.join("credentials"))
+            .expect("Kimi import credential directory");
+        let expires_at = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock after epoch")
+            .as_secs_f64()
+            + 3600.0;
+        std::fs::write(
+            kimi_home.join("credentials/kimi-code.json"),
+            serde_json::json!({
+                "access_token": "unexpired-user-owned-token",
+                "refresh_token": "must-not-be-used",
+                "expires_at": expires_at,
+            })
+            .to_string(),
+        )
+        .expect("write Kimi import fixture");
+        let _kimi_home = crate::test_support::EnvVarGuard::set(
+            "KIMI_CODE_HOME",
+            kimi_home.to_str().expect("utf8 path"),
+        );
+        let _moonshot_key = crate::test_support::EnvVarGuard::remove("MOONSHOT_API_KEY");
+        let _kimi_key = crate::test_support::EnvVarGuard::remove("KIMI_API_KEY");
+
+        let mut picker = ProviderPickerView::new(ApiProvider::Deepseek, &Config::default());
+        move_to_provider(&mut picker, ApiProvider::Moonshot);
+        let row = &picker.rows[picker.selected_idx];
+        assert_eq!(row.auth_status, ProviderAuthStatus::Missing);
+        assert_eq!(row.credential_state, CredentialState::MissingKey);
+
+        assert!(matches!(
+            picker.handle_key(key(KeyCode::Enter)),
+            ViewAction::None
+        ));
+        assert_eq!(
+            picker.stage,
+            Stage::KeyEntry,
+            "a stray Kimi CLI credential must lead to API-key setup, not import activation"
+        );
+    }
+
+    #[test]
+    fn explicit_kimi_import_is_labeled_and_usable_only_while_unexpired() {
+        let _env = crate::test_support::lock_test_env();
+        let temp = tempfile::tempdir().expect("Kimi import fixture root");
+        let kimi_home = temp.path().join("kimi-code");
+        std::fs::create_dir_all(kimi_home.join("credentials"))
+            .expect("Kimi import credential directory");
+        let expires_at = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock after epoch")
+            .as_secs_f64()
+            + 3600.0;
+        std::fs::write(
+            kimi_home.join("credentials/kimi-code.json"),
+            serde_json::json!({
+                "access_token": "unexpired-user-owned-token",
+                "refresh_token": "must-not-be-used",
+                "expires_at": expires_at,
+            })
+            .to_string(),
+        )
+        .expect("write Kimi import fixture");
+        let _kimi_home = crate::test_support::EnvVarGuard::set(
+            "KIMI_CODE_HOME",
+            kimi_home.to_str().expect("utf8 path"),
+        );
+        let config = Config {
+            providers: Some(crate::config::ProvidersConfig {
+                moonshot: crate::config::ProviderConfig {
+                    auth_mode: Some("kimi_oauth".to_string()),
+                    ..Default::default()
+                },
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+
+        let mut picker = ProviderPickerView::new(ApiProvider::Deepseek, &config);
+        move_to_provider(&mut picker, ApiProvider::Moonshot);
+        let row = &picker.rows[picker.selected_idx];
+        assert_eq!(row.auth_status, ProviderAuthStatus::ImportedToken);
+        assert_eq!(row.credential_state, CredentialState::ImportedToken);
+        assert_eq!(row.base_url, crate::config::DEFAULT_KIMI_CODE_BASE_URL);
+        assert_eq!(
+            row.default_route.logical_model,
+            crate::config::DEFAULT_KIMI_CODE_MODEL
+        );
+        assert_eq!(row.usage_meter, "usage: Kimi imported token");
+        assert_eq!(
+            row.readiness,
+            ResolvedProviderReadiness::ImportedTokenUnchecked
+        );
+        assert!(matches!(
+            picker.handle_key(key(KeyCode::Enter)),
+            ViewAction::EmitAndClose(ViewEvent::ProviderPickerApplied {
+                provider: ApiProvider::Moonshot,
+                ..
+            })
+        ));
     }
 
     #[test]

@@ -486,10 +486,14 @@ max_subagents = 10 # optional (1-20)
 # api_key = "YOUR_MOONSHOT_API_KEY"           # or KIMI_API_KEY
 # base_url = "https://api.moonshot.ai/v1"      # or KIMI_BASE_URL
 # model = "kimi-k2.6"
-# # Kimi Code path:
+# # Supported Kimi Code path (use a Kimi Code API key):
+# # api_key = "YOUR_KIMI_CODE_API_KEY"
 # # base_url = "https://api.kimi.com/coding/v1"
 # # model = "kimi-for-coding"
-# # auth_mode = "kimi_oauth"                   # reads Kimi Code OAuth credentials
+# # Legacy compatibility only: auth_mode = "kimi_oauth" reads an already
+# # unexpired Kimi CLI access token, read-only. Codewhale never logs in,
+# # refreshes, or rewrites Kimi CLI credentials; API-key setup is recommended
+# # while first-class vendor registration remains tracked in #4417.
 
 # Z.AI GLM Coding Plan endpoint (https://docs.z.ai)
 [providers.zai]

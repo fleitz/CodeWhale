@@ -12178,18 +12178,6 @@ async fn handle_view_events(
                 .await;
                 refresh_config_view_if_open(app, "provider");
             }
-            ViewEvent::ProviderPickerKimiOAuthEnabled { provider } => {
-                apply_provider_picker_auth_mode(
-                    app,
-                    engine_handle,
-                    config,
-                    provider,
-                    "kimi_oauth",
-                    "Linked Kimi CLI OAuth",
-                )
-                .await;
-                refresh_config_view_if_open(app, "provider");
-            }
             ViewEvent::ProviderPickerXaiOAuthRequested => {
                 run_xai_device_login_from_tui(terminal, app, engine_handle, config).await?;
             }
@@ -12943,14 +12931,12 @@ async fn apply_provider_picker_api_key_with_verifier(
     scoped_config.provider = Some(identity.key.clone());
     // #3875: verify the key against the provider before opening the rest of
     // the guided flow. Nothing is persisted until the confirm stage.
-    // Use the provider's configured base URL (or the default) for the
-    // models-endpoint probe so custom endpoints are also verified.
-    let base_url = scoped_config
-        .provider_config_for(provider)
-        .and_then(|entry| entry.base_url.as_deref())
-        .filter(|url| !url.trim().is_empty())
-        .unwrap_or_else(|| provider.default_base_url());
-    match verifier.verify(provider, &api_key, base_url).await {
+    // Resolve the effective route, including compatibility routes whose
+    // endpoint is selected by auth mode (notably a legacy Kimi CLI import).
+    // This prevents a replacement Kimi Code API key from being probed against
+    // the ordinary Moonshot endpoint.
+    let base_url = scoped_config.deepseek_base_url();
+    match verifier.verify(provider, &api_key, &base_url).await {
         Ok(()) => {
             // Key is valid — continue the guided flow at model pick without
             // writing the secret yet.
@@ -13082,12 +13068,22 @@ fn mirror_saved_model_in_config(config: &mut Config, provider: ApiProvider, mode
 fn mirror_saved_api_key_in_config(config: &mut Config, provider: ApiProvider, api_key: String) {
     if matches!(provider, ApiProvider::Deepseek | ApiProvider::DeepseekCN) {
         config.api_key = Some(api_key);
+        config.auth_mode = Some("api_key".to_string());
         return;
     }
     if provider == ApiProvider::Custom && config.uses_legacy_literal_custom_route() {
         config.api_key = Some(api_key);
+        config.auth_mode = Some("api_key".to_string());
         return;
     }
+    let pin_kimi_code_base_url = provider == ApiProvider::Moonshot
+        && config.provider_config_for(provider).is_some_and(|entry| {
+            crate::config::provider_config_uses_kimi_imported_token(entry)
+                && entry
+                    .base_url
+                    .as_deref()
+                    .is_none_or(|base_url| base_url.trim().is_empty())
+        });
     let custom_key = (provider == ApiProvider::Custom).then(|| {
         config
             .provider
@@ -13136,6 +13132,10 @@ fn mirror_saved_api_key_in_config(config: &mut Config, provider: ApiProvider, ap
         ApiProvider::Meta => &mut providers.meta,
         ApiProvider::Xai => &mut providers.xai,
     };
+    if pin_kimi_code_base_url {
+        entry.base_url = Some(crate::config::DEFAULT_KIMI_CODE_BASE_URL.to_string());
+    }
+    entry.auth_mode = Some("api_key".to_string());
     entry.api_key = Some(api_key);
 }
 
@@ -14865,6 +14865,84 @@ mod provider_key_validation_tests {
             rendered.contains("Default model") || rendered.contains("Pick a default model"),
             "expected model-pick stage UI, got:\n{rendered}"
         );
+    }
+
+    #[tokio::test]
+    async fn replacing_legacy_kimi_import_verifies_and_persists_the_kimi_code_api_key_route() {
+        let config_env = ConfigPathEnvGuard::new();
+        std::fs::write(
+            config_env.config_path(),
+            r#"# preserve-kimi-comment
+[providers.moonshot]
+auth_mode = "kimi_oauth"
+"#,
+        )
+        .expect("seed legacy Kimi import config");
+        let mut app = create_test_app();
+        let mut engine = mock_engine_handle();
+        let mut config = Config {
+            providers: Some(ProvidersConfig {
+                moonshot: ProviderConfig {
+                    auth_mode: Some("kimi_oauth".to_string()),
+                    ..ProviderConfig::default()
+                },
+                ..ProvidersConfig::default()
+            }),
+            ..Config::default()
+        };
+        let identity = picker_provider_identity(&config, ApiProvider::Moonshot, None)
+            .expect("Moonshot identity");
+        let verifier = MockProviderKeyVerifier::new(Ok(()));
+
+        apply_provider_picker_api_key_with_verifier(
+            &mut app,
+            &mut engine.handle,
+            &mut config,
+            identity.clone(),
+            "sk-kimi-supported".to_string(),
+            &verifier,
+        )
+        .await;
+
+        assert_eq!(
+            verifier.calls(),
+            vec![(
+                ApiProvider::Moonshot,
+                "sk-kimi-supported".to_string(),
+                crate::config::DEFAULT_KIMI_CODE_BASE_URL.to_string(),
+            )],
+            "replacement keys must be verified against Kimi Code, not the ordinary Moonshot API"
+        );
+
+        apply_provider_picker_setup_confirmed(
+            &mut app,
+            &mut engine.handle,
+            &mut config,
+            identity,
+            "sk-kimi-supported".to_string(),
+            crate::config::DEFAULT_KIMI_CODE_MODEL.to_string(),
+        )
+        .await;
+
+        let moonshot = config
+            .providers
+            .as_ref()
+            .map(|providers| &providers.moonshot)
+            .expect("in-memory Moonshot config");
+        assert_eq!(moonshot.auth_mode.as_deref(), Some("api_key"));
+        assert_eq!(
+            moonshot.base_url.as_deref(),
+            Some(crate::config::DEFAULT_KIMI_CODE_BASE_URL)
+        );
+        assert_eq!(moonshot.api_key.as_deref(), Some("sk-kimi-supported"));
+
+        let saved = std::fs::read_to_string(config_env.config_path()).expect("saved config");
+        assert!(saved.contains("# preserve-kimi-comment"));
+        assert!(saved.contains("auth_mode = \"api_key\""));
+        assert!(saved.contains(&format!(
+            "base_url = \"{}\"",
+            crate::config::DEFAULT_KIMI_CODE_BASE_URL
+        )));
     }
 
     #[tokio::test]

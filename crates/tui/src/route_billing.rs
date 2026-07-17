@@ -95,8 +95,8 @@ pub fn for_route(config: &Config, provider: ApiProvider) -> BillingPresentation 
         ApiProvider::Xai if provider_config.is_some_and(uses_xai_oauth) => {
             BillingPresentation::Subscription("Grok OAuth quota")
         }
-        ApiProvider::Moonshot if provider_config.is_some_and(uses_kimi_oauth) => {
-            BillingPresentation::Subscription("Kimi OAuth quota")
+        ApiProvider::Moonshot if provider_config.is_some_and(uses_kimi_imported_token) => {
+            BillingPresentation::Subscription("Kimi imported token")
         }
         ApiProvider::Anthropic if provider_config.is_some_and(uses_anthropic_oauth) => {
             BillingPresentation::Subscription("Claude OAuth quota")
@@ -284,7 +284,7 @@ fn uses_xai_oauth(config: &ProviderConfig) -> bool {
     auth_mode(config).is_some_and(|mode| crate::xai_oauth::auth_mode_uses_xai_oauth(&mode))
 }
 
-fn uses_kimi_oauth(config: &ProviderConfig) -> bool {
+fn uses_kimi_imported_token(config: &ProviderConfig) -> bool {
     auth_mode(config).is_some_and(|mode| {
         matches!(
             mode.as_str(),
@@ -391,6 +391,36 @@ mod tests {
             format_usage_chip(&chip).as_deref(),
             Some("usage: Codex OAuth quota")
         );
+        assert!(!format_usage_line(&chip).contains('$'));
+    }
+
+    #[test]
+    fn kimi_cli_compatibility_route_is_labeled_as_an_import_not_oauth() {
+        let config = config_with(
+            ApiProvider::Moonshot,
+            ProviderConfig {
+                auth_mode: Some("kimi_oauth".to_string()),
+                ..ProviderConfig::default()
+            },
+        );
+        let billing = for_route(&config, ApiProvider::Moonshot);
+        assert_eq!(
+            billing,
+            BillingPresentation::Subscription("Kimi imported token")
+        );
+        let chip = usage_chip(
+            billing,
+            ApiProvider::Moonshot,
+            crate::config::DEFAULT_KIMI_CODE_MODEL,
+            12.34,
+            CostCurrency::Usd,
+            None,
+        );
+        assert_eq!(
+            format_usage_chip(&chip).as_deref(),
+            Some("usage: Kimi imported token")
+        );
+        assert!(!format_usage_line(&chip).contains("OAuth"));
         assert!(!format_usage_line(&chip).contains('$'));
     }
 

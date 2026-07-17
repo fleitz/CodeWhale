@@ -4450,7 +4450,7 @@ fn moonshot_provider_preserves_explicit_kimi_k26() {
 }
 
 #[test]
-fn moonshot_kimi_oauth_uses_kimi_code_endpoint_and_model() {
+fn moonshot_legacy_kimi_import_uses_kimi_code_endpoint_and_model() {
     let _lock = env_lock();
     let _env = EnvGuard::without_deepseek_runtime_overrides();
     let mut config = ConfigToml {
