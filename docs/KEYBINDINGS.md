@@ -43,7 +43,8 @@ Editing the message you're about to send.
 | `Ctrl-E` / `End`            | Move to end of line                                     |
 | `Ctrl-←` / `Alt-←`          | Move backward one word                                  |
 | `Ctrl-→` / `Alt-→`          | Move forward one word                                   |
-| `Ctrl-V` / `Cmd-V`          | Paste from clipboard (also bracketed-paste auto-handled)|
+| `Cmd-V` / `Ctrl-Shift-V`    | Terminal-local paste (arrives as bracketed paste when supported) |
+| `Ctrl-V`                    | Direct clipboard paste in a local or forwarded graphical session |
 | `Ctrl-Y`                    | Yank (paste) from kill buffer                           |
 | `↑` / `↓`                   | Cycle composer history (also selects popup/attachment items) |
 | `Ctrl-P` / `Ctrl-N`         | Cycle composer history (alternative)                     |
@@ -97,9 +98,16 @@ When `[memory] enabled = true`, typing `# foo` and pressing `Enter` appends `foo
 | `Home` / `g`         | Jump to top                                         |
 | `End` / `G`          | Jump to bottom                                     |
 | `Esc`                | Return focus to composer                           |
-| `y`                  | Yank selected region to clipboard                  |
-| `v`                  | Begin / extend visual selection                    |
+| Mouse drag           | Select transcript text in Codewhale                |
+| `Ctrl-C`             | Copy an active Codewhale selection                 |
 | `Cmd-click` (macOS) / `Ctrl-click` (Linux/Windows) | Open an OSC 8 link in a supporting terminal (terminal-owned) |
+
+For terminal-native selection, hold `Shift` while dragging (terminal support
+varies), then use the terminal's own copy command: usually `Cmd-C` on macOS or
+`Ctrl-Shift-C` on Linux/Windows. Those commands are handled by the local
+terminal and are intentionally separate from Codewhale's `Ctrl-C` selection
+binding. Over SSH, Codewhale sends copy requests back through OSC 52, or via
+tmux's `load-buffer -w` path when running inside tmux.
 
 ## Sidebar (when sidebar has focus)
 

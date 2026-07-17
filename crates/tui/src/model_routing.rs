@@ -444,9 +444,14 @@ fn auto_route_from_inventory_heuristic(
         };
     };
     // Use the candidates' cheap/big info for complexity-based routing.
-    let router_candidates = provider_router_candidates(config.api_provider(), &active.model);
+    let router_candidates = provider_router_candidates(active.provider, &active.model);
     let chosen = if router_candidates.cheap.is_some() {
-        auto_model_heuristic_for_candidates(latest_request, &active.model, &router_candidates)
+        auto_model_heuristic_with_bias_for_candidates(
+            latest_request,
+            &active.model,
+            config.auto_cost_saving(),
+            &router_candidates,
+        )
     } else {
         active.model.clone()
     };
@@ -472,7 +477,7 @@ async fn auto_route_inventory_recommendation(
     router_config.default_text_model = Some(inventory.router_model.to_string());
 
     let client = DeepSeekClient::new(&router_config)?;
-    let router_system = inventory_auto_router_system_prompt(inventory);
+    let router_system = inventory_auto_router_system_prompt(inventory, config.auto_cost_saving());
     let request = MessageRequest {
         model: inventory.router_model.to_string(),
         messages: vec![Message {
@@ -508,15 +513,46 @@ async fn auto_route_inventory_recommendation(
     ))
 }
 
-fn inventory_auto_router_system_prompt(inventory: &ModelInventory) -> String {
-    format!(
+fn inventory_auto_router_system_prompt(inventory: &ModelInventory, cost_saving: bool) -> String {
+    let mut prompt = format!(
         "You are the codewhale model-routing classifier. Return only compact JSON: \
 {{\"provider\":\"<provider>\",\"model\":\"<model>\",\"thinking\":\"off|high|max\"}}.\n\
 Choose only provider/model pairs present in the inventory JSON. Use off only for trivial no-tool answers, \
 high for ordinary reasoning, and max for agentic, coding, multi-file, release, architecture, debugging, \
 security, tool-heavy, or uncertain work.\n\nInventory JSON:\n{}",
         inventory.router_context_json()
-    )
+    );
+
+    if cost_saving {
+        let active_pair = inventory.active_default().and_then(|active| {
+            let candidates = provider_router_candidates(active.provider, &active.model);
+            let fast = candidates.cheap.as_deref()?;
+            (inventory
+                .candidate(active.provider, &candidates.big)
+                .is_some()
+                && inventory.candidate(active.provider, fast).is_some())
+            .then_some((active.provider, candidates.big, fast.to_string()))
+        });
+
+        if let Some((provider, strong, fast)) = active_pair {
+            prompt.push_str(&format!(
+                "\n\nCost-saving mode is ON. For the active provider `{}`, `{fast}` is the fast tier \
+and `{strong}` is the strong tier. Prefer `{fast}` for ambiguous, routine, or single-step work. \
+Select `{strong}` only when the request is unmistakably agentic, multi-step, architecture/design, \
+security review, debugging, or otherwise clearly beyond the fast tier. Keep the selected model paired \
+with provider `{}`.",
+                provider.as_str(),
+                provider.as_str()
+            ));
+        } else {
+            prompt.push_str(
+                "\n\nCost-saving mode is ON, but the active provider has no known runnable fast sibling. \
+Do not invent a model or cross-provider downgrade solely to save cost.",
+            );
+        }
+    }
+
+    prompt
 }
 
 fn parse_inventory_auto_route_recommendation(
@@ -667,6 +703,33 @@ mod tests {
         assert!(
             prompt.starts_with("Session mode: plan\n"),
             "auto-route prompt should reflect the active session mode, got: {prompt}"
+        );
+    }
+
+    #[test]
+    fn inventory_auto_router_prompt_names_cost_saving_zai_pair() {
+        let _env_lock = crate::test_support::lock_test_env();
+        let _deepseek = crate::test_support::EnvVarGuard::remove("DEEPSEEK_API_KEY");
+        let _zai = crate::test_support::EnvVarGuard::set("ZAI_API_KEY", "zai-key");
+        let config = Config {
+            provider: Some("zai".to_string()),
+            ..Default::default()
+        };
+        let inventory = ModelInventory::from_config(&config);
+
+        let balanced = inventory_auto_router_system_prompt(&inventory, false);
+        let cost_saving = inventory_auto_router_system_prompt(&inventory, true);
+
+        assert!(!balanced.contains("Cost-saving mode is ON"));
+        assert!(
+            cost_saving.contains(
+                "For the active provider `zai`, `GLM-5-Turbo` is the fast tier and `GLM-5.2` is the strong tier"
+            ),
+            "cost-saving classifier policy must name the provider-safe pair: {cost_saving}"
+        );
+        assert!(
+            cost_saving.contains("Keep the selected model paired with provider `zai`"),
+            "cost-saving policy must preserve provider/model validation: {cost_saving}"
         );
     }
 
@@ -824,6 +887,73 @@ mod tests {
         assert_eq!(route.provider, ApiProvider::Zai);
         assert_eq!(route.model, crate::config::ZAI_GLM_5_TURBO_MODEL);
         assert_eq!(route.source, AutoRouteSource::Heuristic);
+    }
+
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn inventory_auto_route_uses_fallback_candidates_from_their_provider() {
+        let _env_lock = crate::test_support::lock_test_env();
+        let _deepseek = crate::test_support::EnvVarGuard::set("DEEPSEEK_API_KEY", "ds-key");
+        let _zai = crate::test_support::EnvVarGuard::remove("ZAI_API_KEY");
+        let config = Config {
+            provider: Some("zai".to_string()),
+            ..Default::default()
+        };
+
+        let route =
+            resolve_auto_route_with_inventory(&config, "quick status check", "", "auto", "auto")
+                .await
+                .expect("inventory route should fall back to an authenticated provider");
+
+        assert_eq!(route.provider, ApiProvider::Deepseek);
+        assert_eq!(route.model, "deepseek-v4-flash");
+        assert_eq!(route.source, AutoRouteSource::Heuristic);
+    }
+
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn inventory_auto_route_cost_saving_changes_borderline_zai_route() {
+        let _env_lock = crate::test_support::lock_test_env();
+        let _deepseek = crate::test_support::EnvVarGuard::remove("DEEPSEEK_API_KEY");
+        let _zai = crate::test_support::EnvVarGuard::set("ZAI_API_KEY", "zai-key");
+        let balanced = Config {
+            provider: Some("zai".to_string()),
+            ..Default::default()
+        };
+        let cost_saving = Config {
+            auto: Some(crate::config::AutoConfig {
+                cost_saving: Some(true),
+            }),
+            ..balanced.clone()
+        };
+
+        let balanced_route = resolve_auto_route_with_inventory(
+            &balanced,
+            "Please implement a binary search",
+            "",
+            "auto",
+            "auto",
+        )
+        .await
+        .expect("balanced Auto route should resolve");
+        let cost_saving_route = resolve_auto_route_with_inventory(
+            &cost_saving,
+            "Please implement a binary search",
+            "",
+            "auto",
+            "auto",
+        )
+        .await
+        .expect("cost-saving Auto route should resolve");
+
+        assert_eq!(balanced_route.provider, ApiProvider::Zai);
+        assert_eq!(balanced_route.model, crate::config::ZAI_GLM_5_2_MODEL);
+        assert_eq!(cost_saving_route.provider, ApiProvider::Zai);
+        assert_eq!(
+            cost_saving_route.model,
+            crate::config::ZAI_GLM_5_TURBO_MODEL
+        );
+        assert_eq!(cost_saving_route.source, AutoRouteSource::Heuristic);
     }
 
     #[tokio::test]
@@ -1012,13 +1142,20 @@ mod tests {
             big: "qwen3:32b".to_string(),
             cheap: None,
         };
-        for prompt in [
-            "hi",
-            "please refactor the auth module for security",
-            &"long filler sentence. ".repeat(60),
-        ] {
-            let model = auto_model_heuristic_for_candidates(prompt, "qwen3:32b", &candidates);
-            assert_eq!(model, "qwen3:32b", "prompt {prompt:?}");
+        for cost_saving in [false, true] {
+            for prompt in [
+                "hi",
+                "please refactor the auth module for security",
+                &"long filler sentence. ".repeat(60),
+            ] {
+                let model = auto_model_heuristic_with_bias_for_candidates(
+                    prompt,
+                    "qwen3:32b",
+                    cost_saving,
+                    &candidates,
+                );
+                assert_eq!(model, "qwen3:32b", "prompt {prompt:?}");
+            }
         }
     }
 

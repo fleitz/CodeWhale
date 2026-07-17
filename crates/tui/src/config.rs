@@ -1989,10 +1989,11 @@ pub struct SubagentProviderConfig {
 
 /// `[auto]` table — knobs for the `--model auto` / `/model auto` router.
 ///
-/// `cost_saving` (#1207): when `true`, the auto-mode router prefers
-/// `deepseek-v4-flash` for ambiguous requests, only escalating to
-/// `deepseek-v4-pro` when the task clearly benefits from deeper reasoning.
-/// Default is `false` (balanced — match the existing routing voice).
+/// `cost_saving` (#1207): when `true`, the auto-mode router prefers the
+/// active provider's known fast sibling for ambiguous requests, only using
+/// its strong tier when the task clearly benefits from deeper reasoning.
+/// Providers without a validated sibling stay on the active model. Default
+/// is `false` (balanced — match the existing routing voice).
 #[derive(Debug, Clone, Deserialize, Default)]
 pub struct AutoConfig {
     #[serde(default)]
@@ -3391,9 +3392,10 @@ impl Config {
     }
 
     /// Return `true` if the `[auto] cost_saving = true` opt-in is set
-    /// (#1207). When true, the auto-mode router biases toward
-    /// `deepseek-v4-flash` for ambiguous requests instead of escalating to
-    /// `deepseek-v4-pro`. Default: `false` (balanced behaviour).
+    /// (#1207). When true, the auto-mode router biases toward the active
+    /// provider's validated fast sibling for ambiguous requests instead of
+    /// its strong tier. Providers without a known sibling stay on the active
+    /// model. Default: `false` (balanced behaviour).
     #[must_use]
     pub fn auto_cost_saving(&self) -> bool {
         self.auto

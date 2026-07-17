@@ -1684,9 +1684,17 @@ provider = "searxng" # duckduckgo | bing | tavily | bocha | metaso | searxng | b
 
 Use `@path/to/file` in the composer to add local text file or directory context
 to the next message. Use `/attach <path>` for local image/video media paths, or
-`Ctrl+V` to attach an image from the clipboard. DeepSeek's public Chat
-Completions API currently accepts text message content, so media attachments are
-sent as explicit local path references instead of native image/video payloads.
+`Ctrl+V` to attach an image from a local clipboard or an explicitly forwarded
+X11/Wayland clipboard. SSH terminal paste without a forwarded graphical display
+is text-only; use the local terminal's paste command (`Cmd+V` on macOS or
+`Ctrl+Shift+V` on Linux/Windows), and use `/attach <path>` for remote image
+files. OpenSSH loopback X11 displays are detected automatically. For an
+explicitly forwarded Wayland or non-loopback X11 display, set
+`CODEWHALE_SSH_CLIPBOARD=graphical`; set it to `terminal` to force terminal
+transfer instead of an ambient remote display. DeepSeek's public Chat
+Completions API currently accepts text message
+content, so media attachments are sent as explicit local path references instead
+of native image/video payloads.
 Attachment rows appear above the composer before submit; move to the start of
 the composer, press `↑` to select an attachment row, then press `Backspace` or
 `Delete` to remove it without editing the sample text by hand.
