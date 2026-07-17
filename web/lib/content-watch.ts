@@ -99,23 +99,25 @@ export async function runLinkCheck(env: WatchEnv): Promise<{ ok: boolean; checke
   }), { expirationTtl: 60 * 60 * 24 * 14 });
 
   // Write drafts ONLY for new breakages — dedup by URL on the open-draft list.
-  for (const b of broken) {
-    const id = b.url.replace(/[^a-z0-9]+/gi, "-").slice(0, 80);
-    const key = `draft:linkcheck:${id}`;
-    const existing = await env.CURATED_KV.get(key);
-    if (existing) continue; // already flagged; don't churn
+  await Promise.all(
+    broken.map(async (b) => {
+      const id = b.url.replace(/[^a-z0-9]+/gi, "-").slice(0, 80);
+      const key = `draft:linkcheck:${id}`;
+      const existing = await env.CURATED_KV!.get(key);
+      if (existing) return; // already flagged; don't churn
 
-    const draft: AgentDraft = {
-      id,
-      type: "triage", // reuse existing draft type so /admin renders it
-      targetUrl: b.url,
-      bodyEn: `**Broken link** (auto-detected by daily watch cron)\n\n- Label: **${b.label}**\n- URL: ${b.url}\n- HTTP status: ${b.status}\n- Latency: ${b.ms}ms\n\nThis URL is referenced in codewhale.net copy. Update the source page or fix the destination.\n\n— drafted by community assistant, pending maintainer review`,
-      bodyZh: `**链接失效**（每日巡检自动发现）\n\n- 名称：**${b.label}**\n- 地址：${b.url}\n- HTTP 状态：${b.status}\n- 延迟：${b.ms}ms\n\n该地址被 codewhale.net 文案引用，请更新源页面或修复目标。\n\n— 由社区助理草拟，待维护者审阅`,
-      generatedAt: new Date().toISOString(),
-      posted: false,
-    };
-    await saveDraft(env.CURATED_KV, draft);
-  }
+      const draft: AgentDraft = {
+        id,
+        type: "triage", // reuse existing draft type so /admin renders it
+        targetUrl: b.url,
+        bodyEn: `**Broken link** (auto-detected by daily watch cron)\n\n- Label: **${b.label}**\n- URL: ${b.url}\n- HTTP status: ${b.status}\n- Latency: ${b.ms}ms\n\nThis URL is referenced in codewhale.net copy. Update the source page or fix the destination.\n\n— drafted by community assistant, pending maintainer review`,
+        bodyZh: `**链接失效**（每日巡检自动发现）\n\n- 名称：**${b.label}**\n- 地址：${b.url}\n- HTTP 状态：${b.status}\n- 延迟：${b.ms}ms\n\n该地址被 codewhale.net 文案引用，请更新源页面或修复目标。\n\n— 由社区助理草拟，待维护者审阅`,
+        generatedAt: new Date().toISOString(),
+        posted: false,
+      };
+      await saveDraft(env.CURATED_KV, draft);
+    })
+  );
 
   return { ok: true, checked: results.length, broken: broken.length, results: broken };
 }
