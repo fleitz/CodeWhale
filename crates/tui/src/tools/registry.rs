@@ -1155,14 +1155,10 @@ impl ToolRegistryBuilder {
     /// so saved transcripts and older prompts still replay.
     #[must_use]
     pub fn with_todo_tool(self, todo_list: super::todo::SharedTodoList) -> Self {
-        use super::todo::{TodoAddTool, TodoListTool, TodoUpdateTool, TodoWriteTool};
+        use super::todo::{TodoListTool, TodoWriteTool};
         self.with_tool(Arc::new(TodoWriteTool::work_update(todo_list.clone())))
             .with_tool(Arc::new(TodoWriteTool::checklist(todo_list.clone())))
             .with_tool(Arc::new(TodoWriteTool::todo(todo_list.clone())))
-            .with_tool(Arc::new(TodoAddTool::checklist(todo_list.clone())))
-            .with_tool(Arc::new(TodoAddTool::todo(todo_list.clone())))
-            .with_tool(Arc::new(TodoUpdateTool::checklist(todo_list.clone())))
-            .with_tool(Arc::new(TodoUpdateTool::todo(todo_list.clone())))
             .with_tool(Arc::new(TodoListTool::checklist(todo_list.clone())))
             .with_tool(Arc::new(TodoListTool::todo(todo_list.clone())))
     }
@@ -1410,12 +1406,8 @@ mod tests {
         for name in [
             "work_update",
             "checklist_write",
-            "checklist_add",
-            "checklist_update",
             "checklist_list",
             "todo_write",
-            "todo_add",
-            "todo_update",
             "todo_list",
         ] {
             assert!(registry.contains(name), "{name} should remain callable");
@@ -1433,12 +1425,8 @@ mod tests {
         );
         for hidden in [
             "checklist_write",
-            "checklist_add",
-            "checklist_update",
             "checklist_list",
             "todo_write",
-            "todo_add",
-            "todo_update",
             "todo_list",
         ] {
             assert!(
