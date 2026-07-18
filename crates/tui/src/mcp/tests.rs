@@ -1098,7 +1098,11 @@ command = "node"
     assert!(config.servers.is_empty());
 }
 
-fn plugin_with_local_mcp(name: &str, base_path: PathBuf) -> crate::plugins::types::LoadedPlugin {
+fn registry_with_local_mcp(
+    name: &str,
+    base_path: PathBuf,
+    workspace: &Path,
+) -> crate::plugins::PluginRegistry {
     fs::write(
         base_path.join("plugin.toml"),
         format!(
@@ -1115,7 +1119,18 @@ args = ["server.js"]
         ),
     )
     .unwrap();
-    crate::plugins::discovery::load_plugin_for_test(&base_path.join("plugin.toml")).unwrap()
+    let plugins_root = base_path.parent().expect("plugin parent").to_path_buf();
+    let discovery = crate::plugins::discovery::DiscoveryConfig {
+        workspace: workspace.to_path_buf(),
+        user_plugins_dir: plugins_root,
+        workspace_plugins_dir: workspace.join(".codewhale/plugins-unused"),
+        builtin_plugin_dirs: Vec::new(),
+        state_path: workspace.join(format!("plugin-state-{name}.json")),
+    };
+    let mut registry = crate::plugins::discovery::discover_with_config(&discovery);
+    registry.trust(name).unwrap();
+    registry.enable(name).unwrap();
+    registry
 }
 
 #[test]
@@ -1132,26 +1147,21 @@ fn plugin_mcp_servers_merge_without_project_config() {
     )
     .unwrap();
 
-    let cfg = load_config_with_workspace_from_plugins(
-        &global_path,
-        &workspace,
-        vec![(
-            "fixture".to_string(),
-            plugin_with_local_mcp("fixture", plugin_base.clone()),
-        )],
-    )
-    .unwrap();
+    let plugins = registry_with_local_mcp("fixture", plugin_base.clone(), &workspace);
+    let staged_root = plugins
+        .get("fixture")
+        .and_then(|plugin| plugin.staged_root.clone())
+        .expect("trusted plugin should have an immutable runtime snapshot");
+    let cfg = load_config_with_workspace_and_plugins(&global_path, &workspace, &plugins).unwrap();
 
     assert!(cfg.servers.contains_key("global"));
+    let qualified_name = qualified_plugin_server_name("fixture", "local");
     let local = cfg
         .servers
-        .get("fixture-local")
+        .get(&qualified_name)
         .expect("plugin MCP should merge without a project MCP config");
     assert_eq!(local.command.as_deref(), Some("node"));
-    assert_eq!(
-        local.cwd.as_deref(),
-        Some(plugin_base.canonicalize().unwrap().as_path())
-    );
+    assert_eq!(local.cwd.as_deref(), Some(staged_root.as_path()));
 }
 
 #[cfg(unix)]
@@ -1771,20 +1781,14 @@ fn workspace_mcp_config_ignores_project_file_until_workspace_trusted() {
     )
     .unwrap();
 
-    let cfg = load_config_with_workspace_from_plugins(
-        &global_path,
-        &workspace,
-        vec![(
-            "fixture".to_string(),
-            plugin_with_local_mcp("fixture", plugin_base),
-        )],
-    )
-    .unwrap();
+    let plugins = registry_with_local_mcp("fixture", plugin_base, &workspace);
+    let cfg = load_config_with_workspace_and_plugins(&global_path, &workspace, &plugins).unwrap();
 
     assert!(cfg.servers.contains_key("global"));
     assert!(!cfg.servers.contains_key("project"));
     assert!(
-        cfg.servers.contains_key("fixture-local"),
+        cfg.servers
+            .contains_key(&qualified_plugin_server_name("fixture", "local")),
         "user plugin MCP should not be gated by project workspace trust"
     );
 }

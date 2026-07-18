@@ -1350,15 +1350,19 @@ fn main() -> Result<()> {
     // admits only built-in provider credential names from a stable file read.
     let cli = Cli::parse();
     let workspace = resolve_workspace(&cli);
+    let mut plugin_discovery = None;
     let mut plugin_registry = None;
     let (cli, command) = prepare_cli_startup(
         cli,
         || {
             let discovery = crate::plugins::PluginDiscoveryContext::capture_pre_dotenv();
             plugin_registry = Some(discovery.registry_for_workspace(&workspace));
+            plugin_discovery = Some(discovery);
         },
         warn_on_workspace_dotenv_result,
     );
+    let plugin_discovery = plugin_discovery
+        .expect("plugin discovery initialization must precede workspace dotenv loading");
     let plugin_registry = plugin_registry
         .expect("plugin discovery initialization must precede workspace dotenv loading");
 
@@ -1372,7 +1376,7 @@ fn main() -> Result<()> {
     let runtime_thread = std::thread::Builder::new()
         .name("codewhale-main".to_string())
         .stack_size(CODEWHALE_MAIN_STACK_BYTES)
-        .spawn(move || run_async_main(cli, command, plugin_registry))
+        .spawn(move || run_async_main(cli, command, plugin_discovery, plugin_registry))
         .context("Failed to start the Codewhale runtime thread")?;
     match runtime_thread.join() {
         Ok(result) => result,
@@ -1391,6 +1395,7 @@ fn main() -> Result<()> {
 async fn run_async_main(
     cli: Cli,
     command: Option<Commands>,
+    plugin_discovery: Arc<crate::plugins::PluginDiscoveryContext>,
     plugin_registry: Arc<crate::plugins::PluginRegistry>,
 ) -> Result<()> {
     // Install signal handlers that restore the terminal before the
