@@ -2061,7 +2061,13 @@ printf 'stdin-bytes=%s\n' "${#payload}"
             );
             #[cfg(windows)]
             let command = "powershell -NoProfile -Command \"$value = [Console]::In.ReadToEnd(); [Console]::Out.WriteLine(('stdin-bytes=' + $value.Length))\"".to_string();
-            let hook = Hook::new(HookEvent::ToolCallBefore, &command).with_timeout(2);
+            // A cold PowerShell process can take several seconds to start on a
+            // contended Windows CI runner. Keep the hook timeout finite so the
+            // regression still detects an inherited live stdin pipe, while
+            // allowing enough startup time for the EOF assertion itself.
+            let hook_timeout_secs = if cfg!(windows) { 10 } else { 2 };
+            let hook =
+                Hook::new(HookEvent::ToolCallBefore, &command).with_timeout(hook_timeout_secs);
             let executor = HookExecutor::new(HooksConfig::default(), dir.path().to_path_buf());
 
             let result = executor.execute_sync(&hook, &HashMap::new());
@@ -2072,7 +2078,8 @@ printf 'stdin-bytes=%s\n' "${#payload}"
 
         // Keep this subprocess's stdin pipe deliberately open. Before #4489,
         // the hook inherited that live pipe and blocked instead of receiving
-        // EOF. The inner test can only finish when HookExecutor uses null stdin.
+        // EOF. The inner test can only finish when HookExecutor closes the
+        // child's stdin write end.
         let mut child = Command::new(std::env::current_exe().expect("current test binary"))
             .args(["--exact", TEST_NAME, "--nocapture", "--test-threads=1"])
             .env(INNER_ENV, "1")
@@ -2080,8 +2087,11 @@ printf 'stdin-bytes=%s\n' "${#payload}"
             .spawn()
             .expect("spawn isolated hook EOF test");
         let held_open_stdin = child.stdin.take().expect("piped child stdin");
+        // Leave headroom around the inner hook timeout so a cold Windows test
+        // process can start, without weakening the held-open-pipe regression.
+        let isolated_timeout_secs = if cfg!(windows) { 25 } else { 10 };
         let status = match child
-            .wait_timeout(Duration::from_secs(10))
+            .wait_timeout(Duration::from_secs(isolated_timeout_secs))
             .expect("wait for isolated hook EOF test")
         {
             Some(status) => status,
