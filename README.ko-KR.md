@@ -1,4 +1,4 @@
-<!-- source: README.md sha256:ddc9cd7b5aea -->
+<!-- source: README.md sha256:ed346d675bdf -->
 # Codewhale
 
 터미널에서 쓰는 코딩 에이전트입니다. 어떤 모델과도 동작하며, 오픈 모델을

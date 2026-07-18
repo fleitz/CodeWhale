@@ -1,4 +1,4 @@
-<!-- source: README.md sha256:ddc9cd7b5aea -->
+<!-- source: README.md sha256:ed346d675bdf -->
 # Codewhale
 
 Một coding agent cho terminal của bạn. Hoạt động với mọi model; ưu tiên model mở.

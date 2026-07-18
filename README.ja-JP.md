@@ -1,4 +1,4 @@
-<!-- source: README.md sha256:ddc9cd7b5aea -->
+<!-- source: README.md sha256:ed346d675bdf -->
 # Codewhale
 
 ターミナルで動くコーディングエージェント。あらゆるモデルで動作し、オープンモデルを最優先します。
