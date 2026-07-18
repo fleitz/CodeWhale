@@ -1110,8 +1110,9 @@ fn reject_symlink_components(root: &Path, target: &Path, kind: &str) -> Result<(
 
 fn looks_windows_absolute(raw: &str) -> bool {
     let bytes = raw.as_bytes();
-    raw.starts_with("\\\\")
-        || raw.starts_with("//")
+    bytes
+        .first()
+        .is_some_and(|byte| matches!(*byte, b'\\' | b'/'))
         || (bytes.len() >= 3
             && bytes[0].is_ascii_alphabetic()
             && bytes[1] == b':'
@@ -1321,6 +1322,48 @@ fn open_bundle_directory(path: &Path) -> std::io::Result<fs::File> {
     Ok(file)
 }
 
+/// Reopen a reviewed path only to compare its current handle identity with a
+/// retained authority handle. Desired access is zero and sharing is permissive
+/// because the retained handle remains responsible for denying writes and
+/// replacement throughout the comparison.
+#[cfg(windows)]
+pub(crate) fn open_bundle_identity_probe(
+    path: &Path,
+    expect_directory: bool,
+) -> std::io::Result<fs::File> {
+    use std::os::windows::fs::OpenOptionsExt as _;
+
+    const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x0000_0400;
+    const FILE_FLAG_BACKUP_SEMANTICS: u32 = 0x0200_0000;
+    const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
+    const FILE_SHARE_READ_WRITE_DELETE: u32 = 0x0000_0007;
+    let flags = FILE_FLAG_OPEN_REPARSE_POINT
+        | if expect_directory {
+            FILE_FLAG_BACKUP_SEMANTICS
+        } else {
+            0
+        };
+    let file = fs::OpenOptions::new()
+        .access_mode(0)
+        .share_mode(FILE_SHARE_READ_WRITE_DELETE)
+        .custom_flags(flags)
+        .open(path)?;
+    let metadata = file.metadata()?;
+    let identity = windows_file_identity(&file)?;
+    let expected_kind = if expect_directory {
+        metadata.is_dir()
+    } else {
+        metadata.is_file() && identity.links == 1
+    };
+    if !expected_kind || identity.attributes & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "plugin identity probe found a reparse point, hard link, or unexpected object",
+        ));
+    }
+    Ok(file)
+}
+
 #[cfg(windows)]
 fn ensure_windows_path_still_opened(path: &Path, opened: &fs::File) -> Result<(), String> {
     let after = fs::symlink_metadata(path)
@@ -1328,14 +1371,15 @@ fn ensure_windows_path_still_opened(path: &Path, opened: &fs::File) -> Result<()
     if metadata_is_link_or_reparse(&after) {
         return Err("plugin path changed into a reparse point during validation".to_string());
     }
-    let current = if after.is_dir() {
-        open_bundle_directory(path)
+    let expect_directory = if after.is_dir() {
+        true
     } else if after.is_file() {
-        open_bundle_file(path)
+        false
     } else {
         return Err("plugin path changed into an unsupported object during validation".to_string());
-    }
-    .map_err(|e| format!("failed to reopen plugin path for identity validation: {e}"))?;
+    };
+    let current = open_bundle_identity_probe(path, expect_directory)
+        .map_err(|e| format!("failed to reopen plugin path for identity validation: {e}"))?;
     let opened = windows_file_identity(opened)
         .map_err(|e| format!("failed to identify retained plugin handle: {e}"))?;
     let current = windows_file_identity(&current)
@@ -1699,6 +1743,37 @@ mod tests {
             "\n[mcp_servers.remote]\nurl = \"https://user:secret@example.invalid/mcp\"\n",
         );
         assert!(PluginManifest::validate_from_path(&credentialed_path).is_err());
+    }
+
+    #[test]
+    fn windows_rooted_path_detection_is_host_independent() {
+        assert!(looks_windows_absolute(r"C:\plugins\server.js"));
+        assert!(looks_windows_absolute(r"C:/plugins/server.js"));
+        assert!(looks_windows_absolute(r"\plugins\server.js"));
+        assert!(looks_windows_absolute("/plugins/server.js"));
+        assert!(!looks_windows_absolute("plugins/server.js"));
+        assert!(!looks_windows_absolute("server.js"));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn retained_bundle_handle_allows_identity_revalidation_but_denies_writes() {
+        use std::os::windows::fs::OpenOptionsExt as _;
+
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("reviewed.bin");
+        fs::write(&path, b"reviewed").unwrap();
+        let retained = open_bundle_file(&path).unwrap();
+
+        ensure_windows_path_still_opened(&path, &retained).unwrap();
+        let denied = fs::OpenOptions::new()
+            .write(true)
+            .share_mode(0x0000_0007)
+            .open(&path);
+        assert!(denied.is_err(), "retained authority must deny mutation");
+
+        drop(retained);
+        fs::OpenOptions::new().write(true).open(&path).unwrap();
     }
 
     #[test]

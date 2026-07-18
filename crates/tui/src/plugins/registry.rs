@@ -975,6 +975,7 @@ fn ensure_private_runtime_parent(state_path: &Path, parent: &Path) -> Result<(),
         .map_err(|e| format!("failed to canonicalize plugin state directory: {e}"))?;
     let relative = parent
         .strip_prefix(&base)
+        .or_else(|_| parent.strip_prefix(configured_base))
         .map_err(|_| "plugin runtime snapshot escaped the state directory".to_string())?;
     let mut cursor = base;
     for component in relative.components() {
@@ -1151,14 +1152,15 @@ fn ensure_windows_registry_path_still_opened(path: &Path, opened: &fs::File) -> 
     if metadata_is_link_or_reparse(&after) {
         return Err("Plugin path changed into a reparse point during staging".to_string());
     }
-    let current = if after.is_dir() {
-        open_windows_bundle_directory(path)?
+    let expect_directory = if after.is_dir() {
+        true
     } else if after.is_file() {
-        super::manifest::open_bundle_file(path)
-            .map_err(|e| format!("failed to reopen staged source file safely: {e}"))?
+        false
     } else {
         return Err("Plugin path changed into an unsupported object during staging".to_string());
     };
+    let current = super::manifest::open_bundle_identity_probe(path, expect_directory)
+        .map_err(|e| format!("failed to reopen staged source path safely: {e}"))?;
     let opened = windows_file_identity(opened)
         .map_err(|e| format!("failed to identify retained plugin handle: {e}"))?;
     let current = windows_file_identity(&current)
@@ -1702,7 +1704,7 @@ mod state_publication_tests {
     #[test]
     fn successful_state_publication_replaces_the_stable_file_without_temp_debris() {
         let directory = tempfile::tempdir().unwrap();
-        let state_path = directory.path().join("state.json");
+        let state_path = directory.path().join("state-鲸.json");
         std::fs::write(&state_path, b"old-authoritative-state").unwrap();
 
         save_state_with_hardener(
@@ -1718,7 +1720,7 @@ mod state_publication_tests {
             .unwrap()
             .map(|entry| entry.unwrap().file_name())
             .collect::<Vec<_>>();
-        assert_eq!(entries, [std::ffi::OsString::from("state.json")]);
+        assert_eq!(entries, [std::ffi::OsString::from("state-鲸.json")]);
     }
 
     #[test]
@@ -1760,7 +1762,8 @@ mod state_publication_tests {
 #[cfg(all(test, windows))]
 mod windows_acl_tests {
     use super::{
-        ensure_private_runtime_parent, harden_staged_tree_contents, set_windows_owner_only_acl,
+        PluginStateFile, ensure_private_runtime_parent, harden_plugin_state_file,
+        harden_staged_tree_contents, save_state_with_hardener, set_windows_owner_only_acl,
     };
     use std::ffi::c_void;
     use std::mem::{MaybeUninit, size_of};
@@ -1830,6 +1833,37 @@ mod windows_acl_tests {
 
         let error = harden_staged_tree_contents(&stage).unwrap_err();
         assert!(error.contains("reparse point"), "unexpected error: {error}");
+    }
+
+    #[test]
+    fn blocked_state_replacement_preserves_the_stable_authority_file() {
+        use std::os::windows::fs::OpenOptionsExt as _;
+
+        let directory = tempfile::tempdir().unwrap();
+        let state_path = directory.path().join("state.json");
+        std::fs::write(&state_path, b"old-authoritative-state").unwrap();
+        let retained = std::fs::OpenOptions::new()
+            .read(true)
+            .share_mode(0x0000_0001)
+            .open(&state_path)
+            .unwrap();
+
+        let error = save_state_with_hardener(
+            &state_path,
+            &PluginStateFile::default(),
+            harden_plugin_state_file,
+        )
+        .unwrap_err();
+
+        assert!(
+            error.contains("durably persist"),
+            "unexpected error: {error}"
+        );
+        assert_eq!(
+            std::fs::read(&state_path).unwrap(),
+            b"old-authoritative-state"
+        );
+        drop(retained);
     }
 
     #[test]
