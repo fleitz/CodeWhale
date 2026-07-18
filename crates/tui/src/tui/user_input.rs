@@ -409,7 +409,7 @@ impl ModalView for UserInputView {
                     } else {
                         self.other_input.clone()
                     },
-                    Style::default().fg(palette::WHALE_ACCENT_PRIMARY),
+                    Style::default().fg(palette::WHALE_HUMAN),
                 ),
             ]));
         }

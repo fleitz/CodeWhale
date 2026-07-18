@@ -63,7 +63,7 @@ pub fn render(f: &mut Frame, area: Rect, app: &App) {
             .title(Line::from(Span::styled(
                 " Codewhale ",
                 Style::default()
-                    .fg(palette::WHALE_ACCENT_PRIMARY)
+                    .fg(palette::WHALE_HUMAN)
                     .add_modifier(Modifier::BOLD),
             )))
             .borders(Borders::ALL)
@@ -344,7 +344,7 @@ fn provider_lines(app: &App) -> Vec<ratatui::text::Line<'static>> {
         let is_current = app.onboarding_provider == *provider;
         let bullet = if is_current { "●" } else { "○" };
         let bullet_color = if is_current {
-            palette::WHALE_ACCENT_PRIMARY
+            palette::WHALE_ACTION
         } else {
             palette::TEXT_MUTED
         };

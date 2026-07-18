@@ -514,7 +514,7 @@ impl ModalView for HelpView {
                         lines.push(Line::from(Span::styled(
                             format!("  {} ({})", section.label(self.locale), count),
                             Style::default()
-                                .fg(palette::WHALE_ACCENT_PRIMARY)
+                                .fg(palette::WHALE_ACTION)
                                 .add_modifier(Modifier::BOLD),
                         )));
                     }

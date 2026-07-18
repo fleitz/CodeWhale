@@ -288,7 +288,7 @@ impl<'a> HeaderWidget<'a> {
             return Vec::new();
         };
         let color = if frame == "cw" {
-            palette::WHALE_ACCENT_PRIMARY
+            palette::WHALE_HUMAN
         } else {
             palette::WHALE_INFO
         };
@@ -858,6 +858,36 @@ mod tests {
             whale_idx < max_idx,
             "expected whale to render before effort label, got: {rendered}"
         );
+    }
+
+    #[test]
+    fn cw_indicator_keeps_the_human_brand_lane_distinct_from_live_frames() {
+        let cw = HeaderWidget::new(
+            HeaderData::new(
+                AppMode::Agent,
+                "deepseek-v4-pro",
+                "codewhale-tui",
+                false,
+                palette::WHALE_BG,
+            )
+            .with_status_indicator(Some("cw")),
+        )
+        .status_indicator_spans();
+        let live = HeaderWidget::new(
+            HeaderData::new(
+                AppMode::Agent,
+                "deepseek-v4-pro",
+                "codewhale-tui",
+                false,
+                palette::WHALE_BG,
+            )
+            .with_status_indicator(Some("··")),
+        )
+        .status_indicator_spans();
+
+        assert_eq!(cw[0].style.fg, Some(palette::WHALE_HUMAN));
+        assert_eq!(live[0].style.fg, Some(palette::WHALE_INFO));
+        assert_ne!(cw[0].style.fg, live[0].style.fg);
     }
 
     #[test]

@@ -125,7 +125,7 @@ pub(crate) fn render_underwater_surface(
         .title(Line::from(Span::styled(
             format!(" {title} "),
             Style::default()
-                .fg(palette::WHALE_ACCENT_PRIMARY)
+                .fg(palette::WHALE_ACTION)
                 .add_modifier(Modifier::BOLD),
         )))
         .borders(Borders::TOP | Borders::BOTTOM)
@@ -3100,7 +3100,7 @@ impl ModalView for ConfigView {
                     Line::from(vec![
                         Span::styled(
                             self.tr(MessageId::ConfigTitle),
-                            Style::default().fg(palette::WHALE_ACCENT_PRIMARY).bold(),
+                            Style::default().fg(palette::WHALE_ACTION).bold(),
                         ),
                         Span::styled(
                             format!(" — {}", self.tr(MessageId::ConfigSubtitle)),
@@ -3597,7 +3597,7 @@ impl ModalView for SubAgentsView {
             Line::from(vec![
                 Span::styled(
                     "─ fleet ",
-                    Style::default().fg(palette::WHALE_ACCENT_PRIMARY).bold(),
+                    Style::default().fg(palette::WHALE_ACTION).bold(),
                 ),
                 Span::styled(
                     "──────────────────────── ",
@@ -3766,7 +3766,7 @@ fn format_agent_status(
         SubAgentStatus::Running => ("running", Style::default().fg(palette::WHALE_INFO), None),
         SubAgentStatus::Completed => (
             "completed",
-            Style::default().fg(palette::WHALE_ACCENT_PRIMARY),
+            Style::default().fg(palette::STATUS_SUCCESS),
             None,
         ),
         SubAgentStatus::Interrupted(reason) => (
@@ -4990,7 +4990,7 @@ base_url = "https://api.xiaomimimo.com/v1"
         );
         assert!(
             !(area.x..area.x.saturating_add(area.width))
-                .any(|x| buf[(x, y)].bg == palette::WHALE_ACCENT_PRIMARY),
+                .any(|x| buf[(x, y)].bg == palette::WHALE_ACTION),
             "selected config row should not use the bright accent background"
         );
     }

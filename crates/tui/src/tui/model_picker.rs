@@ -1683,7 +1683,7 @@ impl ModelPickerView {
             Line::from(vec![
                 Span::styled(
                     format!("─ {} ", tr(self.locale, MessageId::RoutePanelHeader)),
-                    Style::default().fg(palette::WHALE_ACCENT_PRIMARY).bold(),
+                    Style::default().fg(palette::WHALE_ACTION).bold(),
                 ),
                 Span::styled(
                     "──────────────────────── ",
@@ -3718,7 +3718,7 @@ mod tests {
         );
         assert!(
             !(area.x..area.x.saturating_add(area.width))
-                .any(|x| buf[(x, y)].bg == palette::WHALE_ACCENT_PRIMARY),
+                .any(|x| buf[(x, y)].bg == palette::WHALE_ACTION),
             "selected /model row should not use the bright accent background"
         );
     }

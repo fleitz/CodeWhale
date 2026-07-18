@@ -1,13 +1,14 @@
 use super::adapt::{
     ColorDepth, adapt_bg, adapt_bg_for_palette_mode, adapt_bg_for_theme, adapt_color,
-    adapt_fg_for_palette_mode, adapt_fg_for_theme, blend, luma, nearest_ansi16, pulse_brightness,
-    reasoning_surface_tint, rgb_to_ansi256,
+    adapt_fg_for_depth, adapt_fg_for_palette_mode, adapt_fg_for_theme, blend, luma, nearest_ansi16,
+    pulse_brightness, reasoning_surface_tint, rgb_to_ansi256,
 };
 use super::detect::{PaletteMode, palette_mode_from_apple_interface_style};
 use super::themes::{
-    GRAYSCALE_UI_THEME, LIGHT_UI_THEME, MATRIX_UI_THEME, SOLARIZED_LIGHT_UI_THEME,
-    TERMINAL_UI_THEME, TOKYO_NIGHT_UI_THEME, ThemeId, UI_THEME, UiTheme, normalize_hex_rgb_color,
-    normalize_theme_name, parse_hex_rgb_color, theme_label_for_mode, ui_theme_from_settings,
+    CATPPUCCIN_MOCHA_UI_THEME, GRAYSCALE_UI_THEME, LIGHT_UI_THEME, MATRIX_UI_THEME,
+    SELECTABLE_THEMES, SOLARIZED_LIGHT_UI_THEME, TERMINAL_UI_THEME, TOKYO_NIGHT_UI_THEME, ThemeId,
+    UI_THEME, UiTheme, normalize_hex_rgb_color, normalize_theme_name, parse_hex_rgb_color,
+    theme_label_for_mode, ui_theme_from_settings,
 };
 use super::tokens::{
     ACCENT_REASONING_LIVE, DIFF_ADDED, DIFF_ADDED_BG, DIFF_DELETED_BG, GRAYSCALE_BORDER,
@@ -18,9 +19,9 @@ use super::tokens::{
     LIGHT_TEXT_HINT, LIGHT_WARNING, MODE_AGENT, MODE_PLAN, MODE_YOLO, SELECTION_BG,
     SOLARIZED_PANEL, SOLARIZED_SURFACE, SOLARIZED_TEXT_BODY, SOLARIZED_TEXT_HINT, STATUS_ERROR,
     STATUS_WARNING, SURFACE_ERROR, SURFACE_REASONING, SURFACE_REASONING_TINT, SURFACE_TOOL_ACTIVE,
-    TEXT_BODY, TEXT_HINT, TEXT_REASONING, TEXT_TOOL_OUTPUT, WHALE_ACTION, WHALE_BG, WHALE_ERROR,
-    WHALE_HUMAN, WHALE_INFO, WHALE_LIVE, WHALE_PANEL, WHALE_REASONING_TEXT_RGB,
-    WHALE_REASONING_TINT_RGB, WHALE_TEXT_BODY_RGB,
+    TEXT_BODY, TEXT_HINT, TEXT_REASONING, TEXT_TOOL_OUTPUT, WHALE_ACCENT_PRIMARY, WHALE_ACTION,
+    WHALE_BG, WHALE_ERROR, WHALE_HUMAN, WHALE_INFO, WHALE_LIVE, WHALE_PANEL,
+    WHALE_REASONING_TEXT_RGB, WHALE_REASONING_TINT_RGB, WHALE_TEXT_BODY_RGB,
 };
 use ratatui::style::Color;
 
@@ -423,6 +424,69 @@ fn adapt_color_drops_to_named_on_ansi16() {
         adapt_color(WHALE_ERROR, ColorDepth::Ansi16),
         Color::LightRed
     );
+}
+
+#[test]
+fn semantic_tokens_keep_brand_compatibility_distinct_from_action() {
+    assert_eq!(WHALE_ACCENT_PRIMARY, WHALE_HUMAN);
+    assert_eq!(WHALE_ACTION, WHALE_INFO);
+    assert_ne!(WHALE_ACTION, WHALE_HUMAN);
+}
+
+#[test]
+fn community_theme_info_keeps_the_sky_live_role_on_ansi16() {
+    assert_eq!(
+        adapt_fg_for_depth(
+            CATPPUCCIN_MOCHA_UI_THEME.info,
+            CATPPUCCIN_MOCHA_UI_THEME.info,
+            ColorDepth::Ansi16,
+            &CATPPUCCIN_MOCHA_UI_THEME,
+        ),
+        Color::LightCyan,
+    );
+    assert_eq!(
+        adapt_fg_for_depth(
+            CATPPUCCIN_MOCHA_UI_THEME.status_working,
+            CATPPUCCIN_MOCHA_UI_THEME.status_working,
+            ColorDepth::Ansi16,
+            &CATPPUCCIN_MOCHA_UI_THEME,
+        ),
+        Color::LightCyan,
+    );
+}
+
+#[test]
+fn every_selectable_theme_keeps_action_and_working_roles_distinct_on_ansi16() {
+    for theme_id in SELECTABLE_THEMES {
+        // Grayscale deliberately collapses colored semantic lanes to neutral
+        // luminance tiers before terminal-depth adaptation.
+        if *theme_id == ThemeId::Grayscale {
+            continue;
+        }
+        let ui = theme_id.ui_theme();
+        assert_eq!(
+            adapt_fg_for_depth(
+                ui.accent_primary,
+                ui.accent_primary,
+                ColorDepth::Ansi16,
+                &ui,
+            ),
+            Color::LightBlue,
+            "theme '{}' lost the action lane",
+            theme_id.name(),
+        );
+        assert_eq!(
+            adapt_fg_for_depth(
+                ui.status_working,
+                ui.status_working,
+                ColorDepth::Ansi16,
+                &ui,
+            ),
+            Color::LightCyan,
+            "theme '{}' lost the live working lane",
+            theme_id.name(),
+        );
+    }
 }
 
 #[test]

@@ -3028,7 +3028,7 @@ async fn run_doctor(
     use crate::palette;
     use colored::Colorize;
 
-    let (accent_r, accent_g, accent_b) = palette::WHALE_ACCENT_PRIMARY_RGB;
+    let (accent_r, accent_g, accent_b) = palette::WHALE_HUMAN_RGB;
     let (sky_r, sky_g, sky_b) = palette::WHALE_INFO_RGB;
     let (aqua_r, aqua_g, aqua_b) = palette::WHALE_INFO_RGB;
     let (red_r, red_g, red_b) = palette::WHALE_ERROR_RGB;
@@ -5578,7 +5578,8 @@ fn list_sessions(limit: usize, search: Option<String>) -> Result<()> {
     use colored::Colorize;
     use session_manager::{SessionManager, format_session_line};
 
-    let (accent_r, accent_g, accent_b) = palette::WHALE_ACCENT_PRIMARY_RGB;
+    let (action_r, action_g, action_b) = palette::WHALE_ACTION_RGB;
+    let (human_r, human_g, human_b) = palette::WHALE_HUMAN_RGB;
     let (sky_r, sky_g, sky_b) = palette::WHALE_INFO_RGB;
     let (aqua_r, aqua_g, aqua_b) = palette::WHALE_INFO_RGB;
 
@@ -5594,7 +5595,7 @@ fn list_sessions(limit: usize, search: Option<String>) -> Result<()> {
         println!("{}", "No sessions found.".truecolor(sky_r, sky_g, sky_b));
         println!(
             "Start a new session with: {}",
-            "codewhale".truecolor(accent_r, accent_g, accent_b)
+            "codewhale".truecolor(human_r, human_g, human_b)
         );
         return Ok(());
     }
@@ -5602,7 +5603,7 @@ fn list_sessions(limit: usize, search: Option<String>) -> Result<()> {
     println!(
         "{}",
         "Saved Sessions"
-            .truecolor(accent_r, accent_g, accent_b)
+            .truecolor(action_r, action_g, action_b)
             .bold()
     );
     println!("{}", "==============".truecolor(sky_r, sky_g, sky_b));
@@ -5629,12 +5630,12 @@ fn list_sessions(limit: usize, search: Option<String>) -> Result<()> {
     println!();
     println!(
         "Resume with: {} {}",
-        sessions_resume_command().truecolor(accent_r, accent_g, accent_b),
+        sessions_resume_command().truecolor(action_r, action_g, action_b),
         "<session-id>".dimmed()
     );
     println!(
         "Continue latest in this workspace: {}",
-        "codewhale --continue".truecolor(accent_r, accent_g, accent_b)
+        "codewhale --continue".truecolor(action_r, action_g, action_b)
     );
 
     Ok(())

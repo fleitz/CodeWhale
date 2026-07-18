@@ -41,11 +41,11 @@ fn adapt_fg_for_light_palette(color: Color) -> Color {
         LIGHT_BORDER
     } else if color == TEXT_ACCENT || color == ACCENT_TOOL_LIVE {
         LIGHT_LIVE
-    } else if color == WHALE_INFO || color == WHALE_ACCENT_PRIMARY {
+    } else if color == WHALE_INFO || color == WHALE_ACTION {
         LIGHT_ACTION
     } else if color == MODE_AGENT {
         LIGHT_UI_THEME.mode_agent
-    } else if color == WHALE_HUMAN {
+    } else if color == WHALE_HUMAN || color == WHALE_ACCENT_PRIMARY {
         LIGHT_HUMAN
     } else if color == MODE_PLAN {
         LIGHT_UI_THEME.mode_plan
@@ -114,11 +114,11 @@ fn adapt_fg_for_solarized_light_palette(color: Color) -> Color {
         SOLARIZED_BORDER
     } else if color == TEXT_ACCENT || color == ACCENT_TOOL_LIVE {
         SOLARIZED_CYAN
-    } else if color == WHALE_INFO || color == WHALE_ACCENT_PRIMARY {
+    } else if color == WHALE_INFO || color == WHALE_ACTION {
         SOLARIZED_BLUE
     } else if color == MODE_AGENT {
         SOLARIZED_LIGHT_UI_THEME.mode_agent
-    } else if color == WHALE_HUMAN {
+    } else if color == WHALE_HUMAN || color == WHALE_ACCENT_PRIMARY {
         SOLARIZED_ORANGE
     } else if color == MODE_PLAN {
         SOLARIZED_LIGHT_UI_THEME.mode_plan
@@ -252,11 +252,11 @@ pub fn adapt_fg_for_theme(color: Color, theme: ThemeId, ui: &UiTheme) -> Color {
         ui.border
     } else if color == TEXT_ACCENT || color == ACCENT_TOOL_LIVE {
         ui.status_working
-    } else if color == WHALE_INFO || color == WHALE_ACCENT_PRIMARY {
+    } else if color == WHALE_INFO || color == WHALE_ACTION {
         ui.accent_primary
     } else if color == MODE_AGENT {
         ui.mode_agent
-    } else if color == WHALE_HUMAN {
+    } else if color == WHALE_HUMAN || color == WHALE_ACCENT_PRIMARY {
         ui.accent_action
     } else if color == MODE_PLAN {
         ui.mode_plan
@@ -542,7 +542,7 @@ fn raw_semantic_foreground_role(color: Color) -> Option<SemanticForegroundRole> 
         Some(SemanticForegroundRole::Action)
     } else if color == WHALE_LIVE || color == TEXT_ACCENT || color == ACCENT_TOOL_LIVE {
         Some(SemanticForegroundRole::Live)
-    } else if color == WHALE_HUMAN {
+    } else if color == WHALE_HUMAN || color == WHALE_ACCENT_PRIMARY {
         Some(SemanticForegroundRole::Human)
     } else if color == STATUS_WARNING {
         Some(SemanticForegroundRole::Warning)
@@ -572,6 +572,9 @@ fn theme_semantic_foreground_role(color: Color, ui: &UiTheme) -> Option<Semantic
     } else if color == ui.status_working
         || color == ui.accent_secondary
         || color == ui.tool_running
+        // `UiTheme::info` is the sky/worker lane used by ambient and live
+        // surfaces. Several shipped themes intentionally alias it to their
+        // working color, so it must not precede the live buckets.
         || color == ui.info
     {
         Some(SemanticForegroundRole::Live)

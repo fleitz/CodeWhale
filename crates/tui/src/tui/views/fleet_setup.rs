@@ -888,7 +888,7 @@ impl ModalView for FleetSetupView {
             .title(Line::from(Span::styled(
                 " Fleet setup — your agent team ",
                 Style::default()
-                    .fg(palette::WHALE_ACCENT_PRIMARY)
+                    .fg(palette::WHALE_ACTION)
                     .add_modifier(Modifier::BOLD),
             )))
             .title_bottom(
@@ -1233,7 +1233,7 @@ fn render_choice_step(
     let mut detail_lines: Vec<Line> = vec![
         Line::from(Span::styled(
             choice.summary.clone(),
-            Style::default().fg(palette::WHALE_ACCENT_PRIMARY).bold(),
+            Style::default().fg(palette::WHALE_ACTION).bold(),
         )),
         Line::from(""),
         Line::from(Span::styled(

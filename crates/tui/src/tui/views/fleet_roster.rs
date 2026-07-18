@@ -217,7 +217,7 @@ impl ModalView for FleetRosterView {
             Line::from(vec![
                 Span::styled(
                     format!("─ {} ", tr(self.locale, MessageId::FleetRosterHeaderLabel)),
-                    Style::default().fg(palette::WHALE_ACCENT_PRIMARY).bold(),
+                    Style::default().fg(palette::WHALE_ACTION).bold(),
                 ),
                 Span::styled(
                     "──────────────────────── ",
@@ -317,7 +317,7 @@ impl FleetRosterView {
                         self.operator.model
                     ),
                     Style::default()
-                        .fg(palette::WHALE_ACCENT_PRIMARY)
+                        .fg(palette::WHALE_ACTION)
                         .add_modifier(Modifier::BOLD),
                 )
             } else {

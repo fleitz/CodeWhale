@@ -20,7 +20,7 @@ pub fn lines(app: &App) -> Vec<Line<'static>> {
         Line::from(Span::styled(
             "codewhale",
             Style::default()
-                .fg(palette::WHALE_ACCENT_PRIMARY)
+                .fg(palette::WHALE_HUMAN)
                 .add_modifier(Modifier::BOLD),
         )),
         Line::from(Span::styled(
@@ -131,6 +131,14 @@ mod tests {
         assert!(body.contains("/constitution"));
         assert!(!body.contains("add an API key"));
         assert!(!body.contains("land in the chat"));
+    }
+
+    #[test]
+    fn welcome_wordmark_uses_the_human_brand_lane() {
+        let app = test_app_with_locale(Locale::En);
+        let welcome = lines(&app);
+        assert_eq!(welcome[0].spans[0].style.fg, Some(palette::WHALE_HUMAN));
+        assert_ne!(palette::WHALE_HUMAN, palette::WHALE_ACTION);
     }
 
     #[test]

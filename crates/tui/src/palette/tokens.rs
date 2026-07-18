@@ -16,9 +16,12 @@ pub const WHALE_TEXT_HINT_RGB: (u8, u8, u8) = (132, 145, 170); // #8491AA
 #[allow(dead_code)]
 pub const WHALE_TEXT_DIM_RGB: (u8, u8, u8) = (105, 119, 145); // #697791
 pub const WHALE_ACTION_RGB: (u8, u8, u8) = (106, 174, 242); // #6AAEF2 Cobalt action blue
-pub const WHALE_ACCENT_PRIMARY_RGB: (u8, u8, u8) = WHALE_ACTION_RGB;
 pub const WHALE_ACCENT_SECONDARY_RGB: (u8, u8, u8) = (79, 209, 197); // #4FD1C5 Seafoam
 pub const WHALE_HUMAN_RGB: (u8, u8, u8) = (246, 196, 83); // #F6C453 Signal Gold
+/// Compatibility name retained for downstream callers that used the original
+/// Codewhale brand accent. New action/focus call sites should use
+/// [`WHALE_ACTION_RGB`] instead.
+pub const WHALE_ACCENT_PRIMARY_RGB: (u8, u8, u8) = WHALE_HUMAN_RGB;
 pub const WHALE_WORKING_GREEN_RGB: (u8, u8, u8) = (155, 214, 111); // #9BD66F Working Green
 #[allow(dead_code)]
 pub const WHALE_ACCENT_ACTION_RGB: (u8, u8, u8) = WHALE_HUMAN_RGB;
@@ -224,7 +227,8 @@ pub const WHALE_ACCENT_PRIMARY: Color = Color::Rgb(
     WHALE_ACCENT_PRIMARY_RGB.1,
     WHALE_ACCENT_PRIMARY_RGB.2,
 );
-pub const WHALE_ACTION: Color = WHALE_ACCENT_PRIMARY;
+pub const WHALE_ACTION: Color =
+    Color::Rgb(WHALE_ACTION_RGB.0, WHALE_ACTION_RGB.1, WHALE_ACTION_RGB.2);
 pub const WHALE_LIVE: Color = Color::Rgb(
     WHALE_ACCENT_SECONDARY_RGB.0,
     WHALE_ACCENT_SECONDARY_RGB.1,

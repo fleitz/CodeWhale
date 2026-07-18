@@ -1627,7 +1627,7 @@ fn freeform_note_line(locale: Locale, note: &str, editing: bool) -> Line<'static
         (_, false, false) => format!("F Own words: {preview}"),
     };
     let style = if editing || !preview.is_empty() {
-        Style::default().fg(palette::WHALE_ACCENT_PRIMARY)
+        Style::default().fg(palette::WHALE_HUMAN)
     } else {
         Style::default().fg(palette::TEXT_MUTED)
     };
@@ -2552,6 +2552,18 @@ impl ModalView for SetupWizardView {
         lines.push(Line::from(""));
         for (idx, step) in STEP_SPECS.iter().enumerate() {
             let selected = idx == self.selected;
+            let status = self.state.status(step.id());
+            let status_color = match status {
+                StepStatus::InProgress => palette::WHALE_LIVE,
+                StepStatus::NeedsAction => palette::WHALE_HUMAN,
+                StepStatus::Verified => palette::STATUS_SUCCESS,
+                StepStatus::Failed => palette::STATUS_ERROR,
+                StepStatus::NotStarted
+                | StepStatus::Recommended
+                | StepStatus::Optional
+                | StepStatus::Deferred
+                | StepStatus::Skipped => palette::TEXT_MUTED,
+            };
             let marker = if selected { ">" } else { " " };
             let style = if selected {
                 Style::default()
@@ -2565,8 +2577,8 @@ impl ModalView for SetupWizardView {
                 Span::styled(tr(self.locale, step.title_id()).to_string(), style),
                 Span::raw("  "),
                 Span::styled(
-                    self.status_label(self.state.status(step.id())).to_string(),
-                    Style::default().fg(palette::WHALE_ACCENT_PRIMARY),
+                    self.status_label(status).to_string(),
+                    Style::default().fg(status_color),
                 ),
             ]));
         }
@@ -2700,7 +2712,7 @@ impl SetupWizardView {
         if self.facts.constitution_file == SetupConstitutionFileState::Loaded {
             lines.push(Line::from(Span::styled(
                 keep_existing_invitation_line(self.locale),
-                Style::default().fg(palette::WHALE_ACCENT_PRIMARY),
+                Style::default().fg(palette::WHALE_HUMAN),
             )));
         }
         if let Some(label) = self
@@ -2710,12 +2722,12 @@ impl SetupWizardView {
         {
             lines.push(Line::from(Span::styled(
                 model_draft_ready_line(self.locale, label),
-                Style::default().fg(palette::WHALE_ACCENT_PRIMARY),
+                Style::default().fg(palette::STATUS_SUCCESS),
             )));
         } else if self.facts.provider_ready {
             lines.push(Line::from(Span::styled(
                 model_draft_invitation_line(self.locale, &self.facts.model),
-                Style::default().fg(palette::WHALE_ACCENT_PRIMARY),
+                Style::default().fg(palette::WHALE_HUMAN),
             )));
         }
         lines.push(Line::from(Span::styled(

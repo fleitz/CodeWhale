@@ -32,7 +32,7 @@ fn section_block(title: &str) -> Block<'static> {
         .title(Line::from(vec![Span::styled(
             title.to_string(),
             Style::default()
-                .fg(palette::WHALE_ACCENT_PRIMARY)
+                .fg(palette::WHALE_ACTION)
                 .add_modifier(Modifier::BOLD),
         )]))
         .borders(Borders::TOP)
@@ -1337,7 +1337,7 @@ mod tests {
 
         assert_eq!(span.style.fg, Some(palette::SELECTION_TEXT));
         assert_eq!(span.style.bg, Some(palette::SELECTION_BG));
-        assert_ne!(span.style.bg, Some(palette::WHALE_ACCENT_PRIMARY));
+        assert_ne!(span.style.bg, Some(palette::WHALE_ACTION));
         assert!(span.style.add_modifier.contains(Modifier::BOLD));
     }
 
@@ -1376,7 +1376,7 @@ mod tests {
         );
         assert!(
             !(area.x..area.x.saturating_add(area.width))
-                .any(|x| buf[(x, y)].bg == palette::WHALE_ACCENT_PRIMARY),
+                .any(|x| buf[(x, y)].bg == palette::WHALE_ACTION),
             "selected /sessions row should not use the bright accent background"
         );
     }
