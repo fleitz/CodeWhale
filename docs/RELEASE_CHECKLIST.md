@@ -161,6 +161,17 @@ release anxiety: contributors cannot tell whether their work merged.
 
 - [ ] All required CI jobs are green. The `versions` job should mirror the
       preflight `check-versions.sh` and is your last line of defense.
+- [ ] After the final source reaches `main`, dispatch exact-head full CI and the
+      non-publishing release-candidate build with the same 40-character SHA:
+      ```bash
+      candidate_sha="$(git rev-parse origin/main)"
+      gh workflow run ci.yml --ref main -f expected_sha="${candidate_sha}"
+      gh workflow run release-candidate.yml --ref main -f expected_sha="${candidate_sha}"
+      ```
+      Both runs must resolve to that SHA. The candidate must report all seven
+      targets and the complete 34-file asset inventory, including Android
+      arm64, Windows arm64, `codew`, the NSIS installer, archives, and checksum
+      manifests. These are Actions artifacts only and are not a release.
 - [ ] PR has been reviewed.
 
 ## 7. Tag and release (after review)
