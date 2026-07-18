@@ -8717,7 +8717,12 @@ pub(crate) fn persist_external_credential_consent_for_at(
             i64::from(codewhale_config::EXTERNAL_CREDENTIAL_CONSENT_VERSION),
         )
     })
-    .with_context(|| format!("Failed to write config to {}", config_path.display()))?;
+    .with_context(|| {
+        format!(
+            "Failed to write config to {}",
+            codewhale_config::quote_os_path(&config_path)
+        )
+    })?;
     live_config
         .providers
         .get_or_insert_with(ProvidersConfig::default);
@@ -8756,7 +8761,12 @@ pub(crate) fn revoke_external_credential_consent_for_at(
         )?;
         Ok(())
     })
-    .with_context(|| format!("Failed to write config to {}", config_path.display()))?;
+    .with_context(|| {
+        format!(
+            "Failed to write config to {}",
+            codewhale_config::quote_os_path(&config_path)
+        )
+    })?;
     live_config
         .provider_config_for_mut(provider)
         .external_credentials = None;
