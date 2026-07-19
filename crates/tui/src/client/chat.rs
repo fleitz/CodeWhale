@@ -228,6 +228,32 @@ impl DeepSeekClient {
                     }
                 }
             }
+            // xAI rejects a parameters root that is not a plain object schema
+            // (e.g. apply_patch's root `oneOf` required-groups) with a 400.
+            if matches!(self.api_provider, crate::config::ApiProvider::Xai) {
+                for t in &mut chat_tools {
+                    let Some(function) = t
+                        .as_object_mut()
+                        .and_then(|t| t.get_mut("function"))
+                        .and_then(|f| f.as_object_mut())
+                    else {
+                        continue;
+                    };
+                    let note = function.get_mut("parameters").and_then(|parameters| {
+                        crate::tools::schema_sanitize::sanitize_for_xai_parameters(parameters)
+                    });
+                    if let Some(note) = note
+                        && let Some(description) = function
+                            .get_mut("description")
+                            .and_then(|d| d.as_str().map(str::to_string))
+                    {
+                        function.insert(
+                            "description".to_string(),
+                            json!(format!("{description} {note}")),
+                        );
+                    }
+                }
+            }
             body["tools"] = json!(chat_tools);
         }
         if should_send_tool_choice_for_chat(self.api_provider, request.reasoning_effort.as_deref())
@@ -359,6 +385,32 @@ impl DeepSeekClient {
                         .and_then(|f| f.get_mut("parameters"))
                     {
                         crate::tools::schema_sanitize::sanitize_for_kimi_parameters(fn_obj);
+                    }
+                }
+            }
+            // xAI rejects a parameters root that is not a plain object schema
+            // (e.g. apply_patch's root `oneOf` required-groups) with a 400.
+            if matches!(self.api_provider, crate::config::ApiProvider::Xai) {
+                for t in &mut chat_tools {
+                    let Some(function) = t
+                        .as_object_mut()
+                        .and_then(|t| t.get_mut("function"))
+                        .and_then(|f| f.as_object_mut())
+                    else {
+                        continue;
+                    };
+                    let note = function.get_mut("parameters").and_then(|parameters| {
+                        crate::tools::schema_sanitize::sanitize_for_xai_parameters(parameters)
+                    });
+                    if let Some(note) = note
+                        && let Some(description) = function
+                            .get_mut("description")
+                            .and_then(|d| d.as_str().map(str::to_string))
+                    {
+                        function.insert(
+                            "description".to_string(),
+                            json!(format!("{description} {note}")),
+                        );
                     }
                 }
             }

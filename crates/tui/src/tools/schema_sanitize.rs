@@ -69,6 +69,20 @@ pub fn sanitize_for_strict(schema: &mut Value) {
     enforce_strict_subset(schema);
 }
 
+/// Sanitize a tool `parameters` schema for xAI chat completions.
+///
+/// xAI validates that the parameters root is an object schema and rejects a
+/// root-level `anyOf`/`oneOf` union with any non-object branch
+/// ("tool parameter root must be an object type"). The built-in `apply_patch`
+/// schema's `oneOf: [{required:["patch"]}, {required:["changes"]}]` trips this
+/// with a 400 on the first tool-bearing request. The Responses-API pass
+/// performs exactly the required normalization — merge root composition
+/// properties, force `type: object`, drop root-only composition keywords —
+/// so reuse it and surface the dropped constraint as a description note.
+pub fn sanitize_for_xai_parameters(parameters: &mut Value) -> Option<String> {
+    sanitize_for_responses(parameters)
+}
+
 /// Sanitize a schema for OpenAI Responses function tools.
 ///
 /// The Responses API requires the top-level `parameters` schema to be an object
@@ -928,6 +942,30 @@ mod tests {
         assert!(schema.get("anyOf").is_none());
         assert!(schema["properties"]["value"].get("anyOf").is_some());
         assert_eq!(note, None);
+    }
+
+    #[test]
+    fn xai_sanitize_flattens_apply_patch_root_one_of() {
+        // The exact shape that produced the live 400:
+        // "apply_patch: tool parameter root must be an object type (root
+        // schema is an anyOf/oneOf union with a non-object branch)".
+        use crate::tools::spec::ToolSpec as _;
+        let mut schema = crate::tools::apply_patch::ApplyPatchTool.input_schema();
+        assert!(schema.get("oneOf").is_some(), "fixture must match the tool");
+
+        let note = sanitize_for_xai_parameters(&mut schema);
+
+        assert_eq!(schema["type"], "object");
+        assert!(schema.get("oneOf").is_none());
+        assert!(schema.get("anyOf").is_none());
+        assert!(schema["properties"].get("patch").is_some());
+        assert!(schema["properties"].get("changes").is_some());
+        assert_eq!(
+            note.as_deref(),
+            Some(
+                "Exactly one of these parameter groups must be provided: `changes` | `patch` | `replace`."
+            )
+        );
     }
 
     #[test]
