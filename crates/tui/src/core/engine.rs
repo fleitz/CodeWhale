@@ -2065,6 +2065,14 @@ impl Engine {
                             let _ = tx.send(status);
                         }
                     }
+                    Op::ReloadMcp { config_path, tx } => {
+                        let result = self.reload_mcp_pool(config_path).await.map_err(|error| {
+                            codewhale_config::persistence::redact_secrets(&format!("{error:#}"))
+                        });
+                        if let Some(tx) = tx.lock().ok().and_then(|mut guard| guard.take()) {
+                            let _ = tx.send(result);
+                        }
+                    }
                     Op::PurgeContext => {
                         self.handle_purge().await;
                     }
@@ -3779,8 +3787,22 @@ impl Engine {
             Arc::clone(&self.plugin_registry),
         )
         .unwrap_or_else(|e| {
-            tracing::debug!("No MCP config: {e}");
-            McpPool::new(McpConfig::default())
+            tracing::debug!(
+                "MCP config unavailable: {}",
+                crate::mcp::format_mcp_error_for_display(&e)
+            );
+            McpPool::empty_with_workspace_config_sources(
+                &self.session.mcp_config_path,
+                &self.session.workspace,
+                Arc::clone(&self.plugin_registry),
+            )
+            .unwrap_or_else(|fallback_error| {
+                tracing::debug!(
+                    "MCP reload source setup failed: {}",
+                    crate::mcp::format_mcp_error_for_display(&fallback_error)
+                );
+                McpPool::new(McpConfig::default())
+            })
         });
         if let Some(decider) = self.config.network_policy.as_ref() {
             pool = pool.with_network_policy(decider.clone());
@@ -3788,6 +3810,33 @@ impl Engine {
         let pool = Arc::new(AsyncMutex::new(pool));
         self.mcp_pool = Some(Arc::clone(&pool));
         Ok(pool)
+    }
+
+    async fn reload_mcp_pool(
+        &mut self,
+        config_path: PathBuf,
+    ) -> anyhow::Result<crate::mcp::McpManagerSnapshot> {
+        let pool = self
+            .ensure_mcp_pool()
+            .await
+            .map_err(|error| anyhow::anyhow!(error.to_string()))?;
+        let mut pool = pool.lock().await;
+        let connection_errors = if config_path == self.session.mcp_config_path {
+            pool.reload_and_connect_all().await?
+        } else {
+            pool.switch_workspace_config_source_and_connect_all(
+                &config_path,
+                &self.session.workspace,
+                Arc::clone(&self.plugin_registry),
+            )
+            .await?
+        };
+        let errors = connection_errors
+            .into_iter()
+            .map(|(name, error)| (name, crate::mcp::format_mcp_error_for_display(&error)))
+            .collect::<HashMap<_, _>>();
+        self.session.mcp_config_path = config_path;
+        Ok(pool.manager_snapshot(&self.session.mcp_config_path, false, &errors))
     }
 
     async fn mcp_tools(&mut self) -> Vec<Tool> {

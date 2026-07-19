@@ -101,7 +101,7 @@ fn hf_mcp_status(app: &App) -> CommandResult {
             if let Some(server_name) = configured_hf_mcp_server(&config) {
                 CommandResult::message(format!(
                     "Hugging Face MCP appears configured as `{server_name}` in {}.\n\
-                     Run /mcp validate or restart Codewhale if tools are not visible yet.",
+                     Run /mcp reload to rebuild the live model-visible tool pool if tools are not visible yet.",
                     app.mcp_config_path.display()
                 ))
             } else {
@@ -125,7 +125,7 @@ fn hf_mcp_setup_message(app: &App) -> String {
          1. Open {HF_MCP_SETTINGS_URL} while signed in.\n\
          2. Choose your MCP client and copy the generated configuration snippet.\n\
          3. Paste the Hugging Face server entry into {}.\n\
-         4. Restart Codewhale, or run /mcp reload for the TUI manager snapshot.\n\n\
+         4. Run /mcp reload to rebuild the live model-visible tool pool.\n\n\
          Codewhale-compatible placeholder shape:\n\n\
          ```json\n{HF_MCP_CONFIG_SKELETON}\n```\n\n\
          The placeholder is intentionally not runnable until your private MCP config has a real token value. \

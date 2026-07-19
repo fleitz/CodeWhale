@@ -2721,6 +2721,37 @@ impl McpPool {
         Ok(pool)
     }
 
+    /// Construct a source-aware empty pool after the initial config load
+    /// failed. Keeping the source paths means a later edit or explicit
+    /// `/mcp reload` can recover in-process instead of pinning the session to
+    /// an ad-hoc pool that has no files to re-read.
+    pub(crate) fn empty_with_workspace_config_sources(
+        path: &std::path::Path,
+        workspace: &Path,
+        plugins: Arc<crate::plugins::PluginRegistry>,
+    ) -> Result<Self> {
+        validate_mcp_config_path(path)?;
+        if plugins.workspace() != workspace {
+            anyhow::bail!("plugin registry workspace does not match MCP pool workspace");
+        }
+        let workspace = checked_workspace_path(workspace)?;
+        let mut pool = Self::new(McpConfig::default());
+        pool.config_sources = vec![
+            path.to_path_buf(),
+            checked_workspace_mcp_config_path(&workspace)?,
+        ];
+        pool.config_sources
+            .extend(crate::config::workspace_trust_config_candidate_paths());
+        pool.last_mtimes = pool
+            .config_sources
+            .iter()
+            .map(|source| mcp_config_mtime(source))
+            .collect();
+        pool.workspace = Some(workspace);
+        pool.plugin_registry = Some(plugins);
+        Ok(pool)
+    }
+
     /// Attach a per-domain network policy (#135). When set, HTTP/SSE
     /// transports are gated through it; STDIO transports are unaffected.
     pub fn with_network_policy(mut self, policy: NetworkPolicyDecider) -> Self {
@@ -2766,8 +2797,11 @@ impl McpPool {
     /// call (and only re-reads the file when the mtime moved). On networked
     /// or remote filesystems where mtime granularity is poor, the hash
     /// compare keeps us from churning connections on every check.
-    pub async fn reload_if_config_changed(&mut self) -> Result<bool> {
+    fn reload_from_config_sources(&mut self, force: bool) -> Result<bool> {
         if self.config_sources.is_empty() {
+            if force {
+                anyhow::bail!("MCP pool has no configuration source to reload");
+            }
             return Ok(false);
         }
         let current_mtimes: Vec<_> = self
@@ -2775,10 +2809,11 @@ impl McpPool {
             .iter()
             .map(|path| mcp_config_mtime(path))
             .collect();
-        if current_mtimes == self.last_mtimes {
+        if !force && current_mtimes == self.last_mtimes {
             return Ok(false);
         }
-        // mtime moved — we owe a re-read.
+        // An mtime moved, or the user explicitly requested a reload: re-read
+        // the complete global + workspace + plugin-backed config.
         let primary = self
             .config_sources
             .first()
@@ -2797,16 +2832,72 @@ impl McpPool {
         // Always advance mtimes so a touched-but-unchanged file doesn't
         // make us re-read on every subsequent call.
         self.last_mtimes = current_mtimes;
-        if new_hash == self.config_hash {
+        if !force && new_hash == self.config_hash {
             return Ok(false);
         }
-        // Real content change — drop all live connections so the next
-        // get_or_connect picks up the new config (sandbox flags, env, args).
-        self.drop_all_connections("config reload");
+        // A real content change, or an explicit reload, invalidates every
+        // advertised route and live transport. The latter matters when OAuth
+        // credentials changed without changing the config bytes.
+        self.drop_all_connections(if force {
+            "explicit config reload"
+        } else {
+            "config reload"
+        });
         self.config = new_config;
         self.config_hash = new_hash;
         self.catalog_generation.fetch_add(1, Ordering::SeqCst);
         Ok(true)
+    }
+
+    pub async fn reload_if_config_changed(&mut self) -> Result<bool> {
+        self.reload_from_config_sources(false)
+    }
+
+    /// Force a source re-read, invalidate all advertised routes, reconnect
+    /// enabled servers, and return per-server connection errors. Dynamic
+    /// in-memory servers remain registered because this mutates the existing
+    /// pool rather than replacing it.
+    pub async fn reload_and_connect_all(&mut self) -> Result<Vec<(String, anyhow::Error)>> {
+        self.reload_from_config_sources(true)?;
+        Ok(self.connect_all().await)
+    }
+
+    /// Switch the global config source transactionally, preserving this
+    /// shared pool (and its dynamic runtime servers) for parent and sub-agent
+    /// holders. A malformed replacement leaves the current config,
+    /// connections, and source paths unchanged.
+    pub(crate) async fn switch_workspace_config_source_and_connect_all(
+        &mut self,
+        path: &Path,
+        workspace: &Path,
+        plugins: Arc<crate::plugins::PluginRegistry>,
+    ) -> Result<Vec<(String, anyhow::Error)>> {
+        validate_mcp_config_path(path)?;
+        if plugins.workspace() != workspace {
+            anyhow::bail!("plugin registry workspace does not match MCP pool workspace");
+        }
+        let workspace = checked_workspace_path(workspace)?;
+        let new_config =
+            load_config_with_workspace_and_plugins(path, &workspace, plugins.as_ref())?;
+        let mut new_sources = vec![
+            path.to_path_buf(),
+            checked_workspace_mcp_config_path(&workspace)?,
+        ];
+        new_sources.extend(crate::config::workspace_trust_config_candidate_paths());
+        let new_mtimes = new_sources
+            .iter()
+            .map(|source| mcp_config_mtime(source))
+            .collect();
+
+        self.drop_all_connections("config source switch");
+        self.config_hash = hash_mcp_config(&new_config);
+        self.config = new_config;
+        self.config_sources = new_sources;
+        self.last_mtimes = new_mtimes;
+        self.workspace = Some(workspace);
+        self.plugin_registry = Some(plugins);
+        self.catalog_generation.fetch_add(1, Ordering::SeqCst);
+        Ok(self.connect_all().await)
     }
 
     /// Get or create a connection to a server
@@ -2880,6 +2971,14 @@ impl McpPool {
     /// Connect to all enabled servers, returning errors for failed connections
     pub async fn connect_all(&mut self) -> Vec<(String, anyhow::Error)> {
         let mut errors = Vec::new();
+        // Reload before taking the configured-name snapshot. Previously the
+        // first call after adding a server captured the old names, then only
+        // noticed the config change inside `get_or_connect`, delaying the new
+        // server until a second turn.
+        if let Err(err) = self.reload_if_config_changed().await {
+            errors.push(("configuration".to_string(), err));
+            return errors;
+        }
         let names: Vec<String> = self
             .config
             .servers
@@ -3614,7 +3713,7 @@ pub struct McpServerSnapshot {
 pub struct McpManagerSnapshot {
     pub config_path: std::path::PathBuf,
     pub config_exists: bool,
-    pub restart_required: bool,
+    pub reload_required: bool,
     pub servers: Vec<McpServerSnapshot>,
 }
 
@@ -4151,13 +4250,13 @@ pub fn set_server_enabled(path: &Path, name: &str, enabled: bool) -> Result<()> 
 #[cfg(test)]
 pub fn manager_snapshot_from_config(
     path: &Path,
-    restart_required: bool,
+    reload_required: bool,
 ) -> Result<McpManagerSnapshot> {
     let cfg = load_config(path)?;
     Ok(snapshot_from_config(
         path,
         path.exists(),
-        restart_required,
+        reload_required,
         &cfg,
         None,
     ))
@@ -4167,13 +4266,13 @@ pub fn manager_snapshot_from_config(
 pub fn manager_snapshot_from_config_with_workspace(
     path: &Path,
     workspace: &Path,
-    restart_required: bool,
+    reload_required: bool,
 ) -> Result<McpManagerSnapshot> {
     let plugins = crate::plugins::PluginRegistry::empty(workspace);
     manager_snapshot_from_config_with_workspace_and_plugins(
         path,
         workspace,
-        restart_required,
+        reload_required,
         &plugins,
     )
 }
@@ -4181,14 +4280,14 @@ pub fn manager_snapshot_from_config_with_workspace(
 pub fn manager_snapshot_from_config_with_workspace_and_plugins(
     path: &Path,
     workspace: &Path,
-    restart_required: bool,
+    reload_required: bool,
     plugins: &crate::plugins::PluginRegistry,
 ) -> Result<McpManagerSnapshot> {
     let cfg = load_config_with_workspace_and_plugins(path, workspace, plugins)?;
     Ok(snapshot_from_config(
         path,
         path.exists(),
-        restart_required,
+        reload_required,
         &cfg,
         None,
     ))
@@ -4198,7 +4297,7 @@ pub fn manager_snapshot_from_config_with_workspace_and_plugins(
 pub async fn discover_manager_snapshot(
     path: &Path,
     network_policy: Option<NetworkPolicyDecider>,
-    restart_required: bool,
+    reload_required: bool,
 ) -> Result<McpManagerSnapshot> {
     let cfg = load_config(path)?;
     let mut pool = McpPool::new(cfg.clone());
@@ -4209,12 +4308,12 @@ pub async fn discover_manager_snapshot(
         .connect_all()
         .await
         .into_iter()
-        .map(|(name, err)| (name, format!("{err:#}")))
+        .map(|(name, err)| (name, format_mcp_error_for_display(&err)))
         .collect::<HashMap<_, _>>();
     Ok(snapshot_from_config(
         path,
         path.exists(),
-        restart_required,
+        reload_required,
         &cfg,
         Some((&pool, &errors)),
     ))
@@ -4224,7 +4323,7 @@ pub async fn discover_manager_snapshot_with_workspace_and_plugins(
     path: &Path,
     workspace: &Path,
     network_policy: Option<NetworkPolicyDecider>,
-    restart_required: bool,
+    reload_required: bool,
     plugins: Arc<crate::plugins::PluginRegistry>,
 ) -> Result<McpManagerSnapshot> {
     let cfg = load_config_with_workspace_and_plugins(path, workspace, plugins.as_ref())?;
@@ -4238,21 +4337,45 @@ pub async fn discover_manager_snapshot_with_workspace_and_plugins(
         .connect_all()
         .await
         .into_iter()
-        .map(|(name, err)| (name, format!("{err:#}")))
+        .map(|(name, err)| (name, format_mcp_error_for_display(&err)))
         .collect::<HashMap<_, _>>();
     Ok(snapshot_from_config(
         path,
         path.exists(),
-        restart_required,
+        reload_required,
         &cfg,
         Some((&pool, &errors)),
     ))
 }
 
+pub(crate) fn format_mcp_error_for_display(error: &anyhow::Error) -> String {
+    codewhale_config::persistence::redact_secrets(&format!("{error:#}"))
+}
+
+impl McpPool {
+    /// Snapshot the live pool rather than starting a second discovery pool.
+    /// This keeps the manager, hotbar, and next model turn aligned on one
+    /// exact config/catalog generation.
+    pub(crate) fn manager_snapshot(
+        &self,
+        path: &Path,
+        reload_required: bool,
+        errors: &HashMap<String, String>,
+    ) -> McpManagerSnapshot {
+        snapshot_from_config(
+            path,
+            path.exists(),
+            reload_required,
+            &self.config,
+            Some((self, errors)),
+        )
+    }
+}
+
 fn snapshot_from_config(
     path: &Path,
     config_exists: bool,
-    restart_required: bool,
+    reload_required: bool,
     cfg: &McpConfig,
     discovery: Option<(&McpPool, &HashMap<String, String>)>,
 ) -> McpManagerSnapshot {
@@ -4359,7 +4482,7 @@ fn snapshot_from_config(
     McpManagerSnapshot {
         config_path: path.to_path_buf(),
         config_exists,
-        restart_required,
+        reload_required,
         servers,
     }
 }

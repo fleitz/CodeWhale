@@ -821,7 +821,7 @@ fn test_mcp_config_parse_mcp_servers_alias_and_snapshot() {
     let cfg = load_config(&path).unwrap();
     assert!(cfg.servers.contains_key("disabled"));
     let snapshot = manager_snapshot_from_config(&path, true).unwrap();
-    assert!(snapshot.restart_required);
+    assert!(snapshot.reload_required);
     assert_eq!(snapshot.servers[0].name, "disabled");
     assert!(!snapshot.servers[0].enabled);
     assert_eq!(snapshot.servers[0].error.as_deref(), Some("disabled"));
@@ -2603,6 +2603,132 @@ async fn reload_if_config_changed_drops_live_connections() {
         pool.config.servers.get("local").unwrap().args,
         vec!["server-v2.js".to_string()]
     );
+}
+
+#[tokio::test]
+async fn connect_all_reloads_before_snapshotting_new_server_names() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("mcp.json");
+    std::fs::write(&path, r#"{"servers":{}}"#).unwrap();
+    let mut pool = McpPool::from_config_path(&path).unwrap();
+
+    std::fs::write(
+        &path,
+        r#"{"servers":{"late":{"command":"codewhale-test-command-that-does-not-exist"}}}"#,
+    )
+    .unwrap();
+    // Make the test independent of filesystem mtime granularity.
+    pool.last_mtimes = vec![None];
+
+    let errors = pool.connect_all().await;
+    assert!(
+        pool.server_names().contains(&"late".to_string()),
+        "the first connect_all call must install the changed config"
+    );
+    assert!(
+        errors.iter().any(|(name, _)| name == "late"),
+        "the newly-added server must be attempted on the same call"
+    );
+}
+
+#[tokio::test]
+async fn explicit_reload_reconnects_unchanged_config_and_preserves_dynamic_servers() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("mcp.json");
+    std::fs::write(
+        &path,
+        r#"{"servers":{"local":{"command":"node","disabled":true}}}"#,
+    )
+    .unwrap();
+    let mut pool = McpPool::from_config_path(&path).unwrap();
+    let drops = Arc::new(AtomicUsize::new(0));
+    let mut conn = test_connection(Box::new(DropCountingTransport {
+        drops: Arc::clone(&drops),
+    }));
+    conn.name = "local".to_string();
+    conn.config = pool.config.servers.get("local").unwrap().clone();
+    pool.connections.insert("local".to_string(), conn);
+    let mut runtime_config = test_server_config();
+    runtime_config.command = Some("runtime-server".to_string());
+    pool.add_runtime_server_config("runtime".to_string(), runtime_config)
+        .unwrap();
+    let generation_before = pool.catalog_generation.load(AtomicOrdering::SeqCst);
+
+    let errors = pool.reload_and_connect_all().await.unwrap();
+
+    assert!(
+        errors.is_empty(),
+        "disabled config should not connect: {errors:?}"
+    );
+    assert_eq!(drops.load(AtomicOrdering::SeqCst), 1);
+    assert!(!pool.connections.contains_key("local"));
+    assert!(pool.server_names().contains(&"runtime".to_string()));
+    assert_eq!(
+        pool.catalog_generation.load(AtomicOrdering::SeqCst),
+        generation_before + 1,
+        "explicit reload must invalidate every previously advertised route"
+    );
+}
+
+#[tokio::test]
+async fn config_source_switch_preserves_dynamic_servers_in_the_shared_pool() {
+    let dir = tempfile::tempdir().unwrap();
+    let workspace = dir.path().join("workspace");
+    std::fs::create_dir_all(&workspace).unwrap();
+    let initial_path = dir.path().join("initial.json");
+    let invalid_path = dir.path().join("invalid.json");
+    let replacement_path = dir.path().join("replacement.json");
+    std::fs::write(
+        &initial_path,
+        r#"{"servers":{"local":{"command":"node","disabled":true}}}"#,
+    )
+    .unwrap();
+    std::fs::write(&invalid_path, r#"{"servers":{"broken": trailing}}"#).unwrap();
+    std::fs::write(&replacement_path, r#"{"servers":{}}"#).unwrap();
+    let plugins = Arc::new(crate::plugins::PluginRegistry::empty(&workspace));
+    let mut pool = McpPool::from_config_path_with_workspace_and_plugins(
+        &initial_path,
+        &workspace,
+        Arc::clone(&plugins),
+    )
+    .unwrap();
+    let mut runtime_config = test_server_config();
+    runtime_config.command = Some("runtime-server".to_string());
+    pool.add_runtime_server_config("runtime".to_string(), runtime_config)
+        .unwrap();
+    let drops = Arc::new(AtomicUsize::new(0));
+    let mut conn = test_connection(Box::new(DropCountingTransport {
+        drops: Arc::clone(&drops),
+    }));
+    conn.name = "local".to_string();
+    conn.config = pool.config.servers.get("local").unwrap().clone();
+    pool.connections.insert("local".to_string(), conn);
+    let generation_before = pool.catalog_generation.load(AtomicOrdering::SeqCst);
+
+    pool.switch_workspace_config_source_and_connect_all(
+        &invalid_path,
+        &workspace,
+        Arc::clone(&plugins),
+    )
+    .await
+    .expect_err("malformed replacement must fail closed");
+    assert_eq!(pool.config_sources.first(), Some(&initial_path));
+    assert!(pool.connections.contains_key("local"));
+    assert_eq!(drops.load(AtomicOrdering::SeqCst), 0);
+    assert_eq!(
+        pool.catalog_generation.load(AtomicOrdering::SeqCst),
+        generation_before
+    );
+
+    let errors = pool
+        .switch_workspace_config_source_and_connect_all(&replacement_path, &workspace, plugins)
+        .await
+        .unwrap();
+
+    assert!(errors.is_empty());
+    assert!(pool.server_names().contains(&"runtime".to_string()));
+    assert_eq!(pool.config_sources.first(), Some(&replacement_path));
+    assert_eq!(drops.load(AtomicOrdering::SeqCst), 1);
 }
 
 /// #1267 part 2: hash-based comparison must be stable for byte-identical

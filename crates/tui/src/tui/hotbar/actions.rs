@@ -1506,7 +1506,7 @@ mod tests {
         McpManagerSnapshot {
             config_path: PathBuf::from("mcp.json"),
             config_exists: true,
-            restart_required: false,
+            reload_required: false,
             servers: vec![
                 server(
                     "search",

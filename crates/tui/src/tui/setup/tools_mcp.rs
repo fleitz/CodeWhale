@@ -294,8 +294,8 @@ fn mcp_snapshot_inventory(
     if !names_off.is_empty() {
         detail.push_str(&format!("; off: {}", names_off.join(", ")));
     }
-    if snapshot.restart_required {
-        detail.push_str("; restart required for live tool list");
+    if snapshot.reload_required {
+        detail.push_str("; /mcp reload required for live tool list");
     }
     detail.push_str("; /mcp for details (commands/tokens never shown here)");
     McpInventoryRow {
@@ -897,7 +897,7 @@ mod tests {
         app.mcp_snapshot = Some(McpManagerSnapshot {
             config_path: tmp.path().join("mcp.json"),
             config_exists: true,
-            restart_required: false,
+            reload_required: false,
             servers: vec![
                 McpServerSnapshot {
                     name: "ok".into(),

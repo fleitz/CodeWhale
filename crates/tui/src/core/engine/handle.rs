@@ -176,4 +176,18 @@ impl EngineHandle {
         rx.await
             .map_err(|_| anyhow::anyhow!("Engine dropped provider runtime status oneshot"))
     }
+
+    /// Force the engine-owned MCP pool to reload and reconnect, returning a
+    /// snapshot from the exact live pool that supplies the next model turn.
+    pub async fn reload_mcp(
+        &self,
+        config_path: std::path::PathBuf,
+    ) -> Result<crate::mcp::McpManagerSnapshot> {
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        let tx = std::sync::Arc::new(std::sync::Mutex::new(Some(tx)));
+        self.send(Op::ReloadMcp { config_path, tx }).await?;
+        rx.await
+            .map_err(|_| anyhow::anyhow!("Engine dropped MCP reload oneshot"))?
+            .map_err(anyhow::Error::msg)
+    }
 }

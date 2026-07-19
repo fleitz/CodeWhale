@@ -2256,7 +2256,7 @@ pub struct App {
     /// the user runs `/mcp` for the first time. `0` hides the chip.
     pub mcp_configured_count: usize,
     /// Set after in-TUI MCP config edits because the engine caches its MCP pool.
-    pub mcp_restart_required: bool,
+    pub mcp_reload_required: bool,
     /// Tool execution log
     pub tool_log: Vec<String>,
     /// Active skill to apply to next user message
@@ -3406,7 +3406,7 @@ impl App {
             // the JSON files); errors fall through to zero so a missing
             // or malformed config simply hides the chip.
             mcp_configured_count,
-            mcp_restart_required: false,
+            mcp_reload_required: false,
             tool_log: Vec::new(),
             active_skill: None,
             active_skill_provenance: None,

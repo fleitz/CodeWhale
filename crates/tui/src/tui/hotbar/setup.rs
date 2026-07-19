@@ -1115,7 +1115,7 @@ mod tests {
         registry.replace_mcp_tools(Some(&crate::mcp::McpManagerSnapshot {
             config_path: PathBuf::from("mcp.json"),
             config_exists: true,
-            restart_required: false,
+            reload_required: false,
             servers: vec![crate::mcp::McpServerSnapshot {
                 name: "search".to_string(),
                 enabled: true,

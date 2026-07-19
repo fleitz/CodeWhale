@@ -853,9 +853,9 @@ fn config_editability_audit(app: &App) -> CommandResult {
         (
             "mcp_config_path",
             app.mcp_config_path.display().to_string(),
-            "persisted restart",
+            "persisted live reload",
             "/config mcp_config_path <path> --save",
-            "The MCP tool pool is built at startup, so a restart is required.",
+            "Run /mcp reload to rebuild the live model-visible tool pool.",
         ),
         (
             "workspace_follow_symlinks",
@@ -1616,22 +1616,33 @@ pub fn set_config_value(app: &mut App, key: &str, value: &str, persist: bool) ->
             if value.trim().is_empty() {
                 return CommandResult::error("mcp_config_path cannot be empty");
             }
-            app.mcp_config_path = PathBuf::from(expand_tilde(value));
-            app.mcp_restart_required = true;
+            let next_path = PathBuf::from(expand_tilde(value));
+            let path_changed = next_path != app.mcp_config_path;
+            app.mcp_config_path = next_path;
+            if path_changed {
+                app.mcp_reload_required = true;
+            }
+            let reload_note = if path_changed {
+                "; run /mcp reload to rebuild the live tool pool"
+            } else {
+                ""
+            };
             let message = if persist {
                 match persist_root_string_key(app.config_path.as_deref(), "mcp_config_path", value)
                 {
                     Ok(path) => format!(
-                        "mcp_config_path = {} (saved to {}; restart required for MCP tool pool)",
+                        "mcp_config_path = {} (saved to {}){}",
                         app.mcp_config_path.display(),
-                        path.display()
+                        path.display(),
+                        reload_note
                     ),
                     Err(err) => return CommandResult::error(format!("Failed to save: {err}")),
                 }
             } else {
                 format!(
-                    "mcp_config_path = {} (session only; restart required for MCP tool pool)",
-                    app.mcp_config_path.display()
+                    "mcp_config_path = {} (session only){}",
+                    app.mcp_config_path.display(),
+                    reload_note
                 )
             };
             return CommandResult::message(message);

@@ -601,10 +601,110 @@ fn plain_mcp_show_refreshes_discovery_counts() {
 
     assert!(mcp_ui_action_refreshes_discovery(&McpUiAction::Show));
     assert!(mcp_ui_action_refreshes_discovery(&McpUiAction::Validate));
-    assert!(mcp_ui_action_refreshes_discovery(&McpUiAction::Reload));
+    assert!(
+        !mcp_ui_action_refreshes_discovery(&McpUiAction::Reload),
+        "reload is handled by the engine-owned live pool, not a UI discovery pool"
+    );
     assert!(!mcp_ui_action_refreshes_discovery(&McpUiAction::Init {
         force: false,
     }));
+}
+
+#[tokio::test]
+async fn mcp_reload_uses_engine_snapshot_and_clears_pending_state() {
+    use crate::mcp::{McpManagerSnapshot, McpServerSnapshot};
+    use crate::tui::app::McpUiAction;
+
+    let mut app = create_test_app();
+    app.mcp_reload_required = true;
+    let config = Config::default();
+    let mut mock = mock_engine_handle();
+    let handle = mock.handle.clone();
+    let snapshot = McpManagerSnapshot {
+        config_path: PathBuf::from("mcp.json"),
+        config_exists: true,
+        reload_required: false,
+        servers: vec![McpServerSnapshot {
+            name: "ready".to_string(),
+            enabled: true,
+            required: false,
+            transport: "stdio".to_string(),
+            command_or_url: "server".to_string(),
+            connect_timeout: 5,
+            execute_timeout: 5,
+            read_timeout: 5,
+            connected: true,
+            error: None,
+            tools: Vec::new(),
+            resources: Vec::new(),
+            prompts: Vec::new(),
+        }],
+    };
+    let response_snapshot = snapshot.clone();
+    let respond = async {
+        match mock.rx_op.recv().await.expect("reload op") {
+            Op::ReloadMcp { config_path, tx } => {
+                assert_eq!(config_path, PathBuf::from("mcp.json"));
+                let sender = tx.lock().unwrap().take().expect("reload reply sender");
+                sender.send(Ok(response_snapshot)).expect("reload reply");
+            }
+            other => panic!("unexpected op: {other:?}"),
+        }
+    };
+    let action = handle_mcp_ui_action(&mut app, &handle, &config, McpUiAction::Reload);
+    tokio::join!(action, respond);
+
+    assert!(!app.mcp_reload_required);
+    assert_eq!(app.mcp_snapshot.as_ref(), Some(&snapshot));
+    assert_eq!(app.mcp_configured_count, 1);
+    assert!(app.history.iter().any(|cell| matches!(
+        cell,
+        HistoryCell::System { content }
+            if content.contains("MCP tool pool reloaded in process")
+                && content.contains("next model turn")
+    )));
+}
+
+#[tokio::test]
+async fn mcp_reload_failure_keeps_pending_state_and_live_snapshot() {
+    use crate::mcp::McpManagerSnapshot;
+    use crate::tui::app::McpUiAction;
+
+    let mut app = create_test_app();
+    app.mcp_reload_required = true;
+    app.mcp_snapshot = Some(McpManagerSnapshot {
+        config_path: PathBuf::from("mcp.json"),
+        config_exists: true,
+        reload_required: true,
+        servers: Vec::new(),
+    });
+    let previous = app.mcp_snapshot.clone();
+    let config = Config::default();
+    let mut mock = mock_engine_handle();
+    let handle = mock.handle.clone();
+    let respond = async {
+        match mock.rx_op.recv().await.expect("reload op") {
+            Op::ReloadMcp { config_path, tx } => {
+                assert_eq!(config_path, PathBuf::from("mcp.json"));
+                let sender = tx.lock().unwrap().take().expect("reload reply sender");
+                sender
+                    .send(Err("safe config parse failure".to_string()))
+                    .expect("reload reply");
+            }
+            other => panic!("unexpected op: {other:?}"),
+        }
+    };
+    let action = handle_mcp_ui_action(&mut app, &handle, &config, McpUiAction::Reload);
+    tokio::join!(action, respond);
+
+    assert!(app.mcp_reload_required);
+    assert_eq!(app.mcp_snapshot, previous);
+    assert!(app.history.iter().any(|cell| matches!(
+        cell,
+        HistoryCell::System { content }
+            if content.contains("live tool pool is unchanged")
+                && content.contains("safe config parse failure")
+    )));
 }
 
 #[test]

@@ -794,9 +794,9 @@ fn reload_runtime_config(app: &mut App, config: &mut Config) -> Result<()> {
 fn config_reload_notes(app: &App, config: &Config) -> Vec<String> {
     let mut notes = Vec::new();
     notes.push("Config saved and reloaded".to_string());
-    if app.mcp_restart_required {
+    if app.mcp_reload_required {
         notes.push(format!(
-            "MCP tool pool still requires restart after {}",
+            "MCP tool pool still needs `/mcp reload` after {}",
             config.mcp_config_path().display()
         ));
     }

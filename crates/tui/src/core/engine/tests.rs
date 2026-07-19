@@ -9137,6 +9137,64 @@ fn engine_handle_try_send_does_not_block_when_op_channel_is_full() {
 }
 
 #[tokio::test]
+async fn reload_mcp_op_recovers_from_invalid_initial_config_in_process() {
+    let tmp = tempdir().expect("tempdir");
+    let workspace = tmp.path().join("workspace");
+    std::fs::create_dir_all(&workspace).expect("workspace");
+    let config_path = tmp.path().join("mcp.json");
+    let secret = "mcp-op-secret-must-not-escape";
+    std::fs::write(
+        &config_path,
+        format!(r#"{{"servers":{{"bad":{{"token":"{secret}"}} trailing}}}}"#),
+    )
+    .expect("invalid config");
+    let engine_config = EngineConfig {
+        workspace,
+        mcp_config_path: config_path.clone(),
+        ..Default::default()
+    };
+    let (engine, handle) = Engine::new(engine_config, &Config::default());
+    let task = tokio::spawn(async move { engine.run().await });
+
+    let error = handle
+        .reload_mcp(config_path.clone())
+        .await
+        .expect_err("invalid config must fail closed");
+    assert!(!error.to_string().contains(secret));
+    std::fs::write(
+        &config_path,
+        r#"{"servers":{"ready":{"command":"node","disabled":true}}}"#,
+    )
+    .expect("fixed config");
+
+    let snapshot = handle
+        .reload_mcp(config_path.clone())
+        .await
+        .expect("fixed config reloads without restarting the engine");
+    assert!(!snapshot.reload_required);
+    assert_eq!(snapshot.servers.len(), 1);
+    assert_eq!(snapshot.servers[0].name, "ready");
+    assert!(!snapshot.servers[0].enabled);
+
+    let alternate_path = tmp.path().join("alternate-mcp.json");
+    std::fs::write(
+        &alternate_path,
+        r#"{"servers":{"alternate":{"command":"node","disabled":true}}}"#,
+    )
+    .expect("alternate config");
+    let alternate = handle
+        .reload_mcp(alternate_path.clone())
+        .await
+        .expect("a changed config path replaces the engine pool in process");
+    assert_eq!(alternate.config_path, alternate_path);
+    assert_eq!(alternate.servers.len(), 1);
+    assert_eq!(alternate.servers[0].name, "alternate");
+
+    handle.send(Op::Shutdown).await.expect("shutdown");
+    task.await.expect("engine task");
+}
+
+#[tokio::test]
 async fn list_subagents_event_try_send_does_not_block_when_event_channel_full() {
     use tokio::sync::mpsc;
 

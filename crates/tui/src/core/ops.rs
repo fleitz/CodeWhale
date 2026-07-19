@@ -41,6 +41,9 @@ pub struct ProviderRuntimeStatus {
     pub active_provider_requests: usize,
 }
 
+/// Result of rebuilding the engine-owned MCP pool in process.
+pub type McpReloadResult = Result<crate::mcp::McpManagerSnapshot, String>;
+
 /// Origin of text being introduced as a user-role turn.
 ///
 /// Chat providers force several runtime/control-plane signals through
@@ -239,6 +242,13 @@ pub enum Op {
         tx: std::sync::Arc<
             std::sync::Mutex<Option<tokio::sync::oneshot::Sender<ProviderRuntimeStatus>>>,
         >,
+    },
+
+    /// Force the engine-owned MCP config/catalog to reload and reconnect.
+    /// The returned snapshot is taken from that same live pool.
+    ReloadMcp {
+        config_path: PathBuf,
+        tx: std::sync::Arc<std::sync::Mutex<Option<tokio::sync::oneshot::Sender<McpReloadResult>>>>,
     },
 
     /// Run agent-driven context purging.

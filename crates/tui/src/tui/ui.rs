@@ -10260,7 +10260,7 @@ async fn apply_command_result(
                 refresh_active_task_panel(app, task_manager).await;
             }
             AppAction::Mcp(action) => {
-                handle_mcp_ui_action(app, config, action).await;
+                handle_mcp_ui_action(app, engine_handle, config, action).await;
             }
             AppAction::SwitchWorkspace { workspace } => {
                 switch_workspace(app, engine_handle, task_manager, config, workspace).await;
@@ -10445,6 +10445,7 @@ async fn switch_workspace(
 
 async fn handle_mcp_ui_action(
     app: &mut App,
+    engine_handle: &EngineHandle,
     config: &Config,
     action: crate::tui::app::McpUiAction,
 ) {
@@ -10453,6 +10454,7 @@ async fn handle_mcp_ui_action(
     let path = app.mcp_config_path.clone();
     let mut changed = false;
     let mut message = None;
+    let is_reload = matches!(&action, crate::tui::app::McpUiAction::Reload);
     let discover = mcp_ui_action_refreshes_discovery(&action);
 
     let action_result = match action {
@@ -10535,8 +10537,9 @@ async fn handle_mcp_ui_action(
             }
             .await;
             result.map(|()| {
+                changed = true;
                 message = Some(format!(
-                    "Stored OAuth credentials for MCP server '{name}'. Restart if the server was already connected."
+                    "Stored OAuth credentials for MCP server '{name}'. Run /mcp reload to reconnect it."
                 ));
             })
         }
@@ -10554,8 +10557,11 @@ async fn handle_mcp_ui_action(
                 mcp::oauth::delete_oauth_tokens_for_server(&name, server)
             })();
             result.map(|deleted| {
+                changed = deleted;
                 message = Some(if deleted {
-                    format!("Deleted stored OAuth credentials for MCP server '{name}'.")
+                    format!(
+                        "Deleted stored OAuth credentials for MCP server '{name}'. Run /mcp reload to reconnect it."
+                    )
                 } else {
                     format!("No stored OAuth credentials found for MCP server '{name}'.")
                 });
@@ -10570,13 +10576,25 @@ async fn handle_mcp_ui_action(
     }
 
     if changed {
-        app.mcp_restart_required = true;
+        app.mcp_reload_required = true;
     }
     if let Some(message) = message {
         add_mcp_message(app, message);
     }
 
-    let snapshot_result = if discover {
+    let snapshot_result = if is_reload {
+        match engine_handle.reload_mcp(path.clone()).await {
+            Ok(snapshot) => {
+                app.mcp_reload_required = false;
+                add_mcp_message(app, mcp_reload_summary(&snapshot));
+                Ok(snapshot)
+            }
+            Err(error) => {
+                app.mcp_reload_required = true;
+                Err(error)
+            }
+        }
+    } else if discover {
         let network_policy = config.network.clone().map(|toml_cfg| {
             crate::network_policy::NetworkPolicyDecider::with_default_audit(toml_cfg.into_runtime())
         });
@@ -10584,7 +10602,7 @@ async fn handle_mcp_ui_action(
             &path,
             &app.workspace,
             network_policy,
-            app.mcp_restart_required,
+            app.mcp_reload_required,
             std::sync::Arc::clone(&app.plugin_registry),
         )
         .await
@@ -10592,7 +10610,7 @@ async fn handle_mcp_ui_action(
         mcp::manager_snapshot_from_config_with_workspace_and_plugins(
             &path,
             &app.workspace,
-            app.mcp_restart_required,
+            app.mcp_reload_required,
             app.plugin_registry.as_ref(),
         )
     };
@@ -10602,7 +10620,7 @@ async fn handle_mcp_ui_action(
             if discover {
                 add_mcp_message(
                     app,
-                    "MCP discovery refreshed for the UI. Restart the TUI after config edits to rebuild the model-visible MCP tool pool.".to_string(),
+                    "MCP discovery refreshed for the UI. Run /mcp reload after config or credential edits to rebuild the live model-visible tool pool.".to_string(),
                 );
             }
             // Keep the boot-time MCP-count chip in sync with the live
@@ -10615,8 +10633,33 @@ async fn handle_mcp_ui_action(
             app.hotbar_actions.replace_mcp_tools(Some(&snapshot));
             open_mcp_manager_pager(app, &snapshot);
         }
+        Err(err) if is_reload => add_mcp_message(
+            app,
+            format!("MCP reload failed; the live tool pool is unchanged: {err}"),
+        ),
         Err(err) => add_mcp_message(app, format!("MCP snapshot failed: {err}")),
     }
+}
+
+fn mcp_reload_summary(snapshot: &crate::mcp::McpManagerSnapshot) -> String {
+    let connected = snapshot
+        .servers
+        .iter()
+        .filter(|server| server.connected)
+        .count();
+    let failed = snapshot
+        .servers
+        .iter()
+        .filter(|server| server.enabled && server.error.is_some())
+        .count();
+    let disabled = snapshot
+        .servers
+        .iter()
+        .filter(|server| !server.enabled)
+        .count();
+    format!(
+        "MCP tool pool reloaded in process: {connected} connected, {failed} failed, {disabled} disabled. The next model turn uses this catalog."
+    )
 }
 
 fn mcp_ui_action_refreshes_discovery(action: &crate::tui::app::McpUiAction) -> bool {
@@ -10624,7 +10667,6 @@ fn mcp_ui_action_refreshes_discovery(action: &crate::tui::app::McpUiAction) -> b
         action,
         crate::tui::app::McpUiAction::Show
             | crate::tui::app::McpUiAction::Validate
-            | crate::tui::app::McpUiAction::Reload
             | crate::tui::app::McpUiAction::Login { .. }
             | crate::tui::app::McpUiAction::Logout { .. }
     )

@@ -330,8 +330,8 @@ pub enum AppRequest {
     /// Mirrors the TUI `reload_runtime_config` codepath for everything
     /// reachable from the headless `Runtime`. MCP server connections
     /// are not refreshed — changing `mcp_config_path` or the referenced
-    /// `mcp.json` still requires a restart, matching the TUI's
-    /// `mcp_restart_required` behavior.
+    /// `mcp.json` still requires a headless-runtime restart. The TUI's
+    /// explicit `/mcp reload` operation is not part of this protocol path.
     ConfigReload,
     /// List available models.
     Models,

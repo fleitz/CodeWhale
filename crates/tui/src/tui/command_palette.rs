@@ -1703,7 +1703,7 @@ mod tests {
         let snapshot = crate::mcp::McpManagerSnapshot {
             config_path: Path::new("mcp.json").to_path_buf(),
             config_exists: true,
-            restart_required: false,
+            reload_required: false,
             servers: vec![
                 crate::mcp::McpServerSnapshot {
                     name: "fs".to_string(),
@@ -1779,7 +1779,7 @@ mod tests {
         let snapshot = crate::mcp::McpManagerSnapshot {
             config_path: Path::new("mcp.json").to_path_buf(),
             config_exists: true,
-            restart_required: false,
+            reload_required: false,
             servers: vec![crate::mcp::McpServerSnapshot {
                 name: "muted".to_string(),
                 enabled: false,

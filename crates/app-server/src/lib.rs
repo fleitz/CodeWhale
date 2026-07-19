@@ -1703,8 +1703,8 @@ async fn apply_config_update(
     }
     // Sync into the live Runtime so the next turn picks up the change
     // without a restart. MCP server connections are NOT refreshed here —
-    // see `Runtime::reload_config_and_policy` for the rationale and the
-    // matching TUI `mcp_restart_required` note.
+    // see `Runtime::reload_config_and_policy` for the headless boundary;
+    // the TUI's explicit `/mcp reload` operation is a separate path.
     {
         let mut runtime = state.runtime.write().await;
         match exec_policy {

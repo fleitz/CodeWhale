@@ -939,8 +939,8 @@ impl Runtime {
     /// **Not** refreshed by this call:
     /// * `mcp_manager` — MCP server connections are loaded once at
     ///   startup from `mcp_config_path`. Changing `mcp_config_path` or the
-    ///   referenced `mcp.json` still requires a restart, exactly as the
-    ///   TUI flags via `mcp_restart_required`.
+    ///   referenced `mcp.json` still requires a headless-runtime restart;
+    ///   the TUI owns a separate explicit `/mcp reload` operation.
     /// * `tool_registry` — built once at startup.
     /// * `model_registry` — static catalog.
     pub fn reload_config_and_policy(&mut self, config: ConfigToml, exec_policy: ExecPolicyEngine) {
