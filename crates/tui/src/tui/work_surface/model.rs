@@ -233,7 +233,7 @@ fn graph_rows(
         .collect::<Vec<_>>();
     let running = visible
         .iter()
-        .filter(|node| node.state == NodeState::Active)
+        .filter(|node| matches!(node.state, NodeState::Initializing | NodeState::Active))
         .count();
     let waiting = visible
         .iter()
@@ -690,6 +690,51 @@ fn section_list(out: &mut String, title: &str, items: Vec<String>) {
                 .map(|item| format!("- {item}"))
                 .collect::<Vec<_>>()
                 .join("\n"),
+        );
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::work_graph::{OperationBinding, WorkNodeId};
+
+    fn operation(state: NodeState, suffix: &str) -> WorkNode {
+        WorkNode {
+            id: WorkNodeId::derive("work-surface-test", suffix),
+            kind: NodeKind::Operation,
+            title: format!("operation {suffix}"),
+            state,
+            acceptance: Vec::new(),
+            binding: Some(OperationBinding {
+                external: format!("shell:{suffix}"),
+                durable: false,
+                last_observation: None,
+            }),
+            evidence: None,
+            provenance: Provenance::ToolUpdate {
+                tool: "test".to_string(),
+                call_id: suffix.to_string(),
+            },
+            created_at: 1,
+            updated_at: 1,
+        }
+    }
+
+    #[test]
+    fn heading_counts_initializing_and_active_operations_as_running() {
+        let mut snapshot = WorkGraphSnapshot::new();
+        snapshot.nodes = vec![
+            operation(NodeState::Initializing, "initializing"),
+            operation(NodeState::Active, "active"),
+            operation(NodeState::Ready, "ready"),
+        ];
+
+        let rows = graph_rows(&snapshot, None);
+
+        assert_eq!(
+            rows.first().map(|row| row.label.as_str()),
+            Some("Work · 2 running · 1 ready · 0 blocked")
         );
     }
 }
