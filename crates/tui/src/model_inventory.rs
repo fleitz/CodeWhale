@@ -91,7 +91,7 @@ impl ModelInventory {
                 if let Ok(route) =
                     crate::route_runtime::resolve_runtime_route(config, provider, Some(&model))
                 {
-                    if let Some(context_window) = route.candidate.limits.context_tokens {
+                    if let Some(context_window) = route.candidate.limits().context_tokens {
                         capability.context_window = context_window.min(u64::from(u32::MAX)) as u32;
                     }
                     // Do not promote bare `k3` into the global capability
@@ -99,8 +99,8 @@ impl ModelInventory {
                     // Kimi Code's exact membership-plan route.
                     if crate::config::is_exact_kimi_code_k3_route(
                         provider,
-                        &route.candidate.endpoint.base_url,
-                        route.candidate.wire_model_id.as_str(),
+                        &route.candidate.endpoint().base_url,
+                        route.candidate.wire_model_id().as_str(),
                     ) {
                         capability.thinking_supported = true;
                     }

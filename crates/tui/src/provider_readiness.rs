@@ -375,10 +375,11 @@ pub(crate) fn route_is_valid_for_model(
                 .filter(|value| !value.is_empty())
                 .map(str::to_string)
         },
+        limit_overrides: Vec::new(),
     };
     RouteResolver::new()
         .resolve(&request)
-        .is_ok_and(|candidate| candidate.validation.ok)
+        .is_ok_and(|candidate| candidate.validation().ok)
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

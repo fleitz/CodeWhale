@@ -902,8 +902,8 @@ impl DeepSeekClient {
     /// `config`.
     pub fn from_candidate(config: &Config, candidate: &ReadyRouteCandidate) -> Result<Self> {
         Self::from_parts(
-            candidate.endpoint.base_url.clone(),
-            candidate.wire_model_id.as_str().to_string(),
+            candidate.endpoint().base_url.clone(),
+            candidate.wire_model_id().as_str().to_string(),
             config,
         )
     }
@@ -6469,8 +6469,11 @@ mod tests {
             .expect("client should construct from candidate");
 
         // The transport is bound to the candidate, not re-derived from Config.
-        assert_eq!(client.base_url, route.candidate.endpoint.base_url);
-        assert_eq!(client.default_model, route.candidate.wire_model_id.as_str());
+        assert_eq!(client.base_url, route.candidate.endpoint().base_url);
+        assert_eq!(
+            client.default_model,
+            route.candidate.wire_model_id().as_str()
+        );
     }
 
     #[test]
@@ -6538,9 +6541,9 @@ mod tests {
         assert_eq!(client.api_provider, ApiProvider::Custom);
         // The candidate carried the custom endpoint + verbatim wire model.
         assert_eq!(
-            route.candidate.endpoint.base_url,
+            route.candidate.endpoint().base_url,
             "https://api.example.com/v1"
         );
-        assert_eq!(route.candidate.wire_model_id.as_str(), "custom-model-v1");
+        assert_eq!(route.candidate.wire_model_id().as_str(), "custom-model-v1");
     }
 }

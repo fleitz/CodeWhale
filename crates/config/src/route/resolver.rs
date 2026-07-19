@@ -28,7 +28,8 @@
 //! which structurally bars prompt-content routing.
 
 use super::candidate::{
-    PricingSku, ReadyRouteCandidate, ResolvedAuthSource, ResolvedEndpoint, ValidationReport,
+    LimitField, PricingSku, ReadyRouteCandidate, ResolvedAuthSource, ResolvedEndpoint,
+    SourcedLimitOverride, ValidationReport,
 };
 use super::descriptor::ProviderDescriptor;
 use super::errors::RouteError;
@@ -51,6 +52,11 @@ pub struct RouteRequest {
     pub saved_provider_model: Option<WireModelId>,
     /// An explicit base URL override for the endpoint.
     pub base_url_override: Option<String>,
+    /// Sourced limit overrides, applied in order BEFORE the candidate is
+    /// constructed and recorded on it as provenance. This is the ONLY channel
+    /// for adjusting a route's effective limits: the candidate itself is
+    /// immutable once minted.
+    pub limit_overrides: Vec<SourcedLimitOverride>,
 }
 
 /// Resolves [`RouteRequest`]s into [`ReadyRouteCandidate`]s.
@@ -192,6 +198,18 @@ impl RouteResolver {
         }
         let validation = ValidationReport { ok: true, messages };
 
+        // Apply caller-requested limit overrides in order, BEFORE the candidate
+        // is minted. The candidate is immutable afterwards; the applied
+        // overrides are recorded on it as provenance.
+        let mut limits = limits;
+        for limit_override in &req.limit_overrides {
+            match limit_override.field {
+                LimitField::ContextTokens => limits.context_tokens = limit_override.value,
+                LimitField::InputTokens => limits.input_tokens = limit_override.value,
+                LimitField::OutputTokens => limits.output_tokens = limit_override.value,
+            }
+        }
+
         Ok(ReadyRouteCandidate::new(
             provider_id,
             provider_kind,
@@ -199,7 +217,9 @@ impl RouteResolver {
             canonical_model,
             wire_model_id,
             endpoint,
-            ResolvedAuthSource::Missing,
+            // The resolver never inspects credentials: auth is honestly
+            // `Unresolved` at resolution time, not a claimed `Missing`.
+            ResolvedAuthSource::Unresolved,
             descriptor.protocol(),
             limits,
             // #3085: honest pricing projected from the matched offering (the
@@ -207,6 +227,7 @@ impl RouteResolver {
             // no offering was matched or the offering carried no price.
             Some(pricing),
             validation,
+            req.limit_overrides.clone(),
         ))
     }
 

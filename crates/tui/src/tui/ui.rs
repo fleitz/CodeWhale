@@ -8016,7 +8016,7 @@ fn compaction_for_validated_route(
     app.compaction_config_for_route(
         route.identity.provider,
         &route.model,
-        crate::route_budget::known_route_limits(route.candidate.limits),
+        crate::route_budget::known_route_limits(route.candidate.limits()),
     )
 }
 
@@ -8132,7 +8132,7 @@ async fn dispatch_user_message(
     } else {
         turn_route
     };
-    let turn_route_limits = crate::route_budget::known_route_limits(turn_route.candidate.limits);
+    let turn_route_limits = crate::route_budget::known_route_limits(turn_route.candidate.limits());
     let effective_provider_identity = turn_route.identity.key.clone();
     let effective_provider_label = if effective_provider == ApiProvider::Custom {
         effective_provider_identity.clone()
@@ -8168,7 +8168,7 @@ async fn dispatch_user_message(
         effort
             .api_value_for_route(
                 effective_provider,
-                &turn_route.candidate.endpoint.base_url,
+                &turn_route.candidate.endpoint().base_url,
                 &turn_route.model,
             )
             .map(str::to_string)
@@ -8176,7 +8176,7 @@ async fn dispatch_user_message(
         app.reasoning_effort
             .api_value_for_route(
                 effective_provider,
-                &turn_route.candidate.endpoint.base_url,
+                &turn_route.candidate.endpoint().base_url,
                 &turn_route.model,
             )
             .map(str::to_string)
@@ -8576,15 +8576,15 @@ async fn apply_model_picker_choice(
             None,
         ) {
             Ok(resolution) => {
-                resolved_model = resolution.candidate.wire_model_id.as_str().to_string();
-                route_base_url = resolution.candidate.endpoint.base_url.clone();
+                resolved_model = resolution.candidate.wire_model_id().as_str().to_string();
+                route_base_url = resolution.candidate.endpoint().base_url.clone();
                 if model_changed {
                     app.set_active_context_window_override(
                         config.context_window_for_provider_config(app.api_provider),
                     );
                     app.set_active_route_resolution(
                         route_base_url.clone(),
-                        resolution.candidate.limits,
+                        resolution.candidate.limits(),
                         resolution.context_window.source,
                     );
                 }
@@ -8854,8 +8854,8 @@ async fn switch_provider(
     };
     let target_identity_record = validated_route.identity.clone();
     let target_identity = target_identity_record.key.clone();
-    let resolved_endpoint = validated_route.candidate.endpoint.base_url.clone();
-    let route_limits = validated_route.candidate.limits;
+    let resolved_endpoint = validated_route.candidate.endpoint().base_url.clone();
+    let route_limits = validated_route.candidate.limits();
     let context_window_source = validated_route.context_window.source;
     let new_model = validated_route.model.clone();
     *config = *validated_route.config;
@@ -9003,7 +9003,7 @@ async fn apply_provider_fallback_switch(
         }
     };
     let target_identity = resolved_route.identity.clone();
-    let resolved_endpoint = resolved_route.candidate.endpoint.base_url.clone();
+    let resolved_endpoint = resolved_route.candidate.endpoint().base_url.clone();
     let next_config = resolved_route.config;
     let new_model = resolved_route.model;
     let context_window_source = resolved_route.context_window.source;
@@ -9037,7 +9037,7 @@ async fn apply_provider_fallback_switch(
     app.set_active_context_window_override(config.context_window_for_provider_config(target));
     app.set_active_route_resolution(
         new_base_url.clone(),
-        resolved_route.candidate.limits,
+        resolved_route.candidate.limits(),
         context_window_source,
     );
     app.update_model_compaction_budget();
@@ -10006,7 +10006,7 @@ async fn apply_command_result(
                         let new_model = validated_route.model.clone();
                         let provider_identity = validated_route.identity.clone();
                         let route_limits = crate::route_budget::known_route_limits(
-                            validated_route.candidate.limits,
+                            validated_route.candidate.limits(),
                         );
                         app.config_profile = Some(profile.clone());
                         *config = new_config.clone();
@@ -13855,8 +13855,8 @@ fn resolve_loaded_session_route(app: &mut App, config: &Config) {
         None,
     ) {
         Ok(resolution) => app.set_active_route_resolution(
-            resolution.candidate.endpoint.base_url,
-            resolution.candidate.limits,
+            resolution.candidate.endpoint().base_url.clone(),
+            resolution.candidate.limits(),
             resolution.context_window.source,
         ),
         Err(_) => {

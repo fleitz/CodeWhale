@@ -242,7 +242,7 @@ pub fn build_headless_context_report(config: &Config, workspace: &Path) -> Promp
     let provider = config.api_provider();
     let provider_identity = config.provider_identity_for(provider);
     let route = crate::route_runtime::resolve_runtime_route(config, provider, Some(&model)).ok();
-    let route_limits = route.as_ref().map(|route| route.candidate.limits);
+    let route_limits = route.as_ref().map(|route| route.candidate.limits());
     let context_window_source = route
         .as_ref()
         .map(|route| route.context_window.source)

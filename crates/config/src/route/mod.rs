@@ -34,7 +34,8 @@ pub mod offering;
 pub mod resolver;
 
 pub use candidate::{
-    PricingSku, ReadyRouteCandidate, ResolvedAuthSource, ResolvedEndpoint, ValidationReport,
+    LimitField, OverrideSource, PricingSku, ReadyRouteCandidate, ResolvedAuthSource,
+    ResolvedEndpoint, SourcedLimitOverride, ValidationReport,
 };
 pub use descriptor::{EndpointDescriptor, ProviderDescriptor};
 pub use errors::RouteError;

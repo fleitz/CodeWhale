@@ -898,7 +898,7 @@ impl Engine {
         let identity = route.identity.key;
         let provider_id = route.identity.exact_id;
         let model = route.model;
-        let limits = crate::route_budget::known_route_limits(route.candidate.limits);
+        let limits = crate::route_budget::known_route_limits(route.candidate.limits());
         let api_config = *route.config;
         let client = route.client;
 
@@ -941,7 +941,7 @@ impl Engine {
         let identity = route.identity.key;
         let provider_id = route.identity.exact_id;
         let model = route.model;
-        let limits = crate::route_budget::known_route_limits(route.candidate.limits);
+        let limits = crate::route_budget::known_route_limits(route.candidate.limits());
         let api_config = *route.config;
         let concrete_client = preflighted_client
             .map(Ok)
@@ -2644,7 +2644,7 @@ impl Engine {
         let effective_provider = route.identity.provider;
         let provider_identity = route.identity.key.clone();
         let model = route.model.clone();
-        let route_limits = crate::route_budget::known_route_limits(route.candidate.limits);
+        let route_limits = crate::route_budget::known_route_limits(route.candidate.limits());
         if let Err(err) = self.install_resolved_runtime_route(route) {
             let _ = self
                 .tx_event

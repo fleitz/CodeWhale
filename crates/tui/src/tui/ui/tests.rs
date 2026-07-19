@@ -5392,7 +5392,7 @@ fn auto_routed_turn_compaction_uses_selected_route_not_stale_app_route() {
         .expect("resolve auto-selected route")
         .validate()
         .expect("preflight auto-selected route");
-    let route_limits = crate::route_budget::known_route_limits(route.candidate.limits);
+    let route_limits = crate::route_budget::known_route_limits(route.candidate.limits());
 
     let compaction =
         app.compaction_config_for_route(route.identity.provider, &route.model, route_limits);
@@ -11846,7 +11846,7 @@ fn named_custom_provider_resume_uses_exact_live_endpoint_model_and_workspace() {
     let route = resolve_runtime_route(&config, app.api_provider, Some(&app.model))
         .expect("runtime route remains exact");
     assert_eq!(
-        route.candidate.endpoint.base_url,
+        route.candidate.endpoint().base_url,
         "http://127.0.0.1:1234/v1"
     );
     assert_eq!(route.model, "local-code-model");
@@ -14402,11 +14402,11 @@ async fn failed_fallback_restores_exact_literal_custom_identity_without_root_cro
     .expect("restored identity must still resolve the exact literal table");
     assert_eq!(route.identity.exact_id.as_deref(), Some("custom"));
     assert_eq!(
-        route.candidate.endpoint.base_url,
+        route.candidate.endpoint().base_url,
         "http://127.0.0.1:18181/v1"
     );
     assert_ne!(
-        route.candidate.endpoint.base_url,
+        route.candidate.endpoint().base_url,
         "http://127.0.0.1:18180/v1"
     );
 }

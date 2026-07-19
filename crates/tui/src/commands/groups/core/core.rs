@@ -227,8 +227,8 @@ pub fn model(app: &mut App, model_name: Option<&str>) -> CommandResult {
         app.set_model_selection(model_id.clone());
         if let Some(resolution) = route_resolution {
             app.set_active_route_resolution(
-                resolution.candidate.endpoint.base_url,
-                resolution.candidate.limits,
+                resolution.candidate.endpoint().base_url.clone(),
+                resolution.candidate.limits(),
                 resolution.context_window.source,
             );
         } else {

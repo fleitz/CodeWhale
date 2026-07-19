@@ -561,8 +561,8 @@ impl ProviderDashboardRow {
         ) = match route {
             Ok(resolution) => {
                 let candidate = resolution.candidate;
-                if !candidate.validation.messages.is_empty() {
-                    messages.extend(candidate.validation.messages.clone());
+                if !candidate.validation().messages.is_empty() {
+                    messages.extend(candidate.validation().messages.clone());
                 }
                 (
                     if provider == ApiProvider::DeepseekCN {
@@ -570,15 +570,15 @@ impl ProviderDashboardRow {
                             .clone()
                             .unwrap_or_else(|| provider.default_base_url().to_string())
                     } else {
-                        candidate.endpoint.base_url
+                        candidate.endpoint().base_url.clone()
                     },
-                    vec![protocol_label(candidate.protocol).to_string()],
+                    vec![protocol_label(candidate.protocol()).to_string()],
                     ProviderDefaultRoute {
-                        logical_model: candidate.logical_model.raw().to_string(),
-                        wire_model: candidate.wire_model_id.as_str().to_string(),
+                        logical_model: candidate.logical_model().raw().to_string(),
+                        wire_model: candidate.wire_model_id().as_str().to_string(),
                     },
-                    pricing_label(provider, candidate.pricing.as_ref()),
-                    candidate.validation.ok,
+                    pricing_label(provider, candidate.pricing()),
+                    candidate.validation().ok,
                     Some(resolution.context_window.tokens),
                     Some(resolution.context_window.source.label().to_string()),
                 )

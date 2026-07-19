@@ -10119,7 +10119,7 @@ async fn run_exec_agent(
     let approval_posture = if auto_approve { "auto_tools" } else { "ask" }.to_string();
     let sandbox_posture = explicit_sandbox.unwrap_or("configured_default").to_string();
     let active_route_limits =
-        crate::route_budget::known_route_limits(validated_route.candidate.limits);
+        crate::route_budget::known_route_limits(validated_route.candidate.limits());
     let max_subagents = if max_subagents == config.max_subagents_for_provider(config.api_provider())
     {
         execution_config

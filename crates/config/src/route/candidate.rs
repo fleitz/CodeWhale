@@ -5,13 +5,14 @@
 //! > Execution requires a `ReadyRouteCandidate`.
 //! > A `ReadyRouteCandidate` can only be produced by `RouteResolver`.
 //!
-//! Fields are pub-*read*, but the type cannot be *constructed* outside this
-//! crate: the struct is `#[non_exhaustive]` (no other crate can build it via a
-//! struct literal) and deliberately does not derive `Deserialize` (so it cannot
-//! be fabricated from JSON either). The only constructor is
-//! [`ReadyRouteCandidate::new`]
+//! Fields are private and exposed only through read-only getters, so the type
+//! can neither be *constructed* nor *mutated* outside this crate, and it
+//! deliberately does not derive `Deserialize` (so it cannot be fabricated from
+//! JSON either). The only constructor is [`ReadyRouteCandidate::new`]
 //! (`pub(super)`), and [`super::resolver::RouteResolver::resolve`] is its sole
-//! caller. A candidate's existence is therefore proof it passed the resolver.
+//! caller. A candidate's existence is therefore proof it passed the resolver,
+//! and a candidate's limits are therefore exactly what the resolver produced
+//! (including any [`SourcedLimitOverride`]s recorded on it).
 //!
 //! DEFERRED: #3384's full sketch also carried `capabilities: CapabilityProfile`
 //! and `config_snapshot: Config`. Both are intentionally omitted here: pulling
@@ -58,6 +59,57 @@ pub enum ResolvedAuthSource {
     Secret,
     /// No credential resolved.
     Missing,
+    /// Auth resolution has not been performed for this candidate.
+    ///
+    /// The route resolver never inspects credentials, so a freshly resolved
+    /// candidate honestly reports `Unresolved` rather than claiming `Missing`
+    /// (which would assert a lookup that never happened).
+    Unresolved,
+}
+
+/// Which token limit a [`SourcedLimitOverride`] targets.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum LimitField {
+    /// [`RouteLimits::context_tokens`](super::offering::RouteLimits).
+    ContextTokens,
+    /// [`RouteLimits::input_tokens`](super::offering::RouteLimits).
+    InputTokens,
+    /// [`RouteLimits::output_tokens`](super::offering::RouteLimits).
+    OutputTokens,
+}
+
+/// Why a limit override was requested.
+///
+/// This is provenance, not policy: the resolver applies whatever the caller
+/// requested and records the source on the candidate so every consumer can see
+/// where an effective limit came from.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum OverrideSource {
+    /// Operator-configured context window.
+    UserContextWindow,
+    /// Catalog limits describe the public API offering, not the account-scoped
+    /// Codex route; the API-only limits are stripped.
+    CodexPublicApiLimitStrip,
+    /// Per-model context from the fresh Codex account roster.
+    CodexRosterCorrection,
+    /// Fresh, route-scoped provider-reported context metadata.
+    ProviderReportedContextWindow,
+    /// Conservative all-plan safe floor for a membership-plan route.
+    MembershipPlanSafeFloor,
+}
+
+/// One sourced limit override, applied by the resolver BEFORE the candidate is
+/// constructed and recorded on the candidate as provenance.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SourcedLimitOverride {
+    /// The limit field to override.
+    pub field: LimitField,
+    /// The value to set (`None` clears the limit to "unknown").
+    pub value: Option<u64>,
+    /// Why the override was requested.
+    pub source: OverrideSource,
 }
 
 /// Pricing/quota class for the resolved route.
@@ -106,34 +158,53 @@ pub struct ValidationReport {
 
 /// A runtime-resolved, executable route.
 ///
-/// Fields are read-only to callers; the type cannot be constructed outside this
-/// crate (`#[non_exhaustive]` + no `Deserialize`). The only constructor is
-/// [`Self::new`], which is `pub(super)`; see module docs.
+/// The candidate is IMMUTABLE once minted: every field is private and exposed
+/// only through read-only getters, the type cannot be constructed outside this
+/// crate (private fields + no `Deserialize`), and there are no setters. The
+/// only constructor is [`Self::new`], which is `pub(super)`; see module docs.
+/// Post-resolution limit adjustments must instead be requested up front via
+/// [`super::resolver::RouteRequest::limit_overrides`], which the resolver
+/// applies BEFORE construction and records in [`Self::applied_limit_overrides`].
+///
+/// Immutability is compile-time enforced — this does not build:
+///
+/// ```compile_fail
+/// use codewhale_config::route::{RouteRequest, RouteResolver};
+///
+/// let mut candidate = RouteResolver::new()
+///     .resolve(&RouteRequest::default())
+///     .unwrap();
+/// // ERROR: field `limits` of `ReadyRouteCandidate` is private
+/// candidate.limits.context_tokens = Some(1);
+/// ```
 #[derive(Debug, Clone, Serialize)]
 #[non_exhaustive]
 pub struct ReadyRouteCandidate {
     /// Resolved provider id.
-    pub provider_id: ProviderId,
+    provider_id: ProviderId,
     /// Resolved provider kind.
-    pub provider_kind: ProviderKind,
+    provider_kind: ProviderKind,
     /// The selector the user/route requested.
-    pub logical_model: LogicalModelRef,
+    logical_model: LogicalModelRef,
     /// Canonical model identity, if one was resolved.
-    pub canonical_model: Option<ModelId>,
+    canonical_model: Option<ModelId>,
     /// Provider-owned wire id put on the request.
-    pub wire_model_id: WireModelId,
+    wire_model_id: WireModelId,
     /// Resolved endpoint transport facts.
-    pub endpoint: ResolvedEndpoint,
+    endpoint: ResolvedEndpoint,
     /// Resolved auth source CLASS (never a secret value).
-    pub auth: ResolvedAuthSource,
+    auth: ResolvedAuthSource,
     /// Selected wire protocol.
-    pub protocol: RequestProtocol,
-    /// Route/offering-scoped token limits, when known.
-    pub limits: RouteLimits,
+    protocol: RequestProtocol,
+    /// Route/offering-scoped token limits, when known (overrides applied).
+    limits: RouteLimits,
     /// Pricing/quota class, if known.
-    pub pricing: Option<PricingSku>,
+    pricing: Option<PricingSku>,
     /// Validation outcome.
-    pub validation: ValidationReport,
+    validation: ValidationReport,
+    /// Provenance of every limit override applied at resolution time.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    applied_limit_overrides: Vec<SourcedLimitOverride>,
 }
 
 impl ReadyRouteCandidate {
@@ -152,6 +223,7 @@ impl ReadyRouteCandidate {
         limits: RouteLimits,
         pricing: Option<PricingSku>,
         validation: ValidationReport,
+        applied_limit_overrides: Vec<SourcedLimitOverride>,
     ) -> Self {
         Self {
             provider_id,
@@ -165,6 +237,79 @@ impl ReadyRouteCandidate {
             limits,
             pricing,
             validation,
+            applied_limit_overrides,
         }
+    }
+
+    /// Resolved provider id.
+    #[must_use]
+    pub fn provider_id(&self) -> &ProviderId {
+        &self.provider_id
+    }
+
+    /// Resolved provider kind.
+    #[must_use]
+    pub fn provider_kind(&self) -> ProviderKind {
+        self.provider_kind
+    }
+
+    /// The selector the user/route requested.
+    #[must_use]
+    pub fn logical_model(&self) -> &LogicalModelRef {
+        &self.logical_model
+    }
+
+    /// Canonical model identity, if one was resolved.
+    #[must_use]
+    pub fn canonical_model(&self) -> Option<&ModelId> {
+        self.canonical_model.as_ref()
+    }
+
+    /// Provider-owned wire id put on the request.
+    #[must_use]
+    pub fn wire_model_id(&self) -> &WireModelId {
+        &self.wire_model_id
+    }
+
+    /// Resolved endpoint transport facts.
+    #[must_use]
+    pub fn endpoint(&self) -> &ResolvedEndpoint {
+        &self.endpoint
+    }
+
+    /// Resolved auth source CLASS (never a secret value).
+    #[must_use]
+    pub fn auth(&self) -> &ResolvedAuthSource {
+        &self.auth
+    }
+
+    /// Selected wire protocol.
+    #[must_use]
+    pub fn protocol(&self) -> RequestProtocol {
+        self.protocol
+    }
+
+    /// Route/offering-scoped token limits, when known (overrides applied).
+    #[must_use]
+    pub fn limits(&self) -> RouteLimits {
+        self.limits
+    }
+
+    /// Pricing/quota class, if known.
+    #[must_use]
+    pub fn pricing(&self) -> Option<&PricingSku> {
+        self.pricing.as_ref()
+    }
+
+    /// Validation outcome.
+    #[must_use]
+    pub fn validation(&self) -> &ValidationReport {
+        &self.validation
+    }
+
+    /// Provenance of every limit override applied at resolution time.
+    #[must_use]
+    pub fn applied_limit_overrides(&self) -> &[SourcedLimitOverride] {
+        &self.applied_limit_overrides
     }
 }

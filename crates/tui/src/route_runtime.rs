@@ -1,6 +1,7 @@
 use chrono::{DateTime, Duration, Utc};
 use codewhale_config::route::{
-    LogicalModelRef, ReadyRouteCandidate, RouteLimits, RouteRequest, RouteResolver, WireModelId,
+    LimitField, LogicalModelRef, OverrideSource, ReadyRouteCandidate, RouteRequest, RouteResolver,
+    SourcedLimitOverride, WireModelId,
 };
 use serde::Serialize;
 
@@ -196,55 +197,121 @@ pub(crate) fn resolve_route_candidate_with_context_metadata(
     context_window_override: Option<u32>,
     provider_reported_context: Option<ProviderReportedKimiCodeContext>,
 ) -> Result<RouteCandidateResolution, String> {
-    let route_request = RouteRequest {
+    let resolver = RouteResolver::new();
+    let base_request = RouteRequest {
         explicit_provider: provider.kind(),
         model_selector: model_selector.map(|model| LogicalModelRef::from(model.to_string())),
         saved_provider_model: saved_provider_model
             .map(|model| WireModelId::from(model.to_string())),
         base_url_override,
+        limit_overrides: Vec::new(),
     };
-    let mut candidate = RouteResolver::new()
-        .resolve(&route_request)
+    // First pass: resolve the route without overrides to learn the effective
+    // endpoint, wire model id, and catalog limits. Candidates are immutable, so
+    // limit adjustments are planned from this read-only resolution and then
+    // requested through `RouteRequest::limit_overrides` on a second pass; the
+    // resolver applies them BEFORE minting the final candidate and records
+    // their provenance on it.
+    let resolved = resolver
+        .resolve(&base_request)
         .map_err(|err| err.to_string())?;
+    let plan = plan_limit_overrides(
+        provider,
+        &resolved,
+        context_window_override,
+        provider_reported_context,
+    );
+    let candidate = if plan.overrides.is_empty() {
+        resolved
+    } else {
+        resolver
+            .resolve(&RouteRequest {
+                limit_overrides: plan.overrides,
+                ..base_request
+            })
+            .map_err(|err| err.to_string())?
+    };
+    Ok(RouteCandidateResolution {
+        candidate,
+        context_window: plan.context_window,
+    })
+}
+
+/// The sourced limit overrides a route needs, plus the context-window receipt
+/// describing the effective context value they produce.
+struct LimitOverridePlan {
+    overrides: Vec<SourcedLimitOverride>,
+    context_window: ContextWindowResolution,
+}
+
+/// Plan the limit overrides for a resolved route.
+///
+/// Precedence (unchanged from the previous post-hoc mutation order):
+/// provider-scoped roster/API corrections first, then operator-configured
+/// context, then fresh route-scoped provider-reported context, then the
+/// membership-plan safe floor, then catalog data, then the conservative
+/// fallback.
+fn plan_limit_overrides(
+    provider: ApiProvider,
+    resolved: &ReadyRouteCandidate,
+    context_window_override: Option<u32>,
+    provider_reported_context: Option<ProviderReportedKimiCodeContext>,
+) -> LimitOverridePlan {
+    let mut overrides = Vec::new();
+    let configured = context_window_override.filter(|window| *window > 0);
+    let mut effective_context = resolved.limits().context_tokens;
     if provider == ApiProvider::OpenaiCodex {
         // Models.dev describes the public API offering, not the account-scoped
         // ChatGPT OAuth route. Strip API-only limits, then carry the fresh
         // Codex roster's per-model context into every runtime consumer.
-        candidate.limits.input_tokens = None;
-        candidate.limits.output_tokens = None;
-        if context_window_override
-            .filter(|window| *window > 0)
-            .is_none()
-        {
+        overrides.push(SourcedLimitOverride {
+            field: LimitField::InputTokens,
+            value: None,
+            source: OverrideSource::CodexPublicApiLimitStrip,
+        });
+        overrides.push(SourcedLimitOverride {
+            field: LimitField::OutputTokens,
+            value: None,
+            source: OverrideSource::CodexPublicApiLimitStrip,
+        });
+        if configured.is_none() {
             let roster = model_roster();
-            candidate.limits.context_tokens = if roster.freshness == CodexModelCacheFreshness::Fresh
-            {
+            let roster_context = if roster.freshness == CodexModelCacheFreshness::Fresh {
                 roster
-                    .metadata_for(candidate.wire_model_id.as_str())
+                    .metadata_for(resolved.wire_model_id().as_str())
                     .and_then(|metadata| metadata.context_window)
                     .map(u64::from)
             } else {
                 None
             };
+            effective_context = roster_context;
+            overrides.push(SourcedLimitOverride {
+                field: LimitField::ContextTokens,
+                value: roster_context,
+                source: OverrideSource::CodexRosterCorrection,
+            });
         }
     }
 
-    let configured = context_window_override.filter(|window| *window > 0);
     if let Some(context_window) = configured {
-        apply_context_window_override(&mut candidate.limits, Some(context_window));
-        return Ok(RouteCandidateResolution {
-            candidate,
+        overrides.push(SourcedLimitOverride {
+            field: LimitField::ContextTokens,
+            value: Some(u64::from(context_window)),
+            source: OverrideSource::UserContextWindow,
+        });
+        return LimitOverridePlan {
+            overrides,
             context_window: ContextWindowResolution {
                 tokens: context_window,
                 source: ContextWindowSource::Configured,
             },
-        });
+        };
     }
 
     let is_exact_kimi_code_k3 = is_exact_kimi_code_k3_route(
         provider,
-        &candidate.endpoint.base_url,
-        candidate.wire_model_id.as_str(),
+        &resolved.endpoint().base_url,
+        resolved.wire_model_id().as_str(),
     );
     let now = Utc::now();
     if is_exact_kimi_code_k3
@@ -256,14 +323,18 @@ pub(crate) fn resolve_route_candidate_with_context_metadata(
         })
     {
         let reported = provider_reported_context.expect("checked above");
-        candidate.limits.context_tokens = Some(u64::from(reported.context_tokens));
-        return Ok(RouteCandidateResolution {
-            candidate,
+        overrides.push(SourcedLimitOverride {
+            field: LimitField::ContextTokens,
+            value: Some(u64::from(reported.context_tokens)),
+            source: OverrideSource::ProviderReportedContextWindow,
+        });
+        return LimitOverridePlan {
+            overrides,
             context_window: ContextWindowResolution {
                 tokens: reported.context_tokens,
                 source: ContextWindowSource::ProviderReported,
             },
-        });
+        };
     }
 
     // Kimi Code's bare `k3` is a membership-plan route, not an alias for
@@ -271,45 +342,39 @@ pub(crate) fn resolve_route_candidate_with_context_metadata(
     // the route's next precedence after an explicit config or fresh, scoped
     // provider report.
     if is_exact_kimi_code_k3 {
-        candidate.limits.context_tokens = Some(u64::from(KIMI_CODE_K3_CONTEXT_WINDOW_TOKENS));
-        return Ok(RouteCandidateResolution {
-            candidate,
+        overrides.push(SourcedLimitOverride {
+            field: LimitField::ContextTokens,
+            value: Some(u64::from(KIMI_CODE_K3_CONTEXT_WINDOW_TOKENS)),
+            source: OverrideSource::MembershipPlanSafeFloor,
+        });
+        return LimitOverridePlan {
+            overrides,
             context_window: ContextWindowResolution {
                 tokens: KIMI_CODE_K3_CONTEXT_WINDOW_TOKENS,
                 source: ContextWindowSource::StaticKimiCodeSafeFloor,
             },
-        });
+        };
     }
 
-    if let Some(tokens) = candidate
-        .limits
-        .context_tokens
-        .and_then(|tokens| u32::try_from(tokens).ok())
-    {
-        return Ok(RouteCandidateResolution {
-            candidate,
+    if let Some(tokens) = effective_context.and_then(|tokens| u32::try_from(tokens).ok()) {
+        return LimitOverridePlan {
+            overrides,
             context_window: ContextWindowResolution {
                 tokens,
                 source: ContextWindowSource::Catalog,
             },
-        });
+        };
     }
 
     let fallback_tokens =
-        crate::config::provider_capability(provider, candidate.wire_model_id.as_str())
+        crate::config::provider_capability(provider, resolved.wire_model_id().as_str())
             .context_window;
-    Ok(RouteCandidateResolution {
-        candidate,
+    LimitOverridePlan {
+        overrides,
         context_window: ContextWindowResolution {
             tokens: fallback_tokens,
             source: ContextWindowSource::Fallback,
         },
-    })
-}
-
-fn apply_context_window_override(limits: &mut RouteLimits, context_window: Option<u32>) {
-    if let Some(context_window) = context_window.filter(|window| *window > 0) {
-        limits.context_tokens = Some(u64::from(context_window));
     }
 }
 
@@ -351,7 +416,7 @@ pub(crate) fn resolve_runtime_route_for_identity(
         None,
     )?;
     let candidate = resolution.candidate;
-    let model = candidate.wire_model_id.as_str().to_string();
+    let model = candidate.wire_model_id().as_str().to_string();
     set_model_for_route(&mut route_config, provider, &model);
 
     Ok(ResolvedRuntimeRoute {
@@ -476,14 +541,14 @@ mod tests {
         )
         .expect("Codex route");
 
-        assert_eq!(candidate.limits.context_tokens, Some(128_000));
-        assert_eq!(candidate.limits.input_tokens, None);
-        assert_eq!(candidate.limits.output_tokens, None);
+        assert_eq!(candidate.limits().context_tokens, Some(128_000));
+        assert_eq!(candidate.limits().input_tokens, None);
+        assert_eq!(candidate.limits().output_tokens, None);
         assert_eq!(
             crate::route_budget::route_context_window_tokens(
                 ApiProvider::OpenaiCodex,
                 crate::config::DEFAULT_OPENAI_CODEX_MODEL,
-                Some(candidate.limits),
+                Some(candidate.limits()),
             ),
             128_000
         );
@@ -495,14 +560,14 @@ mod tests {
             resolve_route_candidate(ApiProvider::Moonshot, Some("kimi-k3"), None, None, None)
                 .expect("Moonshot Kimi K3 route");
 
-        assert_eq!(candidate.wire_model_id.as_str(), "kimi-k3");
-        assert_eq!(candidate.limits.context_tokens, Some(1_048_576));
-        assert_eq!(candidate.limits.output_tokens, Some(131_072));
+        assert_eq!(candidate.wire_model_id().as_str(), "kimi-k3");
+        assert_eq!(candidate.limits().context_tokens, Some(1_048_576));
+        assert_eq!(candidate.limits().output_tokens, Some(131_072));
         assert_eq!(
             crate::route_budget::route_context_window_tokens(
                 ApiProvider::Moonshot,
                 "kimi-k3",
-                Some(candidate.limits),
+                Some(candidate.limits()),
             ),
             1_048_576
         );
@@ -519,8 +584,8 @@ mod tests {
         )
         .expect("Kimi Code K3 route");
 
-        assert_eq!(candidate.wire_model_id.as_str(), "k3");
-        assert_eq!(candidate.limits.context_tokens, Some(262_144));
+        assert_eq!(candidate.wire_model_id().as_str(), "k3");
+        assert_eq!(candidate.limits().context_tokens, Some(262_144));
     }
 
     #[test]
@@ -624,7 +689,7 @@ mod tests {
         )
         .expect("Kimi Code K3 route");
 
-        assert_eq!(candidate.limits.context_tokens, Some(1_048_576));
+        assert_eq!(candidate.limits().context_tokens, Some(1_048_576));
     }
 
     #[test]
@@ -638,7 +703,7 @@ mod tests {
             None,
         )
         .expect("direct Moonshot K3 route");
-        assert_eq!(direct_moonshot.limits.context_tokens, Some(1_048_576));
+        assert_eq!(direct_moonshot.limits().context_tokens, Some(1_048_576));
 
         let generic_moonshot = resolve_route_candidate(
             ApiProvider::Moonshot,
@@ -648,7 +713,7 @@ mod tests {
             None,
         )
         .expect("generic Moonshot route");
-        assert_ne!(generic_moonshot.limits.context_tokens, Some(262_144));
+        assert_ne!(generic_moonshot.limits().context_tokens, Some(262_144));
 
         let kimi_code_default = resolve_route_candidate(
             ApiProvider::Moonshot,
@@ -658,7 +723,7 @@ mod tests {
             None,
         )
         .expect("Kimi Code default route");
-        assert_ne!(kimi_code_default.limits.context_tokens, Some(262_144));
+        assert_ne!(kimi_code_default.limits().context_tokens, Some(262_144));
     }
 
     #[test]
@@ -759,18 +824,18 @@ mod tests {
         // Endpoint + model come from the named table; the prefixed model id is
         // preserved verbatim as the wire id (no provider-prefix sniffing).
         assert_eq!(
-            route.candidate.endpoint.base_url,
+            route.candidate.endpoint().base_url,
             "https://api.example.com/v1"
         );
         assert_eq!(
-            route.candidate.wire_model_id.as_str(),
+            route.candidate.wire_model_id().as_str(),
             "vendor/custom-model-v1"
         );
         assert_eq!(route.model, "vendor/custom-model-v1");
-        assert_eq!(route.candidate.protocol, RequestProtocol::ChatCompletions);
+        assert_eq!(route.candidate.protocol(), RequestProtocol::ChatCompletions);
         // HTTPS endpoint: route is valid with no insecure-http advisory.
-        assert!(route.candidate.validation.ok);
-        assert!(route.candidate.validation.messages.is_empty());
+        assert!(route.candidate.validation().ok);
+        assert!(route.candidate.validation().messages.is_empty());
         // The selected provider name is preserved (not overwritten with "custom").
         assert_eq!(route.config.provider.as_deref(), Some("my_thing"));
     }
@@ -802,7 +867,7 @@ mod tests {
             .expect("custom route should resolve");
 
         assert_eq!(route.model, "qwen3.7");
-        assert_eq!(route.candidate.limits.context_tokens, Some(1_000_000));
+        assert_eq!(route.candidate.limits().context_tokens, Some(1_000_000));
     }
 
     #[test]
@@ -813,19 +878,19 @@ mod tests {
 
         // Advisory only: the route still validates (ok == true) but warns that
         // credentials would be sent in plaintext over a non-loopback http URL.
-        assert!(route.candidate.validation.ok);
+        assert!(route.candidate.validation().ok);
         assert!(
             route
                 .candidate
-                .validation
+                .validation()
                 .messages
                 .iter()
                 .any(|message| message.contains("insecure http")),
             "expected insecure-http advisory, got {:?}",
-            route.candidate.validation.messages
+            route.candidate.validation().messages
         );
         assert_eq!(
-            route.candidate.endpoint.base_url,
+            route.candidate.endpoint().base_url,
             "http://gpu.internal.example:8000/v1"
         );
     }

@@ -4438,8 +4438,8 @@ mod tests {
         )
         .expect("bare k3 on the Kimi Code route must resolve");
         app.set_active_route_resolution(
-            resolution.candidate.endpoint.base_url,
-            resolution.candidate.limits,
+            resolution.candidate.endpoint().base_url.clone(),
+            resolution.candidate.limits(),
             resolution.context_window.source,
         );
         let facts = SetupRuntimeFacts::from_app_config(&app, &config);

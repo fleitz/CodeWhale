@@ -1738,7 +1738,7 @@ impl RuntimeThreadManager {
         let stream_chunk_timeout_secs = self.read_config().stream_chunk_timeout_secs();
         for (thread_id, engine, route) in validated {
             let provider = route.identity.provider;
-            let route_limits = known_route_limits(route.candidate.limits);
+            let route_limits = known_route_limits(route.candidate.limits());
             let engine_compaction = runtime_compaction_config(
                 provider,
                 &route.model,
@@ -4376,7 +4376,7 @@ impl RuntimeThreadManager {
                 effort
                     .normalize_for_route(
                         route.identity.provider,
-                        &route.candidate.endpoint.base_url,
+                        &route.candidate.endpoint().base_url,
                         &route.model,
                     )
                     .as_setting()
@@ -4403,7 +4403,7 @@ impl RuntimeThreadManager {
         let provider = route.identity.provider;
         let provider_identity = route.identity.clone();
         let model = route.model.clone();
-        let route_limits = known_route_limits(route.candidate.limits);
+        let route_limits = known_route_limits(route.candidate.limits());
         let settings = crate::settings::Settings::load().unwrap_or_default();
         let compaction = runtime_compaction_config(
             provider,
@@ -4726,7 +4726,7 @@ impl RuntimeThreadManager {
         let route_provider = route.identity.provider;
         let route_identity = route.identity.clone();
         let route_model = route.model.clone();
-        let route_limits = known_route_limits(route.candidate.limits);
+        let route_limits = known_route_limits(route.candidate.limits());
         let settings = crate::settings::Settings::load().unwrap_or_default();
         let compaction = runtime_compaction_config(
             route_provider,
@@ -4913,7 +4913,7 @@ impl RuntimeThreadManager {
             let provider = route.identity.provider;
             let route_identity = route.identity;
             let route_model = route.model;
-            let route_limits = known_route_limits(route.candidate.limits);
+            let route_limits = known_route_limits(route.candidate.limits());
             let cfg = route.config;
 
             // Resolve the provider-route-aware auto-compaction default unless the

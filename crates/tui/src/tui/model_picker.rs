@@ -451,7 +451,7 @@ impl ModelPickerView {
 
     fn resolved_base_url_for_provider(&self, provider: ApiProvider, model: &str) -> String {
         crate::route_runtime::resolve_runtime_route(&self.route_config, provider, Some(model))
-            .map(|route| route.candidate.endpoint.base_url)
+            .map(|route| route.candidate.endpoint().base_url.clone())
             .unwrap_or_else(|_| provider.default_base_url().to_string())
     }
 

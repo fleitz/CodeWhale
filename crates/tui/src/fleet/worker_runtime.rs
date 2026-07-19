@@ -202,20 +202,20 @@ pub(crate) fn resolve_fleet_route_with_config(
             None => ApiProvider::Deepseek,
         };
         let candidate = resolve_route_candidate(provider, model_selector, None, None, None).ok()?;
-        let provider_id = candidate.provider_id.as_str().to_string();
+        let provider_id = candidate.provider_id().as_str().to_string();
         (candidate, provider_id, None, "resolver")
     };
 
     Some(FleetResolvedRoute {
         provider_id,
         provider_exact_id,
-        provider_kind: candidate.provider_kind.as_str().to_string(),
+        provider_kind: candidate.provider_kind().as_str().to_string(),
         canonical_model: candidate
-            .canonical_model
+            .canonical_model()
             .as_ref()
             .map(|model| model.as_str().to_string()),
-        wire_model_id: candidate.wire_model_id.as_str().to_string(),
-        protocol: route_protocol_label(candidate.protocol).to_string(),
+        wire_model_id: candidate.wire_model_id().as_str().to_string(),
+        protocol: route_protocol_label(candidate.protocol()).to_string(),
         role,
         loadout: loadout_intent_label(&loadout),
         model_class,
@@ -1475,12 +1475,15 @@ mod tests {
         .expect("openrouter should resolve the pinned model directly");
         assert_eq!(
             route.wire_model_id,
-            openrouter_candidate.wire_model_id.as_str()
+            openrouter_candidate.wire_model_id().as_str()
         );
-        assert_eq!(route.provider_id, openrouter_candidate.provider_id.as_str());
+        assert_eq!(
+            route.provider_id,
+            openrouter_candidate.provider_id().as_str()
+        );
         assert_eq!(
             route.provider_kind,
-            openrouter_candidate.provider_kind.as_str()
+            openrouter_candidate.provider_kind().as_str()
         );
         assert_eq!(route.reasoning_effort.as_deref(), Some("max"));
         // Differs from DeepSeek — the pre-#4093 hardcoded default AND the
@@ -1546,9 +1549,12 @@ mod tests {
         .expect("openrouter should resolve the saved model directly");
         assert_eq!(
             route.wire_model_id,
-            openrouter_candidate.wire_model_id.as_str()
+            openrouter_candidate.wire_model_id().as_str()
         );
-        assert_eq!(route.provider_id, openrouter_candidate.provider_id.as_str());
+        assert_eq!(
+            route.provider_id,
+            openrouter_candidate.provider_id().as_str()
+        );
         assert_eq!(route.reasoning_effort.as_deref(), Some("max"));
         assert_ne!(route.provider_id, "deepseek");
     }

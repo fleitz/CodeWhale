@@ -2958,8 +2958,8 @@ impl App {
                 )
                 .map(|resolution| {
                     (
-                        crate::route_budget::known_route_limits(resolution.candidate.limits),
-                        resolution.candidate.endpoint.base_url,
+                        crate::route_budget::known_route_limits(resolution.candidate.limits()),
+                        resolution.candidate.endpoint().base_url.clone(),
                         resolution.context_window.source,
                     )
                 })

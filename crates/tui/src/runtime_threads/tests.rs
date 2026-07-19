@@ -1260,7 +1260,7 @@ async fn config_reload_updates_next_turn_route_without_mutating_engine_route() -
                 Some(crate::route_budget::route_context_window_tokens(
                     ApiProvider::Custom,
                     "local-model",
-                    crate::route_budget::known_route_limits(route.candidate.limits),
+                    crate::route_budget::known_route_limits(route.candidate.limits()),
                 ))
             );
         }

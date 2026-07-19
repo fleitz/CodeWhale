@@ -452,7 +452,7 @@ pub(crate) fn normalize_auto_route_effort_for_configured_route(
 ) -> ReasoningEffort {
     crate::route_runtime::resolve_runtime_route(config, provider, Some(model))
         .map(|route| {
-            effort.normalize_for_route(provider, &route.candidate.endpoint.base_url, &route.model)
+            effort.normalize_for_route(provider, &route.candidate.endpoint().base_url, &route.model)
         })
         .unwrap_or_else(|_| normalize_auto_route_effort_for_provider(provider, effort))
 }
