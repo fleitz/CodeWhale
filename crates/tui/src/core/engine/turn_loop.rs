@@ -2027,6 +2027,10 @@ impl Engine {
                 coalesced: coalesced_read_plans,
                 occurrences: read_repeat_occurrences,
             } = plan_read_repeat_execution(plans, &mut read_repeat_guard);
+            let coalesced_read_indices = coalesced_read_plans
+                .iter()
+                .map(|plan| plan.follower.index)
+                .collect::<std::collections::HashSet<_>>();
             if !coalesced_read_plans.is_empty() {
                 let _ = self
                     .tx_event
@@ -2834,12 +2838,18 @@ impl Engine {
                             error.push_str("\n\n");
                             error.push_str(nudge);
                         }
-                        self.session.working_set.observe_tool_call(
-                            &tool_name_for_ws,
-                            &tool_input,
-                            Some(&error),
-                            &self.session.workspace,
-                        );
+                        // A raw ToolError has no result metadata where the
+                        // coalescer can record `executed: false`. Keep the
+                        // follower model-visible, but do not count it as a
+                        // second physical working-set touch.
+                        if !coalesced_read_indices.contains(&outcome.index) {
+                            self.session.working_set.observe_tool_call(
+                                &tool_name_for_ws,
+                                &tool_input,
+                                Some(&error),
+                                &self.session.workspace,
+                            );
+                        }
                         self.add_session_message(Message {
                             role: "user".to_string(),
                             content: vec![ContentBlock::ToolResult {
