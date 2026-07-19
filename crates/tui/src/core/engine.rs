@@ -3588,6 +3588,18 @@ impl Engine {
         ctx.search_provider = self.config.search_provider;
         ctx.search_api_key = self.config.search_api_key.clone();
         ctx.search_base_url = self.config.search_base_url.clone();
+        ctx.route_capabilities = self.active_route_capabilities;
+        if self
+            .active_route_capabilities
+            .server_side_web_search
+            .is_supported()
+        {
+            ctx.provider_native_search = self
+                .deepseek_client
+                .as_ref()
+                .cloned()
+                .and_then(crate::client::ProviderNativeSearchClient::new);
+        }
 
         let policy = authority.sandbox_policy(&self.session.workspace);
         let mut ctx = ctx.with_elevated_sandbox_policy(policy);

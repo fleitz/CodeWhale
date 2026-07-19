@@ -1048,6 +1048,42 @@ fn resolver_carries_exact_offering_capabilities_without_protocol_inference() {
 }
 
 #[test]
+fn provider_native_web_search_requires_exact_direct_endpoint_offering() {
+    use crate::route::CapabilityState;
+
+    let resolver = RouteResolver::new();
+    let direct = resolver
+        .resolve(&req(Some(ProviderKind::Xai), Some("grok-4.5")))
+        .expect("bundled direct xAI offering resolves");
+    assert_eq!(
+        direct.capabilities().server_side_web_search,
+        CapabilityState::Supported
+    );
+
+    let aggregator = resolver
+        .resolve(&req(Some(ProviderKind::OpencodeGo), Some("grok-4.5")))
+        .expect("aggregator offering resolves independently");
+    assert_eq!(
+        aggregator.capabilities().server_side_web_search,
+        CapabilityState::Unknown
+    );
+
+    let custom_endpoint = resolver
+        .resolve(&RouteRequest {
+            explicit_provider: Some(ProviderKind::Xai),
+            model_selector: Some(LogicalModelRef::from("grok-4.5")),
+            saved_provider_model: None,
+            base_url_override: Some("https://gateway.example.test/v1".to_string()),
+            limit_overrides: Vec::new(),
+        })
+        .expect("custom compatible endpoint resolves");
+    assert_eq!(
+        custom_endpoint.capabilities().server_side_web_search,
+        CapabilityState::Unknown
+    );
+}
+
+#[test]
 fn priced_offering_yields_token_pricing_sku() {
     use super::candidate::PricingSku;
 

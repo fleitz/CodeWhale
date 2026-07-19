@@ -2615,6 +2615,7 @@ impl DeepSeekClient {
 
 mod anthropic;
 mod chat;
+mod provider_native_search;
 mod responses;
 
 fn extract_sse_data_value(line: &str) -> Option<&str> {
@@ -2638,6 +2639,7 @@ fn take_sse_line(buffer: &mut Vec<u8>) -> Option<String> {
 }
 
 pub(crate) use chat::{CacheWarmupKey, PromptInspection};
+pub(crate) use provider_native_search::{ProviderNativeSearchClient, ProviderNativeSearchRequest};
 
 pub(crate) fn inspect_prompt_for_request(request: &MessageRequest) -> PromptInspection {
     chat::inspect_prompt_for_request(request)

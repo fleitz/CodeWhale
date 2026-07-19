@@ -1,6 +1,7 @@
-//! Web search tool backed by a bounded backend chain: configured API search,
-//! then DuckDuckGo HTML scrape with a one-way Bing fallback. Explicit Bing and
-//! private DuckDuckGo-compatible routes remain single-provider. API adapters
+//! Web search tool backed by a bounded backend chain: the active route's
+//! documented provider-native search, configured API search, then DuckDuckGo
+//! HTML scrape with a one-way Bing fallback. Explicit Bing and private
+//! DuckDuckGo-compatible routes remain single-provider. API adapters
 //! include Tavily, Bocha (博查),
 //! Metaso API (<https://metaso.cn>), SearXNG JSON API, Baidu AI Search,
 //! Volcengine Ark, and Sofya (<https://sofya.co>).
@@ -50,7 +51,10 @@ const VOLCENGINE_MIN_TIMEOUT_MS: u64 = 90_000;
 
 /// Returns `Ok(())` if the policy allows the call, or a `ToolError` otherwise.
 /// Falls through silently when no policy is attached (back-compat).
-fn check_policy(decider: Option<&NetworkPolicyDecider>, host: &str) -> Result<(), ToolError> {
+pub(crate) fn check_policy(
+    decider: Option<&NetworkPolicyDecider>,
+    host: &str,
+) -> Result<(), ToolError> {
     let Some(decider) = decider else {
         return Ok(());
     };
@@ -96,7 +100,7 @@ impl ToolSpec for WebSearchTool {
     }
 
     fn description(&self) -> &'static str {
-        "Search the web and return ranked results with URLs, snippets, and an execution receipt. Default backend is DuckDuckGo with Bing fallback. Configured API backends are tried first and visibly degrade through DuckDuckGo then Bing when unavailable; configuration and network-policy errors fail closed. Explicit Bing and private DuckDuckGo-compatible routes do not cross providers. Set `[search] provider = \"bing\" | \"tavily\" | \"bocha\" | \"metaso\" | \"searxng\" | \"baidu\" | \"volcengine\" | \"sofya\"` in config.toml, or `[search] base_url` for a private DuckDuckGo-compatible endpoint or trusted SearXNG instance. For a known canonical URL, prefer `fetch_url` directly."
+        "Search the web and return ranked results with URLs, snippets, and an execution receipt. When the exact active route reports a documented first-party server-side search tool, it is tried first; otherwise the default backend is DuckDuckGo with Bing fallback. Configured API backends visibly degrade through DuckDuckGo then Bing when unavailable, and every hop is recorded. Configuration and network-policy errors fail closed. Explicit Bing and private DuckDuckGo-compatible routes do not cross providers. Set `[search] provider = \"bing\" | \"tavily\" | \"bocha\" | \"metaso\" | \"searxng\" | \"baidu\" | \"volcengine\" | \"sofya\"` in config.toml, or `[search] base_url` for a private DuckDuckGo-compatible endpoint or trusted SearXNG instance. For a known canonical URL, prefer `fetch_url` directly."
     }
 
     fn input_schema(&self) -> Value {
@@ -723,19 +727,25 @@ pub(crate) async fn execute_search(
         )));
     }
 
-    preflight_search_provider(context)?;
     let chain = SearchBackendChain::from_context(context);
-    debug_assert_eq!(
-        chain.initial_backend().as_str(),
-        context.search_provider.as_str()
-    );
     let initial_backend = chain.initial_backend();
-    let normalized_base_url = normalized_search_base_url(context.search_base_url.as_deref());
+    if initial_backend != BackendId::ProviderNative {
+        debug_assert_eq!(initial_backend.as_str(), context.search_provider.as_str());
+        preflight_search_provider(context)?;
+    }
+    let cache_scope = if initial_backend == BackendId::ProviderNative {
+        context
+            .provider_native_search
+            .as_ref()
+            .map(crate::client::ProviderNativeSearchClient::cache_identity)
+    } else {
+        normalized_search_base_url(context.search_base_url.as_deref())
+    };
 
     if let Some(mut cached) = cache::get_search(
         &context.state_namespace,
         initial_backend,
-        normalized_base_url.as_deref(),
+        cache_scope.as_deref(),
         &query,
     ) {
         validate_cached_search_policy(&cached, context)?;
@@ -759,7 +769,7 @@ pub(crate) async fn execute_search(
     cache::insert_search(
         &context.state_namespace,
         initial_backend,
-        normalized_base_url.as_deref(),
+        cache_scope.as_deref(),
         &query,
         response.clone(),
     );
@@ -835,6 +845,7 @@ fn validate_cached_search_policy(
 
 const fn default_backend_host(backend: BackendId) -> Option<&'static str> {
     match backend {
+        BackendId::ProviderNative => None,
         BackendId::Bing => Some(BING_HOST),
         BackendId::DuckDuckGo => Some("html.duckduckgo.com"),
         BackendId::Tavily => Some("api.tavily.com"),
@@ -854,28 +865,52 @@ fn finalize_search_response(
     started: Instant,
 ) -> SearchResponse {
     let mut honored = HonoredQueryCapabilities {
-        max_results: true,
+        max_results: matches!(
+            capabilities.max_results,
+            super::web::contract::CapabilityState::Supported
+        ),
         ..HonoredQueryCapabilities::default()
     };
 
     if query.recency.is_some() {
-        raw.degraded.push(DegradedReason::KnobIgnored {
-            knob: QueryKnob::Recency,
-        });
+        if matches!(
+            capabilities.recency,
+            super::web::contract::CapabilityState::Supported
+        ) {
+            honored.recency = true;
+        } else {
+            raw.degraded.push(DegradedReason::KnobIgnored {
+                knob: QueryKnob::Recency,
+            });
+        }
     }
     if !query.domains.is_empty() {
+        let before = raw.results.len();
         raw.results
             .retain(|result| domain_matches(&result.url, &query.domains));
         rerank(&mut raw.results);
         honored.domains = true;
-        raw.degraded.push(DegradedReason::PostFiltered {
-            knob: QueryKnob::Domains,
-        });
+        let provider_honored = matches!(
+            capabilities.domains,
+            super::web::contract::CapabilityState::Supported
+        );
+        if !provider_honored || raw.results.len() != before {
+            raw.degraded.push(DegradedReason::PostFiltered {
+                knob: QueryKnob::Domains,
+            });
+        }
     }
     if query.locale.is_some() {
-        raw.degraded.push(DegradedReason::KnobIgnored {
-            knob: QueryKnob::Locale,
-        });
+        if matches!(
+            capabilities.locale,
+            super::web::contract::CapabilityState::Supported
+        ) {
+            honored.locale = true;
+        } else {
+            raw.degraded.push(DegradedReason::KnobIgnored {
+                knob: QueryKnob::Locale,
+            });
+        }
     }
 
     raw.results.truncate(usize::from(query.max_results));
@@ -1823,9 +1858,13 @@ mod tests {
         parse_volcengine_results, run_scrape_search_with_endpoints, sanitize_error_body,
         searxng_search_url, truncate_error_body, volcengine_extract_text,
     };
-    use crate::tools::web::contract::{BackendId, QueryCapabilities, SearchQuery};
+    use crate::tools::web::contract::{
+        BackendId, BackendSearch, CapabilityState, DegradedReason, QueryCapabilities, QueryKnob,
+        Recency, SearchQuery, SearchResult,
+    };
     use crate::tools::web::scrape::{decode_html_entities, normalize_bing_url};
     use serde_json::json;
+    use std::time::Instant;
 
     // Regression guard: Bing /ck/a redirect hrefs are HTML-entity-encoded
     // (`&amp;`). normalize_bing_url must decode entities before extracting the
@@ -2710,6 +2749,59 @@ mod tests {
                 .iter()
                 .any(|item| { item["kind"] == "knob_ignored" && item["knob"] == "locale" })
         );
+    }
+
+    #[test]
+    fn provider_native_domain_filter_is_reported_as_provider_honored() {
+        let query = SearchQuery::new(
+            "current release".to_string(),
+            3,
+            Some(Recency::Week),
+            vec!["example.com".to_string()],
+            None,
+        );
+        let raw = BackendSearch {
+            backend: BackendId::ProviderNative,
+            source: "provider-native/xai/grok-4.5".to_string(),
+            backend_detail: Some("api.x.ai".to_string()),
+            results: vec![SearchResult::new(
+                1,
+                "Exact source".to_string(),
+                "https://docs.example.com/release".to_string(),
+                None,
+                None,
+            )],
+            degraded: Vec::new(),
+            note: Some("Grounded answer.".to_string()),
+        };
+        let response = finalize_search_response(
+            query,
+            QueryCapabilities {
+                max_results: CapabilityState::Supported,
+                recency: CapabilityState::Unsupported,
+                domains: CapabilityState::Supported,
+                locale: CapabilityState::Unsupported,
+                published_date: CapabilityState::Unknown,
+            },
+            raw,
+            Instant::now(),
+        );
+
+        assert!(response.receipt.honored.max_results);
+        assert!(response.receipt.honored.domains);
+        assert!(!response.receipt.honored.recency);
+        assert!(response.receipt.degraded.iter().any(|reason| matches!(
+            reason,
+            DegradedReason::KnobIgnored {
+                knob: QueryKnob::Recency
+            }
+        )));
+        assert!(!response.receipt.degraded.iter().any(|reason| matches!(
+            reason,
+            DegradedReason::PostFiltered {
+                knob: QueryKnob::Domains
+            }
+        )));
     }
 
     #[tokio::test]

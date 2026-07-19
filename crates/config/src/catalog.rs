@@ -158,6 +158,10 @@ impl CatalogOffering {
                 structured_output: crate::route::CapabilityState::from_optional_bool(
                     self.structured_output,
                 ),
+                server_side_web_search: crate::route::documented_server_side_web_search(
+                    &self.provider,
+                    &self.wire_model_id,
+                ),
                 ..crate::route::RouteCapabilities::default()
             },
             pricing: crate::pricing::route_pricing_sku(self),

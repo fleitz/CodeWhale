@@ -39,6 +39,7 @@ pub use candidate::{
     LimitField, OverrideSource, PricingSku, ReadyRouteCandidate, ResolvedAuthSource,
     ResolvedEndpoint, SourcedLimitOverride, ValidationReport,
 };
+pub(crate) use capabilities::documented_server_side_web_search;
 pub use capabilities::{CapabilityState, RouteCapabilities};
 pub use descriptor::{EndpointDescriptor, ProviderDescriptor};
 pub use errors::RouteError;

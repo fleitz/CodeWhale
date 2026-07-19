@@ -5,6 +5,8 @@ use std::time::{Duration, Instant};
 use async_trait::async_trait;
 
 use super::contract::{BackendId, BackendSearch, DegradedReason, QueryCapabilities, SearchQuery};
+use super::contract::{CapabilityState as QueryCapabilityState, SearchResult};
+use crate::client::ProviderNativeSearchRequest;
 use crate::config::SearchProvider;
 use crate::tools::spec::{ToolContext, ToolError};
 
@@ -34,6 +36,11 @@ pub(crate) enum ConfiguredSearchBackend<'a> {
     Baidu(BackendContext<'a>),
     Volcengine(BackendContext<'a>),
     Sofya(BackendContext<'a>),
+}
+
+#[derive(Clone, Copy)]
+struct ProviderNativeSearchBackend<'a> {
+    context: &'a ToolContext,
 }
 
 impl<'a> ConfiguredSearchBackend<'a> {
@@ -85,7 +92,7 @@ impl<'a> ConfiguredSearchBackend<'a> {
 }
 
 pub(crate) struct SearchBackendChain<'a> {
-    backends: Vec<ConfiguredSearchBackend<'a>>,
+    backends: Vec<Box<dyn SearchBackend + 'a>>,
 }
 
 #[derive(Debug)]
@@ -98,12 +105,18 @@ impl<'a> SearchBackendChain<'a> {
     #[must_use]
     pub(crate) fn from_context(context: &'a ToolContext) -> Self {
         let selected = context.search_provider;
-        let mut backends = vec![ConfiguredSearchBackend::from_provider(context, selected)];
+        let mut backends: Vec<Box<dyn SearchBackend + 'a>> = Vec::new();
+        if should_prepend_provider_native(context) {
+            backends.push(Box::new(ProviderNativeSearchBackend { context }));
+        }
+        backends.push(Box::new(ConfiguredSearchBackend::from_provider(
+            context, selected,
+        )));
         if !matches!(selected, SearchProvider::Bing | SearchProvider::DuckDuckGo) {
-            backends.push(ConfiguredSearchBackend::from_provider(
+            backends.push(Box::new(ConfiguredSearchBackend::from_provider(
                 context,
                 SearchProvider::DuckDuckGo,
-            ));
+            )));
         }
         Self { backends }
     }
@@ -125,10 +138,24 @@ impl<'a> SearchBackendChain<'a> {
         let backends = self
             .backends
             .iter()
-            .map(|backend| backend as &dyn SearchBackend)
+            .map(|backend| backend.as_ref())
             .collect::<Vec<_>>();
         run_backend_chain(&backends, query, deadline, first_attempt_budget).await
     }
+}
+
+fn should_prepend_provider_native(context: &ToolContext) -> bool {
+    provider_native_is_available(
+        context
+            .route_capabilities
+            .server_side_web_search
+            .is_supported(),
+        context.provider_native_search.is_some(),
+    )
+}
+
+const fn provider_native_is_available(capability_supported: bool, client_present: bool) -> bool {
+    capability_supported && client_present
 }
 
 async fn run_backend_chain(
@@ -267,6 +294,99 @@ impl SearchBackend for ConfiguredSearchBackend<'_> {
     }
 }
 
+#[async_trait]
+impl SearchBackend for ProviderNativeSearchBackend<'_> {
+    fn id(&self) -> BackendId {
+        BackendId::ProviderNative
+    }
+
+    fn capabilities(&self) -> QueryCapabilities {
+        QueryCapabilities {
+            max_results: QueryCapabilityState::Supported,
+            recency: QueryCapabilityState::Unsupported,
+            domains: QueryCapabilityState::Supported,
+            locale: QueryCapabilityState::Unsupported,
+            published_date: QueryCapabilityState::Unknown,
+        }
+    }
+
+    async fn search(
+        &self,
+        query: &SearchQuery,
+        _deadline: Instant,
+    ) -> Result<BackendSearch, ToolError> {
+        if !self
+            .context
+            .route_capabilities
+            .server_side_web_search
+            .is_supported()
+        {
+            return Err(ToolError::not_available(
+                "active route does not report provider-native web search",
+            ));
+        }
+        let client = self
+            .context
+            .provider_native_search
+            .as_ref()
+            .ok_or_else(|| ToolError::not_available("provider-native search client unavailable"))?;
+        if let Some(maximum) = client.maximum_domain_count()
+            && query.domains.len() > maximum
+        {
+            return Err(ToolError::invalid_input(format!(
+                "{} native web search accepts at most {maximum} domains",
+                client.provider().as_str()
+            )));
+        }
+        let host = client.host().ok_or_else(|| {
+            ToolError::execution_failed("provider-native search endpoint has no valid host")
+        })?;
+        crate::tools::web_search::check_policy(
+            self.context.network_policy.as_ref(),
+            host.as_str(),
+        )?;
+        let response = client
+            .search(&ProviderNativeSearchRequest {
+                query: query.query.clone(),
+                max_results: query.max_results,
+                domains: query.domains.clone(),
+            })
+            .await
+            .map_err(|error| {
+                ToolError::execution_failed(format!(
+                    "{} provider-native web search failed: {error}",
+                    client.provider().as_str()
+                ))
+            })?;
+        let results = response
+            .citations
+            .into_iter()
+            .enumerate()
+            .map(|(index, citation)| {
+                SearchResult::new(
+                    index + 1,
+                    citation.title,
+                    citation.url,
+                    citation.snippet,
+                    citation.published,
+                )
+            })
+            .collect();
+        Ok(BackendSearch {
+            backend: BackendId::ProviderNative,
+            source: format!(
+                "provider-native/{}/{}",
+                client.provider().as_str(),
+                client.model()
+            ),
+            backend_detail: Some(host),
+            results,
+            degraded: Vec::new(),
+            note: response.answer,
+        })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::sync::{Arc, Mutex};
@@ -344,6 +464,14 @@ mod tests {
         }
     }
 
+    #[test]
+    fn provider_native_is_fail_closed_without_both_fact_and_client() {
+        assert!(!provider_native_is_available(false, false));
+        assert!(!provider_native_is_available(true, false));
+        assert!(!provider_native_is_available(false, true));
+        assert!(provider_native_is_available(true, true));
+    }
+
     #[tokio::test]
     async fn unavailable_api_falls_back_with_explicit_receipts() {
         let api = FakeBackend {
@@ -369,6 +497,52 @@ mod tests {
         assert_eq!(
             response.raw.degraded,
             vec![
+                DegradedReason::BackendUnavailable {
+                    backend: BackendId::Tavily,
+                },
+                DegradedReason::BackendFallback {
+                    from: BackendId::Tavily,
+                    to: BackendId::DuckDuckGo,
+                },
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn provider_native_to_api_to_scrape_records_every_transition() {
+        let native = FakeBackend {
+            id: BackendId::ProviderNative,
+            result: Err(ToolError::execution_failed("native unavailable")),
+        };
+        let api = FakeBackend {
+            id: BackendId::Tavily,
+            result: Err(ToolError::execution_failed("API unavailable")),
+        };
+        let scrape = FakeBackend {
+            id: BackendId::DuckDuckGo,
+            result: Ok(vec![result()]),
+        };
+
+        let response = run_backend_chain(
+            &[&native, &api, &scrape],
+            &query(),
+            Instant::now() + Duration::from_secs(1),
+            None,
+        )
+        .await
+        .expect("final scrape fallback should succeed");
+
+        assert_eq!(response.raw.backend, BackendId::DuckDuckGo);
+        assert_eq!(
+            response.raw.degraded,
+            vec![
+                DegradedReason::BackendUnavailable {
+                    backend: BackendId::ProviderNative,
+                },
+                DegradedReason::BackendFallback {
+                    from: BackendId::ProviderNative,
+                    to: BackendId::Tavily,
+                },
                 DegradedReason::BackendUnavailable {
                     backend: BackendId::Tavily,
                 },

@@ -181,12 +181,14 @@ impl RouteResolver {
 
         // 4. Map the selector to a wire id within provider scope.
         //    Prefixed selectors are preserved VERBATIM as the wire id.
-        let class = if request_uses_custom_endpoint(&descriptor, req.base_url_override.as_deref()) {
+        let custom_endpoint =
+            request_uses_custom_endpoint(&descriptor, req.base_url_override.as_deref());
+        let class = if custom_endpoint {
             ProviderClass::LocalOrCustom
         } else {
             classify(provider_kind)
         };
-        let selected = if is_auto {
+        let mut selected = if is_auto {
             default_offering.map_or_else(
                 || {
                     // No offering in hand on the default branch: capability
@@ -198,6 +200,13 @@ impl RouteResolver {
         } else {
             self.scope_selector(provider_kind, &provider_id, &logical_model, class)?
         };
+        if custom_endpoint {
+            // A documented first-party server tool is an endpoint-owned fact.
+            // Reusing a provider enum/model id against a custom compatible
+            // endpoint cannot carry that fact across the authority boundary.
+            selected.capabilities.server_side_web_search =
+                super::capabilities::CapabilityState::Unknown;
+        }
 
         let endpoint = ResolvedEndpoint {
             base_url: req

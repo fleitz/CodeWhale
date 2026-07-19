@@ -625,6 +625,24 @@
         }
       }
     },
+    "xai": {
+      "id": "xai",
+      "name": "xAI",
+      "api": "https://api.x.ai/v1",
+      "npm": "@ai-sdk/xai",
+      "env": ["XAI_API_KEY"],
+      "models": {
+        "grok-4.5": {
+          "id": "grok-4.5",
+          "name": "Grok 4.5",
+          "family": "grok",
+          "default": true,
+          "reasoning": true,
+          "tool_call": true,
+          "modalities": { "input": ["text"], "output": ["text"] }
+        }
+      }
+    },
     "xiaomi-mimo": {
       "id": "xiaomi-mimo",
       "name": "Xiaomi MiMo",

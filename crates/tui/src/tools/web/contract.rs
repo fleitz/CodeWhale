@@ -12,6 +12,7 @@ pub(crate) const MAX_SEARCH_RESULTS: u8 = 10;
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub(crate) enum BackendId {
+    ProviderNative,
     Bing,
     #[serde(rename = "duckduckgo")]
     DuckDuckGo,
@@ -28,6 +29,7 @@ impl BackendId {
     #[must_use]
     pub(crate) const fn as_str(self) -> &'static str {
         match self {
+            Self::ProviderNative => "provider_native",
             Self::Bing => "bing",
             Self::DuckDuckGo => "duckduckgo",
             Self::Tavily => "tavily",

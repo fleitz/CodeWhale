@@ -38,6 +38,51 @@ impl CapabilityState {
     }
 }
 
+/// Return the documented server-side web-search fact for one exact direct
+/// provider/model offering.
+///
+/// This is intentionally a small sourced table, not a protocol or model-family
+/// heuristic. Aggregators, custom endpoints, aliases, snapshots, and nearby
+/// model names remain [`CapabilityState::Unknown`] until a provider-owned fact
+/// exists for that exact offering.
+///
+/// Sources:
+/// - OpenAI Responses web search: <https://developers.openai.com/api/docs/guides/tools-web-search>
+/// - Anthropic web search tool: <https://platform.claude.com/docs/en/agents-and-tools/tool-use/web-search-tool>
+/// - xAI web search tool: <https://docs.x.ai/developers/tools/web-search>
+#[must_use]
+pub(crate) fn documented_server_side_web_search(
+    provider_id: &str,
+    wire_model_id: &str,
+) -> CapabilityState {
+    let provider_id = provider_id.trim().to_ascii_lowercase();
+    let wire_model_id = wire_model_id.trim().to_ascii_lowercase();
+    let supported = match provider_id.as_str() {
+        "openai" => matches!(
+            wire_model_id.as_str(),
+            "gpt-5.6" | "gpt-5.5" | "gpt-5.4" | "gpt-4.1" | "gpt-4.1-mini" | "o4-mini"
+        ),
+        "anthropic" => matches!(
+            wire_model_id.as_str(),
+            "claude-fable-5"
+                | "claude-opus-4-8"
+                | "claude-mythos-5"
+                | "claude-mythos-preview"
+                | "claude-opus-4-7"
+                | "claude-opus-4-6"
+                | "claude-sonnet-5"
+                | "claude-sonnet-4-6"
+        ),
+        "xai" => wire_model_id == "grok-4.5",
+        _ => false,
+    };
+    if supported {
+        CapabilityState::Supported
+    } else {
+        CapabilityState::Unknown
+    }
+}
+
 /// Capability facts owned by one provider/model route offering.
 ///
 /// Fields without a current authoritative catalog source remain `Unknown`.
@@ -91,5 +136,35 @@ mod tests {
             capabilities.server_side_web_search,
             CapabilityState::Unknown
         );
+    }
+
+    #[test]
+    fn documented_web_search_is_exact_and_provider_owned() {
+        assert_eq!(
+            documented_server_side_web_search("xai", "grok-4.5"),
+            CapabilityState::Supported
+        );
+        assert_eq!(
+            documented_server_side_web_search("openai", "gpt-5.6"),
+            CapabilityState::Supported
+        );
+        assert_eq!(
+            documented_server_side_web_search("anthropic", "claude-sonnet-4-6"),
+            CapabilityState::Supported
+        );
+
+        for (provider, model) in [
+            ("openrouter", "openai/gpt-5.6"),
+            ("custom", "gpt-5.6"),
+            ("openai", "gpt-5.6-sol"),
+            ("xai", "grok-4.5-fast"),
+            ("anthropic", "claude-haiku-4-5"),
+        ] {
+            assert_eq!(
+                documented_server_side_web_search(provider, model),
+                CapabilityState::Unknown,
+                "{provider}/{model} must not inherit a capability by similarity"
+            );
+        }
     }
 }
