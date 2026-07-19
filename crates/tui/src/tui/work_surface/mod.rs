@@ -26,8 +26,8 @@ mod tests {
     use crate::tui::app::{App, SidebarRowAction, TuiOptions};
     use crate::work_graph::{
         AcceptanceRequirement, ChangeCtx, EdgeKind, EvidenceKindTag, NodeKind, NodeState,
-        OperationBinding, Provenance, WorkEdge, WorkEdgeId, WorkGraph, WorkGraphChange, WorkNode,
-        WorkNodeId,
+        OperationBinding, OperationOwnerSnapshot, OwnerState, Provenance, WorkEdge, WorkEdgeId,
+        WorkGraph, WorkGraphChange, WorkNode, WorkNodeId,
     };
 
     const SESSION: &str = "work-surface-test";
@@ -262,6 +262,15 @@ mod tests {
         let mut app = app();
         let graph = operation_graph(NodeState::Waiting);
         restore_graph(&mut app, &graph);
+        app.runtime_services
+            .work
+            .as_ref()
+            .expect("Work Graph runtime")
+            .reconcile_operation(
+                SESSION,
+                OperationOwnerSnapshot::new("shell:shell_1234abcd", OwnerState::Waiting, 1, 6),
+            )
+            .expect("waiting shell owner");
 
         let rows = super::model::project(&mut app);
 
@@ -285,9 +294,16 @@ mod tests {
         let row = rows.iter().find(|row| row.selectable).expect("stale row");
         assert_eq!(row.mark, "?");
         assert!(row.detail.starts_with("stale · operation"));
-        let Some(SidebarRowAction::InspectWork { body, .. }) = row.primary_action.as_ref() else {
+        let Some(SidebarRowAction::InspectWork {
+            body, stop_action, ..
+        }) = row.primary_action.as_ref()
+        else {
             panic!("stale row must open inspector");
         };
+        assert!(
+            stop_action.is_none(),
+            "a stale owner cannot truthfully expose a stop action"
+        );
         assert!(
             body.contains("Last bounded output\nNo output receipt"),
             "{body}"
@@ -344,8 +360,17 @@ mod tests {
     #[test]
     fn work_rows_open_graph_inspector_without_inline_controls() {
         let mut app = app();
-        let graph = operation_graph(NodeState::Ready);
+        let graph = operation_graph(NodeState::Active);
         restore_graph(&mut app, &graph);
+        app.runtime_services
+            .work
+            .as_ref()
+            .expect("Work Graph runtime")
+            .reconcile_operation(
+                SESSION,
+                OperationOwnerSnapshot::new("shell:shell_1234abcd", OwnerState::Running, 1, 6),
+            )
+            .expect("live shell owner");
 
         let text = render_text(&mut app, 100, 6);
         assert!(!text.contains("[open]"), "{text}");

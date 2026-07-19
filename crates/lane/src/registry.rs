@@ -53,6 +53,9 @@ pub struct LaneRecord {
     pub goal: Option<String>,
     pub runtime: RuntimeBackendKind,
     pub status: LaneStatus,
+    /// Monotonic durable lifecycle sequence used by Work Graph reconciliation.
+    #[serde(default)]
+    pub lifecycle_seq: u64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub worktree_path: Option<PathBuf>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -200,6 +203,7 @@ impl LaneRegistry {
             goal,
             runtime,
             status: LaneStatus::Pending,
+            lifecycle_seq: 1,
             worktree_path: None,
             branch: None,
             tmux_session: None,
@@ -259,6 +263,7 @@ impl LaneRegistry {
             *record = current;
             return Ok(false);
         }
+        record.lifecycle_seq = current.lifecycle_seq.max(1);
 
         // `record` carries backend metadata (tmux session, worktree, attach
         // target) populated during launch. Persist it while still Pending so
@@ -269,9 +274,11 @@ impl LaneRegistry {
 
         before_transition()?;
         record.status = LaneStatus::Running;
+        record.lifecycle_seq = record.lifecycle_seq.saturating_add(1);
         record.stopped_at = None;
         if let Err(save_error) = self.save(record) {
             record.status = LaneStatus::Pending;
+            record.lifecycle_seq = current.lifecycle_seq.max(1);
             if let Err(rollback_error) = rollback() {
                 return Err(save_error).context(format!(
                     "persist running Lane; backend rollback also failed: {rollback_error:#}"
@@ -334,6 +341,7 @@ impl LaneRegistry {
             return Ok(false);
         }
         before_transition(&current)?;
+        current.lifecycle_seq = current.lifecycle_seq.max(1).saturating_add(1);
         current.status = status;
         current.stopped_at = Some(LaneRecord::now_rfc3339());
         current.attach_target = None;
@@ -373,6 +381,7 @@ mod tests {
         assert_eq!(loaded.issue.as_deref(), Some("4375"));
         assert_eq!(loaded.runtime, RuntimeBackendKind::Tmux);
         assert_eq!(loaded.status, LaneStatus::Pending);
+        assert_eq!(loaded.lifecycle_seq, 1);
         assert!(loaded.log_path.is_file() || loaded.log_path.exists());
 
         let listed = reg2.list().unwrap();
@@ -405,7 +414,10 @@ mod tests {
         );
         assert_eq!(starts.load(Ordering::SeqCst), 0);
         assert_eq!(record.status, LaneStatus::Stopped);
-        assert_eq!(reg.load(&record.id).unwrap().status, LaneStatus::Stopped);
+        assert_eq!(record.lifecycle_seq, 2);
+        let loaded = reg.load(&record.id).unwrap();
+        assert_eq!(loaded.status, LaneStatus::Stopped);
+        assert_eq!(loaded.lifecycle_seq, 2);
     }
 
     #[test]
@@ -466,7 +478,12 @@ mod tests {
 
         assert_eq!(starts.load(Ordering::SeqCst), 1);
         assert_eq!(teardowns.load(Ordering::SeqCst), 1);
-        assert_eq!(reg.load(&id).unwrap().status, LaneStatus::Stopped);
+        let loaded = reg.load(&id).unwrap();
+        assert_eq!(loaded.status, LaneStatus::Stopped);
+        assert_eq!(
+            loaded.lifecycle_seq, 3,
+            "pending, running, and stopped are three durable owner states"
+        );
     }
 
     #[test]
@@ -484,6 +501,9 @@ mod tests {
             .unwrap_err();
         assert!(error.to_string().contains("backend still alive"));
         assert_eq!(record.status, LaneStatus::Running);
-        assert_eq!(reg.load(&record.id).unwrap().status, LaneStatus::Running);
+        assert_eq!(record.lifecycle_seq, 2);
+        let loaded = reg.load(&record.id).unwrap();
+        assert_eq!(loaded.status, LaneStatus::Running);
+        assert_eq!(loaded.lifecycle_seq, 2);
     }
 }

@@ -718,6 +718,7 @@ mod tests {
             started_at: None,
             ended_at: None,
             duration_ms,
+            lifecycle_seq: 1,
             hunt_verdict: None,
             error: None,
             thread_id: None,

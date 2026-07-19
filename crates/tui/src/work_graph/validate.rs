@@ -10,7 +10,7 @@
 //!
 //! Invariants:
 //! - V1  `DependsOn` edges are acyclic.
-//! - V2  every live (`Active`/`Waiting`) Operation reaches an
+//! - V2  every live (`Initializing`/`Active`/`Waiting`) Operation reaches an
 //!   Objective/PlanStep via `Contains` ancestry — no orphaned live work.
 //! - V3  `binding.is_some()` ⇒ `kind == Operation`.
 //! - V4  `Verified` ⇒ acceptance non-empty ⇒ a `Verifies`-edge evidence path

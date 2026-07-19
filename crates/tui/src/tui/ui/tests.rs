@@ -16139,6 +16139,7 @@ mod work_sidebar_projection_tests {
             started_at: Some(created_at + Duration::seconds(1)),
             ended_at,
             duration_ms: ended_at.map(|_| 1_234),
+            lifecycle_seq: 1,
             hunt_verdict: None,
             error: None,
             thread_id: None,

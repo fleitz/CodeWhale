@@ -3572,7 +3572,19 @@ async fn run_shell_command_op_requests_approval_and_executes_shell() {
 
 #[tokio::test]
 async fn run_shell_command_op_skips_approval_when_auto_approved() {
-    let (mut engine, handle) = Engine::new(EngineConfig::default(), &Config::default());
+    let todos = crate::tools::todo::new_shared_todo_list();
+    let plan = crate::tools::plan::new_shared_plan_state();
+    let work = crate::work_graph::new_shared_work_runtime(todos, plan);
+    let mut runtime_services = crate::tools::spec::RuntimeToolServices::default();
+    runtime_services.work = Some(work.clone());
+    let (mut engine, handle) = Engine::new(
+        EngineConfig {
+            runtime_services,
+            ..EngineConfig::default()
+        },
+        &Config::default(),
+    );
+    let session_id = engine.session.id.clone();
 
     engine
         .handle_run_shell_command(
@@ -3607,6 +3619,30 @@ async fn run_shell_command_op_skips_approval_when_auto_approved() {
     }
 
     assert!(saw_complete);
+    let graph = work
+        .capture(Some(&session_id))
+        .expect("capture bang-shell work")
+        .expect("bang-shell graph")
+        .graph;
+    let operation = graph
+        .nodes
+        .iter()
+        .find(|node| node.kind == crate::work_graph::NodeKind::Operation)
+        .expect("bang-shell operation registered before execution");
+    assert_eq!(operation.state, crate::work_graph::NodeState::Completed);
+    let observation = operation
+        .binding
+        .as_ref()
+        .and_then(|binding| binding.last_observation.as_ref())
+        .expect("terminal shell owner observation");
+    assert!(
+        observation
+            .output
+            .as_ref()
+            .and_then(crate::work_graph::EvidenceRef::raw_bytes)
+            .is_some_and(|raw_bytes| raw_bytes > 0),
+        "bang-shell completion must retain a logical byte-count receipt"
+    );
 }
 
 #[tokio::test]
@@ -7456,6 +7492,103 @@ fn compaction_summary_stays_in_stable_system_prompt() {
 
     assert!(prompt.contains(COMPACTION_SUMMARY_MARKER));
     assert!(!prompt.contains(WORKING_SET_SUMMARY_MARKER));
+}
+
+#[test]
+fn compaction_reanchors_active_operation_identity_without_raw_output() {
+    let tmp = tempdir().expect("tempdir");
+    let todos = crate::tools::todo::new_shared_todo_list();
+    let plan = crate::tools::plan::new_shared_plan_state();
+    let work = crate::work_graph::new_shared_work_runtime(todos, plan);
+    let mut runtime_services = crate::tools::spec::RuntimeToolServices::default();
+    runtime_services.work = Some(work.clone());
+    let config = EngineConfig {
+        workspace: tmp.path().to_path_buf(),
+        runtime_services,
+        ..Default::default()
+    };
+    let (mut engine, _handle) = Engine::new(config, &Config::default());
+    let session_id = engine.session.id.clone();
+    work.register_operation(
+        &session_id,
+        crate::work_graph::OperationIntent::new(
+            "shell:shell_compact",
+            "quiet receipt sentinel",
+            false,
+            "exec_shell",
+            "shell_compact",
+        ),
+    )
+    .expect("register active operation");
+    work.reconcile_operation(
+        &session_id,
+        crate::work_graph::OperationOwnerSnapshot::new(
+            "shell:shell_compact",
+            crate::work_graph::OwnerState::Running,
+            1,
+            1,
+        ),
+    )
+    .expect("owner running report");
+
+    engine.merge_compaction_summary(Some(SystemPrompt::Text(format!(
+        "{COMPACTION_SUMMARY_MARKER}\nordinary summary"
+    ))));
+    let prompt = match &engine.session.system_prompt {
+        Some(SystemPrompt::Text(text)) => text.clone(),
+        Some(SystemPrompt::Blocks(blocks)) => blocks
+            .iter()
+            .map(|block| block.text.as_str())
+            .collect::<Vec<_>>()
+            .join("\n"),
+        None => panic!("expected system prompt"),
+    };
+    assert!(prompt.contains("Active Work Graph Operations"), "{prompt}");
+    assert!(prompt.contains("shell:shell_compact"), "{prompt}");
+    assert!(prompt.contains("quiet receipt sentinel"), "{prompt}");
+    assert!(prompt.contains("active"), "{prompt}");
+    assert_eq!(
+        prompt
+            .matches(crate::work_graph::ACTIVE_OPERATION_SUMMARY_START)
+            .count(),
+        1,
+        "the active-operation re-anchor must be unique: {prompt}"
+    );
+    assert!(
+        !prompt.contains("raw output sentinel"),
+        "the re-anchor must never copy operation output"
+    );
+
+    engine.merge_compaction_summary(Some(SystemPrompt::Text(format!(
+        "{COMPACTION_SUMMARY_MARKER}\nsecond summary"
+    ))));
+    let repeated = engine.rendered_compaction_summary().expect("summary");
+    assert_eq!(
+        repeated
+            .matches(crate::work_graph::ACTIVE_OPERATION_SUMMARY_START)
+            .count(),
+        1,
+        "repeated compaction must replace, not duplicate, the re-anchor: {repeated}"
+    );
+
+    work.reconcile_operation(
+        &session_id,
+        crate::work_graph::OperationOwnerSnapshot::new(
+            "shell:shell_compact",
+            crate::work_graph::OwnerState::Completed,
+            2,
+            2,
+        ),
+    )
+    .expect("owner completion report");
+    engine.merge_compaction_summary(Some(SystemPrompt::Text(format!(
+        "{COMPACTION_SUMMARY_MARKER}\nthird summary"
+    ))));
+    let completed = engine.rendered_compaction_summary().expect("summary");
+    assert!(
+        !completed.contains("Active Work Graph Operations"),
+        "a completed operation must not survive in a stale re-anchor: {completed}"
+    );
 }
 
 #[test]

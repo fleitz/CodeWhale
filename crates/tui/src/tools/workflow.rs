@@ -43,6 +43,10 @@ use crate::tools::workflow_plan_approval::{
     workflow_approval_requirement_for,
 };
 use crate::utils::spawn_supervised;
+use crate::work_graph::{
+    CancelOutcome, EvidenceKind, EvidenceRef, OperationIntent, OperationObservation,
+    OperationOwnerSnapshot, OwnerState, SharedWorkRuntime,
+};
 
 /// Keep promoted artifacts compact without clipping ordinary evidence reports.
 /// A 900-character cap cut six-line source receipts in half during live Fleet
@@ -78,6 +82,122 @@ impl WorkflowTool {
 
 type SharedWorkflowRuns = Arc<Mutex<HashMap<String, WorkflowRunRecord>>>;
 type SharedWorkflowControllers = Arc<Mutex<HashMap<String, Arc<WorkflowRunController>>>>;
+type SharedWorkflowLifecycles = Arc<Mutex<HashMap<String, WorkflowWorkLifecycle>>>;
+
+#[derive(Clone)]
+struct WorkflowWorkLifecycle {
+    work: SharedWorkRuntime,
+    session_id: String,
+    external: String,
+}
+
+impl WorkflowWorkLifecycle {
+    fn register(
+        context: &ToolContext,
+        run_id: &str,
+        title: &str,
+    ) -> Result<Option<Self>, ToolError> {
+        let Some(work) = context.runtime.work.clone() else {
+            return Ok(None);
+        };
+        let lifecycle = Self {
+            work,
+            session_id: context.state_namespace.clone(),
+            external: format!("workflow:{run_id}"),
+        };
+        lifecycle
+            .work
+            .register_operation(
+                &lifecycle.session_id,
+                OperationIntent::new(
+                    lifecycle.external.clone(),
+                    title,
+                    true,
+                    "workflow",
+                    format!("workflow:{run_id}:start"),
+                ),
+            )
+            .map_err(ToolError::execution_failed)?;
+        Ok(Some(lifecycle))
+    }
+
+    fn for_bound(context: &ToolContext, run_id: &str) -> Option<Self> {
+        let work = context.runtime.work.clone()?;
+        let external = format!("workflow:{run_id}");
+        work.has_operation_binding(Some(&context.state_namespace), &external)
+            .then(|| Self {
+                work,
+                session_id: context.state_namespace.clone(),
+                external,
+            })
+    }
+
+    fn reconcile_record(&self, record: &WorkflowRunRecord) -> Result<bool, String> {
+        let output = record.result.as_ref().and_then(|result| {
+            serde_json::to_vec(result).ok().and_then(|bytes| {
+                EvidenceRef::new(
+                    EvidenceKind::Receipt {
+                        owner: "workflow".to_string(),
+                    },
+                    format!("workflow:{}:result", record.run_id),
+                    Some(u64::try_from(bytes.len()).unwrap_or(u64::MAX)),
+                    false,
+                )
+                .ok()
+            })
+        });
+        let state = match record.status {
+            WorkflowRunStatus::Running => OwnerState::Running,
+            WorkflowRunStatus::Completed => OwnerState::Completed,
+            WorkflowRunStatus::Failed => OwnerState::Failed,
+            WorkflowRunStatus::Cancelled => OwnerState::Cancelled,
+        };
+        let mut snapshot = OperationOwnerSnapshot::new(
+            self.external.clone(),
+            state,
+            record.lifecycle_seq,
+            i64::try_from(record.completed_at_ms.unwrap_or(record.started_at_ms))
+                .unwrap_or(i64::MAX),
+        );
+        if let Some(output) = output {
+            snapshot = snapshot.with_output(output);
+        }
+        self.work.reconcile_operation(&self.session_id, snapshot)
+    }
+
+    fn reconcile_cancel(&self, outcome: CancelOutcome) -> Result<bool, String> {
+        self.work.reconcile_observation(
+            &self.session_id,
+            &self.external,
+            OperationObservation::CancelUpdate {
+                outcome,
+                at: i64::try_from(now_ms()).unwrap_or(i64::MAX),
+            },
+        )
+    }
+
+    fn reconcile_spawn_failure(&self) {
+        let _ = self.work.reconcile_operation(
+            &self.session_id,
+            OperationOwnerSnapshot::new(
+                self.external.clone(),
+                OwnerState::Failed,
+                1,
+                i64::try_from(now_ms()).unwrap_or(i64::MAX),
+            ),
+        );
+    }
+
+    fn reconcile_missing(&self) {
+        let _ = self.work.reconcile_observation(
+            &self.session_id,
+            &self.external,
+            OperationObservation::OwnerMissing {
+                checked_at: i64::try_from(now_ms()).unwrap_or(i64::MAX),
+            },
+        );
+    }
+}
 
 struct WorkflowRunController {
     driver: Arc<SubAgentWorkflowDriver>,
@@ -116,6 +236,7 @@ impl WorkflowRunController {
 struct WorkflowRunSummary {
     run_id: String,
     status: WorkflowRunStatus,
+    lifecycle_seq: u64,
     started_at_ms: u64,
     completed_at_ms: Option<u64>,
     source_path: Option<PathBuf>,
@@ -284,6 +405,8 @@ impl WorkflowUiEventKind {
 struct WorkflowRunRecord {
     run_id: String,
     status: WorkflowRunStatus,
+    #[serde(default)]
+    lifecycle_seq: u64,
     started_at_ms: u64,
     completed_at_ms: Option<u64>,
     source_path: Option<PathBuf>,
@@ -323,6 +446,7 @@ impl WorkflowRunRecord {
         Self {
             run_id,
             status: WorkflowRunStatus::Running,
+            lifecycle_seq: 1,
             started_at_ms: now_ms(),
             completed_at_ms: None,
             source_path,
@@ -347,6 +471,7 @@ impl WorkflowRunRecord {
         WorkflowRunSummary {
             run_id: self.run_id.clone(),
             status: self.status,
+            lifecycle_seq: self.lifecycle_seq,
             started_at_ms: self.started_at_ms,
             completed_at_ms: self.completed_at_ms,
             source_path: self.source_path.clone(),
@@ -533,6 +658,7 @@ impl ToolSpec for WorkflowTool {
 
     async fn execute(&self, input: Value, context: &ToolContext) -> Result<ToolResult, ToolError> {
         let state = shared_workflow_state(&context.workspace);
+        attach_bound_workflow_lifecycles(context, &state)?;
         match parse_workflow_action(&input)? {
             WorkflowAction::Start => {
                 let wait = optional_bool(&input, "wait", false);
@@ -563,6 +689,56 @@ impl ToolSpec for WorkflowTool {
             WorkflowAction::Cancel => cancel_workflow(input, state).await,
         }
     }
+}
+
+fn attach_bound_workflow_lifecycles(
+    context: &ToolContext,
+    state: &Arc<WorkflowWorkspaceState>,
+) -> Result<(), ToolError> {
+    let records = lock_mutex(&state.runs)?
+        .values()
+        .cloned()
+        .collect::<Vec<_>>();
+    for record in records {
+        if let Some(lifecycle) = WorkflowWorkLifecycle::for_bound(context, &record.run_id) {
+            state.attach_lifecycle(&record.run_id, lifecycle);
+            state.reconcile_snapshot(&record);
+        }
+    }
+    Ok(())
+}
+
+fn fail_workflow_start(state: &Arc<WorkflowWorkspaceState>, run_id: &str, message: String) {
+    let snapshot = state.runs.lock().ok().and_then(|mut runs| {
+        let record = runs.get_mut(run_id)?;
+        record.status = WorkflowRunStatus::Failed;
+        record.lifecycle_seq = record.lifecycle_seq.saturating_add(1);
+        record.completed_at_ms = Some(now_ms());
+        record.error = Some(message);
+        Some(record.clone())
+    });
+    let Some(snapshot) = snapshot else {
+        state.mark_owner_missing(run_id);
+        return;
+    };
+    if state.try_record_snapshot(&snapshot).is_ok() {
+        state.reconcile_snapshot(&snapshot);
+    } else {
+        state.mark_owner_missing(run_id);
+    }
+}
+
+fn fail_workflow_after_controller_registration(
+    state: &Arc<WorkflowWorkspaceState>,
+    run_id: &str,
+    controller: &Arc<WorkflowRunController>,
+    message: String,
+) {
+    controller.cancel();
+    if let Ok(mut controllers) = state.controllers.lock() {
+        controllers.remove(run_id);
+    }
+    fail_workflow_start(state, run_id, message);
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -602,9 +778,29 @@ async fn start_workflow(
         approval_decision
     };
     let plan_approval = summary.to_receipt(approval_decision, now_ms());
+    let workflow_title = source
+        .spec
+        .as_ref()
+        .map(|spec| spec.goal.as_str())
+        .or_else(|| {
+            source
+                .path
+                .as_ref()
+                .and_then(|path| path.file_name()?.to_str())
+        })
+        .unwrap_or("Workflow run");
+    let lifecycle = WorkflowWorkLifecycle::register(context, &run_id, workflow_title)?;
 
     {
-        let mut runs_guard = lock_mutex(&state.runs)?;
+        let mut runs_guard = match lock_mutex(&state.runs) {
+            Ok(guard) => guard,
+            Err(err) => {
+                if let Some(lifecycle) = lifecycle.as_ref() {
+                    lifecycle.reconcile_spawn_failure();
+                }
+                return Err(err);
+            }
+        };
         let mut record = WorkflowRunRecord::new(
             run_id.clone(),
             source.path.clone(),
@@ -624,7 +820,15 @@ async fn start_workflow(
         );
         record.events.push(started.clone());
         runs_guard.insert(run_id.clone(), record.clone());
-        state.record_snapshot(&record);
+        if let Err(err) = state.try_record_snapshot(&record) {
+            runs_guard.remove(&run_id);
+            if let Some(lifecycle) = lifecycle.as_ref() {
+                lifecycle.reconcile_spawn_failure();
+            }
+            return Err(ToolError::execution_failed(format!(
+                "workflow journal snapshot failed before launch: {err}"
+            )));
+        }
         // #4122: emit RunStarted immediately so the panel + history card open
         // before the first task/phase (including wait:false fire-and-forget).
         if let Some(tx) = runtime.event_tx.as_ref()
@@ -638,6 +842,9 @@ async fn start_workflow(
                 event: value,
             });
         }
+    }
+    if let Some(lifecycle) = lifecycle {
+        state.attach_lifecycle(&run_id, lifecycle);
     }
 
     let driver = SubAgentWorkflowDriver::new(
@@ -655,10 +862,52 @@ async fn start_workflow(
         driver.clone(),
         vm_cancel.clone(),
     ));
-    {
-        let mut controllers_guard = lock_mutex(&state.controllers)?;
+    if let Err(err) = lock_mutex(&state.controllers).map(|mut controllers_guard| {
         controllers_guard.insert(run_id.clone(), controller.clone());
+    }) {
+        fail_workflow_start(&state, &run_id, err.to_string());
+        return Err(err);
     }
+    let running_snapshot = {
+        let mut runs_guard = match lock_mutex(&state.runs) {
+            Ok(guard) => guard,
+            Err(err) => {
+                fail_workflow_after_controller_registration(
+                    &state,
+                    &run_id,
+                    &controller,
+                    err.to_string(),
+                );
+                return Err(err);
+            }
+        };
+        let Some(record) = runs_guard.get_mut(&run_id) else {
+            drop(runs_guard);
+            fail_workflow_after_controller_registration(
+                &state,
+                &run_id,
+                &controller,
+                "workflow owner record disappeared before launch".to_string(),
+            );
+            return Err(ToolError::execution_failed(
+                "workflow owner record disappeared before launch",
+            ));
+        };
+        record.lifecycle_seq = record.lifecycle_seq.saturating_add(1);
+        record.clone()
+    };
+    if let Err(err) = state.try_record_snapshot(&running_snapshot) {
+        fail_workflow_after_controller_registration(
+            &state,
+            &run_id,
+            &controller,
+            format!("workflow journal failed while activating owner: {err}"),
+        );
+        return Err(ToolError::execution_failed(format!(
+            "workflow journal failed while activating owner: {err}"
+        )));
+    }
+    state.reconcile_snapshot(&running_snapshot);
 
     let run = run_workflow_vm(
         run_id.clone(),
@@ -713,19 +962,36 @@ async fn cancel_workflow(
         let mut controllers_guard = lock_mutex(&state.controllers)?;
         controllers_guard.remove(run_id)
     };
-    let already_cancelled = {
+    let current_status = {
         let runs_guard = lock_mutex(&state.runs)?;
         let record = runs_guard.get(run_id).ok_or_else(|| {
             ToolError::invalid_input(format!("Unknown workflow run_id '{run_id}'"))
         })?;
-        record.status == WorkflowRunStatus::Cancelled
+        record.status
     };
-    if already_cancelled {
+    if current_status != WorkflowRunStatus::Running {
+        state.reconcile_cancel(run_id, CancelOutcome::AlreadyFinished);
+        if let Ok(runs_guard) = state.runs.lock()
+            && let Some(record) = runs_guard.get(run_id)
+        {
+            state.reconcile_snapshot(record);
+        }
         return workflow_result_for(run_id, state);
     }
-    if let Some(controller) = controller.as_ref() {
-        controller.cancel();
-    }
+    state.reconcile_cancel(
+        run_id,
+        if controller.is_some() {
+            CancelOutcome::Requested
+        } else {
+            CancelOutcome::StaleUnknown
+        },
+    );
+    let Some(controller) = controller else {
+        return Err(ToolError::execution_failed(
+            "workflow controller missing; cancellation outcome is unknown",
+        ));
+    };
+    controller.cancel();
     let cancelled_event = WorkflowUiEvent::new(WorkflowUiEventKind::RunCancelled {
         reason: "cancelled by workflow tool".to_string(),
     });
@@ -735,19 +1001,24 @@ async fn cancel_workflow(
             ToolError::invalid_input(format!("Unknown workflow run_id '{run_id}'"))
         })?;
         record.status = WorkflowRunStatus::Cancelled;
+        record.lifecycle_seq = record.lifecycle_seq.saturating_add(1);
         record.completed_at_ms = Some(now_ms());
         let reason = "cancelled by workflow tool".to_string();
         record.error = Some(reason);
         record.events.push(cancelled_event.clone());
         record.clone()
     };
-    state.record_snapshot(&snapshot);
+    if let Err(err) = state.try_record_snapshot(&snapshot) {
+        state.mark_owner_missing(run_id);
+        return Err(ToolError::execution_failed(format!(
+            "workflow cancellation journal failed: {err}"
+        )));
+    }
+    state.reconcile_snapshot(&snapshot);
     // The VM may publish its terminal `run_completed` event while cancellation
     // is racing it. Always stream the authoritative cancellation afterward so
     // the live panel finalizes running rows and cannot remain visually failed.
-    if let Some(controller) = controller.as_ref() {
-        controller.driver.emit_ui_event(&cancelled_event);
-    }
+    controller.driver.emit_ui_event(&cancelled_event);
     workflow_result_for(run_id, state)
 }
 
@@ -855,9 +1126,13 @@ async fn run_workflow_vm(
     let snapshot = {
         let mut runs_guard = match state.runs.lock() {
             Ok(guard) => guard,
-            Err(_) => return,
+            Err(_) => {
+                state.mark_owner_missing(&run_id);
+                return;
+            }
         };
         let Some(record) = runs_guard.get_mut(&run_id) else {
+            state.mark_owner_missing(&run_id);
             return;
         };
         if record.status != WorkflowRunStatus::Cancelled {
@@ -904,6 +1179,7 @@ async fn run_workflow_vm(
         .and_then(|mut guard| {
             let record = guard.get_mut(&run_id)?;
             if record.status != WorkflowRunStatus::Cancelled {
+                record.lifecycle_seq = record.lifecycle_seq.saturating_add(1);
                 let budget_event = WorkflowUiEvent::new(budget_event_kind(final_budget));
                 let completed = WorkflowUiEvent::new(WorkflowUiEventKind::RunCompleted {
                     status: record.status,
@@ -919,7 +1195,11 @@ async fn run_workflow_vm(
             Some(record.clone())
         })
         .unwrap_or(snapshot);
-    state.record_snapshot(&snapshot);
+    if state.try_record_snapshot(&snapshot).is_ok() {
+        state.reconcile_snapshot(&snapshot);
+    } else {
+        state.mark_owner_missing(&run_id);
+    }
     if let Ok(mut controllers_guard) = state.controllers.lock() {
         controllers_guard.remove(&run_id);
     }
@@ -2985,8 +3265,8 @@ fn now_ms() -> u64 {
 
 mod journal {
     use super::{
-        SharedWorkflowControllers, SharedWorkflowRuns, WorkflowRunRecord, WorkflowRunStatus,
-        WorkflowUiEvent,
+        SharedWorkflowControllers, SharedWorkflowLifecycles, SharedWorkflowRuns, WorkflowRunRecord,
+        WorkflowRunStatus, WorkflowUiEvent, WorkflowWorkLifecycle,
     };
     use serde::{Deserialize, Serialize};
     use std::collections::HashMap;
@@ -3003,6 +3283,7 @@ mod journal {
     pub(super) struct WorkflowWorkspaceState {
         pub runs: SharedWorkflowRuns,
         pub controllers: SharedWorkflowControllers,
+        lifecycles: SharedWorkflowLifecycles,
         journal: WorkflowRunJournal,
     }
 
@@ -3013,12 +3294,70 @@ mod journal {
             Arc::new(Self {
                 runs,
                 controllers: Arc::new(Mutex::new(HashMap::new())),
+                lifecycles: Arc::new(Mutex::new(HashMap::new())),
                 journal,
             })
         }
 
+        pub fn attach_lifecycle(&self, run_id: &str, lifecycle: WorkflowWorkLifecycle) {
+            self.lifecycles
+                .lock()
+                .unwrap_or_else(|poison| poison.into_inner())
+                .entry(run_id.to_string())
+                .or_insert(lifecycle);
+        }
+
+        pub fn reconcile_snapshot(&self, record: &WorkflowRunRecord) {
+            let lifecycle = self
+                .lifecycles
+                .lock()
+                .unwrap_or_else(|poison| poison.into_inner())
+                .get(&record.run_id)
+                .cloned();
+            if let Some(lifecycle) = lifecycle
+                && let Err(err) = lifecycle.reconcile_record(record)
+            {
+                warn!(
+                    run_id = record.run_id,
+                    "workflow Work reconciliation failed: {err}"
+                );
+            }
+        }
+
+        pub fn reconcile_cancel(&self, run_id: &str, outcome: super::CancelOutcome) {
+            let lifecycle = self
+                .lifecycles
+                .lock()
+                .unwrap_or_else(|poison| poison.into_inner())
+                .get(run_id)
+                .cloned();
+            if let Some(lifecycle) = lifecycle
+                && let Err(err) = lifecycle.reconcile_cancel(outcome)
+            {
+                warn!(run_id, "workflow cancellation reconciliation failed: {err}");
+            }
+        }
+
+        pub fn mark_owner_missing(&self, run_id: &str) {
+            let lifecycle = self
+                .lifecycles
+                .lock()
+                .unwrap_or_else(|poison| poison.into_inner())
+                .get(run_id)
+                .cloned();
+            if let Some(lifecycle) = lifecycle {
+                lifecycle.reconcile_missing();
+            }
+        }
+
+        pub fn try_record_snapshot(&self, record: &WorkflowRunRecord) -> Result<(), String> {
+            self.journal
+                .append_snapshot(record)
+                .map_err(|err| err.to_string())
+        }
+
         pub fn record_snapshot(&self, record: &WorkflowRunRecord) {
-            if let Err(err) = self.journal.append_snapshot(record) {
+            if let Err(err) = self.try_record_snapshot(record) {
                 warn!("workflow journal snapshot failed: {err}");
             }
         }
@@ -3136,12 +3475,27 @@ mod journal {
             }
             // A run journaled as Running belongs to a process that is gone;
             // without this it would show as live forever after a restart.
+            let mut recovered = Vec::new();
             for run in runs.values_mut() {
                 if run.status == WorkflowRunStatus::Running {
                     run.status = WorkflowRunStatus::Failed;
+                    run.lifecycle_seq = run.lifecycle_seq.saturating_add(1);
+                    run.completed_at_ms.get_or_insert_with(super::now_ms);
                     run.error = Some(
                         "process exited before the run completed (recovered on startup)"
                             .to_string(),
+                    );
+                    recovered.push(run.clone());
+                }
+            }
+            // The recovery decision is owner truth, not a presentation-only
+            // repair. Append it so another restart replays the same terminal
+            // sequence instead of rediscovering and incrementing it again.
+            for run in recovered {
+                if let Err(err) = self.append_snapshot(&run) {
+                    warn!(
+                        run_id = run.run_id,
+                        "workflow recovery snapshot append failed: {err}"
                     );
                 }
             }
@@ -3191,6 +3545,7 @@ mod journal {
             WorkflowRunRecord {
                 run_id: run_id.to_string(),
                 status,
+                lifecycle_seq: 1,
                 started_at_ms: 1,
                 completed_at_ms: None,
                 source_path: None,
@@ -3336,6 +3691,14 @@ mod journal {
                 .cloned()
                 .expect("hydrated run");
             assert_eq!(run.status, WorkflowRunStatus::Failed);
+            assert_eq!(
+                run.lifecycle_seq, 2,
+                "restart recovery is a durable owner lifecycle transition"
+            );
+            assert!(
+                run.completed_at_ms.is_some(),
+                "restart recovery must terminalize the durable owner record"
+            );
             assert!(
                 run.error
                     .as_deref()
@@ -3343,11 +3706,73 @@ mod journal {
                 "expected orphan recovery error, got {:?}",
                 run.error
             );
+
+            let reopened = WorkflowWorkspaceState::open(tmp.path());
+            let replayed = reopened
+                .runs
+                .lock()
+                .expect("runs lock")
+                .get("workflow_orphan")
+                .cloned()
+                .expect("durably recovered run");
+            assert_eq!(replayed.status, WorkflowRunStatus::Failed);
+            assert_eq!(
+                replayed.lifecycle_seq, 2,
+                "reopening must replay the recovery snapshot without another transition"
+            );
         }
     }
 }
 
 use journal::{WorkflowWorkspaceState, shared_workflow_state};
+
+/// Reconcile workflow bindings after the journal has replayed restart
+/// recovery. The journal owns lifecycle truth; the graph only receives its
+/// monotonic projection.
+pub(crate) fn reconcile_persisted_workflow_bindings(
+    work: &SharedWorkRuntime,
+    session_id: &str,
+    workspace: &Path,
+) -> Result<usize, String> {
+    let state = shared_workflow_state(workspace);
+    let records = state
+        .runs
+        .lock()
+        .unwrap_or_else(|poison| poison.into_inner())
+        .values()
+        .cloned()
+        .collect::<Vec<_>>();
+    let candidates = work
+        .reconcilable_durable_bindings(Some(session_id))
+        .into_iter()
+        .filter(|external| external.starts_with("workflow:"))
+        .collect::<std::collections::HashSet<_>>();
+    let mut seen = std::collections::HashSet::new();
+    let mut changed = 0usize;
+    for record in records {
+        let external = format!("workflow:{}", record.run_id);
+        if !candidates.contains(&external) {
+            continue;
+        }
+        seen.insert(external.clone());
+        let lifecycle = WorkflowWorkLifecycle {
+            work: work.clone(),
+            session_id: session_id.to_string(),
+            external,
+        };
+        changed += usize::from(lifecycle.reconcile_record(&record)?);
+    }
+    for external in candidates.difference(&seen) {
+        changed += usize::from(work.reconcile_observation(
+            session_id,
+            external,
+            OperationObservation::OwnerMissing {
+                checked_at: i64::try_from(now_ms()).unwrap_or(i64::MAX),
+            },
+        )?);
+    }
+    Ok(changed)
+}
 
 #[cfg(test)]
 mod tests {
@@ -3358,6 +3783,170 @@ mod tests {
     use axum::{Json, Router, routing::post};
     use codewhale_workflow::{IsolationMode, leaf_is_write_capable};
     use std::sync::atomic::{AtomicUsize, Ordering};
+
+    #[test]
+    fn restored_workflow_binding_consumes_journal_recovery() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let state = WorkflowWorkspaceState::open(tmp.path());
+        let record = WorkflowRunRecord::new("workflow_restore".to_string(), None, None, None);
+        state.record_snapshot(&record);
+
+        let work = crate::work_graph::new_shared_work_runtime(
+            crate::tools::todo::new_shared_todo_list(),
+            crate::tools::plan::new_shared_plan_state(),
+        );
+        work.register_operation(
+            "restored-workflow-session",
+            OperationIntent::new(
+                "workflow:workflow_restore",
+                "restored workflow",
+                true,
+                "workflow",
+                "restore-test",
+            ),
+        )
+        .expect("register saved workflow binding");
+        work.reconcile_operation(
+            "restored-workflow-session",
+            OperationOwnerSnapshot::new("workflow:workflow_restore", OwnerState::Running, 1, 1),
+        )
+        .expect("saved running owner state");
+        work.register_operation(
+            "restored-workflow-session",
+            OperationIntent::new(
+                "workflow:workflow_absent",
+                "absent workflow",
+                true,
+                "workflow",
+                "absent-restore-test",
+            ),
+        )
+        .expect("register absent workflow binding");
+        work.reconcile_operation(
+            "restored-workflow-session",
+            OperationOwnerSnapshot::new("workflow:workflow_absent", OwnerState::Running, 1, 1),
+        )
+        .expect("saved absent owner state");
+
+        assert_eq!(
+            reconcile_persisted_workflow_bindings(&work, "restored-workflow-session", tmp.path(),),
+            Ok(2)
+        );
+        let graph = work
+            .capture(Some("restored-workflow-session"))
+            .expect("capture restored workflow")
+            .expect("graph")
+            .graph;
+        let operation = graph
+            .nodes
+            .iter()
+            .find(|node| {
+                node.binding
+                    .as_ref()
+                    .is_some_and(|binding| binding.external == "workflow:workflow_restore")
+            })
+            .expect("workflow operation");
+        assert_eq!(operation.state, crate::work_graph::NodeState::Failed);
+        assert_eq!(
+            operation
+                .binding
+                .as_ref()
+                .and_then(|binding| binding.last_observation.as_ref())
+                .map(|observation| observation.seq),
+            Some(2),
+            "journal replay must advance the lost live owner before graph reconciliation"
+        );
+        let absent = graph
+            .nodes
+            .iter()
+            .find(|node| {
+                node.binding
+                    .as_ref()
+                    .is_some_and(|binding| binding.external == "workflow:workflow_absent")
+            })
+            .expect("absent workflow operation");
+        assert_eq!(absent.state, crate::work_graph::NodeState::Stale);
+        assert_eq!(
+            reconcile_persisted_workflow_bindings(&work, "restored-workflow-session", tmp.path(),),
+            Ok(0),
+            "rechecking an already stale missing owner must be idempotent"
+        );
+    }
+
+    #[tokio::test]
+    async fn cancellation_without_controller_fails_closed_as_stale() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let state = WorkflowWorkspaceState::open(tmp.path());
+        let record =
+            WorkflowRunRecord::new("workflow_missing_controller".to_string(), None, None, None);
+        state
+            .runs
+            .lock()
+            .expect("runs lock")
+            .insert(record.run_id.clone(), record.clone());
+        state.record_snapshot(&record);
+
+        let work = crate::work_graph::new_shared_work_runtime(
+            crate::tools::todo::new_shared_todo_list(),
+            crate::tools::plan::new_shared_plan_state(),
+        );
+        work.register_operation(
+            "missing-controller-session",
+            OperationIntent::new(
+                "workflow:workflow_missing_controller",
+                "missing controller",
+                true,
+                "workflow",
+                "missing-controller-test",
+            ),
+        )
+        .expect("register workflow");
+        work.reconcile_operation(
+            "missing-controller-session",
+            OperationOwnerSnapshot::new(
+                "workflow:workflow_missing_controller",
+                OwnerState::Running,
+                1,
+                1,
+            ),
+        )
+        .expect("running workflow");
+        state.attach_lifecycle(
+            "workflow_missing_controller",
+            WorkflowWorkLifecycle {
+                work: work.clone(),
+                session_id: "missing-controller-session".to_string(),
+                external: "workflow:workflow_missing_controller".to_string(),
+            },
+        );
+
+        let error = cancel_workflow(
+            json!({"run_id": "workflow_missing_controller"}),
+            state.clone(),
+        )
+        .await
+        .expect_err("missing controller cannot acknowledge cancellation");
+        assert!(error.to_string().contains("outcome is unknown"), "{error}");
+        let record = state
+            .runs
+            .lock()
+            .expect("runs lock")
+            .get("workflow_missing_controller")
+            .cloned()
+            .expect("workflow owner");
+        assert_eq!(record.status, WorkflowRunStatus::Running);
+        assert_eq!(record.lifecycle_seq, 1);
+        let operation = work
+            .capture(Some("missing-controller-session"))
+            .expect("capture")
+            .expect("graph")
+            .graph
+            .nodes
+            .into_iter()
+            .find(|node| node.kind == crate::work_graph::NodeKind::Operation)
+            .expect("workflow operation");
+        assert_eq!(operation.state, crate::work_graph::NodeState::Stale);
+    }
 
     #[test]
     fn handoff_compaction_preserves_release_sized_evidence() {

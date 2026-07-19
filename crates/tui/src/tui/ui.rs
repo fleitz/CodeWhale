@@ -105,6 +105,7 @@ use crate::tui::persistence_actor::{self, PersistRequest};
 use crate::tui::plan_prompt::PlanPromptView;
 use crate::tui::plan_todo_bridge::{PlanAcceptance, project_accepted_plan};
 use crate::tui::scrolling::TranscriptScroll;
+use crate::work_graph::{OperationOwnerSnapshot, OwnerState};
 // SelectionAutoscroll unused
 use crate::tui::motion::{FrameRequester, MotionPolicy};
 use crate::tui::session_picker::SessionPickerView;
@@ -1840,6 +1841,42 @@ pub(crate) fn select_work_sidebar_tasks(
 
 async fn refresh_active_task_panel(app: &mut App, task_manager: &SharedTaskManager) -> bool {
     let tasks = task_manager.list_tasks(None).await;
+    let mut lifecycle_changed = false;
+    if let (Some(work), Some(session_id)) = (
+        app.runtime_services.work.as_ref(),
+        app.current_session_id.as_deref(),
+    ) {
+        for task in &tasks {
+            let external = format!("task:{}", task.id);
+            if !work.has_operation_binding(Some(session_id), &external) {
+                continue;
+            }
+            let owner_state = match task.status {
+                TaskStatus::Queued => OwnerState::Initializing,
+                TaskStatus::Running => OwnerState::Running,
+                TaskStatus::Completed => OwnerState::Completed,
+                TaskStatus::Failed => OwnerState::Failed,
+                TaskStatus::Canceled => OwnerState::Cancelled,
+            };
+            let observed_at = task
+                .ended_at
+                .or(task.started_at)
+                .unwrap_or(task.created_at)
+                .timestamp_millis();
+            match work.reconcile_operation(
+                session_id,
+                OperationOwnerSnapshot::new(external, owner_state, task.lifecycle_seq, observed_at),
+            ) {
+                Ok(changed) => lifecycle_changed |= changed,
+                Err(err) => {
+                    tracing::warn!(task_id = %task.id, error = %err, "failed to reconcile durable task lifecycle");
+                }
+            }
+        }
+    }
+    if lifecycle_changed && let Err(err) = persist_pending_work_checkpoint(app).await {
+        tracing::warn!(error = %err, "durable task lifecycle checkpoint remains pending");
+    }
     let session_started_at = app.session_started_at;
     let mut entries: Vec<TaskPanelEntry> = select_work_sidebar_tasks(tasks, session_started_at)
         .into_iter()
@@ -1888,7 +1925,7 @@ async fn refresh_active_task_panel(app: &mut App, task_manager: &SharedTaskManag
     // Report whether anything visible changed so the idle tick can skip the
     // redraw: an unconditional 2.5 s repaint kept the app from ever going
     // quiescent (#3757).
-    let changed = app.task_panel != entries;
+    let changed = lifecycle_changed || app.task_panel != entries;
     app.task_panel = entries;
     changed
 }
@@ -2262,6 +2299,15 @@ async fn run_event_loop(
             }
             if refresh_shell_exec_live_output(app) {
                 app.needs_redraw = true;
+            }
+            if app
+                .runtime_services
+                .work
+                .as_ref()
+                .is_some_and(|work| work.has_pending_publish())
+                && let Err(err) = persist_pending_work_checkpoint(app).await
+            {
+                tracing::warn!(error = %err, "background Work lifecycle checkpoint remains pending");
             }
             last_task_refresh = Instant::now();
         }
@@ -6867,6 +6913,13 @@ fn is_work_graph_mutation_tool(name: &str) -> bool {
             | "todo_add"
             | "checklist_update"
             | "todo_update"
+            | "task_create"
+            | "task_cancel"
+            | "exec_shell"
+            | "exec_shell_wait"
+            | "exec_shell_cancel"
+            | "agent"
+            | "workflow"
     )
 }
 
@@ -13817,7 +13870,11 @@ fn apply_loaded_session(
     // Restore/validate the contended state before mutating conversation or
     // workspace fields. A failed session switch must leave the current session
     // wholly intact.
-    app.restore_work_state(&session.metadata.id, session.work_state.as_ref())?;
+    app.restore_work_state(
+        &session.metadata.id,
+        &session.metadata.workspace,
+        session.work_state.as_ref(),
+    )?;
     *config = *restored_route.config;
     let projected_messages =
         crate::runtime_handoff::project_messages_for_restore(&session.messages);

@@ -106,7 +106,7 @@ pub fn project_todos(snapshot: &WorkGraphSnapshot) -> TodoProjection {
 
 fn plan_status(node: &WorkNode) -> StepStatus {
     match node.state {
-        NodeState::Active => StepStatus::InProgress,
+        NodeState::Initializing | NodeState::Active => StepStatus::InProgress,
         NodeState::Completed | NodeState::Verified => StepStatus::Completed,
         _ => StepStatus::Pending,
     }
@@ -114,7 +114,7 @@ fn plan_status(node: &WorkNode) -> StepStatus {
 
 fn todo_status(node: &WorkNode) -> TodoStatus {
     match node.state {
-        NodeState::Active => TodoStatus::InProgress,
+        NodeState::Initializing | NodeState::Active => TodoStatus::InProgress,
         NodeState::Completed | NodeState::Verified => TodoStatus::Completed,
         _ => TodoStatus::Pending,
     }

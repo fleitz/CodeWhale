@@ -1,16 +1,27 @@
 //! Active-session Work Graph authority and legacy tool adapters.
 
+use std::path::Path;
 use std::sync::{Arc, Mutex, MutexGuard};
 
+use crate::fleet::ledger::FleetLedger;
 use crate::tools::plan::{PlanSnapshot, PlanState, SharedPlanState, StepStatus};
 use crate::tools::todo::{SharedTodoList, TodoList, TodoListSnapshot, TodoStatus};
+use codewhale_lane::LaneRegistry;
 
 use super::{
-    ApprovalRef, ChangeCtx, CompatPlanMetadata, CompatProjectionState, CompatTodoBinding, EdgeKind,
-    NodeKind, NodeState, ProposalId, ProposedNodeUpdate, Provenance, WorkEdge, WorkEdgeId,
-    WorkGraph, WorkGraphChange, WorkGraphProposal, WorkGraphSnapshot, WorkNode, WorkNodeId,
-    WorkNodePatch, import_legacy, project_plan, project_todos, validate,
+    ApprovalRef, BindingId, ChangeCtx, CompatPlanMetadata, CompatProjectionState,
+    CompatTodoBinding, EdgeKind, IdempotencyKey, NodeKind, NodeState, OperationBinding,
+    OperationIntent, OperationObservation, OperationOwnerSnapshot, ProposalId, ProposedNodeUpdate,
+    Provenance, WorkEdge, WorkEdgeId, WorkGraph, WorkGraphChange, WorkGraphProposal,
+    WorkGraphSnapshot, WorkNode, WorkNodeId, WorkNodePatch, external_identity_is_well_formed,
+    fleet_task_owner_snapshot, import_legacy, lane_owner_snapshot, project_plan, project_todos,
+    validate,
 };
+
+pub(crate) const ACTIVE_OPERATION_SUMMARY_START: &str =
+    "<!-- codewhale:active-work-operations:start -->";
+pub(crate) const ACTIVE_OPERATION_SUMMARY_END: &str =
+    "<!-- codewhale:active-work-operations:end -->";
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct WorkRuntimeSnapshot {
@@ -64,6 +75,307 @@ impl WorkRuntime {
     #[must_use]
     pub fn matches_plan(&self, plan: &SharedPlanState) -> bool {
         Arc::ptr_eq(&self.plan, plan)
+    }
+
+    #[must_use]
+    pub fn has_operation_binding(&self, session_id: Option<&str>, external: &str) -> bool {
+        let active = lock_unpoisoned(&self.graph);
+        if let (Some(expected), Some(actual)) = (session_id, active.session_id.as_deref())
+            && expected != actual
+        {
+            return false;
+        }
+        active.snapshot.as_ref().is_some_and(|graph| {
+            graph.nodes.iter().any(|node| {
+                node.binding
+                    .as_ref()
+                    .is_some_and(|binding| binding.external == external)
+            })
+        })
+    }
+
+    /// Durable owner bindings that still require restore-time confirmation.
+    /// Terminal operations are excluded because their saved owner receipt is
+    /// already sufficient and must not be reopened by a missing live handle.
+    #[must_use]
+    pub fn reconcilable_durable_bindings(&self, session_id: Option<&str>) -> Vec<String> {
+        let active = lock_unpoisoned(&self.graph);
+        if let (Some(expected), Some(actual)) = (session_id, active.session_id.as_deref())
+            && expected != actual
+        {
+            return Vec::new();
+        }
+        active
+            .snapshot
+            .as_ref()
+            .into_iter()
+            .flat_map(|graph| graph.nodes.iter())
+            .filter(|node| node.state.is_live() || node.state == NodeState::Stale)
+            .filter_map(|node| node.binding.as_ref())
+            .filter(|binding| binding.durable)
+            .map(|binding| binding.external.clone())
+            .collect()
+    }
+
+    /// Register an Operation before its owner starts work. The operation is
+    /// first added inert, connected to an Objective/PlanStep, and only then
+    /// advanced to `Initializing`, so every reducer intermediate satisfies
+    /// the no-orphan invariant.
+    pub fn register_operation(
+        &self,
+        session_id: &str,
+        intent: OperationIntent,
+    ) -> Result<WorkNodeId, String> {
+        if !external_identity_is_well_formed(&intent.external) {
+            return Err(format!(
+                "invalid lifecycle binding external {:?}",
+                intent.external
+            ));
+        }
+        let todos = retry_lock(&self.todos, 100)
+            .ok_or_else(|| "To-do state is busy; operation was not registered".to_string())?;
+        let plan = retry_lock(&self.plan, 100)
+            .ok_or_else(|| "Plan state is busy; operation was not registered".to_string())?;
+        let mut active = lock_unpoisoned(&self.graph);
+        let base = graph_for_update(&mut active, session_id, &plan.snapshot(), &todos.snapshot())?;
+        if let Some(existing) = base.nodes.iter().find(|node| {
+            node.binding
+                .as_ref()
+                .is_some_and(|binding| binding.external == intent.external)
+        }) {
+            let binding = existing.binding.as_ref().expect("binding matched above");
+            if binding.durable != intent.durable {
+                return Err(format!(
+                    "lifecycle binding {} changed durability",
+                    intent.external
+                ));
+            }
+            return Ok(existing.id.clone());
+        }
+
+        let mut graph = WorkGraph::from_snapshot(base);
+        let parent = operation_parent(&mut graph, session_id, &intent.source)?;
+        let node_id = WorkNodeId::derive(session_id, &format!("operation:{}", intent.external));
+        let now = now_ms();
+        apply_change(
+            &mut graph,
+            session_id,
+            &intent.source,
+            WorkGraphChange::AddNode {
+                node: WorkNode {
+                    id: node_id.clone(),
+                    kind: NodeKind::Operation,
+                    title: bounded_operation_title(&intent.title),
+                    state: NodeState::Ready,
+                    acceptance: intent.acceptance,
+                    binding: Some(OperationBinding {
+                        external: intent.external,
+                        durable: intent.durable,
+                        last_observation: None,
+                    }),
+                    evidence: None,
+                    provenance: Provenance::ToolUpdate {
+                        tool: intent.source.clone(),
+                        call_id: intent.call_id,
+                    },
+                    created_at: now,
+                    updated_at: now,
+                },
+            },
+        )?;
+        ensure_contains(&mut graph, session_id, &intent.source, &parent, &node_id)?;
+        let title = graph
+            .snapshot()
+            .node(&node_id)
+            .map(|node| node.title.clone())
+            .ok_or_else(|| format!("operation {node_id} disappeared during registration"))?;
+        patch_existing_node(
+            &mut graph,
+            session_id,
+            &intent.source,
+            &node_id,
+            title,
+            NodeState::Initializing,
+        )?;
+        let next = graph.into_snapshot();
+        validate_combined(&next, &project_plan(&next), &project_todos(&next))?;
+        active.snapshot = Some(next);
+        active.pending_publish = true;
+        Ok(node_id)
+    }
+
+    /// Retain a crossed approval boundary as provenance attached to an
+    /// operation. The completed Approval node is historical evidence only: it
+    /// does not grant capabilities or change the owner's runtime authority.
+    pub fn record_operation_approval(
+        &self,
+        session_id: &str,
+        external: &str,
+        reference: &str,
+        source: &str,
+        call_id: &str,
+    ) -> Result<(), String> {
+        let todos = retry_lock(&self.todos, 100)
+            .ok_or_else(|| "To-do state is busy; approval was not recorded".to_string())?;
+        let plan = retry_lock(&self.plan, 100)
+            .ok_or_else(|| "Plan state is busy; approval was not recorded".to_string())?;
+        let mut active = lock_unpoisoned(&self.graph);
+        let base = graph_for_update(&mut active, session_id, &plan.snapshot(), &todos.snapshot())?;
+        let operation = base
+            .nodes
+            .iter()
+            .find(|node| {
+                node.kind == NodeKind::Operation
+                    && node
+                        .binding
+                        .as_ref()
+                        .is_some_and(|binding| binding.external == external)
+            })
+            .map(|node| node.id.clone())
+            .ok_or_else(|| format!("operation binding {external} is not registered"))?;
+        let approval = WorkNodeId::derive(
+            session_id,
+            &format!("approval:operation:{external}:{reference}"),
+        );
+        let mut graph = WorkGraph::from_snapshot(base);
+        if graph.snapshot().node(&approval).is_none() {
+            let now = now_ms();
+            apply_change(
+                &mut graph,
+                session_id,
+                source,
+                WorkGraphChange::AddNode {
+                    node: WorkNode {
+                        id: approval.clone(),
+                        kind: NodeKind::Approval,
+                        title: bounded_operation_title(&format!(
+                            "verification approved: {reference}"
+                        )),
+                        state: NodeState::Completed,
+                        acceptance: Vec::new(),
+                        binding: None,
+                        evidence: None,
+                        provenance: Provenance::ToolUpdate {
+                            tool: source.to_string(),
+                            call_id: call_id.to_string(),
+                        },
+                        created_at: now,
+                        updated_at: now,
+                    },
+                },
+            )?;
+        }
+        let edge = WorkEdgeId::derive(
+            session_id,
+            &format!(
+                "requires-approval:{}:{}",
+                operation.as_str(),
+                approval.as_str()
+            ),
+        );
+        if graph.snapshot().edge(&edge).is_none() {
+            apply_change(
+                &mut graph,
+                session_id,
+                source,
+                WorkGraphChange::AddEdge {
+                    edge: WorkEdge {
+                        id: edge,
+                        kind: EdgeKind::RequiresApproval,
+                        from: operation,
+                        to: approval,
+                    },
+                },
+            )?;
+        }
+        let next = graph.into_snapshot();
+        validate_combined(&next, &project_plan(&next), &project_todos(&next))?;
+        active.snapshot = Some(next);
+        active.pending_publish = true;
+        Ok(())
+    }
+
+    /// Apply one owner observation through the reducer. Unknown bindings are
+    /// rejected rather than materialized after the fact: spawn intent must be
+    /// registered before work begins.
+    pub fn reconcile_operation(
+        &self,
+        session_id: &str,
+        snapshot: OperationOwnerSnapshot,
+    ) -> Result<bool, String> {
+        let external = snapshot.external.clone();
+        self.reconcile_observation(session_id, &external, snapshot.into_observation())
+    }
+
+    pub fn reconcile_observation(
+        &self,
+        session_id: &str,
+        external: &str,
+        observation: OperationObservation,
+    ) -> Result<bool, String> {
+        let mut active = lock_unpoisoned(&self.graph);
+        if active
+            .session_id
+            .as_deref()
+            .is_some_and(|id| id != session_id)
+        {
+            return Err(format!(
+                "lifecycle observation for session {session_id} does not match active session"
+            ));
+        }
+        let base = active
+            .snapshot
+            .clone()
+            .ok_or_else(|| "lifecycle observation arrived before graph registration".to_string())?;
+        let Some(next) = apply_observation_to_snapshot(&base, session_id, external, observation)?
+        else {
+            return Ok(false);
+        };
+        active.snapshot = Some(next);
+        active.pending_publish = true;
+        Ok(true)
+    }
+
+    /// Compact graph-owned continuity injected after context compaction.
+    /// It contains identities and state only; no raw output or reasoning.
+    #[must_use]
+    pub fn active_operation_summary(&self, session_id: Option<&str>) -> Option<String> {
+        let active = lock_unpoisoned(&self.graph);
+        if let (Some(expected), Some(actual)) = (session_id, active.session_id.as_deref())
+            && expected != actual
+        {
+            return None;
+        }
+        let graph = active.snapshot.as_ref()?;
+        let operations = graph
+            .nodes
+            .iter()
+            .filter(|node| {
+                node.kind == NodeKind::Operation
+                    && (node.state.is_live() || node.state == NodeState::Stale)
+            })
+            .take(24)
+            .collect::<Vec<_>>();
+        if operations.is_empty() {
+            return None;
+        }
+        let mut out = format!(
+            "{ACTIVE_OPERATION_SUMMARY_START}\n## Active Work Graph Operations\n\nOwner records remain authoritative; reconcile before acting on a restored operation.\n"
+        );
+        for node in operations {
+            let external = node
+                .binding
+                .as_ref()
+                .map_or("unbound", |binding| binding.external.as_str());
+            out.push_str(&format!(
+                "- `{}` - {} - {}\n",
+                external,
+                operation_state_label(node.state),
+                prompt_safe_title(&node.title)
+            ));
+        }
+        out.push_str(ACTIVE_OPERATION_SUMMARY_END);
+        Some(out)
     }
 
     /// Apply an `update_plan` payload through the graph and publish both
@@ -556,6 +868,31 @@ impl WorkRuntime {
         todos: &TodoListSnapshot,
         plan: &PlanSnapshot,
     ) -> Result<Option<WorkRuntimeSnapshot>, String> {
+        self.restore_internal(session_id, graph, todos, plan, None)
+    }
+
+    /// Restore a saved graph and reconcile workspace-scoped durable owners as
+    /// one candidate transaction. No live state changes until the restored
+    /// graph, owner observations, and both legacy projections all validate.
+    pub fn restore_with_workspace_owner_bindings(
+        &self,
+        session_id: &str,
+        workspace: &Path,
+        graph: Option<&WorkGraphSnapshot>,
+        todos: &TodoListSnapshot,
+        plan: &PlanSnapshot,
+    ) -> Result<Option<WorkRuntimeSnapshot>, String> {
+        self.restore_internal(session_id, graph, todos, plan, Some(workspace))
+    }
+
+    fn restore_internal(
+        &self,
+        session_id: &str,
+        graph: Option<&WorkGraphSnapshot>,
+        todos: &TodoListSnapshot,
+        plan: &PlanSnapshot,
+        workspace: Option<&Path>,
+    ) -> Result<Option<WorkRuntimeSnapshot>, String> {
         let had_graph = graph.is_some();
         let graph = match graph {
             Some(graph) => {
@@ -564,6 +901,15 @@ impl WorkRuntime {
             }
             None if todos.is_empty() && plan.is_empty() => WorkGraphSnapshot::new(),
             None => import_legacy(session_id, plan, todos)?,
+        };
+        let (mut graph, reconciled_ephemeral) =
+            mark_restored_ephemeral_operations_stale(graph, session_id)?;
+        let reconciled_workspace = if let Some(workspace) = workspace {
+            let (reconciled, changed) = reconcile_workspace_snapshot(graph, session_id, workspace)?;
+            graph = reconciled;
+            changed > 0
+        } else {
+            false
         };
         let derived_plan = project_plan(&graph);
         let derived_todos = project_todos(&graph);
@@ -592,7 +938,8 @@ impl WorkRuntime {
         // A legacy load has already restored its complete old views, but its
         // newly imported graph still needs one acknowledged graph-bearing
         // write (and pre-import archive) before the migration is settled.
-        active.pending_publish = !had_graph && !graph.is_empty();
+        active.pending_publish =
+            reconciled_ephemeral || reconciled_workspace || (!had_graph && !graph.is_empty());
         if graph.is_empty() {
             Ok(None)
         } else {
@@ -602,6 +949,43 @@ impl WorkRuntime {
                 plan: derived_plan,
             }))
         }
+    }
+
+    /// Reconcile restored Fleet and Lane bindings from their durable owners.
+    /// Missing records fail toward `Stale`; process probes never override the
+    /// replayed ledger/registry state.
+    pub fn reconcile_workspace_owner_bindings(
+        &self,
+        session_id: &str,
+        workspace: &Path,
+    ) -> Result<usize, String> {
+        let (base, revision) = {
+            let active = lock_unpoisoned(&self.graph);
+            if active.session_id.as_deref() != Some(session_id) {
+                return Err(format!(
+                    "workspace owner reconciliation does not match active session {session_id}"
+                ));
+            }
+            let base = active
+                .snapshot
+                .clone()
+                .ok_or_else(|| "workspace owner reconciliation has no active graph".to_string())?;
+            let revision = base.revision;
+            (base, revision)
+        };
+        let (next, changed) = reconcile_workspace_snapshot(base, session_id, workspace)?;
+        if changed == 0 {
+            return Ok(0);
+        }
+        let mut active = lock_unpoisoned(&self.graph);
+        if active.session_id.as_deref() != Some(session_id)
+            || active.snapshot.as_ref().map(|graph| graph.revision) != Some(revision)
+        {
+            return Err("Work Graph changed during workspace owner reconciliation".to_string());
+        }
+        active.snapshot = Some(next);
+        active.pending_publish = true;
+        Ok(changed)
     }
 
     pub fn clear(&self, session_id: Option<&str>) -> bool {
@@ -618,6 +1002,282 @@ impl WorkRuntime {
         active.snapshot = Some(WorkGraphSnapshot::new());
         active.pending_publish = false;
         true
+    }
+}
+
+fn apply_observation_to_snapshot(
+    base: &WorkGraphSnapshot,
+    session_id: &str,
+    external: &str,
+    observation: OperationObservation,
+) -> Result<Option<WorkGraphSnapshot>, String> {
+    let node = base
+        .nodes
+        .iter()
+        .find(|node| {
+            node.binding
+                .as_ref()
+                .is_some_and(|binding| binding.external == external)
+        })
+        .ok_or_else(|| format!("operation binding {external} is not registered"))?;
+    let stale_owner_recovery = if let OperationObservation::OwnerReported {
+        state, seq, output, ..
+    } = &observation
+        && let Some(previous) = node
+            .binding
+            .as_ref()
+            .and_then(|binding| binding.last_observation.as_ref())
+    {
+        if *seq < previous.seq {
+            return Err(format!(
+                "operation owner {external} sequence regressed from {} to {seq}",
+                previous.seq
+            ));
+        }
+        if *seq == previous.seq {
+            if node.state != NodeState::Stale {
+                return Ok(None);
+            }
+            if *state != previous.owner_state || *output != previous.output {
+                return Err(format!(
+                    "operation owner {external} changed observation at sequence {seq}"
+                ));
+            }
+            true
+        } else {
+            false
+        }
+    } else {
+        false
+    };
+    if matches!(&observation, OperationObservation::OwnerMissing { .. })
+        && node.state == NodeState::Stale
+    {
+        return Ok(None);
+    }
+    let idempotency_key = match &observation {
+        OperationObservation::OwnerReported { .. } if stale_owner_recovery => None,
+        OperationObservation::OwnerReported { seq, .. } => Some(IdempotencyKey {
+            binding: BindingId::derive(session_id, &format!("binding:{external}")),
+            seq: *seq,
+        }),
+        OperationObservation::OwnerMissing { .. } | OperationObservation::CancelUpdate { .. } => {
+            None
+        }
+    };
+    let (next, receipt) = super::reducer::apply(
+        base,
+        WorkGraphChange::ReconcileOperation {
+            node: node.id.clone(),
+            obs: observation,
+        },
+        ChangeCtx {
+            session_id: session_id.to_string(),
+            now: now_ms(),
+            idempotency_key,
+        },
+    )
+    .map_err(|err| format!("runtime reconcile: {err}"))?;
+    Ok((!receipt.no_op).then_some(next))
+}
+
+fn reconcile_workspace_snapshot(
+    mut graph: WorkGraphSnapshot,
+    session_id: &str,
+    workspace: &Path,
+) -> Result<(WorkGraphSnapshot, usize), String> {
+    let candidates = graph
+        .nodes
+        .iter()
+        .filter(|node| node.state.is_live() || node.state == NodeState::Stale)
+        .filter_map(|node| node.binding.as_ref())
+        .filter(|binding| binding.durable)
+        .map(|binding| binding.external.clone())
+        .filter(|external| external.starts_with("fleet:") || external.starts_with("lane:"))
+        .collect::<Vec<_>>();
+    if candidates.is_empty() {
+        return Ok((graph, 0));
+    }
+
+    let fleet = candidates
+        .iter()
+        .any(|external| external.starts_with("fleet:"))
+        .then(|| FleetLedger::open(workspace).and_then(|ledger| ledger.rebuild_state()));
+    if let Some(Err(err)) = fleet.as_ref() {
+        tracing::warn!(
+            workspace = %workspace.display(),
+            error = %err,
+            "Fleet owner store could not be replayed; restored bindings will be stale"
+        );
+    }
+    let lanes = candidates
+        .iter()
+        .any(|external| external.starts_with("lane:"))
+        .then(LaneRegistry::open_default);
+    if let Some(Err(err)) = lanes.as_ref() {
+        tracing::warn!(
+            error = %err,
+            "Lane owner registry could not be opened; restored bindings will be stale"
+        );
+    }
+    let observed_at = now_ms();
+    let mut changed = 0usize;
+    for external in candidates {
+        let observation = if let Some(rest) = external.strip_prefix("fleet:") {
+            rest.split_once('/')
+                .and_then(|(run_id, task_id)| {
+                    fleet
+                        .as_ref()
+                        .and_then(|state| state.as_ref().ok())
+                        .and_then(|state| state.tasks.get(&format!("{run_id}:{task_id}")))
+                })
+                .map(|record| fleet_task_owner_snapshot(record, observed_at).into_observation())
+                .unwrap_or(OperationObservation::OwnerMissing {
+                    checked_at: observed_at,
+                })
+        } else if let Some(lane_id) = external.strip_prefix("lane:") {
+            lanes
+                .as_ref()
+                .and_then(|registry| registry.as_ref().ok())
+                .and_then(|registry| registry.load(lane_id).ok())
+                .map(|record| lane_owner_snapshot(&record, observed_at).into_observation())
+                .unwrap_or(OperationObservation::OwnerMissing {
+                    checked_at: observed_at,
+                })
+        } else {
+            continue;
+        };
+        if let Some(next) =
+            apply_observation_to_snapshot(&graph, session_id, &external, observation)?
+        {
+            graph = next;
+            changed = changed.saturating_add(1);
+        }
+    }
+    Ok((graph, changed))
+}
+
+fn operation_parent(
+    graph: &mut WorkGraph,
+    session_id: &str,
+    source: &str,
+) -> Result<WorkNodeId, String> {
+    if let Some(parent) = graph
+        .snapshot()
+        .nodes
+        .iter()
+        .find(|node| node.kind == NodeKind::PlanStep && node.state == NodeState::Active)
+        .or_else(|| {
+            graph
+                .snapshot()
+                .nodes
+                .iter()
+                .find(|node| node.kind == NodeKind::PlanStep && node.state == NodeState::Ready)
+        })
+        .or_else(|| {
+            graph
+                .snapshot()
+                .nodes
+                .iter()
+                .find(|node| node.kind == NodeKind::Objective)
+        })
+    {
+        return Ok(parent.id.clone());
+    }
+
+    let now = now_ms();
+    let id = WorkNodeId::derive(session_id, "objective:runtime-operations");
+    apply_change(
+        graph,
+        session_id,
+        source,
+        WorkGraphChange::AddNode {
+            node: WorkNode {
+                id: id.clone(),
+                kind: NodeKind::Objective,
+                title: "Runtime operations".to_string(),
+                state: NodeState::Ready,
+                acceptance: Vec::new(),
+                binding: None,
+                evidence: None,
+                provenance: Provenance::RuntimeReconcile {
+                    source: source.to_string(),
+                    observed_at: now,
+                },
+                created_at: now,
+                updated_at: now,
+            },
+        },
+    )?;
+    Ok(id)
+}
+
+fn mark_restored_ephemeral_operations_stale(
+    graph: WorkGraphSnapshot,
+    session_id: &str,
+) -> Result<(WorkGraphSnapshot, bool), String> {
+    let candidates = graph
+        .nodes
+        .iter()
+        .filter_map(|node| {
+            let binding = node.binding.as_ref()?;
+            (!binding.durable && node.state.is_live()).then(|| node.id.clone())
+        })
+        .collect::<Vec<_>>();
+    if candidates.is_empty() {
+        return Ok((graph, false));
+    }
+    let mut graph = WorkGraph::from_snapshot(graph);
+    for node in candidates {
+        graph
+            .apply(
+                WorkGraphChange::ReconcileOperation {
+                    node,
+                    obs: OperationObservation::OwnerMissing {
+                        checked_at: now_ms(),
+                    },
+                },
+                ChangeCtx {
+                    session_id: session_id.to_string(),
+                    now: now_ms(),
+                    idempotency_key: None,
+                },
+            )
+            .map_err(|err| format!("restart reconcile: {err}"))?;
+    }
+    Ok((graph.into_snapshot(), true))
+}
+
+fn bounded_operation_title(title: &str) -> String {
+    let normalized = title.split_whitespace().collect::<Vec<_>>().join(" ");
+    let mut chars = normalized.chars();
+    let bounded = chars.by_ref().take(180).collect::<String>();
+    if chars.next().is_some() {
+        format!("{bounded}...")
+    } else if bounded.is_empty() {
+        "Runtime operation".to_string()
+    } else {
+        bounded
+    }
+}
+
+fn prompt_safe_title(title: &str) -> String {
+    bounded_operation_title(&title.replace('`', "'"))
+}
+
+const fn operation_state_label(state: NodeState) -> &'static str {
+    match state {
+        NodeState::Ready => "ready",
+        NodeState::Initializing => "initializing",
+        NodeState::Active => "running",
+        NodeState::Waiting => "waiting",
+        NodeState::Blocked => "blocked",
+        NodeState::Completed => "completed",
+        NodeState::Verified => "verified",
+        NodeState::Stale => "stale",
+        NodeState::Superseded => "superseded",
+        NodeState::Cancelled => "cancelled",
+        NodeState::Failed => "failed",
     }
 }
 
@@ -1306,6 +1966,7 @@ mod tests {
     use super::*;
     use crate::tools::plan::PlanItemArg;
     use crate::tools::todo::TodoItem;
+    use crate::work_graph::{EvidenceKind, EvidenceRef, OwnerState};
 
     #[tokio::test]
     async fn adapters_keep_graph_and_both_legacy_views_in_lockstep() {
@@ -1663,6 +2324,328 @@ mod tests {
             "{summary}"
         );
         assert_eq!(runtime.plan_for_review(Some("session")), Ok(Some(shorter)));
+    }
+
+    #[test]
+    fn operation_lifecycle_is_registered_idempotent_and_receipt_only() {
+        let runtime = new_shared_work_runtime(
+            crate::tools::todo::new_shared_todo_list(),
+            crate::tools::plan::new_shared_plan_state(),
+        );
+        let intent = OperationIntent::new(
+            "shell:shell_test",
+            "silent `owner` command",
+            false,
+            "exec_shell",
+            "shell_test",
+        );
+        let node_id = runtime
+            .register_operation("session", intent.clone())
+            .expect("register before spawn");
+        assert_eq!(
+            runtime.register_operation("session", intent),
+            Ok(node_id.clone()),
+            "repeat spawn intent must not duplicate the operation"
+        );
+        let initialized = runtime
+            .capture(Some("session"))
+            .expect("capture")
+            .expect("graph");
+        let node = initialized.graph.node(&node_id).expect("operation node");
+        assert_eq!(node.state, NodeState::Initializing);
+        assert!(
+            initialized
+                .graph
+                .edges
+                .iter()
+                .any(|edge| { edge.kind == EdgeKind::Contains && edge.to == node_id })
+        );
+
+        let output = EvidenceRef::new(
+            EvidenceKind::Receipt {
+                owner: "shell".to_string(),
+            },
+            "shell:shell_test:output",
+            Some(4_096),
+            true,
+        )
+        .expect("safe logical receipt");
+        assert_eq!(
+            runtime.reconcile_operation(
+                "session",
+                OperationOwnerSnapshot::new("shell:shell_test", OwnerState::Running, 7, 10,)
+                    .with_output(output),
+            ),
+            Ok(true)
+        );
+        assert_eq!(
+            runtime.reconcile_operation(
+                "session",
+                OperationOwnerSnapshot::new("shell:shell_test", OwnerState::Completed, 7, 11,),
+            ),
+            Ok(false),
+            "the same binding sequence is an idempotent no-op"
+        );
+        assert!(
+            runtime
+                .reconcile_operation(
+                    "session",
+                    OperationOwnerSnapshot::new("shell:unknown", OwnerState::Running, 1, 12,),
+                )
+                .expect_err("unknown owner must not materialize after spawn")
+                .contains("not registered")
+        );
+        let running = runtime
+            .capture(Some("session"))
+            .expect("capture running")
+            .expect("graph");
+        let binding = running
+            .graph
+            .node(&node_id)
+            .and_then(|node| node.binding.as_ref())
+            .expect("binding");
+        assert_eq!(
+            running.graph.node(&node_id).map(|node| node.state),
+            Some(NodeState::Active)
+        );
+        assert_eq!(
+            binding
+                .last_observation
+                .as_ref()
+                .and_then(|obs| obs.output.as_ref())
+                .and_then(EvidenceRef::raw_bytes),
+            Some(4_096)
+        );
+        let summary = runtime
+            .active_operation_summary(Some("session"))
+            .expect("compaction re-anchor");
+        assert!(summary.contains("shell:shell_test"), "{summary}");
+        assert!(summary.contains("silent 'owner' command"), "{summary}");
+        assert!(!summary.contains("4,096"), "{summary}");
+
+        runtime
+            .record_operation_approval(
+                "session",
+                "shell:shell_test",
+                "operate-verification:shell_test",
+                "exec_shell",
+                "approval_test",
+            )
+            .expect("approval provenance");
+        let approved = runtime
+            .capture(Some("session"))
+            .expect("capture approval")
+            .expect("graph");
+        assert!(
+            approved
+                .graph
+                .nodes
+                .iter()
+                .any(|node| node.kind == NodeKind::Approval)
+        );
+        assert!(
+            approved
+                .graph
+                .edges
+                .iter()
+                .any(|edge| edge.kind == EdgeKind::RequiresApproval)
+        );
+
+        runtime
+            .reconcile_operation(
+                "session",
+                OperationOwnerSnapshot::new("shell:shell_test", OwnerState::Completed, 8, 13),
+            )
+            .expect("terminal owner report");
+        runtime
+            .reconcile_observation(
+                "session",
+                "shell:shell_test",
+                OperationObservation::CancelUpdate {
+                    outcome: super::super::CancelOutcome::AlreadyFinished,
+                    at: 14,
+                },
+            )
+            .expect("already-finished cancellation receipt");
+        assert_eq!(
+            runtime
+                .capture(Some("session"))
+                .expect("capture terminal")
+                .expect("graph")
+                .graph
+                .node(&node_id)
+                .map(|node| node.state),
+            Some(NodeState::Completed),
+            "already-finished cancellation must not rewrite owner state"
+        );
+    }
+
+    #[test]
+    fn restore_stales_only_live_ephemeral_operations() {
+        let runtime = new_shared_work_runtime(
+            crate::tools::todo::new_shared_todo_list(),
+            crate::tools::plan::new_shared_plan_state(),
+        );
+        for id in ["shell:live", "shell:done"] {
+            runtime
+                .register_operation(
+                    "session",
+                    OperationIntent::new(id, id, false, "exec_shell", id),
+                )
+                .expect("register shell");
+        }
+        runtime
+            .reconcile_operation(
+                "session",
+                OperationOwnerSnapshot::new("shell:live", OwnerState::Running, 1, 1),
+            )
+            .expect("live shell");
+        runtime
+            .reconcile_operation(
+                "session",
+                OperationOwnerSnapshot::new("shell:done", OwnerState::Completed, 1, 1),
+            )
+            .expect("completed shell");
+        let saved = runtime
+            .capture(Some("session"))
+            .expect("capture")
+            .expect("saved graph");
+
+        let restored = new_shared_work_runtime(
+            crate::tools::todo::new_shared_todo_list(),
+            crate::tools::plan::new_shared_plan_state(),
+        );
+        restored
+            .restore("session", Some(&saved.graph), &saved.todos, &saved.plan)
+            .expect("restore graph");
+        let graph = restored
+            .capture(Some("session"))
+            .expect("capture restored")
+            .expect("restored graph")
+            .graph;
+        let state_for = |external: &str| {
+            graph
+                .nodes
+                .iter()
+                .find(|node| {
+                    node.binding
+                        .as_ref()
+                        .is_some_and(|binding| binding.external == external)
+                })
+                .map(|node| node.state)
+        };
+        assert_eq!(state_for("shell:live"), Some(NodeState::Stale));
+        assert_eq!(state_for("shell:done"), Some(NodeState::Completed));
+        assert!(restored.has_pending_publish());
+    }
+
+    #[test]
+    fn durable_owner_same_sequence_recovers_stale_once_and_rejects_regression() {
+        let runtime = new_shared_work_runtime(
+            crate::tools::todo::new_shared_todo_list(),
+            crate::tools::plan::new_shared_plan_state(),
+        );
+        runtime
+            .register_operation(
+                "session",
+                OperationIntent::new(
+                    "task:task_restore",
+                    "restored task",
+                    true,
+                    "task_create",
+                    "task_restore",
+                ),
+            )
+            .expect("register durable owner");
+        let running = OperationOwnerSnapshot::new("task:task_restore", OwnerState::Running, 7, 10);
+        assert_eq!(
+            runtime.reconcile_operation("session", running.clone()),
+            Ok(true)
+        );
+        assert_eq!(
+            runtime.reconcile_observation(
+                "session",
+                "task:task_restore",
+                OperationObservation::OwnerMissing { checked_at: 11 },
+            ),
+            Ok(true)
+        );
+        assert_eq!(
+            runtime
+                .capture(Some("session"))
+                .expect("capture stale")
+                .expect("graph")
+                .graph
+                .nodes
+                .iter()
+                .find(|node| {
+                    node.binding
+                        .as_ref()
+                        .is_some_and(|binding| binding.external == "task:task_restore")
+                })
+                .map(|node| node.state),
+            Some(NodeState::Stale)
+        );
+
+        let replay = OperationOwnerSnapshot::new("task:task_restore", OwnerState::Running, 7, 12);
+        assert_eq!(
+            runtime.reconcile_operation("session", replay.clone()),
+            Ok(true)
+        );
+        assert_eq!(
+            runtime.reconcile_operation("session", replay),
+            Ok(false),
+            "same-sequence recovery must happen only while the node is stale"
+        );
+        assert_eq!(
+            runtime
+                .capture(Some("session"))
+                .expect("capture recovered")
+                .expect("graph")
+                .graph
+                .nodes
+                .iter()
+                .find(|node| {
+                    node.binding
+                        .as_ref()
+                        .is_some_and(|binding| binding.external == "task:task_restore")
+                })
+                .map(|node| node.state),
+            Some(NodeState::Active)
+        );
+        assert_eq!(
+            runtime.reconcile_operation(
+                "session",
+                OperationOwnerSnapshot::new("task:task_restore", OwnerState::Waiting, 7, 13,),
+            ),
+            Ok(false),
+            "ordinary same-key duplicates retain the reducer no-op contract"
+        );
+        runtime
+            .reconcile_observation(
+                "session",
+                "task:task_restore",
+                OperationObservation::OwnerMissing { checked_at: 14 },
+            )
+            .expect("mark owner missing again");
+        assert!(
+            runtime
+                .reconcile_operation(
+                    "session",
+                    OperationOwnerSnapshot::new("task:task_restore", OwnerState::Waiting, 7, 15,),
+                )
+                .expect_err("inconsistent replay cannot revive a stale node")
+                .contains("changed observation")
+        );
+        assert!(
+            runtime
+                .reconcile_operation(
+                    "session",
+                    OperationOwnerSnapshot::new("task:task_restore", OwnerState::Running, 6, 16,),
+                )
+                .expect_err("owner sequence cannot regress")
+                .contains("sequence regressed")
+        );
     }
 
     #[test]

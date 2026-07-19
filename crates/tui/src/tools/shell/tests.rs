@@ -178,6 +178,69 @@ fn wait_for_completed_shell(manager: &mut ShellManager, task_id: &str) -> ShellR
 }
 
 #[test]
+fn shell_owner_registers_before_spawn_and_silent_work_stays_live() {
+    let work = crate::work_graph::new_shared_work_runtime(
+        crate::tools::todo::new_shared_todo_list(),
+        crate::tools::plan::new_shared_plan_state(),
+    );
+    let lifecycle = ShellWorkLifecycle {
+        work: work.clone(),
+        session_id: "shell-session".to_string(),
+    };
+
+    {
+        let _guard = ShellSpawnIntentGuard::new(
+            Some(lifecycle.clone()),
+            "shell_spawn_failure",
+            "missing-program",
+        )
+        .expect("register spawn intent");
+    }
+    lifecycle
+        .register("shell_silent", "sleep 30")
+        .expect("register silent shell");
+    lifecycle
+        .observe("shell_silent", &ShellStatus::Running, 1, 0)
+        .expect("live owner observation");
+    lifecycle
+        .observe("shell_silent", &ShellStatus::Running, 2, 512)
+        .expect("growing output observation");
+
+    let graph = work
+        .capture(Some("shell-session"))
+        .expect("capture")
+        .expect("graph")
+        .graph;
+    let operation = |external: &str| {
+        graph.nodes.iter().find(|node| {
+            node.binding
+                .as_ref()
+                .is_some_and(|binding| binding.external == external)
+        })
+    };
+    assert_eq!(
+        operation("shell:shell_spawn_failure").map(|node| node.state),
+        Some(crate::work_graph::NodeState::Failed),
+        "dropping an armed spawn guard must terminalize pre-spawn failure"
+    );
+    let silent = operation("shell:shell_silent").expect("silent shell operation");
+    assert_eq!(silent.state, crate::work_graph::NodeState::Active);
+    let observation = silent
+        .binding
+        .as_ref()
+        .and_then(|binding| binding.last_observation.as_ref())
+        .expect("last shell observation");
+    assert_eq!(observation.seq, 2);
+    assert_eq!(
+        observation
+            .output
+            .as_ref()
+            .and_then(crate::work_graph::EvidenceRef::raw_bytes),
+        Some(512)
+    );
+}
+
+#[test]
 fn exec_shell_parallel_flags_are_input_aware() {
     let tool = ExecShellTool;
     let readonly = json!({"command": "git status -s"});

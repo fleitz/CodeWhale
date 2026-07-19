@@ -57,8 +57,8 @@ use crate::tools::spec::{
 use crate::tools::subagent::{
     Mailbox, MailboxMessage, SharedSubAgentManager, SubAgentCompletion, SubAgentForkContext,
     SubAgentResult, SubAgentRuntime, SubAgentStatus, SubAgentThinking, SubAgentType,
-    ensure_subagent_model_for_provider, new_shared_subagent_manager_with_timeout,
-    resolve_subagent_assignment_route,
+    agent_worker_owner_snapshot, ensure_subagent_model_for_provider,
+    new_shared_subagent_manager_with_timeout, resolve_subagent_assignment_route,
 };
 use crate::tools::todo::{SharedTodoList, TodoListSnapshot, new_shared_todo_list};
 use crate::tools::user_input::{UserInputRequest, UserInputResponse};
@@ -1992,6 +1992,7 @@ impl Engine {
                             None
                         };
                         self.session.rebuild_working_set();
+                        self.reconcile_restored_work_bindings().await;
                         self.emit_session_updated().await;
                         let _ = self
                             .tx_event
@@ -3577,6 +3578,114 @@ impl Engine {
         ctx
     }
 
+    /// Revalidate durable owners after a saved session is installed. Owner
+    /// stores apply restart recovery first; the graph consumes only their
+    /// monotonic snapshots and never infers liveness from prior UI state.
+    async fn reconcile_restored_work_bindings(&self) {
+        let Some(work) = self.config.runtime_services.work.as_ref() else {
+            return;
+        };
+        let session_id = self.session.id.as_str();
+        let candidates = work
+            .reconcilable_durable_bindings(Some(session_id))
+            .into_iter()
+            .collect::<HashSet<_>>();
+        let checked_at = chrono::Utc::now().timestamp_millis();
+
+        let mut seen_tasks = HashSet::new();
+        if let Some(task_manager) = self.config.runtime_services.task_manager.as_ref() {
+            for task in task_manager.list_tasks(None).await {
+                let external = format!("task:{}", task.id);
+                if !candidates.contains(&external) {
+                    continue;
+                }
+                seen_tasks.insert(external.clone());
+                let state = match task.status {
+                    crate::task_manager::TaskStatus::Queued => {
+                        crate::work_graph::OwnerState::Initializing
+                    }
+                    crate::task_manager::TaskStatus::Running => {
+                        crate::work_graph::OwnerState::Running
+                    }
+                    crate::task_manager::TaskStatus::Completed => {
+                        crate::work_graph::OwnerState::Completed
+                    }
+                    crate::task_manager::TaskStatus::Failed => {
+                        crate::work_graph::OwnerState::Failed
+                    }
+                    crate::task_manager::TaskStatus::Canceled => {
+                        crate::work_graph::OwnerState::Cancelled
+                    }
+                };
+                let observed_at = task
+                    .ended_at
+                    .or(task.started_at)
+                    .unwrap_or(task.created_at)
+                    .timestamp_millis();
+                if let Err(err) = work.reconcile_operation(
+                    session_id,
+                    crate::work_graph::OperationOwnerSnapshot::new(
+                        external,
+                        state,
+                        task.lifecycle_seq,
+                        observed_at,
+                    ),
+                ) {
+                    tracing::warn!(task_id = %task.id, error = %err, "failed to reconcile restored task owner");
+                }
+            }
+        }
+        for external in candidates
+            .iter()
+            .filter(|external| external.starts_with("task:"))
+            .filter(|external| !seen_tasks.contains(*external))
+        {
+            if let Err(err) = work.reconcile_observation(
+                session_id,
+                external,
+                crate::work_graph::OperationObservation::OwnerMissing { checked_at },
+            ) {
+                tracing::warn!(%external, error = %err, "failed to mark missing task owner");
+            }
+        }
+
+        let worker_records = self.subagent_manager.read().await.list_worker_records();
+        let mut seen_workers = HashSet::new();
+        for record in worker_records {
+            let Some(snapshot) = agent_worker_owner_snapshot(&record) else {
+                continue;
+            };
+            if !candidates.contains(&snapshot.external) {
+                continue;
+            }
+            seen_workers.insert(snapshot.external.clone());
+            if let Err(err) = work.reconcile_operation(session_id, snapshot) {
+                tracing::warn!(worker_id = %record.spec.worker_id, error = %err, "failed to reconcile restored worker owner");
+            }
+        }
+        for external in candidates
+            .iter()
+            .filter(|external| external.starts_with("worker:"))
+            .filter(|external| !seen_workers.contains(*external))
+        {
+            if let Err(err) = work.reconcile_observation(
+                session_id,
+                external,
+                crate::work_graph::OperationObservation::OwnerMissing { checked_at },
+            ) {
+                tracing::warn!(%external, error = %err, "failed to mark missing worker owner");
+            }
+        }
+
+        if let Err(err) = crate::tools::workflow::reconcile_persisted_workflow_bindings(
+            work,
+            session_id,
+            &self.session.workspace,
+        ) {
+            tracing::warn!(error = %err, "failed to reconcile restored workflow owners");
+        }
+    }
+
     async fn ensure_mcp_pool(&mut self) -> Result<Arc<AsyncMutex<McpPool>>, ToolError> {
         if let Some(pool) = self.mcp_pool.as_ref() {
             return Ok(Arc::clone(pool));
@@ -3829,16 +3938,56 @@ impl Engine {
     /// intentionally accepts the cache-invalidation cost because the
     /// context-reduction benefit outweighs it.
     fn merge_compaction_summary(&mut self, summary_prompt: Option<SystemPrompt>) {
-        if summary_prompt.is_none() {
+        let Some(summary_prompt) = summary_prompt else {
             return;
-        }
-        self.session.compaction_summary_prompt = merge_system_prompts(
-            self.session.compaction_summary_prompt.as_ref(),
-            summary_prompt.clone(),
-        );
-        let merged = merge_system_prompts(self.session.system_prompt.as_ref(), summary_prompt);
+        };
+        let reanchor = self
+            .config
+            .runtime_services
+            .work
+            .as_ref()
+            .and_then(|work| work.active_operation_summary(Some(&self.session.id)))
+            .map(SystemPrompt::Text);
+        let summary_prompt =
+            merge_system_prompts(Some(&summary_prompt), reanchor).or(Some(summary_prompt));
+        let prior_compaction =
+            strip_active_operation_reanchor(self.session.compaction_summary_prompt.as_ref());
+        self.session.compaction_summary_prompt =
+            merge_system_prompts(prior_compaction.as_ref(), summary_prompt.clone());
+        let prior_system = strip_active_operation_reanchor(self.session.system_prompt.as_ref());
+        let merged = merge_system_prompts(prior_system.as_ref(), summary_prompt);
         self.session.last_system_prompt_hash = Some(system_prompt_hash(merged.as_ref()));
         self.session.system_prompt = merged;
+    }
+}
+
+fn strip_active_operation_reanchor(prompt: Option<&SystemPrompt>) -> Option<SystemPrompt> {
+    fn strip_text(mut text: String) -> Option<String> {
+        while let Some(start) = text.find(crate::work_graph::ACTIVE_OPERATION_SUMMARY_START) {
+            let tail = start + crate::work_graph::ACTIVE_OPERATION_SUMMARY_START.len();
+            let end = text[tail..]
+                .find(crate::work_graph::ACTIVE_OPERATION_SUMMARY_END)
+                .map_or(text.len(), |offset| {
+                    tail + offset + crate::work_graph::ACTIVE_OPERATION_SUMMARY_END.len()
+                });
+            text.replace_range(start..end, "");
+        }
+        let text = text.trim().to_string();
+        (!text.is_empty()).then_some(text)
+    }
+
+    match prompt.cloned()? {
+        SystemPrompt::Text(text) => strip_text(text).map(SystemPrompt::Text),
+        SystemPrompt::Blocks(blocks) => {
+            let blocks = blocks
+                .into_iter()
+                .filter_map(|mut block| {
+                    block.text = strip_text(block.text)?;
+                    Some(block)
+                })
+                .collect::<Vec<_>>();
+            (!blocks.is_empty()).then_some(SystemPrompt::Blocks(blocks))
+        }
     }
 }
 

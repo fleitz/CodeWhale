@@ -1643,12 +1643,177 @@ fn work_state_snapshot_round_trips_todos_and_plan() {
         .expect("non-empty state");
 
     let mut restored = App::new(test_options(false), &Config::default());
+    let restored_workspace = restored.workspace.clone();
     restored
-        .restore_work_state("restored-session", Some(&state))
+        .restore_work_state("restored-session", &restored_workspace, Some(&state))
         .expect("restore Work state");
     assert_eq!(
         restored.work_state_snapshot().expect("snapshot"),
         Some(state)
+    );
+}
+
+#[test]
+fn work_restore_reconciles_fleet_from_the_restored_workspace() {
+    let restored_workspace = tempfile::tempdir().expect("restored workspace");
+    let ledger = crate::fleet::ledger::FleetLedger::open(restored_workspace.path())
+        .expect("open restored Fleet ledger");
+    ledger
+        .enqueue(codewhale_protocol::fleet::FleetInboxEntry {
+            run_id: codewhale_protocol::fleet::FleetRunId::from("run-restore"),
+            task_id: "task-restore".to_string(),
+            priority: 0,
+            enqueued_at: "2026-07-18T00:00:00Z".to_string(),
+            lease_deadline: None,
+            attempts: 0,
+        })
+        .expect("enqueue restored Fleet task");
+
+    let source = crate::work_graph::new_shared_work_runtime(
+        crate::tools::todo::new_shared_todo_list(),
+        crate::tools::plan::new_shared_plan_state(),
+    );
+    source
+        .register_operation(
+            "restored-session",
+            crate::work_graph::OperationIntent::new(
+                "fleet:run-restore/task-restore",
+                "restored Fleet task",
+                true,
+                "fleet",
+                "restore-test",
+            ),
+        )
+        .expect("register Fleet binding");
+    let captured = source
+        .capture(Some("restored-session"))
+        .expect("capture source Work state")
+        .expect("non-empty source Work state");
+    let state = crate::session_manager::SessionWorkState {
+        graph: Some(captured.graph),
+        todos: captured.todos,
+        plan: captured.plan,
+    };
+
+    let mut app = App::new(test_options(false), &Config::default());
+    assert_ne!(app.workspace, restored_workspace.path());
+    app.restore_work_state("restored-session", restored_workspace.path(), Some(&state))
+        .expect("restore Work state from target workspace");
+    let graph = app
+        .runtime_services
+        .work
+        .as_ref()
+        .expect("Work runtime")
+        .capture(Some("restored-session"))
+        .expect("capture restored Work state")
+        .expect("restored graph")
+        .graph;
+    let operation = graph
+        .nodes
+        .iter()
+        .find(|node| {
+            node.binding
+                .as_ref()
+                .is_some_and(|binding| binding.external == "fleet:run-restore/task-restore")
+        })
+        .expect("restored Fleet operation");
+    assert_eq!(
+        operation.state,
+        crate::work_graph::NodeState::Initializing,
+        "the target workspace ledger must outrank the app's previous workspace"
+    );
+}
+
+#[test]
+fn failed_workspace_owner_reconcile_leaves_previous_work_state_intact() {
+    let restored_workspace = tempfile::tempdir().expect("restored workspace");
+    let ledger = crate::fleet::ledger::FleetLedger::open(restored_workspace.path())
+        .expect("open restored Fleet ledger");
+    ledger
+        .enqueue(codewhale_protocol::fleet::FleetInboxEntry {
+            run_id: codewhale_protocol::fleet::FleetRunId::from("run-regress"),
+            task_id: "task-regress".to_string(),
+            priority: 0,
+            enqueued_at: "2026-07-18T00:00:00Z".to_string(),
+            lease_deadline: None,
+            attempts: 0,
+        })
+        .expect("enqueue older Fleet owner state");
+
+    let incoming = crate::work_graph::new_shared_work_runtime(
+        crate::tools::todo::new_shared_todo_list(),
+        crate::tools::plan::new_shared_plan_state(),
+    );
+    incoming
+        .register_operation(
+            "incoming-session",
+            crate::work_graph::OperationIntent::new(
+                "fleet:run-regress/task-regress",
+                "newer saved Fleet task",
+                true,
+                "fleet",
+                "regression-test",
+            ),
+        )
+        .expect("register incoming Fleet binding");
+    incoming
+        .reconcile_operation(
+            "incoming-session",
+            crate::work_graph::OperationOwnerSnapshot::new(
+                "fleet:run-regress/task-regress",
+                crate::work_graph::OwnerState::Running,
+                2,
+                2,
+            ),
+        )
+        .expect("record newer saved owner sequence");
+    let incoming = incoming
+        .capture(Some("incoming-session"))
+        .expect("capture incoming state")
+        .expect("incoming graph");
+    let incoming = crate::session_manager::SessionWorkState {
+        graph: Some(incoming.graph),
+        todos: incoming.todos,
+        plan: incoming.plan,
+    };
+
+    let mut app = App::new(test_options(false), &Config::default());
+    let work = app
+        .runtime_services
+        .work
+        .as_ref()
+        .expect("Work runtime")
+        .clone();
+    work.register_operation(
+        "previous-session",
+        crate::work_graph::OperationIntent::new(
+            "shell:shell_previous",
+            "previous operation",
+            false,
+            "exec_shell",
+            "previous-test",
+        ),
+    )
+    .expect("register previous state");
+    let before = work
+        .capture(Some("previous-session"))
+        .expect("capture previous state")
+        .expect("previous graph");
+
+    let error = app
+        .restore_work_state(
+            "incoming-session",
+            restored_workspace.path(),
+            Some(&incoming),
+        )
+        .expect_err("owner sequence regression must fail closed");
+    assert!(error.contains("sequence regressed"), "{error}");
+    assert_eq!(
+        work.capture(Some("previous-session"))
+            .expect("capture state after failed restore")
+            .expect("previous graph remains"),
+        before,
+        "failed restore must not replace any part of the previous Work state"
     );
 }
 

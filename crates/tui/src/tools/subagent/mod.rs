@@ -49,6 +49,10 @@ use crate::tools::truncate::{SPILLOVER_HEAD_BYTES, SPILLOVER_THRESHOLD_BYTES, ma
 use crate::tui::app::AppMode;
 use crate::tui::app::ReasoningEffort;
 use crate::utils::spawn_supervised;
+use crate::work_graph::{
+    EvidenceKind, EvidenceRef, OperationIntent, OperationOwnerSnapshot, OwnerState,
+    SharedWorkRuntime,
+};
 use crate::worker_profile::{ModelRoute, ShellPolicy, ToolScope, WorkerRuntimeProfile};
 
 pub mod coord;
@@ -2197,6 +2201,124 @@ impl SubAgentRuntime {
     }
 }
 
+#[derive(Clone)]
+struct SubAgentWorkLifecycle {
+    work: SharedWorkRuntime,
+    session_id: String,
+    external: String,
+}
+
+impl SubAgentWorkLifecycle {
+    fn register(runtime: &SubAgentRuntime, agent_id: &str, title: &str) -> Result<Option<Self>> {
+        let Some(work) = runtime.context.runtime.work.clone() else {
+            return Ok(None);
+        };
+        let session_id = runtime.context.state_namespace.clone();
+        let external = format!("worker:{agent_id}");
+        let lifecycle = Self {
+            work,
+            session_id,
+            external,
+        };
+        lifecycle
+            .work
+            .register_operation(
+                &lifecycle.session_id,
+                OperationIntent::new(
+                    lifecycle.external.clone(),
+                    title,
+                    true,
+                    "agent",
+                    format!("agent:{agent_id}:spawn"),
+                ),
+            )
+            .map_err(|err| anyhow!("failed to register sub-agent work: {err}"))?;
+
+        // A root Operate verification lease is provenance, not delegated
+        // authority. Nested workers cannot inherit this bit.
+        if runtime.accept_verification && runtime.spawn_depth == 1 {
+            let reference = format!("operate-verification:{agent_id}");
+            if let Err(err) = lifecycle.work.record_operation_approval(
+                &lifecycle.session_id,
+                &lifecycle.external,
+                &reference,
+                "agent",
+                &format!("agent:{agent_id}:approval"),
+            ) {
+                let _ = lifecycle.reconcile_state(OwnerState::Failed, 1, None);
+                return Err(anyhow!(
+                    "failed to record sub-agent verification approval: {err}"
+                ));
+            }
+        }
+        Ok(Some(lifecycle))
+    }
+
+    fn reconcile_record(&self, record: &AgentWorkerRecord) -> Result<bool, String> {
+        let Some(snapshot) = agent_worker_owner_snapshot(record) else {
+            return Ok(false);
+        };
+        self.work.reconcile_operation(&self.session_id, snapshot)
+    }
+
+    fn reconcile_state(
+        &self,
+        state: OwnerState,
+        seq: u64,
+        output: Option<EvidenceRef>,
+    ) -> Result<bool, String> {
+        let observed_at = i64::try_from(epoch_millis_now()).unwrap_or(i64::MAX);
+        let mut snapshot =
+            OperationOwnerSnapshot::new(self.external.clone(), state, seq, observed_at);
+        if let Some(output) = output {
+            snapshot = snapshot.with_output(output);
+        }
+        self.work.reconcile_operation(&self.session_id, snapshot)
+    }
+}
+
+/// Translate the persisted worker owner record after its manager has applied
+/// restart recovery. A record without an event predates the lifecycle owner
+/// protocol and cannot safely invent a sequence.
+pub(crate) fn agent_worker_owner_snapshot(
+    record: &AgentWorkerRecord,
+) -> Option<OperationOwnerSnapshot> {
+    let event = record.events.back()?;
+    let output = record.result_summary.as_ref().and_then(|result| {
+        EvidenceRef::new(
+            EvidenceKind::Receipt {
+                owner: "worker".to_string(),
+            },
+            format!("worker:{}:result", record.spec.worker_id),
+            Some(u64::try_from(result.len()).unwrap_or(u64::MAX)),
+            false,
+        )
+        .ok()
+    });
+    let observed_at = i64::try_from(event.timestamp_ms).unwrap_or(i64::MAX);
+    let mut snapshot = OperationOwnerSnapshot::new(
+        format!("worker:{}", record.spec.worker_id),
+        owner_state_from_worker_status(record.status),
+        event.seq,
+        observed_at,
+    );
+    if let Some(output) = output {
+        snapshot = snapshot.with_output(output);
+    }
+    Some(snapshot)
+}
+
+fn owner_state_from_worker_status(status: AgentWorkerStatus) -> OwnerState {
+    match status {
+        AgentWorkerStatus::Starting | AgentWorkerStatus::Running => OwnerState::Running,
+        AgentWorkerStatus::Queued | AgentWorkerStatus::WaitingForUser => OwnerState::Waiting,
+        AgentWorkerStatus::ModelWait | AgentWorkerStatus::RunningTool => OwnerState::Running,
+        AgentWorkerStatus::Completed => OwnerState::Completed,
+        AgentWorkerStatus::Failed | AgentWorkerStatus::Interrupted => OwnerState::Failed,
+        AgentWorkerStatus::Cancelled => OwnerState::Cancelled,
+    }
+}
+
 /// A running sub-agent instance.
 pub struct SubAgent {
     pub id: String,
@@ -2233,6 +2355,7 @@ pub struct SubAgent {
     /// have no live parent/mailbox/event consumers and are reconciled directly
     /// to interrupted state during load.
     terminal_delivery: Option<SubAgentTerminalDeliveryContext>,
+    work_lifecycle: Option<SubAgentWorkLifecycle>,
     input_tx: Option<mpsc::UnboundedSender<SubAgentInput>>,
     task_handle: Option<JoinHandle<()>>,
 }
@@ -2277,6 +2400,7 @@ impl SubAgent {
             workspace,
             completion_claimed: false,
             terminal_delivery: None,
+            work_lifecycle: None,
             input_tx: Some(input_tx),
             task_handle: None,
         }
@@ -2713,6 +2837,7 @@ impl SubAgentManager {
                 session_boot_id: persisted.session_boot_id,
                 completion_claimed: false,
                 terminal_delivery: None,
+                work_lifecycle: None,
                 input_tx: None,
                 task_handle: None,
             };
@@ -3037,6 +3162,28 @@ impl SubAgentManager {
         }
         self.push_worker_event(&mut record, status, message, step, tool_name, now_ms);
         self.worker_records.insert(worker_id.to_string(), record);
+        self.reconcile_worker_lifecycle(worker_id);
+    }
+
+    fn reconcile_worker_lifecycle(&self, worker_id: &str) {
+        let Some(lifecycle) = self
+            .agents
+            .get(worker_id)
+            .and_then(|agent| agent.work_lifecycle.clone())
+        else {
+            return;
+        };
+        let Some(record) = self.worker_records.get(worker_id) else {
+            return;
+        };
+        if let Err(err) = lifecycle.reconcile_record(record) {
+            tracing::warn!(
+                target: "subagent",
+                worker_id,
+                ?err,
+                "failed to reconcile sub-agent Work lifecycle"
+            );
+        }
     }
 
     fn record_worker_progress(&mut self, worker_id: &str, message: String) {
@@ -3054,7 +3201,6 @@ impl SubAgentManager {
             SubAgentStatus::BudgetExhausted => Some("token budget exhausted".to_string()),
             SubAgentStatus::Running => Some("running".to_string()),
         };
-        self.record_worker_event(worker_id, status, message, Some(result.steps_taken), None);
         if let Some(record) = self.worker_records.get_mut(worker_id) {
             record.result_summary = result.result.clone();
             record.steps_taken = result.steps_taken;
@@ -3062,6 +3208,7 @@ impl SubAgentManager {
                 record.error = Some(err.clone());
             }
         }
+        self.record_worker_event(worker_id, status, message, Some(result.steps_taken), None);
     }
 
     pub fn cancel_agent(&mut self, agent_ref: &str) -> Result<SubAgentResult> {
@@ -3667,6 +3814,8 @@ impl SubAgentManager {
             spawn_depth: runtime.spawn_depth,
             max_spawn_depth: runtime.max_spawn_depth,
         };
+        agent.work_lifecycle =
+            SubAgentWorkLifecycle::register(&runtime, &agent_id, &assignment.objective)?;
         agent.terminal_delivery = Some(SubAgentTerminalDeliveryContext::from_runtime(&runtime));
         self.register_worker(worker_spec);
         if let Some(scope) = budget_scope {
@@ -3710,6 +3859,13 @@ impl SubAgentManager {
         );
         agent.task_handle = Some(handle);
         self.agents.insert(agent_id.clone(), agent);
+        self.record_worker_event(
+            &agent_id,
+            AgentWorkerStatus::Running,
+            Some("running".to_string()),
+            None,
+            None,
+        );
         self.persist_state_best_effort();
 
         Ok(self

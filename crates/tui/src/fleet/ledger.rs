@@ -53,6 +53,14 @@ pub enum FleetLedgerRecord {
         #[serde(default = "default_terminal_task_status")]
         status: FleetTaskLedgerStatus,
     },
+    /// Exact owner lifecycle high-water mark retained across compaction. Raw
+    /// lifecycle records remain the normal source; this checkpoint prevents a
+    /// compacted multi-lease history from reusing lower graph idempotency keys.
+    TaskLifecycleCheckpoint {
+        run_id: FleetRunId,
+        task_id: String,
+        lifecycle_seq: u64,
+    },
     /// One crash-atomic terminal transition and its attempt-fenced receipt.
     /// Keeping these values in one JSONL record prevents a process crash from
     /// publishing a terminal task without the receipt that explains it.
@@ -137,6 +145,8 @@ pub struct FleetLedgerState {
 pub struct FleetTaskState {
     pub entry: FleetInboxEntry,
     pub status: FleetTaskLedgerStatus,
+    /// Monotonic owner sequence reconstructed from durable lifecycle records.
+    pub lifecycle_seq: u64,
     pub leased_to: Option<String>,
     pub leased_at: Option<String>,
     pub completed_at: Option<String>,
@@ -1200,6 +1210,7 @@ impl FleetLedger {
             let tmp_path = self.ledger_path.with_extension(PARTIAL_SUFFIX);
             let mut lines = Vec::new();
             let mut terminal_lines = Vec::new();
+            let mut lifecycle_lines = Vec::new();
             for run in state.runs.values() {
                 lines.push(serde_json::to_string(&FleetLedgerRecord::RunCreated {
                     run: Box::new(run.clone()),
@@ -1252,6 +1263,13 @@ impl FleetLedger {
                         },
                     )?);
                 }
+                lifecycle_lines.push(serde_json::to_string(
+                    &FleetLedgerRecord::TaskLifecycleCheckpoint {
+                        run_id: task.entry.run_id.clone(),
+                        task_id: task.entry.task_id.clone(),
+                        lifecycle_seq: task.lifecycle_seq,
+                    },
+                )?);
             }
             for alert in state.alerts.values() {
                 lines.push(serde_json::to_string(&FleetLedgerRecord::AlertSent {
@@ -1316,6 +1334,9 @@ impl FleetLedger {
             // Failed. Emit these records after retained worker events so replay
             // cannot let an earlier Completed event erase that override.
             lines.extend(terminal_lines);
+            // Lifecycle checkpoints follow every reconstructed task-state
+            // transition so replay ends at the exact pre-compaction sequence.
+            lines.extend(lifecycle_lines);
             for receipt in state.receipts.values() {
                 lines.push(serde_json::to_string(
                     &FleetLedgerRecord::ReceiptRecorded {
@@ -1428,6 +1449,9 @@ fn mark_task_terminal(
 ) {
     let key = task_key(&run_id.0, task_id);
     if let Some(task) = state.tasks.get_mut(&key) {
+        if task.status != status {
+            task.lifecycle_seq = task.lifecycle_seq.saturating_add(1);
+        }
         task.status = status;
         if !worker_id.is_empty() {
             task.leased_to = Some(worker_id.to_string());
@@ -1463,6 +1487,7 @@ fn apply_record(state: &mut FleetLedgerState, record: FleetLedgerRecord) {
             state.tasks.entry(key).or_insert_with(|| FleetTaskState {
                 entry,
                 status: FleetTaskLedgerStatus::Enqueued,
+                lifecycle_seq: 1,
                 leased_to: None,
                 leased_at: None,
                 completed_at: None,
@@ -1477,6 +1502,12 @@ fn apply_record(state: &mut FleetLedgerState, record: FleetLedgerRecord) {
         } => {
             let key = task_key(&run_id.0, &task_id);
             if let Some(task) = state.tasks.get_mut(&key) {
+                if task.status != FleetTaskLedgerStatus::Leased
+                    || task.leased_to.as_deref() != Some(worker_id.as_str())
+                    || task.leased_at.as_deref() != Some(leased_at.as_str())
+                {
+                    task.lifecycle_seq = task.lifecycle_seq.saturating_add(1);
+                }
                 task.status = FleetTaskLedgerStatus::Leased;
                 task.leased_to = Some(worker_id);
                 task.leased_at = Some(leased_at);
@@ -1492,6 +1523,15 @@ fn apply_record(state: &mut FleetLedgerState, record: FleetLedgerRecord) {
             status,
         } => {
             mark_task_terminal(state, &run_id, &task_id, &worker_id, &timestamp, status);
+        }
+        FleetLedgerRecord::TaskLifecycleCheckpoint {
+            run_id,
+            task_id,
+            lifecycle_seq,
+        } => {
+            if let Some(task) = state.tasks.get_mut(&task_key(&run_id.0, &task_id)) {
+                task.lifecycle_seq = task.lifecycle_seq.max(lifecycle_seq.max(1));
+            }
         }
         FleetLedgerRecord::TaskAttemptFinalized {
             event,
@@ -2780,6 +2820,13 @@ mod tests {
             })
             .unwrap();
 
+        let lifecycle_seq_before_compaction =
+            ledger.rebuild_state().unwrap().tasks["run-1:task-a"].lifecycle_seq;
+        assert_eq!(
+            lifecycle_seq_before_compaction, 2,
+            "enqueue and lease are the two effective owner states"
+        );
+
         ledger.compact().unwrap();
         let contents = std::fs::read_to_string(ledger.path()).unwrap();
         assert!(contents.lines().count() >= 5, "{contents}");
@@ -2796,8 +2843,47 @@ mod tests {
             state.tasks["run-1:task-a"].entry.attempts, 1,
             "compaction must not mint a synthetic retry attempt"
         );
+        assert_eq!(
+            state.tasks["run-1:task-a"].lifecycle_seq, lifecycle_seq_before_compaction,
+            "compaction must not mint an owner lifecycle transition"
+        );
         assert!(state.latest_seq.values().any(|seq| *seq == 7));
         assert_eq!(state.receipts["run-1:task-a"].result, FleetTaskResult::Pass);
+    }
+
+    #[test]
+    fn fleet_compaction_preserves_multilease_lifecycle_high_water() {
+        let tmp = TempDir::new().unwrap();
+        let ledger = FleetLedger::open(tmp.path()).unwrap();
+        ledger.create_run(&sample_run("run-1")).unwrap();
+        ledger.enqueue(sample_entry("run-1", "task-a")).unwrap();
+        ledger
+            .lease_task(
+                &FleetRunId::from("run-1"),
+                "task-a",
+                "worker-1",
+                "2026-06-12T17:01:00Z",
+                None,
+            )
+            .unwrap();
+        ledger
+            .lease_task(
+                &FleetRunId::from("run-1"),
+                "task-a",
+                "worker-1",
+                "2026-06-12T17:02:00Z",
+                None,
+            )
+            .unwrap();
+        let before = ledger.rebuild_state().unwrap();
+        assert_eq!(before.tasks["run-1:task-a"].lifecycle_seq, 3);
+
+        ledger.compact().unwrap();
+        let after = ledger.rebuild_state().unwrap();
+        assert_eq!(
+            after.tasks["run-1:task-a"].lifecycle_seq, 3,
+            "compaction must not reuse lower Work Graph idempotency keys"
+        );
     }
 
     #[test]

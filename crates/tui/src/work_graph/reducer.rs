@@ -279,13 +279,20 @@ fn reconcile(
         .ok_or_else(|| structural(format!("node {id} has no operation binding")))?;
 
     let new_state = match obs {
-        OperationObservation::OwnerReported { state, seq, at } => {
+        OperationObservation::OwnerReported {
+            state,
+            seq,
+            at,
+            output,
+        } => {
             binding.last_observation = Some(ObservationSummary {
                 owner_state: *state,
                 seq: *seq,
                 observed_at: *at,
+                output: output.clone(),
             });
             Some(match state {
+                OwnerState::Initializing => NodeState::Initializing,
                 OwnerState::Running => NodeState::Active,
                 OwnerState::Waiting => NodeState::Waiting,
                 OwnerState::Completed => NodeState::Completed,
@@ -296,9 +303,10 @@ fn reconcile(
         OperationObservation::OwnerMissing { .. } => Some(NodeState::Stale),
         OperationObservation::CancelUpdate { outcome, .. } => match outcome {
             // In-flight acknowledgements: record only, no state claim yet.
-            CancelOutcome::Requested | CancelOutcome::Acknowledged => None,
+            CancelOutcome::Requested
+            | CancelOutcome::Acknowledged
+            | CancelOutcome::AlreadyFinished => None,
             CancelOutcome::Forced => Some(NodeState::Cancelled),
-            CancelOutcome::AlreadyFinished => Some(NodeState::Completed),
             CancelOutcome::NotFound | CancelOutcome::StaleUnknown => Some(NodeState::Stale),
         },
     };

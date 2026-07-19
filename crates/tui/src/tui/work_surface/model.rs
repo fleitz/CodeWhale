@@ -286,6 +286,7 @@ fn heading(label: &str, detail: &str) -> WorkRow {
 fn graph_node_row(snapshot: &WorkGraphSnapshot, node: &WorkNode) -> WorkRow {
     let (mark, tone) = match node.state {
         NodeState::Ready => ("○", WorkTone::Muted),
+        NodeState::Initializing => ("▸", WorkTone::Live),
         NodeState::Active => ("▸", WorkTone::Live),
         NodeState::Waiting => ("◆", WorkTone::Attention),
         NodeState::Blocked => ("!", WorkTone::Attention),
@@ -298,7 +299,11 @@ fn graph_node_row(snapshot: &WorkGraphSnapshot, node: &WorkNode) -> WorkRow {
     };
     let state = state_label(node);
     let kind = kind_label(node.kind);
-    let stop_action = stop_action(node.binding.as_ref());
+    let stop_action = node
+        .state
+        .is_live()
+        .then(|| stop_action(node.binding.as_ref()))
+        .flatten();
     WorkRow {
         id: WorkRowId(format!("graph:{}", node.id.as_str())),
         mark,
@@ -324,6 +329,7 @@ fn node_is_attention(node: &WorkNode) -> bool {
 fn state_label(node: &WorkNode) -> &'static str {
     match node.state {
         NodeState::Ready => "ready",
+        NodeState::Initializing => "initializing",
         NodeState::Active => "running",
         NodeState::Waiting => "waiting",
         NodeState::Blocked => "blocked",
@@ -480,6 +486,7 @@ fn binding_text(node: &WorkNode) -> String {
     );
     if let Some(observation) = binding.last_observation.as_ref() {
         let owner_state = match observation.owner_state {
+            OwnerState::Initializing => "initializing",
             OwnerState::Running => "running",
             OwnerState::Waiting => "waiting",
             OwnerState::Completed => "completed",
@@ -592,6 +599,7 @@ fn why_next(snapshot: &WorkGraphSnapshot, node: &WorkNode) -> String {
                 format!("Ready after: {}", pending.join(", "))
             }
         }
+        NodeState::Initializing => "Spawn intent is registered; awaiting owner handle".to_string(),
         NodeState::Active => "Lifecycle owner reports active work".to_string(),
         NodeState::Waiting => "Waiting on an owner or approval".to_string(),
         NodeState::Blocked => "Blocked; resolve the causes above".to_string(),
@@ -631,30 +639,39 @@ fn provenance_text(node: &WorkNode) -> String {
 }
 
 fn last_output_ref(snapshot: &WorkGraphSnapshot, node: &WorkNode) -> Option<String> {
-    evidence_for(snapshot, node)
-        .into_iter()
-        .max_by_key(|evidence| evidence.updated_at)
-        .and_then(|evidence| evidence.evidence.as_ref())
-        .map(|evidence| {
-            let kind = match evidence.kind() {
-                EvidenceKind::ToolRun => "tool run",
-                EvidenceKind::Artifact { .. } => "artifact",
-                EvidenceKind::TestSummary => "test summary",
-                EvidenceKind::Receipt { .. } => "receipt",
-                EvidenceKind::Approval => "approval",
-                EvidenceKind::Route => "route",
-            };
-            let bytes = evidence
-                .raw_bytes()
-                .map(|bytes| format!(" · {bytes} raw bytes"))
-                .unwrap_or_default();
-            let truncation = if evidence.truncated() {
-                " · truncated"
-            } else {
-                ""
-            };
-            format!("{} · {kind}{bytes}{truncation}", evidence.reference())
+    node.binding
+        .as_ref()
+        .and_then(|binding| binding.last_observation.as_ref())
+        .and_then(|observation| observation.output.as_ref())
+        .map(format_evidence_ref)
+        .or_else(|| {
+            evidence_for(snapshot, node)
+                .into_iter()
+                .max_by_key(|evidence| evidence.updated_at)
+                .and_then(|evidence| evidence.evidence.as_ref())
+                .map(format_evidence_ref)
         })
+}
+
+fn format_evidence_ref(evidence: &crate::work_graph::EvidenceRef) -> String {
+    let kind = match evidence.kind() {
+        EvidenceKind::ToolRun => "tool run",
+        EvidenceKind::Artifact { .. } => "artifact",
+        EvidenceKind::TestSummary => "test summary",
+        EvidenceKind::Receipt { .. } => "receipt",
+        EvidenceKind::Approval => "approval",
+        EvidenceKind::Route => "route",
+    };
+    let bytes = evidence
+        .raw_bytes()
+        .map(|bytes| format!(" · {bytes} raw bytes"))
+        .unwrap_or_default();
+    let truncation = if evidence.truncated() {
+        " · truncated"
+    } else {
+        ""
+    };
+    format!("{} · {kind}{bytes}{truncation}", evidence.reference())
 }
 
 fn section_text(out: &mut String, title: &str, body: &str) {

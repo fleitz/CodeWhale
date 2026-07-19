@@ -6743,14 +6743,21 @@ impl App {
     pub fn restore_work_state(
         &mut self,
         session_id: &str,
+        workspace: &Path,
         state: Option<&SessionWorkState>,
     ) -> Result<(), String> {
         self.pending_plan_proposal_id = None;
         if let Some(work) = self.runtime_services.work.as_ref() {
             let empty = SessionWorkState::default();
             let state = state.unwrap_or(&empty);
-            let restored =
-                work.restore(session_id, state.graph.as_ref(), &state.todos, &state.plan)?;
+            work.restore_with_workspace_owner_bindings(
+                session_id,
+                workspace,
+                state.graph.as_ref(),
+                &state.todos,
+                &state.plan,
+            )?;
+            let restored = work.capture(Some(session_id))?;
             let normalized_state = restored.map(|state| SessionWorkState {
                 graph: Some(state.graph),
                 todos: state.todos,

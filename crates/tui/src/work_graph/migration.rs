@@ -242,7 +242,7 @@ fn more_advanced_state(left: NodeState, right: NodeState) -> NodeState {
     fn rank(state: NodeState) -> u8 {
         match state {
             NodeState::Completed | NodeState::Verified => 2,
-            NodeState::Active => 1,
+            NodeState::Initializing | NodeState::Active => 1,
             _ => 0,
         }
     }

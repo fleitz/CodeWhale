@@ -277,6 +277,15 @@ fn headless_worker_record_tracks_lifecycle_without_tui_projection() {
     assert!(statuses.contains(&AgentWorkerStatus::ModelWait));
     assert!(statuses.contains(&AgentWorkerStatus::RunningTool));
     assert!(statuses.contains(&AgentWorkerStatus::Completed));
+    let owner = agent_worker_owner_snapshot(&record).expect("worker owner snapshot");
+    assert_eq!(owner.external, "worker:agent_worker_contract");
+    assert_eq!(owner.state, OwnerState::Completed);
+    assert_eq!(owner.seq, record.events.back().expect("terminal event").seq);
+    assert_eq!(
+        owner.output.as_ref().and_then(EvidenceRef::raw_bytes),
+        Some("worker summary".len() as u64),
+        "persisted worker results become byte-count receipts, never raw graph output"
+    );
     assert!(
         record
             .events
@@ -6129,6 +6138,105 @@ async fn root_operate_dispatch_delegates_builtin_verification_but_not_shell() {
     assert!(
         !grandchild.accept_verification,
         "Operate verification delegation must not propagate past the direct worker"
+    );
+}
+
+#[test]
+fn worker_lifecycle_records_direct_operate_approval_without_delegating_authority() {
+    let todos = crate::tools::todo::new_shared_todo_list();
+    let plan = crate::tools::plan::new_shared_plan_state();
+    let work = crate::work_graph::new_shared_work_runtime(todos, plan);
+
+    let mut direct = stub_runtime();
+    direct.context.state_namespace = "worker-lifecycle".to_string();
+    direct.context.runtime.work = Some(work.clone());
+    direct.accept_verification = true;
+    direct.spawn_depth = 1;
+    let lifecycle =
+        SubAgentWorkLifecycle::register(&direct, "agent_01234567", "verify installed acceptance")
+            .expect("direct worker registration")
+            .expect("work runtime attached");
+    lifecycle
+        .reconcile_state(OwnerState::Running, 2, None)
+        .expect("running owner report");
+    let receipt = EvidenceRef::new(
+        EvidenceKind::Receipt {
+            owner: "worker".to_string(),
+        },
+        "worker:agent_01234567:result",
+        Some(512),
+        false,
+    )
+    .expect("safe worker receipt");
+    lifecycle
+        .reconcile_state(OwnerState::Completed, 3, Some(receipt))
+        .expect("terminal owner report");
+
+    let direct_graph = work
+        .capture(Some("worker-lifecycle"))
+        .expect("capture direct worker")
+        .expect("graph")
+        .graph;
+    assert_eq!(
+        direct_graph
+            .nodes
+            .iter()
+            .filter(|node| node.kind == crate::work_graph::NodeKind::Approval)
+            .count(),
+        1,
+        "direct Operate verification must leave one provenance record"
+    );
+    assert!(direct_graph.edges.iter().any(|edge| {
+        edge.kind == crate::work_graph::EdgeKind::RequiresApproval
+            && direct_graph
+                .node(&edge.from)
+                .is_some_and(|node| node.title == "verify installed acceptance")
+            && direct_graph
+                .node(&edge.to)
+                .is_some_and(|node| node.kind == crate::work_graph::NodeKind::Approval)
+    }));
+    let direct_operation = direct_graph
+        .nodes
+        .iter()
+        .find(|node| {
+            node.binding
+                .as_ref()
+                .is_some_and(|binding| binding.external == "worker:agent_01234567")
+        })
+        .expect("bound direct worker operation");
+    assert_eq!(
+        direct_operation.state,
+        crate::work_graph::NodeState::Completed
+    );
+    assert_eq!(
+        direct_operation
+            .binding
+            .as_ref()
+            .and_then(|binding| binding.last_observation.as_ref())
+            .and_then(|observation| observation.output.as_ref())
+            .and_then(EvidenceRef::raw_bytes),
+        Some(512)
+    );
+
+    let mut nested = direct.child_runtime();
+    nested.accept_verification = true;
+    nested.spawn_depth = 2;
+    SubAgentWorkLifecycle::register(&nested, "agent_89abcdef", "nested verification")
+        .expect("nested worker registration")
+        .expect("work runtime attached");
+    let nested_graph = work
+        .capture(Some("worker-lifecycle"))
+        .expect("capture nested worker")
+        .expect("graph")
+        .graph;
+    assert_eq!(
+        nested_graph
+            .nodes
+            .iter()
+            .filter(|node| node.kind == crate::work_graph::NodeKind::Approval)
+            .count(),
+        1,
+        "nested workers must not inherit Operate approval authority"
     );
 }
 

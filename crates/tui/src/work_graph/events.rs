@@ -157,6 +157,7 @@ pub struct ApprovalRef {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum OwnerState {
+    Initializing,
     Running,
     Waiting,
     Completed,
@@ -188,6 +189,10 @@ pub enum OperationObservation {
         state: OwnerState,
         seq: u64,
         at: Ts,
+        /// Bounded logical output receipt. The reference never contains raw
+        /// logs or reasoning; `raw_bytes` preserves the pre-truncation size.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        output: Option<EvidenceRef>,
     },
     /// No live handle for the binding (e.g. after restart). Never maps to
     /// Active or Completed — only to Stale (fail toward honesty).
@@ -206,6 +211,8 @@ pub struct ObservationSummary {
     pub owner_state: OwnerState,
     pub seq: u64,
     pub observed_at: Ts,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub output: Option<EvidenceRef>,
 }
 
 /// Everything ambient the reducer needs, supplied by the caller so the

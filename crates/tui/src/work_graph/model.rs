@@ -68,6 +68,10 @@ pub enum EdgeKind {
 #[serde(rename_all = "snake_case")]
 pub enum NodeState {
     Ready,
+    /// The owner has accepted spawn intent but has not yet reported a live
+    /// handle. Registering this state before process creation prevents work
+    /// from existing outside the graph during the spawn window.
+    Initializing,
     Active,
     Waiting,
     Blocked,
@@ -97,7 +101,10 @@ impl NodeState {
     /// Live states for invariant V2 (no orphaned live work).
     #[must_use]
     pub fn is_live(self) -> bool {
-        matches!(self, NodeState::Active | NodeState::Waiting)
+        matches!(
+            self,
+            NodeState::Initializing | NodeState::Active | NodeState::Waiting
+        )
     }
 }
 
@@ -355,6 +362,7 @@ pub struct OperationBinding {
     /// sessions are in-memory only (`durable == false`): after a restart they
     /// become [`NodeState::Stale`], never silently "still running".
     pub durable: bool,
+    #[serde(default)]
     pub last_observation: Option<ObservationSummary>,
 }
 

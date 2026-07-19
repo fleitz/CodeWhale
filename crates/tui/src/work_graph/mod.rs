@@ -24,6 +24,7 @@
 mod compat;
 mod events;
 mod ids;
+mod liveness;
 mod migration;
 mod model;
 mod reducer;
@@ -39,6 +40,9 @@ pub use events::{
     OwnerState, ProposedNodeUpdate, WorkGraphChange, WorkGraphProposal, WorkNodePatch,
 };
 pub use ids::{BindingId, ChangeId, ProposalId, WorkEdgeId, WorkNodeId};
+pub use liveness::{
+    OperationIntent, OperationOwnerSnapshot, fleet_task_owner_snapshot, lane_owner_snapshot,
+};
 pub use migration::import_legacy;
 pub use model::{
     AcceptanceRequirement, BoundedSet, BoundedVec, CompatPlanMetadata, CompatProjectionState,
@@ -47,6 +51,7 @@ pub use model::{
     SEEN_KEYS_CAP, Ts, WorkEdge, WorkGraphSnapshot, WorkNode, external_identity_is_well_formed,
 };
 pub use reducer::apply;
+pub(crate) use runtime::{ACTIVE_OPERATION_SUMMARY_END, ACTIVE_OPERATION_SUMMARY_START};
 pub use runtime::{SharedWorkRuntime, WorkRuntime, WorkRuntimeSnapshot, new_shared_work_runtime};
 pub use validate::{ValidationCode, ValidationReport, Violation, validate};
 

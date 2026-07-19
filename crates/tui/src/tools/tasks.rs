@@ -13,12 +13,15 @@ use uuid::Uuid;
 use crate::command_safety::{SafetyLevel, analyze_command};
 use crate::dependencies::ExternalTool;
 use crate::task_manager::{
-    NewTaskRequest, TaskArtifactRef, TaskAttemptRecord, TaskGateRecord, TaskRecord,
+    NewTaskRequest, TaskArtifactRef, TaskAttemptRecord, TaskGateRecord, TaskRecord, TaskStatus,
 };
 use crate::tools::shell::{ExecShellTool, ShellWaitTool};
 use crate::tools::spec::{
     ApprovalRequirement, ToolCapability, ToolContext, ToolError, ToolResult, ToolSpec,
     optional_bool, optional_str, optional_u64, required_str,
+};
+use crate::work_graph::{
+    CancelOutcome, OperationIntent, OperationObservation, OperationOwnerSnapshot, OwnerState,
 };
 
 const MAX_SUMMARY_CHARS: usize = 900;
@@ -98,8 +101,9 @@ impl ToolSpec for TaskCreateTool {
         let workspace = optional_str(&input, "workspace")
             .map(PathBuf::from)
             .unwrap_or_else(|| context.workspace.clone());
+        let prompt = required_str(&input, "prompt")?.to_string();
         let req = NewTaskRequest {
-            prompt: required_str(&input, "prompt")?.to_string(),
+            prompt: prompt.clone(),
             model: optional_str(&input, "model").map(ToString::to_string),
             workspace: Some(workspace),
             mode: optional_str(&input, "mode").map(ToString::to_string),
@@ -107,10 +111,38 @@ impl ToolSpec for TaskCreateTool {
             trust_mode: input.get("trust_mode").and_then(Value::as_bool),
             auto_approve: input.get("auto_approve").and_then(Value::as_bool),
         };
-        let task = manager
-            .add_task(req)
-            .await
-            .map_err(|e| ToolError::execution_failed(e.to_string()))?;
+        let task_id = crate::task_manager::TaskManager::new_task_id();
+        if let Some(work) = context.runtime.work.as_ref() {
+            work.register_operation(
+                &context.state_namespace,
+                OperationIntent::new(
+                    format!("task:{task_id}"),
+                    prompt,
+                    true,
+                    "task_create",
+                    &task_id,
+                ),
+            )
+            .map_err(ToolError::execution_failed)?;
+        }
+        let task = match manager.add_task_with_id(req, task_id.clone()).await {
+            Ok(task) => task,
+            Err(err) => {
+                if let Some(work) = context.runtime.work.as_ref() {
+                    let _ = work.reconcile_operation(
+                        &context.state_namespace,
+                        OperationOwnerSnapshot::new(
+                            format!("task:{task_id}"),
+                            OwnerState::Failed,
+                            1,
+                            Utc::now().timestamp_millis(),
+                        ),
+                    );
+                }
+                return Err(ToolError::execution_failed(err.to_string()));
+            }
+        };
+        reconcile_task_record(context, &task)?;
         task_result("task_create", &task)
     }
 }
@@ -237,12 +269,66 @@ impl ToolSpec for TaskCancelTool {
             .task_manager
             .as_ref()
             .ok_or_else(|| ToolError::not_available("TaskManager is not attached"))?;
+        let prior = manager
+            .get_task(required_str(&input, "task_id")?)
+            .await
+            .map_err(|e| ToolError::execution_failed(e.to_string()))?;
         let task = manager
             .cancel_task(required_str(&input, "task_id")?)
             .await
             .map_err(|e| ToolError::execution_failed(e.to_string()))?;
+        let cancel_outcome = match prior.status {
+            TaskStatus::Queued => CancelOutcome::Forced,
+            TaskStatus::Running => CancelOutcome::Requested,
+            TaskStatus::Completed | TaskStatus::Failed | TaskStatus::Canceled => {
+                CancelOutcome::AlreadyFinished
+            }
+        };
+        if let Some(work) = context.runtime.work.as_ref() {
+            let external = format!("task:{}", task.id);
+            if work.has_operation_binding(Some(&context.state_namespace), &external) {
+                work.reconcile_observation(
+                    &context.state_namespace,
+                    &external,
+                    OperationObservation::CancelUpdate {
+                        outcome: cancel_outcome,
+                        at: Utc::now().timestamp_millis(),
+                    },
+                )
+                .map_err(ToolError::execution_failed)?;
+            }
+        }
+        reconcile_task_record(context, &task)?;
         task_result("task_cancel", &task)
     }
+}
+
+fn reconcile_task_record(context: &ToolContext, task: &TaskRecord) -> Result<(), ToolError> {
+    let Some(work) = context.runtime.work.as_ref() else {
+        return Ok(());
+    };
+    let external = format!("task:{}", task.id);
+    if !work.has_operation_binding(Some(&context.state_namespace), &external) {
+        return Ok(());
+    }
+    let state = match task.status {
+        TaskStatus::Queued => OwnerState::Initializing,
+        TaskStatus::Running => OwnerState::Running,
+        TaskStatus::Completed => OwnerState::Completed,
+        TaskStatus::Failed => OwnerState::Failed,
+        TaskStatus::Canceled => OwnerState::Cancelled,
+    };
+    let observed_at = task
+        .ended_at
+        .or(task.started_at)
+        .unwrap_or(task.created_at)
+        .timestamp_millis();
+    work.reconcile_operation(
+        &context.state_namespace,
+        OperationOwnerSnapshot::new(external, state, task.lifecycle_seq, observed_at),
+    )
+    .map(|_| ())
+    .map_err(ToolError::execution_failed)
 }
 
 #[async_trait]

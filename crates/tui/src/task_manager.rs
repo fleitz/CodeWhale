@@ -33,6 +33,9 @@ const DEFAULT_WORKERS: usize = 2;
 const MAX_WORKERS: usize = 8;
 const TIMELINE_SUMMARY_LIMIT: usize = 240;
 const ARTIFACT_THRESHOLD: usize = 1200;
+// `lifecycle_seq` is an additive, serde-defaulted field. Keep the durable task
+// schema at v2 so a v0.9.1 rollback can ignore it and still open tasks written
+// by this build; no existing field changed meaning.
 const CURRENT_TASK_SCHEMA_VERSION: u32 = 2;
 
 const fn default_task_schema_version() -> u32 {
@@ -210,6 +213,11 @@ pub struct TaskRecord {
     pub turn_id: Option<String>,
     #[serde(default)]
     pub runtime_event_count: usize,
+    /// Monotonic owner-lifecycle sequence used by Work Graph reconciliation.
+    /// Output/progress events do not advance this counter; only lifecycle
+    /// transitions do, so replay after restart is stable.
+    #[serde(default)]
+    pub lifecycle_seq: u64,
     #[serde(default)]
     pub checklist: TaskChecklistState,
     #[serde(default)]
@@ -236,6 +244,8 @@ pub struct TaskSummary {
     pub started_at: Option<DateTime<Utc>>,
     pub ended_at: Option<DateTime<Utc>>,
     pub duration_ms: Option<u64>,
+    #[serde(default)]
+    pub lifecycle_seq: u64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub hunt_verdict: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -258,6 +268,7 @@ impl From<&TaskRecord> for TaskSummary {
             started_at: value.started_at,
             ended_at: value.ended_at,
             duration_ms: value.duration_ms,
+            lifecycle_seq: value.lifecycle_seq,
             hunt_verdict: value.hunt_verdict.clone(),
             error: value.error.clone(),
             thread_id: value.thread_id.clone(),
@@ -845,9 +856,32 @@ impl TaskManager {
 
     /// Enqueue a new task.
     pub async fn add_task(&self, req: NewTaskRequest) -> Result<TaskRecord> {
+        self.add_task_with_id(req, Self::new_task_id()).await
+    }
+
+    /// Allocate the durable owner identity before queue insertion so callers
+    /// can register graph spawn intent first.
+    #[must_use]
+    pub(crate) fn new_task_id() -> String {
+        format!("task_{}", &Uuid::new_v4().simple().to_string()[..16])
+    }
+
+    /// Enqueue using a preallocated id. This is crate-visible only for the
+    /// model tool's register-before-work transaction.
+    pub(crate) async fn add_task_with_id(
+        &self,
+        req: NewTaskRequest,
+        task_id: String,
+    ) -> Result<TaskRecord> {
         let prompt = req.prompt.trim().to_string();
         if prompt.is_empty() {
             bail!("Task prompt cannot be empty");
+        }
+        if task_id.len() != 21
+            || !task_id.starts_with("task_")
+            || !task_id[5..].chars().all(|ch| ch.is_ascii_hexdigit())
+        {
+            bail!("Invalid preallocated task id: expected task_<16hex>");
         }
 
         let task = TaskRecord {
@@ -858,7 +892,7 @@ impl TaskManager {
             // overwrites a record while leaving a duplicate queue entry.
             // `resolve_task_id` matches by prefix, so short references still
             // work.
-            id: format!("task_{}", &Uuid::new_v4().simple().to_string()[..16]),
+            id: task_id,
             prompt,
             model: req.model.unwrap_or_else(|| self.cfg.default_model.clone()),
             workspace: match req.workspace {
@@ -883,6 +917,7 @@ impl TaskManager {
             thread_id: None,
             turn_id: None,
             runtime_event_count: 0,
+            lifecycle_seq: 1,
             checklist: TaskChecklistState::default(),
             gates: Vec::new(),
             attempts: Vec::new(),
@@ -899,9 +934,51 @@ impl TaskManager {
 
         {
             let mut state = self.state.lock().await;
-            state.queue.push_back(task.id.clone());
+            let task_path = self.tasks_dir.join(format!("{}.json", task.id));
+            // The staged extension is intentionally not `.json`, so startup
+            // replay ignores an interrupted create until the queue write has
+            // succeeded and this file is atomically promoted.
+            let staged_task_path = self.tasks_dir.join(format!(".{}.json.pending", task.id));
+            if state.tasks.contains_key(&task.id) || task_path.exists() || staged_task_path.exists()
+            {
+                bail!("Task id already exists: {}", task.id);
+            }
+            let mut next_queue = state.queue.clone();
+            next_queue.push_back(task.id.clone());
+
+            // Stage the owner record, then persist its queue membership, then
+            // atomically promote it. A crash before promotion leaves either an
+            // ignored staged file or a queue entry with no task (which replay
+            // drops); a crash after promotion leaves the complete runnable
+            // pair. In-memory scheduling is published only after all three.
+            write_json_atomic(&staged_task_path, &task)?;
+            if let Err(err) = self.persist_queue_locked(&next_queue) {
+                if let Err(cleanup_err) = fs::remove_file(&staged_task_path) {
+                    tracing::warn!(
+                        task_id = %task.id,
+                        error = %cleanup_err,
+                        "failed to remove ignored staged task after queue write failure"
+                    );
+                }
+                return Err(err);
+            }
+            if let Err(promote_err) = fs::rename(&staged_task_path, &task_path) {
+                let rollback_error = self.persist_queue_locked(&state.queue).err();
+                let cleanup_error = fs::remove_file(&staged_task_path).err();
+                let mut message =
+                    format!("Failed to promote staged task {}: {promote_err}", task.id);
+                if let Some(rollback_error) = rollback_error {
+                    message.push_str(&format!("; queue rollback also failed: {rollback_error:#}"));
+                }
+                if let Some(cleanup_error) = cleanup_error {
+                    message.push_str(&format!(
+                        "; ignored staged-file cleanup also failed: {cleanup_error}"
+                    ));
+                }
+                bail!(message);
+            }
+            state.queue = next_queue;
             state.tasks.insert(task.id.clone(), task.clone());
-            self.persist_all_locked(&state)?;
         }
         self.notify.notify_one();
         Ok(task)
@@ -948,6 +1025,7 @@ impl TaskManager {
             match task.status {
                 TaskStatus::Queued => {
                     task.status = TaskStatus::Canceled;
+                    task.lifecycle_seq = task.lifecycle_seq.saturating_add(1);
                     task.ended_at = Some(now);
                     task.duration_ms = Some(0);
                     task.timeline.push(TaskTimelineEntry {
@@ -960,6 +1038,7 @@ impl TaskManager {
                 }
                 TaskStatus::Running => {
                     cancel_running = true;
+                    task.lifecycle_seq = task.lifecycle_seq.saturating_add(1);
                     task.timeline.push(TaskTimelineEntry {
                         timestamp: now,
                         kind: "cancel_requested".to_string(),
@@ -1063,6 +1142,7 @@ impl TaskManager {
                             } else {
                                 let now = Utc::now();
                                 task.status = TaskStatus::Running;
+                                task.lifecycle_seq = task.lifecycle_seq.saturating_add(1);
                                 task.started_at = Some(now);
                                 task.ended_at = None;
                                 task.duration_ms = None;
@@ -1327,6 +1407,7 @@ impl TaskManager {
         }
 
         task.status = result.status;
+        task.lifecycle_seq = task.lifecycle_seq.saturating_add(1);
         task.mode = mode_label.to_string();
         task.ended_at = Some(now);
         task.duration_ms = task.started_at.map(|start| duration_ms(start, now));
@@ -1581,6 +1662,7 @@ fn load_state(tasks_dir: &Path, queue_path: &Path) -> Result<LoadedTaskState> {
                     u64::try_from(now.signed_duration_since(started).num_milliseconds()).ok()
                 });
                 task.status = TaskStatus::Failed;
+                task.lifecycle_seq = task.lifecycle_seq.saturating_add(1);
                 task.ended_at = Some(now);
                 task.duration_ms = duration_ms;
                 task.error = Some(
@@ -1876,6 +1958,10 @@ mod tests {
         assert_eq!(finished.turn_id.as_deref(), Some("turn_test"));
         assert_eq!(finished.checklist.items.len(), 1);
         assert_eq!(finished.checklist.in_progress_id, Some(1));
+        assert!(
+            finished.lifecycle_seq >= 3,
+            "queued, running, and terminal owner transitions must advance the sequence"
+        );
 
         drop(manager);
 
@@ -1886,6 +1972,71 @@ mod tests {
         assert_eq!(loaded.status, TaskStatus::Completed);
         assert!(!loaded.timeline.is_empty());
         assert_eq!(loaded.checklist.items[0].content, "read fixture");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn preallocated_task_ids_are_validated_and_collision_safe() -> Result<()> {
+        let root = std::env::temp_dir().join(format!("deepseek-task-test-{}", Uuid::new_v4()));
+        let manager =
+            TaskManager::start_with_executor(test_config(root), Arc::new(MockExecutor)).await?;
+        let request = NewTaskRequest::from_prompt("preallocated owner identity");
+
+        let invalid = manager
+            .add_task_with_id(request.clone(), "task_short".to_string())
+            .await
+            .expect_err("invalid preallocated id");
+        assert!(invalid.to_string().contains("task_<16hex>"), "{invalid:#}");
+
+        let id = "task_0123456789abcdef".to_string();
+        let created = manager
+            .add_task_with_id(request.clone(), id.clone())
+            .await?;
+        assert_eq!(created.id, id);
+        assert_eq!(
+            created.schema_version, 2,
+            "the additive lifecycle field must remain rollback-readable"
+        );
+        assert_eq!(created.lifecycle_seq, 1);
+        let collision = manager
+            .add_task_with_id(request, id)
+            .await
+            .expect_err("task id collision");
+        assert!(
+            collision.to_string().contains("already exists"),
+            "{collision:#}"
+        );
+        assert_eq!(manager.list_tasks(None).await.len(), 1);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn failed_queue_write_leaves_no_replayable_task_record() -> Result<()> {
+        let root = std::env::temp_dir().join(format!("deepseek-task-test-{}", Uuid::new_v4()));
+        let manager =
+            TaskManager::start_with_executor(test_config(root.clone()), Arc::new(MockExecutor))
+                .await?;
+        std::fs::remove_file(root.join("queue.json"))?;
+        std::fs::create_dir(root.join("queue.json"))?;
+
+        let id = "task_fedcba9876543210".to_string();
+        let error = manager
+            .add_task_with_id(
+                NewTaskRequest::from_prompt("must not resurrect"),
+                id.clone(),
+            )
+            .await
+            .expect_err("queue path directory must reject the atomic queue write");
+        assert!(error.to_string().contains("queue.json"), "{error:#}");
+        assert!(manager.list_tasks(None).await.is_empty());
+        assert!(!root.join("tasks").join(format!("{id}.json")).exists());
+        assert!(
+            !root
+                .join("tasks")
+                .join(format!(".{id}.json.pending"))
+                .exists(),
+            "a failed queue write may leave no replayable or staged task record"
+        );
         Ok(())
     }
 
@@ -1953,6 +2104,7 @@ mod tests {
             thread_id: Some("thr_stale".to_string()),
             turn_id: Some("turn_stale".to_string()),
             runtime_event_count: 0,
+            lifecycle_seq: 2,
             checklist: TaskChecklistState::default(),
             gates: Vec::new(),
             attempts: Vec::new(),
