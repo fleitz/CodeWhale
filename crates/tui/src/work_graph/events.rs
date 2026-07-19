@@ -16,7 +16,7 @@ use serde::{Deserialize, Serialize};
 use super::ids::{ChangeId, ProposalId, WorkEdgeId, WorkNodeId};
 use super::model::{
     AcceptanceRequirement, CompatProjectionState, EvidenceRef, IdempotencyKey, NodeState,
-    OperationBinding, Provenance, Ts, WorkEdge, WorkNode,
+    OperationBinding, Provenance, Ts, WorkActivityEvent, WorkEdge, WorkNode,
 };
 
 /// A single mutation of the work graph. The reducer is the only write path;
@@ -77,6 +77,10 @@ pub enum WorkGraphChange {
     SetImportDigest {
         digest: String,
     },
+    /// Append one bounded, configuration-only activity receipt.
+    RecordActivity {
+        event: WorkActivityEvent,
+    },
 }
 
 impl WorkGraphChange {
@@ -98,6 +102,7 @@ impl WorkGraphChange {
             WorkGraphChange::Supersede { .. } => "supersede",
             WorkGraphChange::ReplaceCompatProjection { .. } => "replace_compat_projection",
             WorkGraphChange::SetImportDigest { .. } => "set_import_digest",
+            WorkGraphChange::RecordActivity { .. } => "record_activity",
         }
     }
 }

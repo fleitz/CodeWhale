@@ -248,6 +248,19 @@ pub enum ReasoningEffort {
     Max,
 }
 
+impl From<ReasoningEffort> for crate::work_graph::ReasoningEffortTier {
+    fn from(value: ReasoningEffort) -> Self {
+        match value {
+            ReasoningEffort::Off => Self::Off,
+            ReasoningEffort::Low => Self::Low,
+            ReasoningEffort::Medium => Self::Medium,
+            ReasoningEffort::High => Self::High,
+            ReasoningEffort::Auto => Self::Auto,
+            ReasoningEffort::Max => Self::Max,
+        }
+    }
+}
+
 impl ReasoningEffort {
     /// Parse an operator-supplied effort value.
     ///
@@ -3741,7 +3754,6 @@ impl App {
         if self.reject_setting_change_while_busy("Thinking") {
             return;
         }
-        self.reasoning_effort_explicit = true;
         self.apply_reasoning_effort_cycle();
     }
 
@@ -3750,15 +3762,32 @@ impl App {
     /// budget. Shared by the Ctrl+T shortcut (`cycle_effort`) and the hotbar
     /// `reasoning.cycle` action so the two paths cannot drift.
     pub(crate) fn apply_reasoning_effort_cycle(&mut self) {
-        self.reasoning_effort = self
+        let requested = self
             .reasoning_effort
             .cycle_next_for_provider(self.api_provider);
+        let effective = self.effective_reasoning_effort_for_active_route(requested);
+        let provider = self.provider_identity_for_persistence().to_string();
+        if let Some(work) = self.runtime_services.work.clone()
+            && let Err(err) = work.record_reasoning_effort_change(
+                self.current_session_id.as_deref(),
+                requested.into(),
+                effective.into(),
+                &provider,
+            )
+        {
+            self.status_message = Some(format!(
+                "Reasoning effort unchanged: Work receipt failed ({err})"
+            ));
+            self.needs_redraw = true;
+            return;
+        }
+        self.reasoning_effort = requested;
+        self.reasoning_effort_explicit = true;
         self.last_effective_reasoning_effort = None;
         self.update_model_compaction_budget();
         self.status_message = Some(format!(
             "Reasoning effort: {}",
-            self.reasoning_effort
-                .display_label_for_provider(self.api_provider)
+            Self::reasoning_effort_resolution_label(requested, effective, self.api_provider)
         ));
         self.needs_redraw = true;
     }
@@ -7088,19 +7117,42 @@ impl App {
         (identity.to_string(), model)
     }
 
-    pub fn reasoning_effort_display_label(&self) -> String {
-        if self.auto_model || self.reasoning_effort == ReasoningEffort::Auto {
-            if let Some(effective) = self.last_effective_reasoning_effort {
-                return format!(
-                    "auto: {}",
-                    effective.display_label_for_provider(self.api_provider)
-                );
-            }
-            return "auto".to_string();
+    fn effective_reasoning_effort_for_active_route(
+        &self,
+        requested: ReasoningEffort,
+    ) -> ReasoningEffort {
+        if self.auto_model || requested == ReasoningEffort::Auto {
+            return self
+                .last_effective_reasoning_effort
+                .unwrap_or(ReasoningEffort::Auto);
         }
-        self.reasoning_effort
-            .display_label_for_provider(self.api_provider)
-            .to_string()
+        requested.normalize_for_route(self.api_provider, &self.active_route_base_url, &self.model)
+    }
+
+    fn reasoning_effort_resolution_label(
+        requested: ReasoningEffort,
+        effective: ReasoningEffort,
+        provider: ApiProvider,
+    ) -> String {
+        if requested == effective {
+            return effective.display_label_for_provider(provider).to_string();
+        }
+        let effective = effective.display_label_for_provider(provider);
+        if requested == ReasoningEffort::Auto {
+            format!("auto: {effective}")
+        } else {
+            format!("{}→{effective}", requested.short_label())
+        }
+    }
+
+    pub fn reasoning_effort_display_label(&self) -> String {
+        let requested = if self.auto_model {
+            ReasoningEffort::Auto
+        } else {
+            self.reasoning_effort
+        };
+        let effective = self.effective_reasoning_effort_for_active_route(requested);
+        Self::reasoning_effort_resolution_label(requested, effective, self.api_provider)
     }
 
     pub fn compaction_config(&self) -> CompactionConfig {

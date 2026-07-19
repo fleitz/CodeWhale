@@ -499,9 +499,25 @@ impl<'a> HeaderWidget<'a> {
             format!("{provider}:{model}")
         };
         let effort = self.data.reasoning_effort_label.unwrap_or("").trim();
-        let fixed_width =
-            3 + mode_label.width() + usize::from(!effort.is_empty()) * (3 + effort.width());
-        let route_budget = max_width.saturating_sub(used + fixed_width + 1);
+        let mode_width = 3 + mode_label.width();
+        let full_effort_width = 3 + effort.width();
+        let compact_effort = Self::compact_effort_label(effort);
+        let compact_effort_width = 3 + compact_effort.width();
+        let effort = if effort.is_empty() {
+            String::new()
+        } else if used + mode_width + full_effort_width <= max_width {
+            effort.to_string()
+        } else if used + mode_width + compact_effort_width <= max_width {
+            compact_effort.to_string()
+        } else {
+            String::new()
+        };
+        // Reserve mode + effort before granting any width to the route. A
+        // long provider/model identity may truncate, but it cannot silently
+        // evict the requested/effective effort receipt.
+        let fixed_width = mode_width + usize::from(!effort.is_empty()) * (3 + effort.width());
+        let status_route_gap = usize::from(used > 0);
+        let route_budget = max_width.saturating_sub(used + fixed_width + status_route_gap);
         let route = if route_budget >= 4 {
             Self::truncate_to_width(&route, route_budget)
         } else {
@@ -526,6 +542,26 @@ impl<'a> HeaderWidget<'a> {
             ));
         }
         spans
+    }
+
+    fn compact_effort_label(label: &str) -> &'static str {
+        let effective = label
+            .rsplit_once('→')
+            .map_or(label, |(_, effective)| effective);
+        let effective = effective
+            .rsplit_once(':')
+            .map_or(effective, |(_, effective)| effective)
+            .trim()
+            .to_ascii_lowercase();
+        match effective.as_str() {
+            "off" => "o",
+            "low" => "l",
+            "med" | "medium" => "m",
+            "high" => "h",
+            "max" | "maximum" | "xhigh" => "x",
+            "auto" => "a",
+            _ => "·",
+        }
     }
 }
 
@@ -567,6 +603,7 @@ mod tests {
     use crate::palette;
     use crate::tui::app::AppMode;
     use ratatui::{buffer::Buffer, layout::Rect};
+    use unicode_width::UnicodeWidthStr;
 
     fn render_header(data: HeaderData<'_>, width: u16) -> String {
         let widget = HeaderWidget::new(data);
@@ -575,6 +612,14 @@ mod tests {
         widget.render(area, &mut buf);
 
         (0..width).map(|x| buf[(x, 0)].symbol()).collect::<String>()
+    }
+
+    fn render_left(data: HeaderData<'_>, width: usize) -> String {
+        HeaderWidget::new(data)
+            .left_spans(width)
+            .iter()
+            .map(|span| span.content.as_ref())
+            .collect()
     }
 
     #[test]
@@ -858,6 +903,47 @@ mod tests {
             whale_idx < max_idx,
             "expected whale to render before effort label, got: {rendered}"
         );
+    }
+
+    #[test]
+    fn route_truncation_reserves_requested_effective_effort() {
+        let rendered = render_left(
+            HeaderData::new(
+                AppMode::Agent,
+                "a-very-long-model-route-that-must-truncate",
+                "codewhale-tui",
+                false,
+                palette::WHALE_BG,
+            )
+            .with_provider(Some("xiaomi-mimo"))
+            .with_reasoning_effort(Some("low→high"))
+            .with_status_indicator(Some("cw")),
+            28,
+        );
+
+        assert!(rendered.contains("low→high"), "{rendered:?}");
+        assert!(rendered.contains("act"), "{rendered:?}");
+        assert!(rendered.width() <= 28, "{rendered:?}");
+    }
+
+    #[test]
+    fn narrow_header_uses_one_glyph_effective_effort() {
+        let rendered = render_left(
+            HeaderData::new(
+                AppMode::Agent,
+                "a-very-long-model-route",
+                "codewhale-tui",
+                false,
+                palette::WHALE_BG,
+            )
+            .with_reasoning_effort(Some("low→high"))
+            .with_status_indicator(Some("cw")),
+            14,
+        );
+
+        assert!(!rendered.contains("low→high"), "{rendered:?}");
+        assert!(rendered.ends_with(" · h"), "{rendered:?}");
+        assert!(rendered.width() <= 14, "{rendered:?}");
     }
 
     #[test]

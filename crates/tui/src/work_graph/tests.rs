@@ -61,6 +61,20 @@ fn mk_edge(disc: &str, kind: EdgeKind, from: &str, to: &str) -> WorkEdge {
     }
 }
 
+fn effort_activity(
+    provider: impl Into<String>,
+    ts: Ts,
+    operation: Option<WorkNodeId>,
+) -> WorkActivityEvent {
+    WorkActivityEvent::ReasoningEffortChanged {
+        requested: ReasoningEffortTier::Low,
+        effective: ReasoningEffortTier::High,
+        provider: provider.into(),
+        ts,
+        operation,
+    }
+}
+
 fn must(graph: &mut WorkGraph, change: WorkGraphChange, now: Ts) -> ChangeReceipt {
     graph.apply(change, ctx(now)).expect("change should apply")
 }
@@ -671,6 +685,99 @@ fn history_stays_bounded_at_cap() {
     let last = snapshot.history.last().unwrap().revision;
     assert_eq!(last, snapshot.revision);
     assert_eq!(first, snapshot.revision - (HISTORY_CAP as u64 - 1));
+}
+
+#[test]
+fn activity_receipts_reject_bad_provider_identity_and_oversized_snapshots() {
+    let mut graph = seeded();
+    for provider in [
+        String::new(),
+        "bad route".to_string(),
+        "bad\nroute".to_string(),
+        "x".repeat(129),
+    ] {
+        let before = graph.snapshot().clone();
+        let result = graph.apply(
+            WorkGraphChange::RecordActivity {
+                event: effort_activity(provider, 10, None),
+            },
+            ctx(10),
+        );
+        expect_code(result, ValidationCode::Structural);
+        assert_eq!(graph.snapshot(), &before, "rejection must be atomic");
+    }
+
+    for offset in 0..(ACTIVITY_CAP + 8) {
+        let ts = 100 + offset as Ts;
+        must(
+            &mut graph,
+            WorkGraphChange::RecordActivity {
+                event: effort_activity("xiaomi-mimo", ts, None),
+            },
+            ts,
+        );
+    }
+    assert_eq!(graph.snapshot().activities.len(), ACTIVITY_CAP);
+    assert_eq!(
+        graph.snapshot().activities.iter().next(),
+        Some(&effort_activity("xiaomi-mimo", 108, None)),
+        "bounded writes evict the oldest receipt"
+    );
+
+    let mut wire = serde_json::to_value(graph.snapshot()).expect("serialize graph");
+    let activities = wire["activities"].as_array_mut().expect("activity array");
+    activities.push(activities.last().expect("bounded receipt").clone());
+    let oversized: WorkGraphSnapshot =
+        serde_json::from_value(wire).expect("deserialize untrusted oversized snapshot");
+    let report = validate(&oversized).expect_err("oversized activity must fail closed");
+    assert!(report.contains_code(ValidationCode::Structural));
+}
+
+#[test]
+fn activity_operation_links_require_live_operations_at_write_time() {
+    let mut graph = seeded();
+    for operation in [nid("missing"), nid("root")] {
+        let before = graph.snapshot().clone();
+        let result = graph.apply(
+            WorkGraphChange::RecordActivity {
+                event: effort_activity("xiaomi-mimo", 10, Some(operation)),
+            },
+            ctx(10),
+        );
+        expect_code(result, ValidationCode::Structural);
+        assert_eq!(graph.snapshot(), &before, "rejection must be atomic");
+    }
+
+    set_state(&mut graph, "op", NodeState::Active, 10);
+    set_state(&mut graph, "op", NodeState::Completed, 11);
+    let result = graph.apply(
+        WorkGraphChange::RecordActivity {
+            event: effort_activity("xiaomi-mimo", 12, Some(nid("op"))),
+        },
+        ctx(12),
+    );
+    expect_code(result, ValidationCode::Structural);
+
+    for operation in [nid("missing"), nid("root")] {
+        let mut malformed = graph.snapshot().clone();
+        malformed
+            .activities
+            .push_bounded(effort_activity("xiaomi-mimo", 13, Some(operation)));
+        let report = validate(&malformed).expect_err("invalid historical link must fail closed");
+        assert!(report.contains_code(ValidationCode::Structural));
+    }
+
+    let mut historical = seeded();
+    set_state(&mut historical, "op", NodeState::Active, 20);
+    must(
+        &mut historical,
+        WorkGraphChange::RecordActivity {
+            event: effort_activity("xiaomi-mimo", 21, Some(nid("op"))),
+        },
+        21,
+    );
+    set_state(&mut historical, "op", NodeState::Completed, 22);
+    validate(historical.snapshot()).expect("a formerly-live historical link remains valid");
 }
 
 #[test]

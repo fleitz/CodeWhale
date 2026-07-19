@@ -324,6 +324,49 @@ fn cycle_effort_updates_effort_status_and_compaction() {
         "cycling effort must refresh the compaction budget"
     );
     assert!(app.needs_redraw);
+
+    let work = app
+        .work_state_snapshot()
+        .expect("Work snapshot")
+        .expect("effort activity creates graph state");
+    let graph = work.graph.expect("Work Graph");
+    let activity = graph.activities.last().expect("effort activity");
+    match activity {
+        crate::work_graph::WorkActivityEvent::ReasoningEffortChanged {
+            requested,
+            effective,
+            provider,
+            operation,
+            ..
+        } => {
+            assert_eq!(*requested, crate::work_graph::ReasoningEffortTier::High);
+            assert_eq!(*effective, crate::work_graph::ReasoningEffortTier::High);
+            assert_eq!(provider, "deepseek");
+            assert!(operation.is_none());
+        }
+    }
+    let wire = serde_json::to_value(activity).expect("serialize activity");
+    assert_eq!(wire["kind"], "reasoning_effort_changed");
+    assert!(
+        wire.get("text").is_none(),
+        "activity must not carry reasoning text"
+    );
+}
+
+#[test]
+fn reasoning_effort_display_receipts_route_normalization() {
+    let mut app = App::new(test_options(false), &Config::default());
+    app.api_provider = ApiProvider::Moonshot;
+    app.auto_model = false;
+    app.reasoning_effort = ReasoningEffort::Low;
+    app.active_route_base_url = crate::config::DEFAULT_MOONSHOT_BASE_URL.to_string();
+    app.model = "kimi-k2.5".to_string();
+
+    assert_eq!(app.reasoning_effort_display_label(), "low→high");
+
+    app.active_route_base_url = crate::config::DEFAULT_KIMI_CODE_BASE_URL.to_string();
+    app.model = "k3".to_string();
+    assert_eq!(app.reasoning_effort_display_label(), "low");
 }
 
 #[test]

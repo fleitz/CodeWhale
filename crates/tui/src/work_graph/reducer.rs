@@ -23,8 +23,8 @@ use super::events::{
 };
 use super::ids::{ChangeId, WorkEdgeId, WorkNodeId};
 use super::model::{
-    EdgeKind, EvidenceRef, NodeKind, NodeState, OperationBinding, Provenance, WorkEdge,
-    WorkGraphSnapshot, WorkNode,
+    EdgeKind, EvidenceRef, NodeKind, NodeState, OperationBinding, Provenance, WorkActivityEvent,
+    WorkEdge, WorkGraphSnapshot, WorkNode,
 };
 use super::validate::{ValidationCode, ValidationReport, validate};
 
@@ -190,6 +190,22 @@ fn apply_pure(
                 return Err(structural("legacy import digest cannot be empty"));
             }
             next.import_digest = Some(digest.clone());
+        }
+        WorkGraphChange::RecordActivity { event } => {
+            let operation = match event {
+                WorkActivityEvent::ReasoningEffortChanged { operation, .. } => operation,
+            };
+            if let Some(operation) = operation {
+                let node = next.node(operation).ok_or_else(|| {
+                    structural(format!("activity references missing operation {operation}"))
+                })?;
+                if node.kind != NodeKind::Operation || !node.state.is_live() {
+                    return Err(structural(format!(
+                        "activity operation {operation} is not live"
+                    )));
+                }
+            }
+            next.activities.push_bounded(event.clone());
         }
     }
     Ok(next)

@@ -35,8 +35,8 @@ use serde::{Deserialize, Serialize};
 
 use super::ids::WorkNodeId;
 use super::model::{
-    EdgeKind, HISTORY_CAP, NodeKind, NodeState, SCHEMA_VERSION, WorkGraphSnapshot, WorkNode,
-    external_identity_is_well_formed,
+    ACTIVITY_CAP, EdgeKind, HISTORY_CAP, NodeKind, NodeState, SCHEMA_VERSION, WorkActivityEvent,
+    WorkGraphSnapshot, WorkNode, external_identity_is_well_formed,
 };
 
 /// Which rule a violation belongs to.
@@ -238,6 +238,49 @@ fn check_structural(snapshot: &WorkGraphSnapshot, out: &mut Vec<Violation>) {
             code: ValidationCode::Structural,
             message: "legacy To-do projection has more than one active row".to_string(),
         });
+    }
+
+    if snapshot.activities.len() > ACTIVITY_CAP {
+        out.push(Violation {
+            code: ValidationCode::Structural,
+            message: format!(
+                "activity length {} exceeds bound {ACTIVITY_CAP}",
+                snapshot.activities.len()
+            ),
+        });
+    }
+    for activity in snapshot.activities.iter() {
+        let (provider, operation) = match activity {
+            WorkActivityEvent::ReasoningEffortChanged {
+                provider,
+                operation,
+                ..
+            } => (provider, operation),
+        };
+        if provider.is_empty()
+            || provider.chars().count() > 128
+            || provider
+                .chars()
+                .any(|ch| ch.is_whitespace() || ch.is_control())
+        {
+            out.push(Violation {
+                code: ValidationCode::Structural,
+                message: "activity provider is not a bounded route identity".to_string(),
+            });
+        }
+        if let Some(operation) = operation {
+            match snapshot.node(operation) {
+                Some(node) if node.kind == NodeKind::Operation => {}
+                Some(_) => out.push(Violation {
+                    code: ValidationCode::Structural,
+                    message: format!("activity operation {operation} is not an Operation node"),
+                }),
+                None => out.push(Violation {
+                    code: ValidationCode::Structural,
+                    message: format!("activity references missing operation {operation}"),
+                }),
+            }
+        }
     }
 }
 

@@ -31,8 +31,39 @@ pub const SCHEMA_VERSION: u32 = 1;
 /// Bounded change-history window kept on the snapshot.
 pub const HISTORY_CAP: usize = 256;
 
+/// Bounded user-visible configuration activity kept on the snapshot.
+pub const ACTIVITY_CAP: usize = 256;
+
 /// Bounded idempotency-key dedup window kept on the snapshot.
 pub const SEEN_KEYS_CAP: usize = 1024;
+
+/// Canonical reasoning-effort tiers recorded as configuration facts. This is
+/// deliberately an enum rather than free-form text so Work Graph activity can
+/// never become a side channel for model reasoning.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ReasoningEffortTier {
+    Off,
+    Low,
+    Medium,
+    High,
+    Auto,
+    Max,
+}
+
+/// Bounded, receipt-only activity attached to the session graph.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum WorkActivityEvent {
+    ReasoningEffortChanged {
+        requested: ReasoningEffortTier,
+        effective: ReasoningEffortTier,
+        provider: String,
+        ts: Ts,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        operation: Option<WorkNodeId>,
+    },
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -615,6 +646,9 @@ pub struct WorkGraphSnapshot {
     pub nodes: Vec<WorkNode>,
     pub edges: Vec<WorkEdge>,
     pub history: BoundedVec<ChangeReceipt, HISTORY_CAP>,
+    /// Configuration facts only; never prompts, output, or reasoning text.
+    #[serde(default, skip_serializing_if = "BoundedVec::is_empty")]
+    pub activities: BoundedVec<WorkActivityEvent, ACTIVITY_CAP>,
     pub import_digest: Option<String>,
     /// `(binding, seq)` dedup window for replayed runtime observations.
     pub seen_keys: BoundedSet<IdempotencyKey, SEEN_KEYS_CAP>,
@@ -633,6 +667,7 @@ impl WorkGraphSnapshot {
             nodes: Vec::new(),
             edges: Vec::new(),
             history: BoundedVec::new(),
+            activities: BoundedVec::new(),
             import_digest: None,
             seen_keys: BoundedSet::new(),
             proposals: Vec::new(),
@@ -667,6 +702,7 @@ impl WorkGraphSnapshot {
         self.nodes.is_empty()
             && self.edges.is_empty()
             && self.history.is_empty()
+            && self.activities.is_empty()
             && self.import_digest.is_none()
             && self.proposals.is_empty()
             && self.compat.is_empty()

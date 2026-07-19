@@ -12,10 +12,10 @@ use super::{
     ApprovalRef, BindingId, ChangeCtx, CompatPlanMetadata, CompatProjectionState,
     CompatTodoBinding, EdgeKind, IdempotencyKey, NodeKind, NodeState, OperationBinding,
     OperationIntent, OperationObservation, OperationOwnerSnapshot, ProposalId, ProposedNodeUpdate,
-    Provenance, WorkEdge, WorkEdgeId, WorkGraph, WorkGraphChange, WorkGraphProposal,
-    WorkGraphSnapshot, WorkNode, WorkNodeId, WorkNodePatch, external_identity_is_well_formed,
-    fleet_task_owner_snapshot, import_legacy, lane_owner_snapshot, project_plan, project_todos,
-    validate,
+    Provenance, ReasoningEffortTier, WorkActivityEvent, WorkEdge, WorkEdgeId, WorkGraph,
+    WorkGraphChange, WorkGraphProposal, WorkGraphSnapshot, WorkNode, WorkNodeId, WorkNodePatch,
+    external_identity_is_well_formed, fleet_task_owner_snapshot, import_legacy,
+    lane_owner_snapshot, project_plan, project_todos, validate,
 };
 
 pub(crate) const ACTIVE_OPERATION_SUMMARY_START: &str =
@@ -376,6 +376,67 @@ impl WorkRuntime {
         }
         out.push_str(ACTIVE_OPERATION_SUMMARY_END);
         Some(out)
+    }
+
+    /// Record one reasoning-effort configuration change as bounded graph
+    /// activity. The event contains typed tiers and a non-secret route
+    /// identity only; there is no field capable of carrying reasoning text.
+    /// When live operations exist, the most recently updated one receives the
+    /// historical link. Later terminalization does not invalidate that link.
+    pub fn record_reasoning_effort_change(
+        &self,
+        session_id: Option<&str>,
+        requested: ReasoningEffortTier,
+        effective: ReasoningEffortTier,
+        provider: &str,
+    ) -> Result<Option<WorkNodeId>, String> {
+        let todos = retry_lock(&self.todos, 100)
+            .ok_or_else(|| "To-do state is busy; effort change was not recorded".to_string())?;
+        let plan = retry_lock(&self.plan, 100)
+            .ok_or_else(|| "Plan state is busy; effort change was not recorded".to_string())?;
+        let mut active = lock_unpoisoned(&self.graph);
+        let session_id = resolved_session_id(&active, session_id);
+        let base = graph_for_update(
+            &mut active,
+            &session_id,
+            &plan.snapshot(),
+            &todos.snapshot(),
+        )?;
+        let operation = base
+            .nodes
+            .iter()
+            .filter(|node| node.kind == NodeKind::Operation && node.state.is_live())
+            .max_by(|left, right| {
+                left.updated_at
+                    .cmp(&right.updated_at)
+                    .then_with(|| left.id.as_str().cmp(right.id.as_str()))
+            })
+            .map(|node| node.id.clone());
+        let now = now_ms();
+        let mut graph = WorkGraph::from_snapshot(base);
+        graph
+            .apply(
+                WorkGraphChange::RecordActivity {
+                    event: WorkActivityEvent::ReasoningEffortChanged {
+                        requested,
+                        effective,
+                        provider: provider.to_string(),
+                        ts: now,
+                        operation: operation.clone(),
+                    },
+                },
+                ChangeCtx {
+                    session_id,
+                    now,
+                    idempotency_key: None,
+                },
+            )
+            .map_err(|err| format!("reasoning effort: {err}"))?;
+        let next = graph.into_snapshot();
+        validate_combined(&next, &project_plan(&next), &project_todos(&next))?;
+        active.snapshot = Some(next);
+        active.pending_publish = true;
+        Ok(operation)
     }
 
     /// Apply an `update_plan` payload through the graph and publish both
@@ -2422,6 +2483,38 @@ mod tests {
         assert!(summary.contains("shell:shell_test"), "{summary}");
         assert!(summary.contains("silent 'owner' command"), "{summary}");
         assert!(!summary.contains("4,096"), "{summary}");
+
+        assert_eq!(
+            runtime.record_reasoning_effort_change(
+                Some("session"),
+                ReasoningEffortTier::Low,
+                ReasoningEffortTier::High,
+                "moonshot",
+            ),
+            Ok(Some(node_id.clone()))
+        );
+        let activity = runtime
+            .capture(Some("session"))
+            .expect("capture effort activity")
+            .expect("graph")
+            .graph
+            .activities
+            .last()
+            .cloned()
+            .expect("effort activity");
+        let ts = match &activity {
+            WorkActivityEvent::ReasoningEffortChanged { ts, .. } => *ts,
+        };
+        assert_eq!(
+            activity,
+            WorkActivityEvent::ReasoningEffortChanged {
+                requested: ReasoningEffortTier::Low,
+                effective: ReasoningEffortTier::High,
+                provider: "moonshot".to_string(),
+                ts,
+                operation: Some(node_id.clone()),
+            }
+        );
 
         runtime
             .record_operation_approval(

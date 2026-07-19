@@ -62,6 +62,30 @@ fn permission_cycle_shortcut_accepts_both_shift_tab_encodings() {
 }
 
 #[test]
+fn ctrl_t_key_event_reaches_reasoning_effort_cycle() {
+    let mut app = create_test_app();
+    app.api_provider = crate::config::ApiProvider::Deepseek;
+    app.auto_model = false;
+    app.reasoning_effort = ReasoningEffort::Off;
+
+    assert!(handle_reasoning_effort_key(
+        &mut app,
+        &KeyEvent::new(KeyCode::Char('t'), KeyModifiers::CONTROL),
+    ));
+    assert_eq!(app.reasoning_effort, ReasoningEffort::High);
+    assert!(
+        !handle_reasoning_effort_key(
+            &mut app,
+            &KeyEvent::new(
+                KeyCode::Char('T'),
+                KeyModifiers::CONTROL | KeyModifiers::SHIFT,
+            ),
+        ),
+        "Ctrl+Shift+T remains owned by the live transcript overlay",
+    );
+}
+
+#[test]
 fn underwater_motion_keeps_its_smoother_cadence_during_live_status() {
     let mut app = create_test_app();
     // App::new reads real terminal overlays. This test owns the authored

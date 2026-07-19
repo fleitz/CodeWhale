@@ -46,10 +46,11 @@ pub use liveness::{
 };
 pub use migration::import_legacy;
 pub use model::{
-    AcceptanceRequirement, BoundedSet, BoundedVec, CompatPlanMetadata, CompatProjectionState,
-    CompatTodoBinding, EdgeKind, EvidenceKind, EvidenceKindTag, EvidenceRef, EvidenceRefError,
-    HISTORY_CAP, IdempotencyKey, NodeKind, NodeState, OperationBinding, Provenance, SCHEMA_VERSION,
-    SEEN_KEYS_CAP, Ts, WorkEdge, WorkGraphSnapshot, WorkNode, external_identity_is_well_formed,
+    ACTIVITY_CAP, AcceptanceRequirement, BoundedSet, BoundedVec, CompatPlanMetadata,
+    CompatProjectionState, CompatTodoBinding, EdgeKind, EvidenceKind, EvidenceKindTag, EvidenceRef,
+    EvidenceRefError, HISTORY_CAP, IdempotencyKey, NodeKind, NodeState, OperationBinding,
+    Provenance, ReasoningEffortTier, SCHEMA_VERSION, SEEN_KEYS_CAP, Ts, WorkActivityEvent,
+    WorkEdge, WorkGraphSnapshot, WorkNode, external_identity_is_well_formed,
 };
 pub use reducer::apply;
 pub(crate) use runtime::{ACTIVE_OPERATION_SUMMARY_END, ACTIVE_OPERATION_SUMMARY_START};

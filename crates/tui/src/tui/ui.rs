@@ -4519,6 +4519,11 @@ async fn run_event_loop(
                             {
                                 return Ok(());
                             }
+                            if let Err(err) = persist_pending_work_checkpoint(app).await {
+                                app.status_message = Some(format!(
+                                    "Hotbar change applied, but its Work receipt is pending ({err})"
+                                ));
+                            }
                             app.needs_redraw = true;
                         }
                     }
@@ -5212,6 +5217,11 @@ async fn run_event_loop(
                             {
                                 return Ok(());
                             }
+                            if let Err(err) = persist_pending_work_checkpoint(app).await {
+                                app.status_message = Some(format!(
+                                    "Hotbar change applied, but its Work receipt is pending ({err})"
+                                ));
+                            }
                             app.needs_redraw = true;
                         }
                     }
@@ -5295,6 +5305,14 @@ async fn run_event_loop(
             }
 
             // Global keybindings
+            if handle_reasoning_effort_key(app, &key) {
+                if let Err(err) = persist_pending_work_checkpoint(app).await {
+                    app.status_message = Some(format!(
+                        "Reasoning effort changed, but its Work receipt is pending ({err})"
+                    ));
+                }
+                continue;
+            }
             match key.code {
                 KeyCode::Enter
                     if app.input.is_empty()
@@ -5356,12 +5374,6 @@ async fn run_event_loop(
                         app.mark_history_updated();
                         app.needs_redraw = true;
                     }
-                    continue;
-                }
-                KeyCode::Char('t') | KeyCode::Char('T')
-                    if key.modifiers == KeyModifiers::CONTROL =>
-                {
-                    app.cycle_effort();
                     continue;
                 }
                 KeyCode::Char('t') | KeyCode::Char('T')
@@ -6299,6 +6311,19 @@ fn clear_work_inspector_after_pager_close(app: &mut App, was_work_inspector: boo
     if was_work_inspector && app.view_stack.top_kind() != Some(ModalKind::Pager) {
         app.work_surface.opened = None;
     }
+}
+
+/// The event-loop seam for Ctrl+T. Keeping the `KeyEvent` predicate and App
+/// mutation together makes the real terminal route directly testable rather
+/// than testing `cycle_effort` in isolation.
+fn handle_reasoning_effort_key(app: &mut App, key: &event::KeyEvent) -> bool {
+    if !matches!(key.code, KeyCode::Char('t') | KeyCode::Char('T'))
+        || key.modifiers != KeyModifiers::CONTROL
+    {
+        return false;
+    }
+    app.cycle_effort();
+    true
 }
 
 fn hotbar_slot_from_key(app: &App, key: &event::KeyEvent) -> Option<u8> {
