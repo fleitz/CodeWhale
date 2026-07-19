@@ -5,9 +5,18 @@ use ratatui::text::{Line, Span};
 
 use crate::localization::MessageId;
 use crate::palette;
-use crate::tui::app::App;
+use crate::tui::app::{App, AppMode};
 
 pub fn lines(app: &App) -> Vec<Line<'static>> {
+    let plan_mode = AppMode::Plan
+        .display_name_localized(app.ui_locale)
+        .to_string();
+    let act_mode = AppMode::Agent
+        .display_name_localized(app.ui_locale)
+        .to_string();
+    let operate_mode = AppMode::Operate
+        .display_name_localized(app.ui_locale)
+        .to_string();
     let current_mode = app.mode.display_name_localized(app.ui_locale).to_string();
     let current_permission = app.approval_mode.permission_chip_label().to_string();
 
@@ -25,14 +34,14 @@ pub fn lines(app: &App) -> Vec<Line<'static>> {
                 Style::default().add_modifier(Modifier::BOLD),
             ),
             Span::raw(" — "),
-            Span::styled("Plan", Style::default().fg(palette::WHALE_ACTION)),
+            Span::styled(plan_mode, Style::default().fg(palette::WHALE_ACTION)),
             Span::raw(format!(
                 " ({}) · ",
                 app.tr(MessageId::OnboardMentalPlanHint)
             )),
-            Span::styled("Act", Style::default().fg(palette::WHALE_ACTION)),
+            Span::styled(act_mode, Style::default().fg(palette::WHALE_ACTION)),
             Span::raw(format!(" ({}) · ", app.tr(MessageId::OnboardMentalActHint))),
-            Span::styled("Operate", Style::default().fg(palette::WHALE_ACTION)),
+            Span::styled(operate_mode, Style::default().fg(palette::WHALE_ACTION)),
             Span::raw(format!(
                 " ({})",
                 app.tr(MessageId::OnboardMentalOperateHint)
@@ -161,5 +170,42 @@ mod tests {
         assert!(body.contains("Tab"));
         assert!(body.contains("Shift+Tab"));
         assert!(body.contains("constitution"));
+    }
+
+    #[test]
+    fn primer_localizes_mode_names_consistently() {
+        let options = TuiOptions {
+            model: "test-model".to_string(),
+            workspace: PathBuf::from("."),
+            config_path: None,
+            config_profile: None,
+            allow_shell: false,
+            use_alt_screen: true,
+            use_mouse_capture: false,
+            use_bracketed_paste: true,
+            max_subagents: 1,
+            skills_dir: PathBuf::from("."),
+            memory_path: PathBuf::from("memory.md"),
+            notes_path: PathBuf::from("notes.txt"),
+            mcp_config_path: PathBuf::from("mcp.json"),
+            use_memory: false,
+            start_in_agent_mode: false,
+            skip_onboarding: true,
+            yolo: false,
+            resume_session_id: None,
+            initial_input: None,
+        };
+        let mut app = App::new(options, &Config::default());
+        app.ui_locale = crate::localization::Locale::Ko;
+        let body = lines(&app)
+            .into_iter()
+            .flat_map(|line| line.spans.into_iter().map(|span| span.content.to_string()))
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        for mode in [AppMode::Plan, AppMode::Agent, AppMode::Operate] {
+            let localized = mode.display_name_localized(app.ui_locale);
+            assert!(body.contains(localized.as_ref()));
+        }
     }
 }

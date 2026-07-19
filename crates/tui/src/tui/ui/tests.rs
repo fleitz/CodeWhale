@@ -10069,6 +10069,20 @@ fn missing_key_recovery_skips_first_run_mental_models() {
 }
 
 #[test]
+fn missing_key_recovery_still_requires_workspace_trust() {
+    let tmpdir = TempDir::new().expect("tempdir");
+    let mut app = create_test_app();
+    app.workspace = tmpdir.path().to_path_buf();
+    app.onboarding = OnboardingState::ApiKey;
+    app.onboarding_missing_key_recovery = true;
+    app.trust_mode = false;
+
+    crate::tui::onboarding::advance_onboarding_after_api_key(&mut app);
+
+    assert_eq!(app.onboarding, OnboardingState::TrustDirectory);
+}
+
+#[test]
 fn mental_models_backtracks_to_the_last_first_run_decision() {
     let mut app = create_test_app();
     app.onboarding = OnboardingState::MentalModels;

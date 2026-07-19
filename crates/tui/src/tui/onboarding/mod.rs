@@ -290,10 +290,10 @@ pub fn advance_onboarding_after_language(app: &mut App) {
 
 pub fn advance_onboarding_after_api_key(app: &mut App) {
     app.status_message = None;
-    if app.onboarding_missing_key_recovery {
-        app.onboarding = OnboardingState::Tips;
-    } else if !app.trust_mode && needs_trust(&app.workspace) {
+    if !app.trust_mode && needs_trust(&app.workspace) {
         app.onboarding = OnboardingState::TrustDirectory;
+    } else if app.onboarding_missing_key_recovery {
+        app.onboarding = OnboardingState::Tips;
     } else {
         app.onboarding = OnboardingState::MentalModels;
     }
