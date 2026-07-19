@@ -675,6 +675,8 @@ max_subagents = 10 # optional (1-20)
 # with Bing fallback — no API key needed. Bing remains selectable for users who
 # explicitly prefer it. Switch to Tavily, Bocha, Metaso, Baidu, Volcengine,
 # Sofya, or a trusted SearXNG instance for API-backed search.
+# API runtime failures and empty responses visibly degrade through DuckDuckGo
+# then Bing. Missing configuration and network-policy denials fail closed.
 #
 # [search]
 # provider = "duckduckgo"  # duckduckgo | bing | tavily | bocha | metaso | searxng | baidu | volcengine | sofya
@@ -682,8 +684,8 @@ max_subagents = 10 # optional (1-20)
 #                            # bing:       HTML scrape, no API key
 #                            # tavily:     https://tavily.com — AI search, needs api_key
 #                            # bocha:      https://bochaai.com — 博查AI搜索，国内友好，需api_key
-#                            # metaso:     https://metaso.cn — 秘塔AI搜索，每天 100 次免费
-#                            #             设置 METASO_API_KEY 或 [search] api_key 可提升额度
+#                            # metaso:     https://metaso.cn — 秘塔AI搜索，需 api_key
+#                            #             设置 METASO_API_KEY 或 [search] api_key
 #                            # searxng:    https://docs.searxng.org — trusted/self-hosted JSON API,
 #                            #             set base_url; no public instance is used by default
 #                            # baidu:      百度 AI Search via qianfan.baidubce.com，需 api_key
@@ -694,7 +696,7 @@ max_subagents = 10 # optional (1-20)
 #                            #             also falls back to the SOFYA_API_KEY env var
 # base_url = "https://search.example/" # optional DuckDuckGo-compatible HTML endpoint;
 #                                      # required SearXNG root or /search endpoint
-# api_key = "YOUR_SEARCH_KEY" # required for tavily, bocha, baidu, volcengine, and sofya; optional for metaso; unused by searxng
+# api_key = "YOUR_SEARCH_KEY" # required for tavily, bocha, metaso, baidu, volcengine, and sofya; unused by searxng
 #                             # WARNING: treat config.toml like a secret file when
 #                             # storing API keys. Prefer env vars for local smoke tests.
 #
@@ -705,6 +707,7 @@ max_subagents = 10 # optional (1-20)
 #   DEEPSEEK_SEARCH_BASE_URL  → search.base_url (legacy alias)
 #   METASO_API_KEY           → metaso key fallback
 #   BAIDU_SEARCH_API_KEY     → baidu key fallback
+#   VOLCENGINE_API_KEY / VOLCENGINE_ARK_API_KEY / ARK_API_KEY → volcengine key fallback
 #   SOFYA_API_KEY            → sofya key fallback
 
 # ─────────────────────────────────────────────────────────────────────────────────

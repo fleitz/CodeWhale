@@ -1663,6 +1663,11 @@ parseable results. Bing remains selectable for users who explicitly want it,
 and Tavily, Bocha, Metaso, SearXNG, Baidu, Volcengine, or Sofya can be selected
 when an API-backed provider is preferred.
 
+Configured API providers are attempted first. Runtime failure or an empty
+result visibly degrades through DuckDuckGo and then Bing; the structured search
+receipt records every hop. Missing configuration and network-policy denials
+fail closed without sending the query to another provider.
+
 For a private/internal search service that serves DuckDuckGo-compatible HTML,
 keep `provider = "duckduckgo"` and set `base_url`; Codewhale appends the `q`
 query parameter to that endpoint and applies network policy to its host.
@@ -1677,8 +1682,8 @@ configured instance's JSON API. Set `provider = "searxng"` and
 by default because public instances often disable JSON output or rate-limit API
 traffic.
 
-**Metaso** ([metaso.cn](https://metaso.cn)) has a 100 searches/day free quota;
-set `METASO_API_KEY` or `[search] api_key` for a higher quota.
+**Metaso** ([metaso.cn](https://metaso.cn)) requires a user-supplied key. Set
+`METASO_API_KEY` or `[search] api_key`; Codewhale does not ship a shared key.
 
 **Baidu** uses Baidu AI Search at
 `https://qianfan.baidubce.com/v2/ai_search/web_search`. Set
@@ -1694,7 +1699,7 @@ Sofya model provider.
 [search]
 provider = "searxng" # duckduckgo | bing | tavily | bocha | metaso | searxng | baidu | volcengine | sofya
 # base_url = "https://search.example/" # optional with provider = "duckduckgo"; required with "searxng"
-# api_key = "YOUR_KEY" # required for tavily, bocha, baidu, volcengine, and sofya; optional for metaso; unused by searxng
+# api_key = "YOUR_KEY" # required for tavily, bocha, metaso, baidu, volcengine, and sofya; unused by searxng
 ```
 
 ## Local Media Attachments

@@ -45,9 +45,6 @@ const METASO_ENDPOINT: &str = "https://metaso.cn/api/v1";
 const BAIDU_ENDPOINT: &str = "https://qianfan.baidubce.com/v2/ai_search/web_search";
 const VOLCENGINE_RESPONSES_ENDPOINT: &str = "https://ark.cn-beijing.volces.com/api/v3/responses";
 const SOFYA_ENDPOINT: &str = "https://sofya.co/v1/search";
-/// Intentionally public default key provided by Metaso for open-source/community use.
-/// Last-resort fallback after config and env var. Rate-limited to ~100 searches/day.
-const METASO_DEFAULT_API_KEY: &str = "mk-E384C1DD5E8501BB7EFE27C949AFDE5B";
 const ERROR_BODY_PREVIEW_BYTES: usize = 512;
 const VOLCENGINE_MIN_TIMEOUT_MS: u64 = 90_000;
 
@@ -436,8 +433,7 @@ impl WebSearchTool {
     }
 
     /// Search via Metaso AI Search API (<https://metaso.cn>). Falls back to
-    /// `METASO_API_KEY` env var then a built-in default key if no config key
-    /// is set.
+    /// `METASO_API_KEY` when no config key is set.
     async fn run_metaso_search(
         &self,
         query: &str,
@@ -450,7 +446,11 @@ impl WebSearchTool {
             .search_api_key
             .as_deref()
             .or(env_key.as_deref())
-            .unwrap_or(METASO_DEFAULT_API_KEY);
+            .ok_or_else(|| {
+                ToolError::execution_failed(
+                    "Metaso search requires an API key. Set `METASO_API_KEY` or `[search] api_key` in config.toml.",
+                )
+            })?;
 
         let client = crate::tls::reqwest_client_builder()
             .timeout(Duration::from_millis(timeout_ms))
@@ -780,6 +780,11 @@ fn preflight_search_provider(context: &ToolContext) -> Result<(), ToolError> {
         SearchProvider::Bocha if !configured_key => Err(ToolError::execution_failed(
             "Bocha search requires an API key. Set `[search] api_key = \"sk-...\"` in config.toml.",
         )),
+        SearchProvider::Metaso if !configured_key && !env_key("METASO_API_KEY") => {
+            Err(ToolError::execution_failed(
+                "Metaso search requires an API key. Set `METASO_API_KEY` or `[search] api_key` in config.toml.",
+            ))
+        }
         SearchProvider::Baidu if !configured_key && !env_key("BAIDU_SEARCH_API_KEY") => {
             Err(ToolError::execution_failed(
                 "Baidu search requires an API key. Set `BAIDU_SEARCH_API_KEY` or `[search] api_key` in config.toml.",
@@ -2423,28 +2428,39 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn metaso_provider_uses_built_in_key_when_no_config_key_set() {
-        // Unlike Tavily/Bocha, Metaso falls back to a built-in default, so
-        // the call should NOT return an API-key-related error — it should
-        // either succeed or fail with a network-level error, but never a
-        // missing-key error.
+    #[allow(clippy::await_holding_lock)]
+    async fn metaso_provider_without_api_key_fails_closed_before_fallback() {
         use crate::config::SearchProvider;
         use crate::tools::spec::{ToolContext, ToolSpec};
+
+        let _guard = crate::test_support::lock_test_env();
+        let previous = std::env::var_os("METASO_API_KEY");
+        unsafe { std::env::remove_var("METASO_API_KEY") };
 
         let tmp = tempfile::tempdir().expect("tempdir");
         let mut ctx = ToolContext::new(tmp.path().to_path_buf());
         ctx.search_provider = SearchProvider::Metaso;
         ctx.search_api_key = None;
-        let result = WebSearchTool
+        let error = WebSearchTool
             .execute(json!({"query": "anything"}), &ctx)
-            .await;
-        let msg = match &result {
-            Ok(res) => format!("{res:?}"),
-            Err(e) => e.to_string(),
-        };
+            .await
+            .expect_err("missing Metaso key must fail before the fallback chain");
+
+        match previous {
+            Some(value) => unsafe { std::env::set_var("METASO_API_KEY", value) },
+            None => unsafe { std::env::remove_var("METASO_API_KEY") },
+        }
+
+        let message = error.to_string();
         assert!(
-            !msg.contains("API key"),
-            "should not complain about missing API key (built-in default); got `{msg}`"
+            message.contains("Metaso")
+                && message.contains("API key")
+                && message.contains("METASO_API_KEY"),
+            "got `{message}`"
+        );
+        assert!(
+            !message.contains("duckduckgo"),
+            "missing configuration must not cross providers: `{message}`"
         );
     }
 

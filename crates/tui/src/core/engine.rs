@@ -413,8 +413,9 @@ pub struct EngineConfig {
     pub workshop: Option<crate::tools::large_output_router::WorkshopConfig>,
     /// Which search backend `web_search` should use. Default: DuckDuckGo.
     pub search_provider: crate::config::SearchProvider,
-    /// API key for Tavily, Bocha, Metaso, or Baidu. `None` for Bing or DuckDuckGo.
-    /// Metaso also falls back to `METASO_API_KEY` env var, then a built-in key.
+    /// API key for Tavily, Bocha, Metaso, Baidu, Volcengine, or Sofya.
+    /// `None` for Bing, DuckDuckGo, or SearXNG.
+    /// Metaso also falls back to the `METASO_API_KEY` env var.
     /// Baidu also falls back to `BAIDU_SEARCH_API_KEY`.
     pub search_api_key: Option<String>,
     /// Optional DuckDuckGo-compatible HTML endpoint override.
