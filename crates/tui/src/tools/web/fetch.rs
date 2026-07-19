@@ -9,7 +9,9 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use futures_util::StreamExt;
 
 use super::cache::{self, CachedFetch};
-use super::guard::{DnsPin, guarded_reqwest_client_builder, validate_fetch_target};
+use super::guard::{
+    DnsPin, guarded_reqwest_client_builder, validate_fetch_target, validate_network_policy,
+};
 use crate::tools::spec::{ToolContext, ToolError};
 
 pub(crate) const DEFAULT_TIMEOUT: Duration = Duration::from_secs(15);
@@ -98,6 +100,16 @@ async fn fetch_inner(
         options.accept,
         options.max_bytes,
     ) {
+        let cached_url = reqwest::Url::parse(&cached.url).map_err(|err| {
+            ToolError::execution_failed(format!("cached response URL was invalid: {err}"))
+        })?;
+        let cached_host = cached_url.host_str().ok_or_else(|| {
+            ToolError::execution_failed("cached response URL did not include a host")
+        })?;
+        // No network request occurs on a cache hit, so DNS/SSRF validation is
+        // unnecessary. The final redirect destination still needs a policy
+        // check in case the session policy was tightened after insertion.
+        validate_network_policy(cached_host, context, tool_label)?;
         return Ok(from_cached(cached, true, 0));
     }
 
@@ -510,6 +522,49 @@ mod tests {
         )
         .await
         .expect_err("policy must win over cache");
+        assert!(error.to_string().contains("blocked by network policy"));
+    }
+
+    #[tokio::test]
+    async fn tightened_network_policy_checks_cached_redirect_destination() {
+        use crate::network_policy::{Decision, NetworkPolicy, NetworkPolicyDecider};
+
+        cache::reset();
+        let initial_url = reqwest::Url::parse("https://8.8.8.8/cached").unwrap();
+        cache::insert(
+            "redirect-policy-cache",
+            &initial_url,
+            "text/plain",
+            CachedFetch {
+                url: "https://1.1.1.1/redirected".to_string(),
+                status: 200,
+                headers: BTreeMap::new(),
+                content_type: "text/plain".to_string(),
+                bytes: Arc::new(b"cached".to_vec()),
+                truncated: false,
+                redirects: 1,
+            },
+        );
+        let policy = NetworkPolicy {
+            default: Decision::Allow.into(),
+            allow: Vec::new(),
+            deny: vec!["1.1.1.1".to_string()],
+            proxy: Vec::new(),
+            proxy_fake_ip_cidrs: Vec::new(),
+            audit: false,
+        };
+        let context = context("redirect-policy-cache")
+            .with_network_policy(NetworkPolicyDecider::new(policy, None));
+
+        let error = fetch(
+            initial_url.as_str(),
+            &FetchOptions::new(Duration::from_secs(1), 100, "text/plain"),
+            &context,
+            "fetch_url",
+        )
+        .await
+        .expect_err("final redirect policy must win over cache");
+        assert!(error.to_string().contains("1.1.1.1"));
         assert!(error.to_string().contains("blocked by network policy"));
     }
 }

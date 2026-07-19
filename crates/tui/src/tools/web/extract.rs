@@ -61,6 +61,7 @@ pub(crate) fn extract_document(
     bytes: &[u8],
 ) -> Result<ExtractedDocument, ToolError> {
     let declared = normalized_content_type(content_type);
+    let declared = declared.as_deref();
 
     if bytes.is_empty() {
         return Ok(ExtractedDocument {
@@ -297,11 +298,12 @@ fn decode_text(bytes: &[u8]) -> Result<String, ToolError> {
     Ok(String::from_utf8_lossy(bytes).into_owned())
 }
 
-fn normalized_content_type(content_type: Option<&str>) -> Option<&str> {
+fn normalized_content_type(content_type: Option<&str>) -> Option<String> {
     content_type
         .and_then(|value| value.split(';').next())
         .map(str::trim)
         .filter(|value| !value.is_empty())
+        .map(str::to_ascii_lowercase)
 }
 
 fn is_html(content_type: Option<&str>, url: &str, body: &str) -> bool {
@@ -617,6 +619,19 @@ mod tests {
         .expect("empty body");
         assert_eq!(document.kind, DocumentKind::Text);
         assert!(document.text.is_empty());
+    }
+
+    #[test]
+    fn content_type_matching_is_case_insensitive() {
+        let document = extract_document(
+            "https://example.com/document",
+            Some("Application/JSON; Charset=UTF-8"),
+            br#"{"status":"ok"}"#,
+        )
+        .expect("mixed-case JSON content type");
+
+        assert_eq!(document.kind, DocumentKind::Text);
+        assert_eq!(document.text, r#"{"status":"ok"}"#);
     }
 
     #[test]
