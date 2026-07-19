@@ -138,6 +138,11 @@ impl DeepSeekClient {
             });
 
             let mut current_block_index: Option<u32> = None;
+            // Whether reasoning text has already been emitted for the current
+            // reasoning block. Used to insert a paragraph break between
+            // consecutive summary parts, which the wire protocol delivers
+            // back-to-back with no separator.
+            let mut reasoning_text_emitted = false;
             let mut saw_tool_call = false;
             let mut usage_data: Option<Usage> = None;
             // Raw byte buffer: decode only COMPLETE lines so a multi-byte
@@ -249,6 +254,7 @@ impl DeepSeekClient {
                                                 Some(content_block_counter - 1);
                                         }
                                         "reasoning" => {
+                                            reasoning_text_emitted = false;
                                             content_block_counter += 1;
                                             yield Ok(StreamEvent::ContentBlockStart {
                                                 index: content_block_counter - 1,
@@ -296,10 +302,30 @@ impl DeepSeekClient {
                                     event.get("delta").and_then(|d| d.as_str())
                                     && let Some(idx) = current_block_index
                                 {
+                                    if !delta_text.is_empty() {
+                                        reasoning_text_emitted = true;
+                                    }
                                     yield Ok(StreamEvent::ContentBlockDelta {
                                         index: idx,
                                         delta: Delta::ThinkingDelta {
                                             thinking: delta_text.to_string(),
+                                        },
+                                    });
+                                }
+                            }
+                            "response.reasoning_summary_part.added" => {
+                                // Consecutive summary parts arrive with no
+                                // separator in the text deltas, so without a
+                                // boundary they concatenate as
+                                // "…done.**Next Phase**…". Insert a paragraph
+                                // break before every part after the first.
+                                if reasoning_text_emitted
+                                    && let Some(idx) = current_block_index
+                                {
+                                    yield Ok(StreamEvent::ContentBlockDelta {
+                                        index: idx,
+                                        delta: Delta::ThinkingDelta {
+                                            thinking: "\n\n".to_string(),
                                         },
                                     });
                                 }
@@ -935,6 +961,61 @@ mod tests {
             err.downcast_ref::<crate::llm_client::LlmError>().is_some(),
             "LlmError should survive the anyhow chain"
         );
+    }
+
+    #[tokio::test]
+    async fn responses_stream_inserts_boundary_between_reasoning_summary_parts() {
+        let server = MockServer::start().await;
+        let sse_body = concat!(
+            "data: {\"type\":\"response.output_item.added\",\"item\":{\"type\":\"reasoning\",\"id\":\"rs_1\"}}\n\n",
+            "data: {\"type\":\"response.reasoning_summary_part.added\",\"item_id\":\"rs_1\",\"summary_index\":0,\"part\":{\"type\":\"summary_text\",\"text\":\"\"}}\n\n",
+            "data: {\"type\":\"response.reasoning_summary_text.delta\",\"delta\":\"partA\"}\n\n",
+            "data: {\"type\":\"response.reasoning_summary_part.added\",\"item_id\":\"rs_1\",\"summary_index\":1,\"part\":{\"type\":\"summary_text\",\"text\":\"\"}}\n\n",
+            "data: {\"type\":\"response.reasoning_summary_text.delta\",\"delta\":\"partB\"}\n\n",
+            "data: {\"type\":\"response.output_item.done\"}\n\n",
+            "data: [DONE]\n\n",
+        );
+        Mock::given(method("POST"))
+            .and(path(CODEX_RESPONSES_PATH))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("Content-Type", "text/event-stream")
+                    .set_body_string(sse_body),
+            )
+            .mount(&server)
+            .await;
+
+        let client = {
+            let _env_lock = crate::test_support::lock_test_env();
+            let _codex_token =
+                crate::test_support::EnvVarGuard::set("OPENAI_CODEX_ACCESS_TOKEN", "test-token");
+            let _legacy_codex_token =
+                crate::test_support::EnvVarGuard::remove("CODEX_ACCESS_TOKEN");
+            DeepSeekClient::new(&test_codex_config(&server)).unwrap()
+        };
+        let mut stream = client
+            .handle_responses_stream(minimal_responses_request())
+            .await
+            .unwrap();
+
+        let mut thinking = String::new();
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            while let Some(event) = stream.next().await {
+                if let StreamEvent::ContentBlockDelta {
+                    delta: Delta::ThinkingDelta { thinking: chunk },
+                    ..
+                } = event.unwrap()
+                {
+                    thinking.push_str(&chunk);
+                }
+            }
+        })
+        .await
+        .expect("Responses reasoning stream should finish after [DONE]");
+
+        // The second summary part must be separated from the first by a
+        // paragraph break, and no separator may precede the first part.
+        assert_eq!(thinking, "partA\n\npartB");
     }
 
     #[test]
