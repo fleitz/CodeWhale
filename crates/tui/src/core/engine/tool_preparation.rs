@@ -336,4 +336,24 @@ mod tests {
             assert!(!prepared.auto_approve, "{}", expected.name);
         }
     }
+
+    #[test]
+    fn mcp_write_preparation_respects_session_auto_approval() {
+        let prepared = prepare_tool_call("mcp_filesystem_write", json!({}), None, true)
+            .expect("prepare MCP write tool with session auto-approval");
+
+        assert_eq!(prepared.call.approval, ApprovalRequirement::Suggest);
+        assert!(!prepared.call.read_only);
+        assert!(!prepared.call.supports_parallel);
+        assert_eq!(
+            prepared.call.resources,
+            vec![ResourceClaim::GlobalExclusive]
+        );
+        assert!(prepared.auto_approve);
+        assert!(!super::super::turn_loop::registered_tool_approval_required(
+            &prepared.call.name,
+            prepared.call.approval,
+            prepared.auto_approve,
+        ));
+    }
 }
