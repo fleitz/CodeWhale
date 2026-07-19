@@ -9,7 +9,7 @@ use ratatui::{
 use unicode_width::UnicodeWidthStr;
 
 use crate::localization::MessageId;
-use crate::tui::app::{App, SidebarHoverRow, SidebarHoverSection};
+use crate::tui::app::{App, SidebarHoverRow, SidebarHoverSection, SidebarRowAction};
 use crate::tui::ui_text::truncate_line_to_width;
 
 use super::model::{WorkHitbox, WorkRow, WorkSurfacePlacement, WorkTone, project};
@@ -294,6 +294,18 @@ pub fn render(frame: &mut Frame, area: Rect, app: &mut App) {
     });
 }
 
+/// Whether a row earns an `[open]` control. Rows whose only action is text
+/// inspection (todos) skip it: the row body click already opens the pager,
+/// hover shows the full text, and right-click copies it, so the suffix would
+/// only waste label width.
+fn shows_open_control(row: &WorkRow) -> bool {
+    match &row.primary_action {
+        Some(SidebarRowAction::InspectText { .. }) => row.stop_action.is_some(),
+        Some(_) => true,
+        None => false,
+    }
+}
+
 fn controls_text(
     app: &App,
     row: &WorkRow,
@@ -321,7 +333,7 @@ fn controls_text(
     let open = app.tr(MessageId::SidebarOpenControl);
     let stop = app.tr(MessageId::SidebarStopControl);
     match (
-        row.primary_action.is_some(),
+        shows_open_control(row),
         row.stop_action.is_some(),
         width < 60,
     ) {
@@ -367,7 +379,10 @@ fn control_zones(
     let mut cursor = controls_start;
     let mut open_zone = (None, None);
     let mut stop_zone = (None, None);
-    if row.primary_action.is_some() {
+    // Derive zones from the same predicate as controls_text so hitboxes always
+    // match the rendered glyphs; inspect-only rows have no [open] hitbox and
+    // rely on the row-body click to reach the pager.
+    if shows_open_control(row) {
         let open_width = UnicodeWidthStr::width(open_text.as_str()) as u16;
         open_zone = (Some(cursor), Some(cursor.saturating_add(open_width)));
         cursor = cursor.saturating_add(open_width);

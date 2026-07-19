@@ -508,7 +508,7 @@ mod tests {
     }
 
     #[test]
-    fn todo_open_records_hitbox_and_opens_pager() {
+    fn todo_row_body_click_opens_pager_without_open_control() {
         let mut app = app();
         app.todos
             .try_lock()
@@ -519,21 +519,30 @@ mod tests {
         terminal
             .draw(|frame| super::render(frame, frame.area(), &mut app))
             .expect("draw");
+        // Inspect-only rows render no [open] suffix and record no open hitbox;
+        // the row body itself is the pager affordance.
+        let text = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect::<String>();
+        assert!(!text.contains("[open]"), "{text}");
         let hit = app
             .work_surface
             .hitboxes
             .iter()
             .find(|hit| hit.id.0.starts_with("todo:"))
             .expect("todo hitbox");
-        assert!(hit.open_zone_start_col.is_some());
-        assert!(hit.open_zone_end_col.is_some());
-        let open_col = hit.open_zone_start_col.expect("open");
+        assert!(hit.open_zone_start_col.is_none());
+        assert!(hit.open_zone_end_col.is_none());
         let row_y = hit.row_y;
         let outcome = super::handle_mouse(
             &mut app,
             MouseEvent {
                 kind: MouseEventKind::Down(crossterm::event::MouseButton::Left),
-                column: open_col,
+                column: 2,
                 row: row_y,
                 modifiers: KeyModifiers::NONE,
             },
