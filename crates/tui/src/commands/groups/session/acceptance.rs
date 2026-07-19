@@ -323,8 +323,8 @@ fn exported_markdown_contains_active_transcript(world: &mut SessionCommandWorld)
     let content = std::fs::read_to_string(export_path)
         .unwrap_or_else(|err| panic!("read exported transcript {export_path:?}: {err}"));
 
-    assert!(content.contains("# Chat Export"));
-    assert!(content.contains("**You:**"));
+    assert!(content.contains("# Codewhale conversation export"));
+    assert!(content.contains("## 1. user"));
     assert!(content.contains("Remember the whale migration"));
 }
 

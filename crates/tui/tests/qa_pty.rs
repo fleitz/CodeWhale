@@ -985,7 +985,7 @@ fn legacy_work_ctrl_t_save_export_and_restart_are_consistent() -> anyhow::Result
     h.wait_for_text("/export", KEY_TIMEOUT)?;
     h.wait_for_idle(Duration::from_millis(150), Duration::from_secs(2))?;
     h.send(keys::key::enter())?;
-    h.wait_for_text("Exported to", KEY_TIMEOUT)?;
+    h.wait_for_text("Conversation exported to", KEY_TIMEOUT)?;
 
     let after_path = ws.workspace().join("wg6-after-export.json");
     h.send(keys::key::text(&format!(
@@ -1040,7 +1040,7 @@ fn legacy_work_ctrl_t_save_export_and_restart_are_consistent() -> anyhow::Result
         "export mutated graph-backed Work state"
     );
     assert!(
-        std::fs::read_to_string(&export_path)?.contains("# Chat Export"),
+        std::fs::read_to_string(&export_path)?.contains("# Codewhale conversation export"),
         "full export artifact missing"
     );
     let _ = h.shutdown();

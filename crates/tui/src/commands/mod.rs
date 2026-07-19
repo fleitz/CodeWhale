@@ -1135,7 +1135,7 @@ mod tests {
     }
 
     /// Build an App scoped to an isolated tempdir so dispatch-side-effects
-    /// (e.g. `/init` writing AGENTS.md, `/export` writing chat transcripts,
+    /// (e.g. `/init` writing AGENTS.md, explicit `/export <path>` writes, or
     /// `/logout` clearing credentials) don't pollute the repo working tree or
     /// the developer's real config when the smoke tests run.
     fn create_isolated_test_app() -> (App, tempfile::TempDir, ConfigPathGuard) {
@@ -1177,10 +1177,9 @@ mod tests {
     /// command, see it autocomplete, and then get an unhelpful "did you
     /// mean" suggestion. Also catches panics in handlers because the test
     /// runner unwinds the panic and reports the offending command.
-    /// `/save` and `/export` default their output paths to `cwd`-relative
-    /// filenames when no arg is supplied, which would scribble files into
-    /// `crates/tui/` when CI runs from there. Pass an explicit tempdir-
-    /// relative path for those two so the dispatch test stays sandboxed.
+    /// `/save` still defaults its output path, while `/export` accepts a legacy
+    /// direct file path. Pass explicit tempdir paths so this smoke test covers
+    /// both file handlers without touching the developer's clipboard.
     fn invocation_for(command_name: &str, alias_or_name: &str, tmpdir: &std::path::Path) -> String {
         match command_name {
             "save" => format!("/{alias_or_name} {}", tmpdir.join("session.json").display()),

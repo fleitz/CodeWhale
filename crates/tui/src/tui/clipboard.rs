@@ -201,6 +201,8 @@ pub struct ClipboardHandler {
     clipboard_init_attempted: bool,
     #[cfg(test)]
     written_text: Vec<String>,
+    #[cfg(test)]
+    fail_text_writes: bool,
 }
 
 impl ClipboardHandler {
@@ -230,6 +232,8 @@ impl ClipboardHandler {
             clipboard_init_attempted: false,
             #[cfg(test)]
             written_text: Vec::new(),
+            #[cfg(test)]
+            fail_text_writes: false,
         }
     }
 
@@ -243,6 +247,14 @@ impl ClipboardHandler {
             },
             in_tmux,
         })
+    }
+
+    /// Construct a deterministic unavailable clipboard for command tests.
+    #[cfg(test)]
+    pub(crate) fn unavailable_for_test(in_ssh_session: bool) -> Self {
+        let mut handler = Self::for_test(in_ssh_session, false);
+        handler.fail_text_writes = true;
+        handler
     }
 
     /// SSH without a forwarded graphical display cannot synchronously read
@@ -326,6 +338,9 @@ impl ClipboardHandler {
     pub fn write_text(&mut self, text: &str) -> Result<()> {
         #[cfg(test)]
         {
+            if self.fail_text_writes {
+                bail!("test clipboard unavailable");
+            }
             self.written_text.push(text.to_string());
             Ok(())
         }

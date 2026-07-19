@@ -122,7 +122,7 @@
     "CmdDiffDescription": "Show file changes since session start",
     "CmdEditDescription": "Revise and resubmit the last message",
     "CmdExitDescription": "Exit the application",
-    "CmdExportDescription": "Export conversation to markdown (/export turn copies a compact turn handoff)",
+    "CmdExportDescription": "Copy a safe conversation export, or write it to an explicit file (/export turn for a compact handoff)",
     "CmdFeedbackDescription": "Generate a GitHub feedback URL",
     "CmdHfDescription": "Inspect Hugging Face MCP setup and concepts",
     "CmdHelpDescription": "Understand concepts, commands, and keybindings",
