@@ -1385,6 +1385,62 @@ async fn injected_model_duplicate_reads_execute_once_and_close_both_tool_ids() {
 }
 
 #[tokio::test]
+async fn coalesced_raw_read_error_touches_working_set_once() {
+    use crate::llm_client::mock::{MockLlmClient, canned};
+
+    let workspace = tempdir().expect("tempdir");
+    let duplicate_read_turn = vec![
+        canned::message_start("mock_msg_duplicate_missing_read"),
+        canned::tool_use_block_start(0, "call-missing-1", "read_file"),
+        canned::tool_input_delta(0, r#"{"path":"missing.rs"}"#),
+        canned::block_stop(0),
+        canned::tool_use_block_start(1, "call-missing-2", "read_file"),
+        canned::tool_input_delta(1, r#"{"path":"missing.rs"}"#),
+        canned::block_stop(1),
+        canned::message_delta("tool_use", None),
+        canned::message_stop(),
+    ];
+    let mock = std::sync::Arc::new(MockLlmClient::new(vec![
+        duplicate_read_turn,
+        canned::simple_text_turn("Missing read handled."),
+    ]));
+    let client: crate::core::model_client::SharedModelClient = mock;
+    let (mut engine, _handle) = Engine::new_with_model_client(
+        deterministic_engine_config(workspace.path()),
+        &Config::default(),
+        client,
+    );
+    let context = crate::tools::ToolContext::new(workspace.path().to_path_buf());
+    let mut registry = crate::tools::ToolRegistry::new(context);
+    registry.register(std::sync::Arc::new(crate::tools::file::ReadFileTool));
+    let tools = Some(registry.to_api_tools_with_cache(true));
+    let mut turn = crate::core::turn::TurnContext::new(8);
+
+    let (status, error) = engine
+        .handle_deepseek_turn(
+            &mut turn,
+            Some(&registry),
+            tools,
+            AppMode::Agent,
+            false,
+            Vec::new(),
+        )
+        .await;
+
+    assert_eq!(status, TurnOutcomeStatus::Completed, "{error:?}");
+    let entry = engine
+        .session
+        .working_set
+        .entries
+        .get("missing.rs")
+        .expect("leader error should record the attempted path");
+    // The generic extractor records this path-shaped value once from its
+    // extension and once from the explicit `path` key. One physical tool
+    // observation is therefore two touches; the old follower bug made four.
+    assert_eq!(entry.touches, 2, "the follower must not add another touch");
+}
+
+#[tokio::test]
 async fn injected_model_receives_malformed_tool_feedback_and_recovers() {
     use crate::llm_client::mock::{MockLlmClient, canned};
 
