@@ -197,6 +197,9 @@ struct Cli {
     no_mouse_capture: bool,
     #[arg(long = "skip-onboarding")]
     skip_onboarding: bool,
+    /// Skip loading project-level config from the selected workspace.
+    #[arg(long = "no-project-config")]
+    no_project_config: bool,
     /// Legacy compatibility alias for Act + Full Access.
     #[arg(long, hide = true)]
     yolo: bool,
@@ -4243,6 +4246,9 @@ fn build_tui_command_with_paths(
     if cli.skip_onboarding {
         cmd.arg("--skip-onboarding");
     }
+    if cli.no_project_config {
+        cmd.arg("--no-project-config");
+    }
     cmd.args(passthrough);
 
     let uses_raw_tui_provider = cli
@@ -7395,6 +7401,7 @@ model = "qwen-2.5-7b"
             "--no-alt-screen",
             "--no-mouse-capture",
             "--skip-onboarding",
+            "--no-project-config",
             "model",
             "resolve",
             "deepseek-v4-pro",
@@ -7420,6 +7427,46 @@ model = "qwen-2.5-7b"
         assert!(cli.no_mouse_capture);
         assert!(!cli.mouse_capture);
         assert!(cli.skip_onboarding);
+        assert!(cli.no_project_config);
+    }
+
+    #[test]
+    fn build_tui_command_forwards_project_config_isolation_before_exec() {
+        let _lock = env_lock();
+        let (_dir, _bin) = install_fake_tui_binary();
+        let cli = parse_ok(&[
+            "codewhale",
+            "--workspace",
+            "/tmp/verifiers-workspace",
+            "--skip-onboarding",
+            "--no-project-config",
+            "exec",
+            "Reply OK",
+        ]);
+        let resolved = resolved_runtime_for_test(ProviderKind::Openai, ProviderSource::Config);
+
+        let cmd = build_tui_command(
+            &cli,
+            &resolved,
+            vec!["exec".to_string(), "Reply OK".to_string()],
+        )
+        .expect("isolated exec command");
+        let args = cmd
+            .get_args()
+            .map(|arg| arg.to_string_lossy().into_owned())
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            args,
+            vec![
+                "--workspace",
+                "/tmp/verifiers-workspace",
+                "--skip-onboarding",
+                "--no-project-config",
+                "exec",
+                "Reply OK",
+            ]
+        );
     }
 
     #[test]
