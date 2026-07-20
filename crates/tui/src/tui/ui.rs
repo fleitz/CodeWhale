@@ -8725,12 +8725,32 @@ fn goal_status_from_snapshot(snapshot: &GoalSnapshot) -> Option<GoalStatus> {
 }
 
 pub(crate) fn apply_goal_snapshot_to_app(app: &mut App, snapshot: &GoalSnapshot) -> bool {
+    // An explicit engine-side clear is represented by the one canonical empty
+    // state emitted by GoalState::snapshot. Require both fields so a malformed
+    // objective-less Active/Blocked update cannot erase valid visible state.
+    if snapshot.objective.is_none() && snapshot.status.trim() == "none" {
+        let changed = app.hunt.quarry.is_some()
+            || app.hunt.token_budget.is_some()
+            || app.hunt.tokens_used != 0
+            || app.hunt.time_used_seconds != 0
+            || app.hunt.continuation_count != 0
+            || app.hunt.started_at.is_some()
+            || app.hunt.finished_at.is_some()
+            || app.hunt.verdict != HuntVerdict::default();
+        app.hunt = crate::tui::app::HuntState::default();
+        return changed;
+    }
+
     let Some(objective) = snapshot
         .objective
         .as_deref()
         .map(str::trim)
         .filter(|objective| !objective.is_empty())
     else {
+        tracing::warn!(
+            "ignoring objective-less runtime goal snapshot with non-clear status: {}",
+            snapshot.status
+        );
         return false;
     };
     let Some(status) = goal_status_from_snapshot(snapshot) else {

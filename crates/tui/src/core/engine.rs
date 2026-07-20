@@ -1646,28 +1646,6 @@ impl Engine {
                         // running are processed before this operation. Re-read
                         // the live goal now so pause/clear/complete/blocked can
                         // cancel a stale continuation without starting a turn.
-                        let goal_is_active = self
-                            .config
-                            .goal_state
-                            .lock()
-                            .map(|state| state.snapshot().is_active())
-                            .unwrap_or(false);
-                        if !goal_is_active {
-                            continue;
-                        }
-
-                        let route = match self.current_runtime_route() {
-                            Ok(route) => route,
-                            Err(err) => {
-                                let _ = self
-                                    .tx_event
-                                    .send(Event::error(ErrorEnvelope::fatal_auth(format!(
-                                        "Goal continuation stopped because its provider route is no longer valid: {err}"
-                                    ))))
-                                    .await;
-                                continue;
-                            }
-                        };
                         let (content, goal_snapshot) = match self.goal_continuation_if_active() {
                             GoalContinuationAction::Inactive => continue,
                             GoalContinuationAction::Dispatch { content, snapshot } => {
@@ -1685,6 +1663,22 @@ impl Engine {
                                 self.emit_session_updated().await;
                                 self.emit_goal_updated().await;
                                 let _ = self.tx_event.send(Event::status(message)).await;
+                                continue;
+                            }
+                        };
+                        // Budget and inactive-state decisions are route
+                        // independent. Resolve the live route only for a real
+                        // dispatch so an exhausted goal still reaches its
+                        // truthful terminal state when provider config drifted.
+                        let route = match self.current_runtime_route() {
+                            Ok(route) => route,
+                            Err(err) => {
+                                let _ = self
+                                    .tx_event
+                                    .send(Event::error(ErrorEnvelope::fatal_auth(format!(
+                                        "Goal continuation stopped because its provider route is no longer valid: {err}"
+                                    ))))
+                                    .await;
                                 continue;
                             }
                         };
@@ -2763,7 +2757,7 @@ impl Engine {
     /// status to `SharedGoalState` so the cross-turn continuation loop respects
     /// it. This does NOT dispatch a model turn — it's a control-plane update.
     async fn handle_set_goal_status(&mut self, status: GoalStatus, clear: bool) {
-        match self.config.goal_state.lock() {
+        let snapshot = match self.config.goal_state.lock() {
             Ok(mut state) => {
                 if clear {
                     // `/goal clear` — wipe the objective entirely.
@@ -2777,11 +2771,34 @@ impl Engine {
                     let budget = state.token_budget();
                     state.sync_from_host_status(objective.as_deref(), budget, status);
                 }
+                state.snapshot()
             }
             Err(err) => {
                 tracing::warn!("goal state lock poisoned during SetGoalStatus: {err}");
+                return;
             }
-        }
+        };
+
+        // Keep every host-side projection aligned with the authoritative
+        // SharedGoalState. In particular, a cleared state must also clear the
+        // configured fallback used by `goal_objective_for_prompt`; otherwise a
+        // prompt refresh would silently restore the old <session_goal> block.
+        self.config.goal_objective.clone_from(&snapshot.objective);
+        self.config.goal_token_budget = snapshot.token_budget;
+        self.config.goal_status = if snapshot.objective.is_some() {
+            status
+        } else {
+            GoalStatus::Active
+        };
+        self.refresh_system_prompt();
+        self.emit_session_updated().await;
+        // Unlike routine end-of-turn updates, an explicit clear must publish
+        // the canonical empty snapshot. Keeping this scoped to the control op
+        // avoids an unrelated no-goal turn racing with a newly declared goal in
+        // the UI while still letting the clear win over a preceding active
+        // TurnComplete snapshot.
+        let _ = self.tx_event.send(Event::GoalUpdated { snapshot }).await;
+
         let label = if clear {
             "cleared"
         } else {
@@ -2796,7 +2813,6 @@ impl Engine {
             .tx_event
             .send(Event::status(format!("Goal {label}.")))
             .await;
-        self.emit_goal_updated().await;
     }
 
     #[allow(clippy::too_many_arguments)]

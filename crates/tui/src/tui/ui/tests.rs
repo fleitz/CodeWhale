@@ -6110,6 +6110,66 @@ fn apply_goal_snapshot_updates_visible_goal_status() {
 }
 
 #[test]
+fn canonical_goal_clear_wins_after_stale_active_snapshot() {
+    let mut app = create_test_app();
+    let stale_active = crate::tools::goal::GoalSnapshot {
+        objective: Some("Goal cleared while the prior turn finished".to_string()),
+        status: "active".to_string(),
+        token_budget: Some(10_000),
+        tokens_used: 500,
+        time_used_seconds: 5,
+        continuation_count: 2,
+        elapsed_seconds: Some(5),
+        evidence: None,
+        blocker: None,
+        completion_verification: None,
+    };
+    assert!(apply_goal_snapshot_to_app(&mut app, &stale_active));
+    assert!(app.hunt.quarry.is_some());
+
+    // SetGoalStatus(clear) is processed after the prior turn's active update.
+    // Its canonical empty snapshot must be observable and win the replay.
+    let cleared = crate::tools::goal::GoalSnapshot {
+        objective: None,
+        status: "none".to_string(),
+        token_budget: None,
+        tokens_used: 0,
+        time_used_seconds: 0,
+        continuation_count: 0,
+        elapsed_seconds: None,
+        evidence: None,
+        blocker: None,
+        completion_verification: None,
+    };
+    assert!(apply_goal_snapshot_to_app(&mut app, &cleared));
+    assert!(app.hunt.quarry.is_none());
+    assert!(app.hunt.token_budget.is_none());
+    assert_eq!(app.hunt.tokens_used, 0);
+    assert_eq!(app.hunt.time_used_seconds, 0);
+    assert_eq!(app.hunt.continuation_count, 0);
+    assert!(app.hunt.started_at.is_none());
+    assert!(app.hunt.finished_at.is_none());
+    assert_eq!(app.hunt.verdict, crate::tui::app::HuntVerdict::Hunting);
+    assert!(
+        !apply_goal_snapshot_to_app(&mut app, &cleared),
+        "replaying the same clear receipt must be idempotent"
+    );
+
+    // Only the exact empty/none pair is a clear. A malformed objective-less
+    // active update must not erase subsequently visible goal state.
+    assert!(apply_goal_snapshot_to_app(&mut app, &stale_active));
+    let malformed = crate::tools::goal::GoalSnapshot {
+        status: "active".to_string(),
+        ..cleared
+    };
+    assert!(!apply_goal_snapshot_to_app(&mut app, &malformed));
+    assert_eq!(
+        app.hunt.quarry.as_deref(),
+        Some("Goal cleared while the prior turn finished")
+    );
+}
+
+#[test]
 fn apply_goal_snapshot_resume_clears_frozen_timer() {
     let mut app = create_test_app();
     app.hunt.quarry = Some("Ship the release lane".to_string());

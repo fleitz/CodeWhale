@@ -535,6 +535,8 @@ async fn goal_continuation_preserves_goal_and_resolves_updated_authoritative_rou
     // that control operation, then put a snapshot receipt behind the already
     // queued continuation. Receiving the receipt proves the continuation was
     // consumed; no third TurnStarted may have been emitted.
+    let mut saw_paused_prompt = false;
+    let mut saw_paused_goal = false;
     loop {
         let event = tokio::time::timeout(Duration::from_secs(3), async {
             handle.rx_event.write().await.recv().await
@@ -542,13 +544,43 @@ async fn goal_continuation_preserves_goal_and_resolves_updated_authoritative_rou
         .await
         .expect("goal pause event timeout")
         .expect("goal pause event");
-        if matches!(event, Event::Status { ref message } if message == "Goal paused.") {
-            break;
+        match event {
+            Event::SessionUpdated {
+                system_prompt: Some(system_prompt),
+                ..
+            } => {
+                let prompt = match system_prompt {
+                    SystemPrompt::Text(text) => text,
+                    SystemPrompt::Blocks(blocks) => blocks
+                        .into_iter()
+                        .map(|block| block.text)
+                        .collect::<Vec<_>>()
+                        .join("\n"),
+                };
+                if !prompt.contains("<session_goal>") {
+                    saw_paused_prompt = true;
+                }
+            }
+            Event::GoalUpdated { snapshot } if snapshot.status == "paused" => {
+                assert_eq!(snapshot.objective.as_deref(), Some("keep going"));
+                saw_paused_goal = true;
+            }
+            Event::Status { ref message } if message == "Goal paused." => {
+                assert!(
+                    saw_paused_prompt,
+                    "pause status must follow the persisted prompt refresh"
+                );
+                assert!(
+                    saw_paused_goal,
+                    "pause status must follow the visible goal snapshot"
+                );
+                break;
+            }
+            Event::TurnStarted { .. } => {
+                panic!("queued pause must prevent an additional goal turn")
+            }
+            _ => {}
         }
-        assert!(
-            !matches!(event, Event::TurnStarted { .. }),
-            "queued pause must prevent an additional goal turn"
-        );
     }
 
     let (snapshot_tx, snapshot_rx) = tokio::sync::oneshot::channel();
@@ -716,6 +748,211 @@ async fn cross_turn_token_budget_exhaustion_blocks_goal_and_refreshes_prompt() {
         model.call_count(),
         1,
         "budget stop must not call the model again"
+    );
+
+    handle.send(Op::Shutdown).await.expect("shutdown engine");
+    run_task.await.expect("engine task");
+}
+
+#[tokio::test]
+async fn queued_goal_clear_refreshes_prompt_and_cancels_stale_continuation() {
+    let config = Config::default();
+    let engine_config = EngineConfig {
+        snapshots_enabled: false,
+        terminal_chrome_enabled: false,
+        goal_objective: Some("clear this goal".to_string()),
+        goal_token_budget: Some(42_000),
+        ..EngineConfig::default()
+    };
+    let (engine, handle) = Engine::new(engine_config, &config);
+    let goal_state = engine.config.goal_state.clone();
+    let run_task = tokio::spawn(engine.run());
+
+    // Model the mailbox order produced when the user clears a goal while its
+    // prior turn is still finishing: the control reaches the queue before the
+    // synthetic continuation that TurnComplete schedules.
+    handle
+        .send(Op::SetGoalStatus {
+            status: crate::tools::goal::GoalStatus::Active,
+            clear: true,
+        })
+        .await
+        .expect("queue goal clear");
+    handle
+        .send(Op::ContinueGoal {
+            dynamic_tools: Vec::new(),
+        })
+        .await
+        .expect("queue stale continuation");
+
+    // This receipt sits behind both operations. Once it arrives, a stale
+    // continuation has either incorrectly started a turn or been consumed.
+    let session = handle
+        .get_session_snapshot()
+        .await
+        .expect("post-clear session snapshot");
+    let prompt = match session.system_prompt.expect("post-clear system prompt") {
+        SystemPrompt::Text(text) => text,
+        SystemPrompt::Blocks(blocks) => blocks
+            .into_iter()
+            .map(|block| block.text)
+            .collect::<Vec<_>>()
+            .join("\n"),
+    };
+    assert!(
+        !prompt.contains("<session_goal>"),
+        "cleared config fallback must not restore the goal prompt: {prompt}"
+    );
+    let snapshot = goal_state.lock().expect("goal lock").snapshot();
+    assert_eq!(snapshot.objective, None);
+    assert_eq!(snapshot.status, "none");
+    assert_eq!(snapshot.token_budget, None);
+
+    let mut saw_clear_session = false;
+    let mut saw_clear_goal = false;
+    let mut saw_clear_status = false;
+    {
+        let mut events = handle.rx_event.write().await;
+        while let Ok(event) = events.try_recv() {
+            match event {
+                Event::TurnStarted { .. } => {
+                    panic!("queued clear must prevent a stale goal continuation")
+                }
+                Event::SessionUpdated { system_prompt, .. } => {
+                    let prompt = match system_prompt.expect("clear SessionUpdated prompt") {
+                        SystemPrompt::Text(text) => text,
+                        SystemPrompt::Blocks(blocks) => blocks
+                            .into_iter()
+                            .map(|block| block.text)
+                            .collect::<Vec<_>>()
+                            .join("\n"),
+                    };
+                    assert!(!prompt.contains("<session_goal>"), "{prompt}");
+                    saw_clear_session = true;
+                }
+                Event::GoalUpdated { snapshot } => {
+                    assert_eq!(snapshot.objective, None);
+                    assert_eq!(snapshot.status, "none");
+                    saw_clear_goal = true;
+                }
+                Event::Status { message } if message == "Goal cleared." => {
+                    saw_clear_status = true;
+                }
+                _ => {}
+            }
+        }
+    }
+    assert!(
+        saw_clear_session,
+        "clear must refresh persisted prompt state"
+    );
+    assert!(saw_clear_goal, "clear must emit a canonical empty snapshot");
+    assert!(saw_clear_status, "clear must remain user-visible");
+
+    handle.send(Op::Shutdown).await.expect("shutdown engine");
+    run_task.await.expect("engine task");
+}
+
+#[tokio::test]
+async fn exhausted_goal_terminalizes_before_invalid_route_resolution() {
+    let mut custom = HashMap::new();
+    custom.insert(
+        "custom-a".to_string(),
+        crate::config::ProviderConfig {
+            kind: Some("openai-compatible".to_string()),
+            base_url: Some("http://127.0.0.1:18181/v1".to_string()),
+            model: Some("local-model".to_string()),
+            api_key: Some("local-test-key".to_string()),
+            ..crate::config::ProviderConfig::default()
+        },
+    );
+    let config = Config {
+        provider: Some("custom-a".to_string()),
+        providers: Some(crate::config::ProvidersConfig {
+            custom,
+            ..crate::config::ProvidersConfig::default()
+        }),
+        ..Config::default()
+    };
+    let engine_config = EngineConfig {
+        model: "local-model".to_string(),
+        snapshots_enabled: false,
+        terminal_chrome_enabled: false,
+        goal_objective: Some("stop at the budget".to_string()),
+        goal_token_budget: Some(10),
+        ..EngineConfig::default()
+    };
+    let (mut engine, handle) = Engine::new(engine_config, &config);
+    let goal_state = engine.config.goal_state.clone();
+    goal_state.lock().expect("goal lock").record_usage(11, 0);
+
+    let mut invalid_route_config = config;
+    invalid_route_config
+        .providers
+        .as_mut()
+        .expect("custom providers")
+        .custom
+        .clear();
+    engine.authoritative_route_config =
+        Some(Arc::new(parking_lot::RwLock::new(invalid_route_config)));
+    assert!(
+        engine.current_runtime_route().is_err(),
+        "fixture must prove route resolution cannot succeed"
+    );
+    let run_task = tokio::spawn(engine.run());
+
+    handle
+        .send(Op::ContinueGoal {
+            dynamic_tools: Vec::new(),
+        })
+        .await
+        .expect("queue exhausted continuation");
+
+    let mut saw_blocked_goal = false;
+    let mut saw_budget_status = false;
+    while !(saw_blocked_goal && saw_budget_status) {
+        let event = tokio::time::timeout(model_turn_event_timeout(), async {
+            handle.rx_event.write().await.recv().await
+        })
+        .await
+        .expect("budget terminal event timeout")
+        .expect("budget terminal event");
+        match event {
+            Event::TurnStarted { .. } => {
+                panic!("an exhausted goal must not attempt an invalid route")
+            }
+            Event::Error { envelope, .. } => {
+                panic!("budget decision must precede route failure: {envelope:?}")
+            }
+            Event::GoalUpdated { snapshot } if snapshot.status == "blocked" => {
+                assert_eq!(snapshot.tokens_used, 11);
+                assert_eq!(snapshot.token_budget, Some(10));
+                saw_blocked_goal = true;
+            }
+            Event::Status { message } if message.contains("Goal token budget reached") => {
+                assert!(message.contains("11 / 10 tokens"), "{message}");
+                saw_budget_status = true;
+            }
+            _ => {}
+        }
+    }
+
+    let session = handle
+        .get_session_snapshot()
+        .await
+        .expect("post-budget session snapshot");
+    let prompt = match session.system_prompt.expect("post-budget system prompt") {
+        SystemPrompt::Text(text) => text,
+        SystemPrompt::Blocks(blocks) => blocks
+            .into_iter()
+            .map(|block| block.text)
+            .collect::<Vec<_>>()
+            .join("\n"),
+    };
+    assert!(!prompt.contains("<session_goal>"), "{prompt}");
+    assert_eq!(
+        goal_state.lock().expect("goal lock").snapshot().status,
+        "blocked"
     );
 
     handle.send(Op::Shutdown).await.expect("shutdown engine");
