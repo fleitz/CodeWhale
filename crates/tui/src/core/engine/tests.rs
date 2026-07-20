@@ -4754,7 +4754,12 @@ async fn full_access_blocks_background_catastrophic_shell_without_prompt_or_side
     let server = MockServer::start().await;
     let victim = workspace.path().join("must-survive");
     fs::write(&victim, "guarded\n").expect("write guarded fixture");
-    let command = format!("rm -rf {}", victim.display());
+    // Keep the engine-boundary regression intrinsically harmless on every
+    // runner: the quoted payload trips the same built-in catastrophic-command
+    // detector, while an execution regression would only overwrite the
+    // sentinel. The policy-level sibling tests exercise real destructive
+    // command shapes directly without ever dispatching them to a shell.
+    let command = format!("echo \"rm -rf /\" > \"{}\"", victim.display());
     let arguments = serde_json::to_string(&json!({
         "command": command,
         "background": true,
@@ -4890,7 +4895,11 @@ async fn full_access_blocks_background_catastrophic_shell_without_prompt_or_side
     run_task.await.expect("engine task");
     assert!(saw_tool_result);
     assert!(saw_complete);
-    assert!(victim.exists(), "blocked command must not touch its target");
+    assert_eq!(
+        fs::read_to_string(&victim).expect("read guarded fixture"),
+        "guarded\n",
+        "blocked command must not touch its target"
+    );
 }
 
 #[tokio::test]
