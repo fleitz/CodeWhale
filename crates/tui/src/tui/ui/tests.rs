@@ -13652,8 +13652,14 @@ fn activity_detail_includes_tool_handle_and_neighbor_context() {
         )
         .footer_chord,
     );
-    assert!(body.contains(&format!("{details_chord} raw")), "{body}");
-    assert!(body.contains("details)"), "{body}");
+    // The pager wraps this line at a platform-dependent point ("⌥V raw /
+    // details" on macOS, "Alt+V / raw details" on Windows), so normalize
+    // whitespace before asserting the full truthful hint.
+    let flat = body.split_whitespace().collect::<Vec<_>>().join(" ");
+    assert!(
+        flat.contains(&format!("{details_chord} raw details)")),
+        "{body}"
+    );
 }
 
 #[test]
