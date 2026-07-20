@@ -287,7 +287,7 @@ async fn exact_turn_snapshot_restores_custom_endpoint_and_turn_receipt_after_bui
 }
 
 #[tokio::test]
-async fn goal_continuation_resolves_updated_authoritative_route_after_active_turn() {
+async fn goal_continuation_preserves_goal_and_resolves_updated_authoritative_route() {
     let mut custom = HashMap::new();
     custom.insert(
         "custom-a".to_string(),
@@ -317,6 +317,7 @@ async fn goal_continuation_resolves_updated_authoritative_route_after_active_tur
     let authoritative = Arc::new(parking_lot::RwLock::new(config.clone()));
     let (mut engine, handle) = Engine::new(engine_config, &config);
     engine.authoritative_route_config = Some(Arc::clone(&authoritative));
+    let goal_state = engine.config.goal_state.clone();
 
     handle
         .send(Op::SendMessage {
@@ -371,6 +372,9 @@ async fn goal_continuation_resolves_updated_authoritative_route_after_active_tur
                 starts += 1;
                 assert_eq!(route.provider_identity, "custom-a");
                 if starts == 2 {
+                    let snapshot = goal_state.lock().expect("goal lock").snapshot();
+                    assert_eq!(snapshot.objective.as_deref(), Some("keep going"));
+                    assert!(snapshot.is_active(), "synthetic turn must retain the goal");
                     handle
                         .send(Op::SetGoalStatus {
                             status: crate::tools::goal::GoalStatus::Paused,

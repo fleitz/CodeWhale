@@ -2590,7 +2590,7 @@ impl Engine {
     /// There is no continuation cap — a goal runs until the model self-reports
     /// done/blocked, the user pauses or clears, or an optional token/time
     /// budget is exhausted. The loop is "until done," not "until N turns."
-    fn goal_continuation_if_active(&self) -> Option<String> {
+    fn goal_continuation_if_active(&self) -> Option<(String, GoalSnapshot)> {
         let snapshot = self.config.goal_state.lock().ok()?.snapshot();
         if !snapshot.is_active() {
             return None;
@@ -2619,12 +2619,13 @@ impl Engine {
         );
 
         match decision {
-            crate::goal_loop::ContinuationDecision::Continue => {
-                Some(crate::tools::goal::render_continuation_prompt(
+            crate::goal_loop::ContinuationDecision::Continue => Some((
+                crate::tools::goal::render_continuation_prompt(
                     &snapshot,
                     snapshot.continuation_count,
-                ))
-            }
+                ),
+                snapshot,
+            )),
             // All stop reasons → no continuation. The caller (the async turn
             // completion path) emits a status message for budget-exhaustion.
             crate::goal_loop::ContinuationDecision::Stop(reason) => {
@@ -3164,7 +3165,7 @@ impl Engine {
         // further turn. A Failed or Interrupted turn never continues.
         if !self.host_managed_turns()
             && status == TurnOutcomeStatus::Completed
-            && let Some(continuation) = self.goal_continuation_if_active()
+            && let Some((continuation, goal_snapshot)) = self.goal_continuation_if_active()
         {
             // Re-dispatch with the same route/mode/approval settings as
             // the prior turn. The non-Copy values were moved into
@@ -3179,8 +3180,13 @@ impl Engine {
                             mode,
                             route: Box::new(route),
                             compaction: Box::new(self.config.compaction.clone()),
-                            goal_objective: None,
-                            goal_token_budget: None,
+                            // Carry the same authoritative runtime snapshot into
+                            // the synthetic turn. Passing `None` here is a host
+                            // instruction to clear `SharedGoalState`, so it made
+                            // an explicit `/goal <objective>` survive only until
+                            // the first cross-turn continuation.
+                            goal_objective: goal_snapshot.objective,
+                            goal_token_budget: goal_snapshot.token_budget,
                             goal_status: GoalStatus::Active,
                             reasoning_effort: self.session.reasoning_effort.clone(),
                             reasoning_effort_auto,
