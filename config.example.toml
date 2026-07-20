@@ -49,7 +49,10 @@ base_url = "https://api.deepseek.com/beta"
 #   GLM-5.1                       — direct Z.AI smaller model
 #   GLM-5-Turbo                   — direct Z.AI fast model (faster/explore sub-agent sibling)
 #   step-3.7-flash                — default direct StepFun / StepFlash model ID
-#   kimi-k2.6                       — default Moonshot/Kimi model ID
+#   kimi-k3                         — direct Moonshot K3 model ID (1M context)
+#   kimi-k2.7-code                  — default direct Moonshot/Kimi K2.7 model ID
+#   k3                              — Kimi Code membership K3 API model ID
+#   kimi-for-coding                 — Kimi Code membership K2.7 compatibility ID
 #   gpt-4.1                         — default generic OpenAI-compatible model ID
 #   deepseek-ai/deepseek-v4-flash   — default AtlasCloud model ID
 #   deepseek-reasoner               — default Wanjie Ark model ID
@@ -485,13 +488,17 @@ max_subagents = 10 # optional (1-20)
 [providers.moonshot]
 # api_key = "YOUR_MOONSHOT_API_KEY"           # or KIMI_API_KEY
 # base_url = "https://api.moonshot.ai/v1"      # or KIMI_BASE_URL
-# model = "kimi-k2.6"
-# # Supported Kimi Code path (use a Kimi Code API key):
-# # api_key = "YOUR_KIMI_CODE_API_KEY"
-# # base_url = "https://api.kimi.com/coding/v1"
-# # model = "kimi-for-coding"
-# # Kimi OAuth is not supported. Legacy auth_mode = "kimi_oauth" fails closed
-# # to the API-key guidance above without probing Kimi CLI credential files.
+# model = "kimi-k3"                         # direct Moonshot K3 wire ID
+# Kimi Code membership path (key: https://www.kimi.com/code/console):
+# api_key = "YOUR_KIMI_CODE_API_KEY"
+# base_url = "https://api.kimi.com/coding/v1"
+# model = "k3"                              # Kimi Code K3 wire ID
+# context_window = 1048576                   # only for Allegretto+ plans with 1M access
+# Omit context_window for Codewhale's safe 262144-token K3 baseline.
+# `k3[1m]` is a Claude Code-only convention, not an API model ID; Codewhale rejects it.
+# Kimi Code K2.7 remains available to all members as model = "kimi-for-coding".
+# Kimi OAuth is not supported. Legacy auth_mode = "kimi_oauth" fails closed
+# to the API-key guidance above without probing Kimi CLI credential files.
 
 # Z.AI GLM Coding Plan endpoint (https://docs.z.ai)
 [providers.zai]
