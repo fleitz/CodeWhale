@@ -1434,7 +1434,11 @@ async fn run_async_main(
     if let Some(command) = command {
         return match command {
             Commands::Doctor(args) => {
-                let config = load_config_from_cli(&cli)?;
+                let config = match load_config_from_cli(&cli) {
+                    Ok(config) => config,
+                    Err(error) if args.json => return run_doctor_json_config_error(&error),
+                    Err(error) => return Err(error),
+                };
                 let workspace = resolve_workspace(&cli);
                 if args.context_json {
                     run_doctor_context_json(&config, &workspace)
@@ -5776,6 +5780,29 @@ fn runtime_posture_source_id(source: codewhale_config::RuntimePostureSource) -> 
         codewhale_config::RuntimePostureSource::Inherited => "inherited",
         codewhale_config::RuntimePostureSource::Confirmed => "confirmed",
     }
+}
+
+/// Emit a bounded, secret-redacted JSON failure when configuration cannot be
+/// loaded or validated. Invalid configuration must not be forced through the
+/// normal doctor report because its route/capability facts would be misleading.
+fn run_doctor_json_config_error(error: &anyhow::Error) -> Result<()> {
+    const MAX_ERROR_CHARS: usize = 2_000;
+
+    let redacted = codewhale_config::persistence::redact_secrets(&format!("{error:#}"));
+    let message =
+        crate::utils::truncate_with_ellipsis(&redacted, MAX_ERROR_CHARS, "...[truncated]");
+    let report = serde_json::json!({
+        "status": "error",
+        "error": {
+            "kind": "config_validation",
+            "message": message,
+        },
+    });
+    println!("{}", serde_json::to_string_pretty(&report)?);
+
+    // Keep stderr generic: the actionable, redacted error is already on
+    // stdout, and Rust's Result termination must never redisclose a secret.
+    bail!("doctor configuration validation failed; see JSON output")
 }
 
 /// Machine-readable counterpart to `run_doctor`. Skips the live API call so it
@@ -12321,36 +12348,6 @@ mod doctor_endpoint_tests {
         assert_eq!(report["context_window_source"], "catalog");
         assert_eq!(report["max_output"], 131_072);
         assert_eq!(report["thinking_supported"], true);
-    }
-
-    #[test]
-    fn doctor_reports_claude_only_k3_1m_alias_as_an_invalid_api_model() {
-        let config = Config {
-            provider: Some("moonshot".to_string()),
-            providers: Some(crate::config::ProvidersConfig {
-                moonshot: crate::config::ProviderConfig {
-                    api_key: Some("kimi-plan-secret".to_string()),
-                    base_url: Some(crate::config::DEFAULT_KIMI_CODE_BASE_URL.to_string()),
-                    model: Some("k3[1m]".to_string()),
-                    ..Default::default()
-                },
-                ..Default::default()
-            }),
-            ..Default::default()
-        };
-
-        for report in [
-            doctor_route_report(&config),
-            provider_capability_report(&config),
-        ] {
-            let error = report["route_error"]
-                .as_str()
-                .expect("doctor must expose the route rejection");
-            assert!(error.contains("model = \"k3\""), "{error}");
-            assert!(error.contains("context_window = 1048576"), "{error}");
-            assert!(error.contains("plan includes 1M context"), "{error}");
-            assert!(!report.to_string().contains("kimi-plan-secret"));
-        }
     }
 
     #[test]

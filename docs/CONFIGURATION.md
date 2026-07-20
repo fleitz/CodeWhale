@@ -1759,6 +1759,11 @@ desktop-managed local service such as Ollama. Top-level keys: `version`,
 (`env`/`config`/`missing`) rather than parsing the human-readable `doctor`
 text.
 
+If configuration loading or validation fails, `doctor --json` returns nonzero
+and prints a bounded, secret-redacted JSON error envelope with
+`status = "error"` and `error.kind = "config_validation"`. It does not emit a
+normal route or capability report for an invalid configuration.
+
 MCP entries are configuration diagnostics unless an explicit MCP command is
 run. `mcp.probe_scope` is `configuration`, `mcp.live_health_checked` is false,
 and each server separates `checks.configuration` / `checks.command` from

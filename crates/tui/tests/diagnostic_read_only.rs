@@ -36,6 +36,145 @@ fn doctor_json_leaves_a_sealed_home_untouched() {
 }
 
 #[test]
+fn doctor_json_rejects_kimi_code_claude_alias_with_machine_readable_guidance() {
+    let fixture = TempDir::new().expect("fixture root");
+    let workspace = fixture.path().join("workspace");
+    let home = fixture.path().join("home");
+    let codewhale_home = fixture.path().join("isolated-codewhale-home");
+    fs::create_dir_all(&workspace).expect("workspace");
+    let config = workspace.join("kimi-invalid.toml");
+    let config_bytes = br#"provider = "moonshot"
+
+[providers.moonshot]
+api_key = "doctor-json-kimi-secret"
+base_url = "https://api.kimi.com/coding/v1"
+model = "k3[1m]"
+"#;
+    fs::write(&config, config_bytes).expect("write invalid Kimi config");
+
+    let mut command = diagnostic_command(&workspace, &home);
+    command
+        .args([
+            "--config",
+            config.to_str().expect("config path"),
+            "doctor",
+            "--json",
+        ])
+        .env("CODEWHALE_HOME", &codewhale_home);
+    let output = command.output().expect("run invalid Kimi doctor json");
+
+    assert!(
+        !output.status.success(),
+        "invalid configuration must return nonzero\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let report: serde_json::Value = serde_json::from_slice(&output.stdout)
+        .expect("invalid doctor --json output must remain machine-readable");
+    assert_eq!(report["status"], "error");
+    assert_eq!(report["error"]["kind"], "config_validation");
+    let message = report["error"]["message"]
+        .as_str()
+        .expect("config error message");
+    assert!(message.contains("model = \"k3\""), "{message}");
+    assert!(message.contains("context_window = 1048576"), "{message}");
+    assert!(message.contains("plan includes 1M context"), "{message}");
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("doctor configuration validation failed; see JSON output"),
+        "stderr must point only to the JSON envelope: {stderr}"
+    );
+    for stdout_only_detail in ["k3[1m]", "context_window", "plan includes 1M context"] {
+        assert!(
+            !stderr.contains(stdout_only_detail),
+            "actionable validation details belong only in redacted stdout JSON: {stderr}"
+        );
+    }
+
+    let all_output = format!(
+        "{}\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(!all_output.contains("doctor-json-kimi-secret"));
+    assert_eq!(
+        fs::read(&config).expect("read config after doctor"),
+        config_bytes,
+        "doctor must not rewrite an invalid config"
+    );
+    assert!(!home.exists(), "doctor must not create HOME state");
+    assert!(
+        !codewhale_home.exists(),
+        "doctor must not create CODEWHALE_HOME state"
+    );
+}
+
+#[test]
+fn doctor_json_reports_valid_kimi_code_k3_context_override_from_runtime_route() {
+    let fixture = TempDir::new().expect("fixture root");
+    let workspace = fixture.path().join("workspace");
+    let home = fixture.path().join("home");
+    let codewhale_home = fixture.path().join("isolated-codewhale-home");
+    fs::create_dir_all(&workspace).expect("workspace");
+    let config = workspace.join("kimi-valid.toml");
+    let config_bytes = br#"provider = "moonshot"
+
+[providers.moonshot]
+api_key = "doctor-json-valid-kimi-secret"
+base_url = "https://api.kimi.com/coding/v1"
+model = "k3"
+context_window = 1048576
+"#;
+    fs::write(&config, config_bytes).expect("write valid Kimi config");
+
+    let mut command = diagnostic_command(&workspace, &home);
+    command
+        .args([
+            "--config",
+            config.to_str().expect("config path"),
+            "doctor",
+            "--json",
+        ])
+        .env("CODEWHALE_HOME", &codewhale_home);
+    let output = command.output().expect("run valid Kimi doctor json");
+
+    assert!(
+        output.status.success(),
+        "valid Kimi doctor --json failed\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let report: serde_json::Value =
+        serde_json::from_slice(&output.stdout).expect("machine-readable doctor report");
+    assert_eq!(report["route"]["model"], "k3");
+    assert_eq!(report["route"]["context_window"]["tokens"], 1_048_576);
+    assert_eq!(report["route"]["context_window"]["source"], "configured");
+    assert!(report["route"]["route_error"].is_null());
+    assert_eq!(report["capability"]["resolved_model"], "k3");
+    assert_eq!(report["capability"]["context_window"], 1_048_576);
+    assert_eq!(report["capability"]["context_window_source"], "configured");
+    assert!(report["capability"]["route_error"].is_null());
+
+    let all_output = format!(
+        "{}\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(!all_output.contains("doctor-json-valid-kimi-secret"));
+    assert_eq!(
+        fs::read(&config).expect("read config after doctor"),
+        config_bytes,
+        "doctor must not rewrite a valid config"
+    );
+    assert!(!home.exists(), "doctor must not create HOME state");
+    assert!(
+        !codewhale_home.exists(),
+        "doctor must not create CODEWHALE_HOME state"
+    );
+}
+
+#[test]
 fn doctor_context_json_leaves_a_sealed_home_untouched() {
     let output = run_sealed_diagnostic(["doctor", "--context-json"]);
     let report: serde_json::Value =

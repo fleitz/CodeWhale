@@ -482,6 +482,11 @@ metadata, not a live API probe. Current fields are:
 `resolved_provider`, `resolved_model`, `context_window`, `max_output`,
 `thinking_supported`, `cache_telemetry_supported`, and `request_payload_mode`.
 
+When configuration cannot be loaded or validated, `doctor --json` exits
+nonzero and prints a bounded, secret-redacted JSON error envelope with
+`status = "error"` and `error.kind = "config_validation"` instead of emitting
+misleading route or capability metadata.
+
 Most shipped providers use the Chat Completions request payload mode. Native
 Messages routes, including `minimax-anthropic`, use `/v1/messages`, and
 `openai-codex` uses Responses.
