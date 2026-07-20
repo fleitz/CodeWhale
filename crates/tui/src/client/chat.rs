@@ -25,13 +25,15 @@ use crate::config::{
 /// hang before any stream chunk exists, leaving the UI stuck at "Working...".
 const DEFAULT_STREAM_OPEN_TIMEOUT: Duration = Duration::from_secs(45);
 
-/// Reads `DEEPSEEK_STREAM_OPEN_TIMEOUT_SECS` as a bounded override for the
+/// Reads `CODEWHALE_STREAM_OPEN_TIMEOUT_SECS` (legacy alias:
+/// `DEEPSEEK_STREAM_OPEN_TIMEOUT_SECS`) as a bounded override for the
 /// response-header wait. This is intentionally shorter than the per-chunk idle
 /// timeout because it only covers connection setup and upstream header return,
 /// not model thinking time after streaming has started.
 fn stream_open_timeout() -> Duration {
     stream_open_timeout_from_env(
-        std::env::var("DEEPSEEK_STREAM_OPEN_TIMEOUT_SECS")
+        std::env::var("CODEWHALE_STREAM_OPEN_TIMEOUT_SECS")
+            .or_else(|_| std::env::var("DEEPSEEK_STREAM_OPEN_TIMEOUT_SECS"))
             .ok()
             .as_deref(),
     )

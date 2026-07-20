@@ -55,7 +55,8 @@ pub(crate) fn route_output_limit_tokens(route_limits: Option<RouteLimits>) -> Op
 /// Effective `max_tokens` for a model before provider/route caps are applied.
 #[must_use]
 pub(crate) fn effective_max_output_tokens(model: &str) -> u32 {
-    if let Ok(raw) = std::env::var("DEEPSEEK_MAX_OUTPUT_TOKENS")
+    if let Ok(raw) = std::env::var("CODEWHALE_MAX_OUTPUT_TOKENS")
+        .or_else(|_| std::env::var("DEEPSEEK_MAX_OUTPUT_TOKENS"))
         && let Ok(tokens) = raw.trim().parse::<u32>()
         && tokens > 0
     {

@@ -126,7 +126,9 @@ impl Drop for InteractiveTerminalGuard {
 }
 
 pub(super) fn emit_tool_audit(event: serde_json::Value) {
-    let Some(path) = std::env::var_os("DEEPSEEK_TOOL_AUDIT_LOG") else {
+    let Some(path) = std::env::var_os("CODEWHALE_TOOL_AUDIT_LOG")
+        .or_else(|| std::env::var_os("DEEPSEEK_TOOL_AUDIT_LOG"))
+    else {
         return;
     };
     emit_tool_audit_to_path(&PathBuf::from(path), event);

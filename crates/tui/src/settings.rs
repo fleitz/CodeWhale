@@ -1443,12 +1443,15 @@ fn settings_path_candidates() -> (Option<PathBuf>, Option<PathBuf>, Option<PathB
 
 fn legacy_config_override_parent() -> Option<PathBuf> {
     fn read() -> Option<PathBuf> {
-        let config_path = std::env::var("DEEPSEEK_CONFIG_PATH").ok()?;
-        let config_path = config_path.trim();
-        if config_path.is_empty() {
-            return None;
+        for var in ["CODEWHALE_CONFIG_PATH", "DEEPSEEK_CONFIG_PATH"] {
+            if let Ok(config_path) = std::env::var(var) {
+                let config_path = config_path.trim();
+                if !config_path.is_empty() {
+                    return expand_path(config_path).parent().map(Path::to_path_buf);
+                }
+            }
         }
-        expand_path(config_path).parent().map(Path::to_path_buf)
+        None
     }
 
     #[cfg(test)]

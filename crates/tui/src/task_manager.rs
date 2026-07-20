@@ -1847,10 +1847,12 @@ fn default_auto_approve() -> bool {
 /// `~/.deepseek/tasks` when only the legacy directory exists).
 #[must_use]
 pub fn default_tasks_dir() -> PathBuf {
-    if let Ok(path) = std::env::var("DEEPSEEK_TASKS_DIR")
-        && !path.trim().is_empty()
-    {
-        return PathBuf::from(path);
+    for var in ["CODEWHALE_TASKS_DIR", "DEEPSEEK_TASKS_DIR"] {
+        if let Ok(path) = std::env::var(var)
+            && !path.trim().is_empty()
+        {
+            return PathBuf::from(path);
+        }
     }
     dirs::home_dir()
         .map(|home| default_tasks_dir_for_home(&home))

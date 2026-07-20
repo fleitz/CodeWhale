@@ -307,12 +307,14 @@ impl Drop for ProviderRequestPermit {
 
 impl TokenBucket {
     fn from_env() -> Self {
-        let rps = std::env::var("DEEPSEEK_RATE_LIMIT_RPS")
+        let rps = std::env::var("CODEWHALE_RATE_LIMIT_RPS")
+            .or_else(|_| std::env::var("DEEPSEEK_RATE_LIMIT_RPS"))
             .ok()
             .and_then(|v| v.parse::<f64>().ok())
             .unwrap_or(DEFAULT_CLIENT_RATE_LIMIT_RPS)
             .max(0.0);
-        let burst = std::env::var("DEEPSEEK_RATE_LIMIT_BURST")
+        let burst = std::env::var("CODEWHALE_RATE_LIMIT_BURST")
+            .or_else(|_| std::env::var("DEEPSEEK_RATE_LIMIT_BURST"))
             .ok()
             .and_then(|v| v.parse::<f64>().ok())
             .unwrap_or(DEFAULT_CLIENT_RATE_LIMIT_BURST)
@@ -830,12 +832,14 @@ fn build_speech_synthesis_body(
 
 // === DeepSeekClient ===
 
-/// Returns true when DEEPSEEK_FORCE_HTTP1 is set to a truthy value
-/// (`1`, `true`, `yes`, `on`, case-insensitive). Used by `build_http_client`
-/// to opt out of HTTP/2 entirely when DeepSeek's edge mishandles long-lived H2
-/// streams (#103). Anything else (unset, `0`, `false`, ...) leaves HTTP/2 on.
+/// Returns true when CODEWHALE_FORCE_HTTP1 (legacy alias: DEEPSEEK_FORCE_HTTP1)
+/// is set to a truthy value (`1`, `true`, `yes`, `on`, case-insensitive). Used
+/// by `build_http_client` to opt out of HTTP/2 entirely when a provider's edge
+/// mishandles long-lived H2 streams (#103). Anything else (unset, `0`,
+/// `false`, ...) leaves HTTP/2 on.
 fn force_http1_from_env() -> bool {
-    std::env::var("DEEPSEEK_FORCE_HTTP1")
+    std::env::var("CODEWHALE_FORCE_HTTP1")
+        .or_else(|_| std::env::var("DEEPSEEK_FORCE_HTTP1"))
         .ok()
         .map(|v| v.trim().to_ascii_lowercase())
         .is_some_and(|v| matches!(v.as_str(), "1" | "true" | "yes" | "on"))

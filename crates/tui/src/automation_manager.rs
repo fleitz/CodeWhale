@@ -1154,10 +1154,12 @@ fn write_json_atomic<T: Serialize>(path: &Path, value: &T) -> Result<()> {
 
 pub fn default_automations_dir() -> PathBuf {
     // Most-specific override: an explicit automations dir.
-    if let Ok(path) = std::env::var("DEEPSEEK_AUTOMATIONS_DIR") {
-        let trimmed = path.trim();
-        if !trimmed.is_empty() {
-            return PathBuf::from(trimmed);
+    for var in ["CODEWHALE_AUTOMATIONS_DIR", "DEEPSEEK_AUTOMATIONS_DIR"] {
+        if let Ok(path) = std::env::var(var) {
+            let trimmed = path.trim();
+            if !trimmed.is_empty() {
+                return PathBuf::from(trimmed);
+            }
         }
     }
     // $CODEWHALE_HOME is a hard override of the base data directory

@@ -1494,8 +1494,11 @@ async fn run_async_main(
                     let _ = parse_sandbox_policy(sandbox, true, Vec::new(), false, false)?;
                     config.sandbox_mode = Some(sandbox.to_ascii_lowercase());
                 }
-                // Honour DEEPSEEK_BASE_URL forwarded by the CLI dispatcher from --base-url.
-                if let Ok(env_url) = std::env::var("DEEPSEEK_BASE_URL") {
+                // Honour CODEWHALE_BASE_URL / DEEPSEEK_BASE_URL forwarded by
+                // the CLI dispatcher from --base-url.
+                if let Ok(env_url) = std::env::var("CODEWHALE_BASE_URL")
+                    .or_else(|_| std::env::var("DEEPSEEK_BASE_URL"))
+                {
                     let trimmed = env_url.trim();
                     if !trimmed.is_empty() {
                         config.base_url = Some(trimmed.to_string());
@@ -5892,7 +5895,8 @@ fn run_doctor_json(
     // until the two PRs land and it can be replaced with a single
     // method call.)
     let memory_path = config.memory_path();
-    let memory_enabled_env = std::env::var("DEEPSEEK_MEMORY")
+    let memory_enabled_env = std::env::var("CODEWHALE_MEMORY")
+        .or_else(|_| std::env::var("DEEPSEEK_MEMORY"))
         .ok()
         .map(|raw| {
             matches!(
@@ -6829,6 +6833,7 @@ fn load_config_from_cli(cli: &Cli) -> Result<Config> {
 fn effective_config_profile(cli: &Cli) -> Option<String> {
     cli.profile
         .clone()
+        .or_else(|| std::env::var("CODEWHALE_PROFILE").ok())
         .or_else(|| std::env::var("DEEPSEEK_PROFILE").ok())
 }
 
@@ -8682,7 +8687,8 @@ fn merge_user_workspace_config(
         return;
     }
     let allow_shell_before = config.allow_shell;
-    let allow_shell_from_env = std::env::var_os("DEEPSEEK_ALLOW_SHELL").is_some();
+    let allow_shell_from_env = std::env::var_os("CODEWHALE_ALLOW_SHELL").is_some()
+        || std::env::var_os("DEEPSEEK_ALLOW_SHELL").is_some();
     let Some(path) = crate::config::resolve_load_config_path(config_path) else {
         return;
     };
@@ -9404,7 +9410,9 @@ async fn run_workflow_tool_command_inner(
     let workspace = resolve_workspace(cli);
     let mut config = load_config_from_cli(cli)?;
     merge_user_workspace_config(&mut config, cli.config.clone(), &workspace);
-    if let Ok(env_url) = std::env::var("DEEPSEEK_BASE_URL") {
+    if let Ok(env_url) =
+        std::env::var("CODEWHALE_BASE_URL").or_else(|_| std::env::var("DEEPSEEK_BASE_URL"))
+    {
         let trimmed = env_url.trim();
         if !trimmed.is_empty() {
             config.base_url = Some(trimmed.to_string());
