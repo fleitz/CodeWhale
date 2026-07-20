@@ -1343,16 +1343,29 @@ fn generic_tool_timeline_kind(generic: &crate::tui::history::GenericToolCell) ->
     }
 }
 
-fn timeline_cell_actions(app: &App, idx: usize, cell: &HistoryCell) -> Vec<&'static str> {
+fn timeline_cell_actions(app: &App, idx: usize, cell: &HistoryCell) -> Vec<String> {
     let mut actions = Vec::new();
     if app.cell_has_detail_target(idx) {
-        actions.push("v raw detail");
-    }
-    match cell {
-        HistoryCell::Tool(ToolCell::DiffPreview(_)) => actions.push("d diff"),
-        HistoryCell::Tool(ToolCell::PatchSummary(_)) => actions.push("d diff"),
-        HistoryCell::Tool(ToolCell::Generic(generic)) if generic.is_diff => actions.push("d diff"),
-        _ => {}
+        let details = crate::tui::shell_key_routing::display_chord(
+            crate::tui::shell_key_routing::binding(
+                crate::tui::shell_key_routing::ShellBindingId::ToolDetails,
+            )
+            .footer_chord,
+        );
+        // Diff-bearing cells open their diff through the same details chord;
+        // bare `v` / `d` always type text (TUI-DOG-002), so no bare-key claim.
+        let is_diff = matches!(
+            cell,
+            HistoryCell::Tool(ToolCell::DiffPreview(_) | ToolCell::PatchSummary(_))
+        ) || matches!(
+            cell,
+            HistoryCell::Tool(ToolCell::Generic(generic)) if generic.is_diff
+        );
+        if is_diff {
+            actions.push(format!("{details} diff"));
+        } else {
+            actions.push(format!("{details} raw detail"));
+        }
     }
     actions
 }
@@ -1362,7 +1375,7 @@ fn timeline_row(
     summary: &str,
     status: Option<&str>,
     duration: Option<&str>,
-    actions: &[&str],
+    actions: &[String],
 ) -> String {
     let mut line = if summary.trim().is_empty() {
         kind.to_string()

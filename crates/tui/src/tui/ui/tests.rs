@@ -13646,7 +13646,13 @@ fn activity_detail_includes_tool_handle_and_neighbor_context() {
         body.contains("retrieve_tool_result ref=art_call-read"),
         "{body}"
     );
-    assert!(body.contains("v raw"), "{body}");
+    let details_chord = crate::tui::shell_key_routing::display_chord(
+        crate::tui::shell_key_routing::binding(
+            crate::tui::shell_key_routing::ShellBindingId::ToolDetails,
+        )
+        .footer_chord,
+    );
+    assert!(body.contains(&format!("{details_chord} raw")), "{body}");
     assert!(body.contains("details)"), "{body}");
 }
 
@@ -13924,20 +13930,28 @@ fn turn_inspector_timeline_numbers_semantic_entries_and_checkpoint_actions() {
         body.contains("1. user prompt: Fix timeline evidence"),
         "{body}"
     );
+    let details_chord = crate::tui::shell_key_routing::display_chord(
+        crate::tui::shell_key_routing::binding(
+            crate::tui::shell_key_routing::ShellBindingId::ToolDetails,
+        )
+        .footer_chord,
+    );
     assert!(
-        body.contains("2. read/search: read · src.rs — done · actions: v raw detail"),
+        body.contains(&format!(
+            "2. read/search: read · src.rs — done · actions: {details_chord} raw detail"
+        )),
         "{body}"
     );
     assert!(
-        body.contains(
-            "3. edit: src.rs — add timeline evidence — done · actions: v raw detail, d diff"
-        ),
+        body.contains(&format!(
+            "3. edit: src.rs — add timeline evidence — done · actions: {details_chord} diff"
+        )),
         "{body}"
     );
     assert!(
-        body.contains(
-            "4. test/verifier: cargo test timeline — done · 1.2s · actions: v raw detail"
-        ),
+        body.contains(&format!(
+            "4. test/verifier: cargo test timeline — done · 1.2s · actions: {details_chord} raw detail"
+        )),
         "{body}"
     );
     assert!(
