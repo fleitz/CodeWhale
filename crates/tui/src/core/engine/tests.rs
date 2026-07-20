@@ -4550,7 +4550,11 @@ async fn yolo_mode_does_not_prompt_for_background_shell() {
 
 #[tokio::test]
 #[allow(clippy::await_holding_lock)]
-async fn yolo_mode_prompts_for_publish_like_shell_safety_floor() {
+async fn yolo_mode_executes_publish_like_shell_without_prompt() {
+    // #4595: Full Access (Bypass/YOLO) is truly full access — the publish
+    // floor prompts only in Ask/Auto-Review postures. The regression guard is
+    // the absence of ApprovalRequired; execution itself may fail (the tempdir
+    // is not a git repo), which is fine.
     use wiremock::matchers::{body_string_contains, method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
@@ -4577,7 +4581,7 @@ async fn yolo_mode_prompts_for_publish_like_shell_safety_floor() {
 
     Mock::given(method("POST"))
         .and(path("/v1/chat/completions"))
-        .and(body_string_contains("denied by user"))
+        .and(body_string_contains("call_publish"))
         .respond_with(
             ResponseTemplate::new(200)
                 .insert_header("content-type", "text/event-stream")
@@ -4614,7 +4618,6 @@ async fn yolo_mode_prompts_for_publish_like_shell_safety_floor() {
         },
         &api_config,
     );
-    let handle_for_approval = handle.clone();
     let run_task = tokio::spawn(engine.run());
 
     handle
@@ -4644,7 +4647,7 @@ async fn yolo_mode_prompts_for_publish_like_shell_safety_floor() {
         .await
         .expect("send model turn");
 
-    let mut saw_approval_prompt = false;
+    let mut saw_tool_complete = false;
     let mut saw_complete = false;
     let mut rx = handle.rx_event.write().await;
     while let Some(event) = tokio::time::timeout(model_turn_event_timeout(), rx.recv())
@@ -4653,30 +4656,19 @@ async fn yolo_mode_prompts_for_publish_like_shell_safety_floor() {
     {
         match event {
             Event::ApprovalRequired {
-                id,
                 tool_name,
                 description,
-                approval_force_prompt,
                 ..
             } => {
-                saw_approval_prompt = true;
-                assert_eq!(tool_name, "exec_shell");
-                assert!(approval_force_prompt);
-                assert!(
-                    description.contains("publish-like"),
-                    "unexpected approval description: {description}"
+                panic!(
+                    "Full Access must not prompt for publish-like shell \
+                     (#4595); got prompt for {tool_name}: {description}"
                 );
-                handle_for_approval
-                    .deny_tool_call(id)
-                    .await
-                    .expect("deny publish-like shell");
             }
-            Event::ToolCallComplete { name, result, .. } if name == "exec_shell" => {
-                let err = result.expect_err("denied publish shell should not execute");
-                assert!(
-                    err.to_string().contains("denied by user"),
-                    "unexpected shell denial: {err:?}"
-                );
+            Event::ToolCallComplete { name, .. } if name == "exec_shell" => {
+                // Execution outcome is irrelevant (the tempdir is not a git
+                // repo); the contract is that it ran without a prompt.
+                saw_tool_complete = true;
             }
             Event::TurnComplete { status, .. } => {
                 assert_eq!(status, TurnOutcomeStatus::Completed);
@@ -4691,10 +4683,10 @@ async fn yolo_mode_prompts_for_publish_like_shell_safety_floor() {
     handle.send(Op::Shutdown).await.expect("shutdown engine");
     run_task.await.expect("engine task");
     assert!(
-        saw_approval_prompt,
-        "YOLO must still prompt for publish-like shell (#3735/#3736)"
+        saw_tool_complete,
+        "the publish-like shell should execute without a prompt under Full Access"
     );
-    assert!(saw_complete, "the denied publish-like turn should complete");
+    assert!(saw_complete, "the publish-like turn should complete");
 }
 
 #[tokio::test]

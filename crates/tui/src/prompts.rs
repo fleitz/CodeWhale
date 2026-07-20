@@ -2935,6 +2935,37 @@ mod tests {
     }
 
     #[test]
+    fn agent_mode_prompt_keeps_safety_invariants_after_compression() {
+        let prompt = AGENT_MODE.replace("\r\n", "\n").replace('\r', "\n");
+        for must in [
+            "Agent mode",
+            "work_update",
+            "update_plan",
+            "workflow",
+            "request_user_input",
+            "agent(action=\"wait\")",
+            "type: \"explore\"",
+            "fork_context",
+            "rlm_open",
+            "Bare `/workflow` means orchestrate current work without re-asking",
+            "stop and synthesize",
+            "Do NOT explain, announce, or mention to the user that you are running in Agent mode",
+        ] {
+            assert!(
+                prompt.contains(must),
+                "compressed agent mode missing invariant {must:?}"
+            );
+        }
+        // Procedural PowerShell manuals must not live in the mode delta.
+        for forbidden in ["Invoke-Expression", "pwsh.exe -NoLogo", "ProcessStartInfo"] {
+            assert!(
+                !prompt.contains(forbidden),
+                "agent mode must not absorb PowerShell manuals: {forbidden}"
+            );
+        }
+    }
+
+    #[test]
     fn mode_prompts_remain_small_deltas_not_base_policy_copies() {
         for (name, prompt) in [
             ("agent", AGENT_MODE),
@@ -2947,8 +2978,12 @@ mod tests {
             let word_count = normalized.split_whitespace().count();
             let estimated_tokens =
                 crate::compaction::estimate_text_tokens_conservative(&normalized);
-            let max_words = if name == "agent" { 800 } else { 350 };
-            let max_tokens = if name == "agent" { 1600 } else { 700 };
+            // 2026-07-20: agent mode compressed (661 -> ~560 words) while
+            // preserving every tested approval, orchestration, subagent-brief,
+            // sentinel, workflow, and fork-context invariant. Keep the budget
+            // tight so procedural detail stays out of the system prefix.
+            let max_words = if name == "agent" { 580 } else { 350 };
+            let max_tokens = if name == "agent" { 1350 } else { 700 };
 
             assert!(
                 word_count <= max_words,
