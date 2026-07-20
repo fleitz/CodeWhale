@@ -63,6 +63,188 @@ const STREAM_DELTA_BATCH_MAX_BYTES: usize = 16 * 1024;
 const REQUEST_USER_INPUT_TOOL_NAME: &str = "request_user_input";
 const REDACTED_USER_INPUT_RECEIPT: &str = "User input submitted";
 
+fn collect_sensitive_user_input_values(messages: &[Message], values: &mut HashSet<String>) {
+    let sensitive_tool_ids = messages
+        .iter()
+        .flat_map(|message| message.content.iter())
+        .filter_map(|block| match block {
+            ContentBlock::ToolUse { id, name, .. } if name == REQUEST_USER_INPUT_TOOL_NAME => {
+                Some(id.clone())
+            }
+            _ => None,
+        })
+        .collect::<HashSet<_>>();
+    for block in messages.iter().flat_map(|message| message.content.iter()) {
+        if let ContentBlock::ToolResult {
+            tool_use_id,
+            content,
+            content_blocks,
+            ..
+        } = block
+            && sensitive_tool_ids.contains(tool_use_id)
+        {
+            match serde_json::from_str::<Value>(content) {
+                Ok(value) => collect_json_string_values(&value, values),
+                Err(_) if !content.trim().is_empty() => {
+                    values.insert(content.clone());
+                }
+                Err(_) => {}
+            }
+            if let Some(content_blocks) = content_blocks {
+                for value in content_blocks {
+                    collect_json_string_values(value, values);
+                }
+            }
+        }
+    }
+}
+
+fn project_messages_for_durable_history_snapshot(
+    messages: &[Message],
+    prior_sensitive_values: &HashSet<String>,
+) -> Vec<Message> {
+    let sensitive_tool_ids = messages
+        .iter()
+        .flat_map(|message| message.content.iter())
+        .filter_map(|block| match block {
+            ContentBlock::ToolUse { id, name, .. } if name == REQUEST_USER_INPUT_TOOL_NAME => {
+                Some(id.clone())
+            }
+            _ => None,
+        })
+        .collect::<HashSet<_>>();
+    let mut sensitive_values = prior_sensitive_values.clone();
+    collect_sensitive_user_input_values(messages, &mut sensitive_values);
+    let mut sensitive_values = sensitive_values.into_iter().collect::<Vec<_>>();
+    sensitive_values.sort_by_key(|value| std::cmp::Reverse(value.len()));
+
+    let mut projected = messages.to_vec();
+    for message in &mut projected {
+        let summary = crate::compaction::compaction_summary_text(message).map(str::to_string);
+        for block in &mut message.content {
+            if let ContentBlock::ToolResult {
+                tool_use_id,
+                content,
+                is_error,
+                content_blocks,
+            } = block
+                && sensitive_tool_ids.contains(tool_use_id)
+            {
+                *content = REDACTED_USER_INPUT_RECEIPT.to_string();
+                *is_error = None;
+                *content_blocks = None;
+            }
+            match block {
+                ContentBlock::Text { text, .. } if summary.is_none() => {
+                    let _ = redact_sensitive_user_input_values(text, &sensitive_values);
+                }
+                ContentBlock::Thinking {
+                    thinking,
+                    signature,
+                } => {
+                    let changed = redact_sensitive_user_input_values(thinking, &sensitive_values);
+                    if changed && signature.is_some() {
+                        *thinking = "[redacted user input]".to_string();
+                        *signature = None;
+                    }
+                }
+                _ => {}
+            }
+        }
+        if let Some(summary) = summary {
+            // The runtime envelope and fixed ownership marker are structural,
+            // not user data. Redact only the generated body so even a modal
+            // answer resembling the sentinel cannot destroy ownership.
+            let marker_end = summary
+                .find(crate::compaction::COMPACTION_SUMMARY_MARKER)
+                .map(|start| start + crate::compaction::COMPACTION_SUMMARY_MARKER.len())
+                .unwrap_or(0);
+            let (owned_prefix, body) = summary.split_at(marker_end);
+            let mut body = body.to_string();
+            let _ = redact_sensitive_user_input_values(&mut body, &sensitive_values);
+            let _ = crate::compaction::replace_compaction_summary_text(
+                message,
+                format!("{owned_prefix}{body}"),
+            );
+        }
+    }
+    projected
+}
+
+fn collect_json_string_values(value: &Value, values: &mut HashSet<String>) {
+    match value {
+        Value::String(value) if !value.is_empty() => {
+            values.insert(value.clone());
+        }
+        Value::Array(items) => {
+            for item in items {
+                collect_json_string_values(item, values);
+            }
+        }
+        Value::Object(object) => {
+            for value in object.values() {
+                collect_json_string_values(value, values);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn redact_sensitive_user_input_values(text: &mut String, sensitive_values: &[String]) -> bool {
+    let mut changed = false;
+    for value in sensitive_values {
+        if value.is_empty() {
+            continue;
+        }
+        let ranges = if value.chars().count() >= 8 {
+            text.match_indices(value)
+                .map(|(start, matched)| (start, start + matched.len()))
+                .collect::<Vec<_>>()
+        } else {
+            text.match_indices(value)
+                .filter_map(|(start, matched)| {
+                    let end = start + matched.len();
+                    let before_is_word = text[..start]
+                        .chars()
+                        .next_back()
+                        .is_some_and(|ch| ch.is_alphanumeric() || ch == '_');
+                    let after_is_word = text[end..]
+                        .chars()
+                        .next()
+                        .is_some_and(|ch| ch.is_alphanumeric() || ch == '_');
+                    (!before_is_word && !after_is_word).then_some((start, end))
+                })
+                .collect::<Vec<_>>()
+        };
+        if ranges.is_empty() {
+            continue;
+        }
+        let mut replacement = String::with_capacity(text.len());
+        let mut cursor = 0usize;
+        for (start, end) in ranges {
+            replacement.push_str(&text[cursor..start]);
+            replacement.push_str("[redacted user input]");
+            cursor = end;
+        }
+        replacement.push_str(&text[cursor..]);
+        *text = replacement;
+        changed = true;
+    }
+    changed
+}
+
+fn compaction_history_snapshot_metadata(
+    messages: &[Message],
+    scope: &str,
+    sensitive_values: &HashSet<String>,
+) -> Value {
+    json!({
+        "history_snapshot_version": 1,
+        "history_snapshot_scope": scope,
+        "compacted_messages": project_messages_for_durable_history_snapshot(messages, sensitive_values),
+    })
+}
+
 #[cfg(test)]
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub(crate) enum EventAppendTestFault {
@@ -190,54 +372,6 @@ async fn coalesce_stream_delta(
         pending_event,
         channel_closed,
     }
-}
-
-/// Sentinel delimiters wrapping the compaction summary section persisted in a
-/// thread record's `system_prompt`. The section carries the engine-rendered
-/// summary (which contains the `Conversation Summary (Auto-Generated)` marker,
-/// so `SyncSession` → `extract_compaction_summary_prompt` restores it on
-/// engine reload). Delimiters make replacement idempotent: each completed
-/// compaction swaps the section in place instead of stacking duplicates.
-/// External `PATCH /v1/threads/{id}` callers that rewrite `system_prompt`
-/// should preserve this section verbatim or the summary is lost on reload.
-const COMPACTION_SUMMARY_BEGIN: &str = "<!-- compaction-summary:begin -->";
-const COMPACTION_SUMMARY_END: &str = "<!-- compaction-summary:end -->";
-
-/// Merge a rendered compaction summary into a thread record's system prompt,
-/// replacing any previously persisted summary section.
-fn merge_summary_into_prompt(base: Option<&str>, summary_text: &str) -> String {
-    let stripped = base.map(strip_summary_section).unwrap_or_default();
-    let mut out = stripped.trim_end().to_string();
-    if !out.is_empty() {
-        out.push_str("\n\n");
-    }
-    out.push_str(COMPACTION_SUMMARY_BEGIN);
-    out.push('\n');
-    out.push_str(summary_text.trim());
-    out.push('\n');
-    out.push_str(COMPACTION_SUMMARY_END);
-    out
-}
-
-/// Remove a previously persisted compaction summary section, if present.
-fn strip_summary_section(base: &str) -> String {
-    let Some(start) = base.find(COMPACTION_SUMMARY_BEGIN) else {
-        return base.to_string();
-    };
-    let end = base[start..]
-        .find(COMPACTION_SUMMARY_END)
-        .map(|rel| start + rel + COMPACTION_SUMMARY_END.len());
-    let mut out = base[..start].trim_end().to_string();
-    if let Some(end) = end {
-        let tail = base[end..].trim_start();
-        if !tail.is_empty() {
-            if !out.is_empty() {
-                out.push_str("\n\n");
-            }
-            out.push_str(tail);
-        }
-    }
-    out
 }
 
 fn validated_record_id<'a>(id: &'a str, label: &str) -> Result<&'a str> {
@@ -5040,10 +5174,18 @@ impl RuntimeThreadManager {
                 Arc::clone(&self.config),
             );
 
-            // When the thread has an associated session, load the full message history
-            // (including thinking/tool blocks) from the session file. This preserves
-            // process information that `reconstruct_messages_from_turns` would lose.
-            let session_messages = if let Some(ref sid) = thread.session_id {
+            let turns = self.store.list_turns_for_thread(&thread.id)?;
+            let has_durable_history_snapshot =
+                self.turns_contain_compaction_history_snapshot(&turns)?;
+            // A Runtime compaction snapshot is newer and more authoritative
+            // than a linked TUI session file, which Runtime does not rewrite.
+            // Once one exists, reconstruction preserves that exact compacted
+            // history plus every later durable item. Before the first Runtime
+            // compaction, prefer the linked session because it retains richer
+            // thinking/tool blocks than ordinary item reconstruction.
+            let session_messages = if has_durable_history_snapshot {
+                self.reconstruct_messages_from_turns(&turns)?
+            } else if let Some(ref sid) = thread.session_id {
                 match crate::session_manager::default_sessions_dir() {
                     Ok(sessions_dir) => {
                         match crate::session_manager::SessionManager::new(sessions_dir) {
@@ -5055,7 +5197,6 @@ impl RuntimeThreadManager {
                                         sid,
                                         thread.id
                                     );
-                                    let turns = self.store.list_turns_for_thread(&thread.id)?;
                                     self.reconstruct_messages_from_turns(&turns)?
                                 }
                             },
@@ -5063,7 +5204,6 @@ impl RuntimeThreadManager {
                                 tracing::warn!(
                                     "Failed to open sessions dir: {e}; falling back to turn reconstruction"
                                 );
-                                let turns = self.store.list_turns_for_thread(&thread.id)?;
                                 self.reconstruct_messages_from_turns(&turns)?
                             }
                         }
@@ -5072,12 +5212,10 @@ impl RuntimeThreadManager {
                         tracing::warn!(
                             "Failed to resolve sessions dir: {e}; falling back to turn reconstruction"
                         );
-                        let turns = self.store.list_turns_for_thread(&thread.id)?;
                         self.reconstruct_messages_from_turns(&turns)?
                     }
                 }
             } else {
-                let turns = self.store.list_turns_for_thread(&thread.id)?;
                 self.reconstruct_messages_from_turns(&turns)?
             };
             let sys_prompt = thread
@@ -5198,7 +5336,11 @@ impl RuntimeThreadManager {
                     });
                 }
             };
+            let mut skip_remaining_items = false;
             for item in items {
+                if skip_remaining_items {
+                    continue;
+                }
                 match item.kind {
                     TurnItemKind::UserMessage => {
                         flush_assistant(&mut assistant_blocks, &mut messages);
@@ -5278,6 +5420,29 @@ impl RuntimeThreadManager {
                             });
                         }
                     }
+                    TurnItemKind::ContextCompaction => {
+                        let compacted_messages = item
+                            .metadata
+                            .as_ref()
+                            .and_then(|metadata| metadata.get("compacted_messages"))
+                            .cloned()
+                            .and_then(|value| serde_json::from_value::<Vec<Message>>(value).ok());
+                        if let Some(compacted_messages) = compacted_messages {
+                            // This is an exact engine history snapshot taken
+                            // immediately after compaction. It supersedes all
+                            // earlier reconstructed turns while keeping the
+                            // system prompt outside conversation history.
+                            assistant_blocks.clear();
+                            user_blocks.clear();
+                            messages = compacted_messages;
+                            skip_remaining_items = item
+                                .metadata
+                                .as_ref()
+                                .and_then(|metadata| metadata.get("history_snapshot_scope"))
+                                .and_then(Value::as_str)
+                                == Some("turn_terminal");
+                        }
+                    }
                     _ => {}
                 }
             }
@@ -5285,6 +5450,25 @@ impl RuntimeThreadManager {
             flush_user(&mut user_blocks, &mut messages);
         }
         Ok(messages)
+    }
+
+    fn turns_contain_compaction_history_snapshot(&self, turns: &[TurnRecord]) -> Result<bool> {
+        for turn in turns {
+            for item_id in &turn.item_ids {
+                let item = self.store.load_item(item_id)?;
+                if item.kind == TurnItemKind::ContextCompaction
+                    && item
+                        .metadata
+                        .as_ref()
+                        .and_then(|metadata| metadata.get("history_snapshot_version"))
+                        .and_then(Value::as_u64)
+                        == Some(1)
+                {
+                    return Ok(true);
+                }
+            }
+        }
+        Ok(false)
     }
 
     async fn monitor_turn(
@@ -5297,6 +5481,9 @@ impl RuntimeThreadManager {
         let mut current_reasoning_item: Option<TurnItemRecord> = None;
         let mut tool_items: HashMap<String, String> = HashMap::new();
         let mut compaction_items: HashMap<String, String> = HashMap::new();
+        let mut history_snapshot_item_ids: Vec<String> = Vec::new();
+        let mut latest_session_messages: Option<Vec<Message>> = None;
+        let mut sensitive_user_input_values: HashSet<String> = HashSet::new();
         let mut turn_usage: Option<Usage> = None;
         let mut turn_base_url: Option<String> = None;
         let mut turn_status: Option<RuntimeTurnStatus> = None;
@@ -5615,8 +5802,10 @@ impl RuntimeThreadManager {
                     }
                 }
                 EngineEvent::CompactionStarted { id, auto, message } => {
+                    latest_session_messages = None;
                     let item_id = format!("item_{}", &Uuid::new_v4().to_string()[..8]);
                     compaction_items.insert(id.clone(), item_id.clone());
+                    history_snapshot_item_ids.push(item_id.clone());
                     let item = TurnItemRecord {
                         schema_version: CURRENT_RUNTIME_SCHEMA_VERSION,
                         id: item_id.clone(),
@@ -5647,50 +5836,34 @@ impl RuntimeThreadManager {
                     message,
                     messages_before,
                     messages_after,
-                    summary_prompt,
+                    summary_prompt: _,
                 } => {
-                    // Persist the summary into the thread record so engine
-                    // reloads (LRU eviction / restart) restore it: reload
-                    // passes the record prompt through SyncSession, where
-                    // `extract_compaction_summary_prompt` picks the summary
-                    // back up. Without this the summary lives only in engine
-                    // memory and silently dies with the engine.
-                    if let Some(summary) =
-                        summary_prompt.as_deref().filter(|s| !s.trim().is_empty())
-                    {
-                        let persist_summary = (|| -> Result<()> {
-                            let _thread_mutation = self.store.thread_mutation.lock();
-                            let mut thread = self.store.load_thread(&thread_id)?;
-                            let merged =
-                                merge_summary_into_prompt(thread.system_prompt.as_deref(), summary);
-                            if thread.system_prompt.as_deref() != Some(merged.as_str()) {
-                                thread.system_prompt = Some(merged);
-                                thread.updated_at = Utc::now();
-                                self.store.save_thread(&thread)?;
-                            }
-                            Ok(())
-                        })();
-                        if let Err(e) = persist_summary {
-                            tracing::warn!(
-                                thread_id = %thread_id,
-                                "Failed to persist compaction summary to thread record: {e}"
-                            );
-                        }
-                    }
                     if let Some(item_id) = compaction_items.remove(&id) {
                         let mut item = self.store.load_item(&item_id)?;
                         item.status = TurnItemLifecycleStatus::Completed;
                         item.summary = summarize_text(&message, SUMMARY_LIMIT);
                         item.detail = Some(message);
+                        if let Some(messages) = latest_session_messages.as_ref() {
+                            item.metadata = Some(compaction_history_snapshot_metadata(
+                                messages,
+                                "compaction_point",
+                                &sensitive_user_input_values,
+                            ));
+                        }
                         item.ended_at = Some(Utc::now());
                         self.store.save_item(&item)?;
+                        let mut event_item = item.clone();
+                        // The durable item owns the history snapshot. Avoid
+                        // duplicating a potentially large transcript into the
+                        // public lifecycle event log.
+                        event_item.metadata = None;
                         self.emit_event(
                             &thread_id,
                             Some(&turn_id),
                             Some(&item_id),
                             "item.completed",
                             json!({
-                                "item": item,
+                                "item": event_item,
                                 "auto": auto,
                                 "messages_before": messages_before,
                                 "messages_after": messages_after,
@@ -5705,14 +5878,27 @@ impl RuntimeThreadManager {
                         item.status = TurnItemLifecycleStatus::Failed;
                         item.summary = summarize_text(&message, SUMMARY_LIMIT);
                         item.detail = Some(message);
+                        if let Some(messages) = latest_session_messages.as_ref() {
+                            // Emergency recovery can rewrite and locally trim
+                            // history yet still miss its target budget. The
+                            // failed status is truthful, but the durable
+                            // reconstruction must retain that partial repair.
+                            item.metadata = Some(compaction_history_snapshot_metadata(
+                                messages,
+                                "compaction_point",
+                                &sensitive_user_input_values,
+                            ));
+                        }
                         item.ended_at = Some(Utc::now());
                         self.store.save_item(&item)?;
+                        let mut event_item = item.clone();
+                        event_item.metadata = None;
                         self.emit_event(
                             &thread_id,
                             Some(&turn_id),
                             Some(&item_id),
                             "item.failed",
-                            json!({ "item": item, "auto": auto }),
+                            json!({ "item": event_item, "auto": auto }),
                         )
                         .await?;
                     }
@@ -6082,6 +6268,13 @@ impl RuntimeThreadManager {
                     }
                     drop(projection);
                 }
+                EngineEvent::SessionUpdated { messages, .. } => {
+                    collect_sensitive_user_input_values(
+                        &messages,
+                        &mut sensitive_user_input_values,
+                    );
+                    latest_session_messages = Some(messages);
+                }
                 EngineEvent::Status { message } => {
                     let item = TurnItemRecord {
                         schema_version: CURRENT_RUNTIME_SCHEMA_VERSION,
@@ -6142,6 +6335,24 @@ impl RuntimeThreadManager {
                     base_url,
                     ..
                 } => {
+                    if let (Some(item_id), Some(messages)) = (
+                        history_snapshot_item_ids.last(),
+                        latest_session_messages.as_ref(),
+                    ) {
+                        // Capture the exact terminal engine history on the
+                        // final compaction boundary. This includes synthetic
+                        // goal continuations and runtime-owned messages added
+                        // after CompactionCompleted. Reconstruction treats it
+                        // as covering the remainder of this turn so later item
+                        // projections are not duplicated.
+                        let mut item = self.store.load_item(item_id)?;
+                        item.metadata = Some(compaction_history_snapshot_metadata(
+                            messages,
+                            "turn_terminal",
+                            &sensitive_user_input_values,
+                        ));
+                        self.store.save_item(&item)?;
+                    }
                     turn_usage = Some(usage);
                     turn_base_url = base_url;
                     let reported_status = match status {

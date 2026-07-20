@@ -1853,7 +1853,11 @@ fn build_chat_messages_with_reasoning(
     }
 
     for (message_index, message) in messages.iter().enumerate() {
-        let role = message.role.as_str();
+        let role = if message.role == crate::compaction::RUNTIME_HISTORY_ROLE {
+            "user"
+        } else {
+            message.role.as_str()
+        };
         let mut text_parts = Vec::new();
         let mut image_parts = Vec::new();
         let mut thinking_parts = Vec::new();
@@ -3395,6 +3399,106 @@ mod stream_diagnostics_tests {
             rendered.contains("server=(absent)"),
             "non-UTF8 header values fall back to (absent); got: {rendered}"
         );
+    }
+}
+
+#[cfg(test)]
+mod prefix_invariant_tests {
+    use super::{
+        build_chat_messages_for_request_and_provider_and_route, tool_to_chat_for_base_url,
+    };
+    use crate::config::ApiProvider;
+    use crate::models::{ContentBlock, Message, MessageRequest, SystemPrompt, Tool};
+    use serde_json::json;
+
+    fn request_with_stable_prefix() -> MessageRequest {
+        MessageRequest {
+            model: "deepseek-v4-pro".to_string(),
+            messages: vec![
+                crate::compaction::compaction_summary_message(
+                    format!(
+                        "## {}\ncompacted history",
+                        crate::compaction::COMPACTION_SUMMARY_MARKER
+                    ),
+                    true,
+                ),
+                Message {
+                    role: "user".to_string(),
+                    content: vec![ContentBlock::Text {
+                        text: "initial turn".to_string(),
+                        cache_control: None,
+                    }],
+                },
+            ],
+            max_tokens: 1_024,
+            system: Some(SystemPrompt::Text("stable constitution".to_string())),
+            tools: Some(vec![Tool {
+                tool_type: None,
+                name: "read_file".to_string(),
+                description: "Read a file".to_string(),
+                input_schema: json!({"type": "object"}),
+                allowed_callers: None,
+                defer_loading: None,
+                input_examples: None,
+                strict: None,
+                cache_control: None,
+            }]),
+            tool_choice: Some(json!({"type": "auto"})),
+            metadata: None,
+            thinking: None,
+            reasoning_effort: Some("high".to_string()),
+            stream: Some(true),
+            temperature: None,
+            top_p: None,
+        }
+    }
+
+    #[test]
+    fn chat_wire_prompt_preserves_prefix_when_history_appends() {
+        let before = request_with_stable_prefix();
+        let mut after = before.clone();
+        after.messages.push(Message {
+            role: "assistant".to_string(),
+            content: vec![ContentBlock::Text {
+                text: "appended tail".to_string(),
+                cache_control: None,
+            }],
+        });
+
+        let before_messages = build_chat_messages_for_request_and_provider_and_route(
+            &before,
+            ApiProvider::Deepseek,
+            "https://api.deepseek.com",
+        );
+        let after_messages = build_chat_messages_for_request_and_provider_and_route(
+            &after,
+            ApiProvider::Deepseek,
+            "https://api.deepseek.com",
+        );
+        assert_eq!(&after_messages[..before_messages.len()], &before_messages);
+        assert_eq!(after_messages.len(), before_messages.len() + 1);
+        assert_eq!(before_messages[1]["role"], "user");
+        assert!(
+            before_messages[1]["content"]
+                .as_str()
+                .is_some_and(|text| text.contains("compacted history"))
+        );
+
+        let before_tools = before
+            .tools
+            .as_ref()
+            .expect("tools")
+            .iter()
+            .map(|tool| tool_to_chat_for_base_url(tool, "https://api.deepseek.com"))
+            .collect::<Vec<_>>();
+        let after_tools = after
+            .tools
+            .as_ref()
+            .expect("tools")
+            .iter()
+            .map(|tool| tool_to_chat_for_base_url(tool, "https://api.deepseek.com"))
+            .collect::<Vec<_>>();
+        assert_eq!(before_tools, after_tools);
     }
 }
 

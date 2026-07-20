@@ -5,6 +5,7 @@ use super::turn_loop::{
     registered_tool_approval_required, registered_tool_blocked_in_full_access,
     registered_tool_forces_prompt, tool_error_degradation_runtime_hint,
 };
+use crate::compaction::compaction_summary_message;
 use crate::config::ApiProvider;
 use crate::models::{SystemBlock, Usage};
 use crate::test_support::{EnvVarGuard, lock_test_env};
@@ -3206,6 +3207,98 @@ struct BlockingModelClient {
     request_dropped: std::sync::Arc<std::sync::atomic::AtomicBool>,
 }
 
+struct WholeStreamRetryClient {
+    calls: std::sync::atomic::AtomicUsize,
+    captured: std::sync::Mutex<Vec<MessageRequest>>,
+    first_stream_started: std::sync::Arc<tokio::sync::Notify>,
+    release_first_stream_error: std::sync::Arc<tokio::sync::Notify>,
+    inner_retry_started: tokio::sync::Notify,
+    release_inner_retry: tokio::sync::Notify,
+}
+
+impl WholeStreamRetryClient {
+    fn new() -> Self {
+        Self {
+            calls: std::sync::atomic::AtomicUsize::new(0),
+            captured: std::sync::Mutex::new(Vec::new()),
+            first_stream_started: std::sync::Arc::new(tokio::sync::Notify::new()),
+            release_first_stream_error: std::sync::Arc::new(tokio::sync::Notify::new()),
+            inner_retry_started: tokio::sync::Notify::new(),
+            release_inner_retry: tokio::sync::Notify::new(),
+        }
+    }
+
+    fn captured_requests(&self) -> Vec<MessageRequest> {
+        self.captured.lock().expect("captured requests").clone()
+    }
+}
+
+#[async_trait::async_trait]
+impl crate::core::model_client::ModelClient for WholeStreamRetryClient {
+    fn provider_name(&self) -> &str {
+        "deterministic-whole-stream-retry"
+    }
+
+    fn model(&self) -> &str {
+        "deepseek-v4-pro"
+    }
+
+    async fn create_message(
+        &self,
+        _request: MessageRequest,
+    ) -> anyhow::Result<crate::models::MessageResponse> {
+        anyhow::bail!("non-streaming request was not expected")
+    }
+
+    async fn create_message_stream(
+        &self,
+        request: MessageRequest,
+    ) -> anyhow::Result<crate::llm_client::StreamEventBox> {
+        use futures_util::stream;
+
+        self.captured
+            .lock()
+            .expect("captured requests")
+            .push(request);
+        let attempt = self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        match attempt {
+            0 => {
+                let first_stream_started = std::sync::Arc::clone(&self.first_stream_started);
+                let release_first_stream_error =
+                    std::sync::Arc::clone(&self.release_first_stream_error);
+                Ok(Box::pin(async_stream::stream! {
+                    yield Ok(crate::llm_client::mock::canned::message_start("first-attempt"));
+                    first_stream_started.notify_one();
+                    release_first_stream_error.notified().await;
+                    yield Err(anyhow::anyhow!("error decoding response body"));
+                }))
+            }
+            1 => {
+                self.inner_retry_started.notify_one();
+                self.release_inner_retry.notified().await;
+                anyhow::bail!("retry stream open failed")
+            }
+            2 | 3 => {
+                let text = if attempt == 2 {
+                    "retry succeeded"
+                } else {
+                    "steer handled"
+                };
+                let events = crate::llm_client::mock::canned::simple_text_turn(text)
+                    .into_iter()
+                    .map(Ok)
+                    .collect::<Vec<_>>();
+                Ok(Box::pin(stream::iter(events)))
+            }
+            _ => anyhow::bail!("unexpected provider request {attempt}"),
+        }
+    }
+
+    async fn health_check(&self) -> anyhow::Result<bool> {
+        Ok(true)
+    }
+}
+
 #[async_trait::async_trait]
 impl crate::core::model_client::ModelClient for BlockingModelClient {
     fn provider_name(&self) -> &str {
@@ -3244,6 +3337,94 @@ fn deterministic_engine_config(workspace: &Path) -> EngineConfig {
         subagents_enabled: false,
         ..EngineConfig::default()
     }
+}
+
+#[tokio::test]
+async fn whole_stream_retry_reuses_identical_request_before_accepting_steer() {
+    let workspace = tempdir().expect("tempdir");
+    let mock = std::sync::Arc::new(WholeStreamRetryClient::new());
+    let client: crate::core::model_client::SharedModelClient = mock.clone();
+    let (engine, handle) = Engine::new_with_model_client(
+        deterministic_engine_config(workspace.path()),
+        &Config::default(),
+        client,
+    );
+    let task = tokio::spawn(engine.run());
+    handle
+        .send(external_user_message_op(
+            "Prove request identity across retry.",
+            AppMode::Agent,
+            &Config::default(),
+        ))
+        .await
+        .expect("send retry turn");
+
+    tokio::time::timeout(
+        model_turn_event_timeout(),
+        mock.first_stream_started.notified(),
+    )
+    .await
+    .expect("first stream started");
+    handle
+        .steer("This steer must wait until the pinned retry completes.")
+        .await
+        .expect("queue steer");
+    mock.release_first_stream_error.notify_one();
+    tokio::time::timeout(
+        model_turn_event_timeout(),
+        mock.inner_retry_started.notified(),
+    )
+    .await
+    .expect("inner retry started");
+    mock.release_inner_retry.notify_one();
+
+    let mut rx = handle.rx_event.write().await;
+    let mut transient_errors = Vec::new();
+    while let Some(event) = tokio::time::timeout(model_turn_event_timeout(), rx.recv())
+        .await
+        .expect("timed out waiting for retry turn")
+    {
+        if let Event::Error { envelope, .. } = &event {
+            transient_errors.push(envelope.message.clone());
+        }
+        if let Event::TurnComplete { status, error, .. } = event {
+            assert_eq!(status, TurnOutcomeStatus::Completed, "{error:?}");
+            break;
+        }
+    }
+    drop(rx);
+    assert!(
+        transient_errors.is_empty(),
+        "transparent retries must not durably poison Runtime turns: {transient_errors:?}"
+    );
+
+    let captured = mock.captured_requests();
+    assert_eq!(
+        captured.len(),
+        4,
+        "three retry attempts plus steered follow-up"
+    );
+    let first = serde_json::to_vec(&captured[0]).expect("serialize first request");
+    assert_eq!(
+        serde_json::to_vec(&captured[1]).expect("serialize inner retry"),
+        first
+    );
+    assert_eq!(
+        serde_json::to_vec(&captured[2]).expect("serialize whole-stream retry"),
+        first,
+        "the outer retry must replay the concrete request before draining steer state"
+    );
+    assert!(
+        captured[3].messages.iter().any(|message| {
+            message.content.iter().any(|block| {
+                matches!(block, ContentBlock::Text { text, .. } if text.contains("This steer must wait"))
+            })
+        }),
+        "queued steer should appear only in the post-retry follow-up"
+    );
+
+    handle.send(Op::Shutdown).await.expect("shutdown engine");
+    task.await.expect("engine task");
 }
 
 #[tokio::test]
@@ -3453,6 +3634,7 @@ async fn coalesced_raw_read_error_touches_working_set_once() {
             AppMode::Agent,
             false,
             Vec::new(),
+            None,
         )
         .await;
 
@@ -10336,6 +10518,7 @@ async fn slop_gate_survives_mid_turn_compaction_without_reinjection() {
         Some(&engine.session.workspace),
         Some(&pins),
         None,
+        None,
     )
     .await
     .expect("mid-turn compaction");
@@ -10376,8 +10559,6 @@ fn engine_prompt_respects_hidden_thinking_config() {
 }
 
 fn sync_runtime_system_prompt_override(engine: &mut Engine, system_prompt: SystemPrompt) {
-    engine.session.compaction_summary_prompt =
-        extract_compaction_summary_prompt(Some(system_prompt.clone()));
     engine.session.system_prompt = Some(system_prompt);
     engine.session.system_prompt_override = true;
 }
@@ -10421,7 +10602,7 @@ fn blocks_system_prompt_override_via_runtime_sync_survives_mode_change_refresh()
 }
 
 #[test]
-fn compaction_summary_stays_in_stable_system_prompt() {
+fn compaction_summary_stays_in_history_and_preserves_system_prefix() {
     let tmp = tempdir().expect("tempdir");
     fs::create_dir_all(tmp.path().join("src")).expect("mkdir");
     fs::write(tmp.path().join("src/main.rs"), "fn main() {}").expect("write");
@@ -10436,24 +10617,169 @@ fn compaction_summary_stays_in_stable_system_prompt() {
         .working_set
         .observe_user_message("continue in src/main.rs", tmp.path());
     engine.refresh_system_prompt();
-    engine.merge_compaction_summary(Some(SystemPrompt::Blocks(vec![SystemBlock {
-        block_type: "text".to_string(),
-        text: format!("{COMPACTION_SUMMARY_MARKER}\nsummary"),
-        cache_control: None,
-    }])));
+    let prefix_before = engine.session.system_prompt.clone();
+    let mut messages = vec![compaction_summary_message(
+        format!("{COMPACTION_SUMMARY_MARKER}\nsummary"),
+        true,
+    )];
+    engine.reanchor_compaction_history(&mut messages);
+    engine.session.replace_messages(messages);
 
-    let prompt = match &engine.session.system_prompt {
-        Some(SystemPrompt::Text(text)) => text.clone(),
-        Some(SystemPrompt::Blocks(blocks)) => blocks
+    assert_eq!(engine.session.system_prompt, prefix_before);
+    assert_eq!(
+        engine.session.messages[0].role,
+        crate::compaction::RUNTIME_HISTORY_ROLE
+    );
+    let summary = engine
+        .rendered_compaction_summary()
+        .expect("history summary");
+    assert!(summary.contains(COMPACTION_SUMMARY_MARKER));
+    assert!(!summary.contains(WORKING_SET_SUMMARY_MARKER));
+}
+
+#[test]
+fn emergency_trim_preserves_summary_and_four_recent_messages() {
+    let tmp = tempdir().expect("tempdir");
+    let config = EngineConfig {
+        workspace: tmp.path().to_path_buf(),
+        ..Default::default()
+    };
+    let (mut engine, _handle) = Engine::new(config, &Config::default());
+    let summary = compaction_summary_message(
+        format!("## {COMPACTION_SUMMARY_MARKER}\ncompacted history"),
+        true,
+    );
+    let mut messages = vec![summary.clone()];
+    messages.extend((0..7).map(|index| Message {
+        role: "user".to_string(),
+        content: vec![ContentBlock::Text {
+            text: format!("ordinary message {index} with enough text to consume tokens"),
+            cache_control: None,
+        }],
+    }));
+    engine.session.replace_messages(messages);
+
+    let removed = engine.trim_oldest_messages_to_budget(0);
+
+    assert_eq!(removed, 3);
+    assert_eq!(engine.session.messages[0], summary);
+    assert_eq!(
+        engine
+            .session
+            .messages
             .iter()
-            .map(|block| block.text.as_str())
-            .collect::<Vec<_>>()
-            .join("\n"),
-        None => panic!("expected system prompt"),
+            .filter(|message| !is_compaction_summary_message(message))
+            .count(),
+        MIN_RECENT_MESSAGES_TO_KEEP
+    );
+    assert!(engine.session.messages.iter().any(|message| {
+        message.content.iter().any(
+            |block| matches!(block, ContentBlock::Text { text, .. } if text.starts_with("ordinary message 6")),
+        )
+    }));
+}
+
+#[test]
+fn emergency_trim_never_splits_tool_round_to_reach_message_floor() {
+    let tmp = tempdir().expect("tempdir");
+    let config = EngineConfig {
+        workspace: tmp.path().to_path_buf(),
+        ..Default::default()
+    };
+    let (mut engine, _handle) = Engine::new(config, &Config::default());
+    let summary = compaction_summary_message(
+        format!("## {COMPACTION_SUMMARY_MARKER}\ncompacted history"),
+        true,
+    );
+    let tool_use = Message {
+        role: "assistant".to_string(),
+        content: vec![ContentBlock::ToolUse {
+            id: "trim-pair".to_string(),
+            name: "read_file".to_string(),
+            input: json!({"path": "src/lib.rs"}),
+            caller: None,
+        }],
+    };
+    let tool_result = Message {
+        role: "user".to_string(),
+        content: vec![ContentBlock::ToolResult {
+            tool_use_id: "trim-pair".to_string(),
+            content: "result".to_string(),
+            is_error: None,
+            content_blocks: None,
+        }],
+    };
+    let mut messages = vec![summary, tool_use.clone(), tool_result.clone()];
+    messages.extend((0..3).map(|index| Message {
+        role: "user".to_string(),
+        content: vec![ContentBlock::Text {
+            text: format!("recent message {index}"),
+            cache_control: None,
+        }],
+    }));
+    engine.session.replace_messages(messages);
+
+    let removed = engine.trim_oldest_messages_to_budget(0);
+
+    assert_eq!(removed, 0, "the tool round cannot be removed atomically");
+    assert!(engine.session.messages.contains(&tool_use));
+    assert!(engine.session.messages.contains(&tool_result));
+}
+
+#[test]
+fn live_child_fork_context_tracks_compaction_and_goal_request_history() {
+    let initial = Message {
+        role: "user".to_string(),
+        content: vec![ContentBlock::Text {
+            text: "pre-compaction history".to_string(),
+            cache_control: None,
+        }],
+    };
+    let shared = std::sync::Arc::new(parking_lot::RwLock::new(SubAgentForkContext {
+        messages: vec![initial],
+        structured_state_block: None,
+    }));
+    let summary = compaction_summary_message(
+        format!("## {COMPACTION_SUMMARY_MARKER}\ncompacted history"),
+        true,
+    );
+    let mut request = MessageRequest {
+        model: "deepseek-v4-pro".to_string(),
+        messages: vec![summary.clone()],
+        max_tokens: 1_024,
+        system: Some(SystemPrompt::Text("stable child prefix".to_string())),
+        tools: None,
+        tool_choice: None,
+        metadata: None,
+        thinking: None,
+        reasoning_effort: Some("high".to_string()),
+        stream: Some(true),
+        temperature: None,
+        top_p: None,
     };
 
-    assert!(prompt.contains(COMPACTION_SUMMARY_MARKER));
-    assert!(!prompt.contains(WORKING_SET_SUMMARY_MARKER));
+    super::turn_loop::update_live_fork_context_from_request(Some(&shared), &request);
+    assert_eq!(shared.read().messages, vec![summary.clone()]);
+
+    let continuation = Message {
+        role: "user".to_string(),
+        content: vec![ContentBlock::Text {
+            text: "Continue working toward the active goal.".to_string(),
+            cache_control: None,
+        }],
+    };
+    request.messages.push(continuation.clone());
+    super::turn_loop::update_live_fork_context_from_request(Some(&shared), &request);
+    let live = shared.read();
+    assert_eq!(live.messages[0], summary);
+    assert_eq!(
+        live.messages
+            .iter()
+            .filter(|message| *message == &continuation)
+            .count(),
+        1,
+        "the synthetic goal continuation must enter the next concrete parent request exactly once"
+    );
 }
 
 #[test]
@@ -10495,18 +10821,15 @@ fn compaction_reanchors_active_operation_identity_without_raw_output() {
     )
     .expect("owner running report");
 
-    engine.merge_compaction_summary(Some(SystemPrompt::Text(format!(
-        "{COMPACTION_SUMMARY_MARKER}\nordinary summary"
-    ))));
-    let prompt = match &engine.session.system_prompt {
-        Some(SystemPrompt::Text(text)) => text.clone(),
-        Some(SystemPrompt::Blocks(blocks)) => blocks
-            .iter()
-            .map(|block| block.text.as_str())
-            .collect::<Vec<_>>()
-            .join("\n"),
-        None => panic!("expected system prompt"),
-    };
+    let prefix_before = engine.session.system_prompt.clone();
+    let mut messages = vec![compaction_summary_message(
+        format!("{COMPACTION_SUMMARY_MARKER}\nordinary summary"),
+        true,
+    )];
+    engine.reanchor_compaction_history(&mut messages);
+    engine.session.replace_messages(messages);
+    let prompt = engine.rendered_compaction_summary().expect("summary");
+    assert_eq!(engine.session.system_prompt, prefix_before);
     assert!(prompt.contains("Active Work Graph Operations"), "{prompt}");
     assert!(prompt.contains("shell:shell_compact"), "{prompt}");
     assert!(prompt.contains("quiet receipt sentinel"), "{prompt}");
@@ -10523,9 +10846,12 @@ fn compaction_reanchors_active_operation_identity_without_raw_output() {
         "the re-anchor must never copy operation output"
     );
 
-    engine.merge_compaction_summary(Some(SystemPrompt::Text(format!(
-        "{COMPACTION_SUMMARY_MARKER}\nsecond summary"
-    ))));
+    let mut repeated_messages = vec![compaction_summary_message(
+        format!("{COMPACTION_SUMMARY_MARKER}\nsecond summary"),
+        true,
+    )];
+    engine.reanchor_compaction_history(&mut repeated_messages);
+    engine.session.replace_messages(repeated_messages);
     let repeated = engine.rendered_compaction_summary().expect("summary");
     assert_eq!(
         repeated
@@ -10545,9 +10871,12 @@ fn compaction_reanchors_active_operation_identity_without_raw_output() {
         ),
     )
     .expect("owner completion report");
-    engine.merge_compaction_summary(Some(SystemPrompt::Text(format!(
-        "{COMPACTION_SUMMARY_MARKER}\nthird summary"
-    ))));
+    let mut completed_messages = vec![compaction_summary_message(
+        format!("{COMPACTION_SUMMARY_MARKER}\nthird summary"),
+        true,
+    )];
+    engine.reanchor_compaction_history(&mut completed_messages);
+    engine.session.replace_messages(completed_messages);
     let completed = engine.rendered_compaction_summary().expect("summary");
     assert!(
         !completed.contains("Active Work Graph Operations"),

@@ -52,7 +52,7 @@ pub(super) fn build_responses_body(request: &MessageRequest) -> Value {
         let responses_tools: Vec<Value> = tools.iter().map(tool_to_responses_function).collect();
         if !responses_tools.is_empty() {
             body["tools"] = json!(responses_tools);
-            body["tool_choice"] = json!("auto");
+            body["tool_choice"] = responses_tool_choice(request.tool_choice.as_ref());
             body["parallel_tool_calls"] = json!(true);
         }
     }
@@ -74,6 +74,20 @@ pub(super) fn build_responses_body(request: &MessageRequest) -> Value {
     body["include"] = json!(["reasoning.encrypted_content"]);
 
     body
+}
+
+fn responses_tool_choice(choice: Option<&Value>) -> Value {
+    match choice {
+        Some(Value::String(choice)) if matches!(choice.as_str(), "auto" | "none" | "required") => {
+            json!(choice)
+        }
+        Some(Value::Object(choice)) => choice
+            .get("type")
+            .and_then(Value::as_str)
+            .filter(|choice| matches!(*choice, "auto" | "none" | "required"))
+            .map_or_else(|| json!("auto"), |choice| json!(choice)),
+        _ => json!("auto"),
+    }
 }
 
 impl DeepSeekClient {
@@ -510,7 +524,7 @@ fn convert_messages_to_responses_input(request: &MessageRequest) -> Vec<Value> {
 
     for msg in &request.messages {
         match msg.role.as_str() {
-            "user" => {
+            "user" | crate::compaction::RUNTIME_HISTORY_ROLE => {
                 let mut content_items = Vec::new();
                 for block in &msg.content {
                     match block {
@@ -813,6 +827,63 @@ mod tests {
             temperature: None,
             top_p: None,
         }
+    }
+
+    #[test]
+    fn responses_body_preserves_prefix_when_history_appends() {
+        let tool = Tool {
+            tool_type: None,
+            name: "read_file".to_string(),
+            description: "Read a file".to_string(),
+            input_schema: json!({"type": "object"}),
+            allowed_callers: None,
+            defer_loading: None,
+            input_examples: None,
+            strict: None,
+            cache_control: None,
+        };
+        let mut before = minimal_responses_request();
+        before.system = Some(crate::models::SystemPrompt::Text(
+            "stable constitution".to_string(),
+        ));
+        before.tools = Some(vec![tool]);
+        before.tool_choice = Some(json!("none"));
+        before.reasoning_effort = Some("high".to_string());
+        before.messages.insert(
+            0,
+            crate::compaction::compaction_summary_message(
+                format!(
+                    "## {}\ncompacted history",
+                    crate::compaction::COMPACTION_SUMMARY_MARKER
+                ),
+                true,
+            ),
+        );
+        let mut after = before.clone();
+        after.messages.push(Message {
+            role: "assistant".to_string(),
+            content: vec![ContentBlock::Text {
+                text: "appended tail".to_string(),
+                cache_control: None,
+            }],
+        });
+
+        let before_body = build_responses_body(&before);
+        let after_body = build_responses_body(&after);
+        assert_eq!(before_body["instructions"], after_body["instructions"]);
+        assert_eq!(before_body["tools"], after_body["tools"]);
+        assert_eq!(before_body["reasoning"], after_body["reasoning"]);
+        assert_eq!(before_body["tool_choice"], json!("none"));
+        let before_input = before_body["input"].as_array().expect("before input");
+        let after_input = after_body["input"].as_array().expect("after input");
+        assert_eq!(&after_input[..before_input.len()], before_input);
+        assert_eq!(after_input.len(), before_input.len() + 1);
+        assert_eq!(before_input[0]["role"], "user");
+        assert!(
+            before_input[0]["content"][0]["text"]
+                .as_str()
+                .is_some_and(|text| text.contains("compacted history"))
+        );
     }
 
     fn test_codex_config(server: &MockServer) -> Config {

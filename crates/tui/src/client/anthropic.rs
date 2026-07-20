@@ -326,7 +326,12 @@ fn message_to_anthropic(message: &crate::models::Message) -> Option<Value> {
     if blocks.is_empty() {
         return None;
     }
-    Some(json!({ "role": message.role, "content": blocks }))
+    let role = if message.role == crate::compaction::RUNTIME_HISTORY_ROLE {
+        "user"
+    } else {
+        message.role.as_str()
+    };
+    Some(json!({ "role": role, "content": blocks }))
 }
 
 fn content_block_to_anthropic(block: &ContentBlock) -> Option<Value> {
@@ -704,6 +709,34 @@ mod tests {
             body.pointer("/messages/0/content/0/cache_control/type")
                 .and_then(Value::as_str),
             Some("ephemeral")
+        );
+    }
+
+    #[test]
+    fn runtime_compaction_history_projects_to_user_wire_role() {
+        let client = test_client();
+        let mut request = request_with("claude-sonnet-4-6", Some("high"), None, None);
+        request.messages.insert(
+            0,
+            crate::compaction::compaction_summary_message(
+                format!(
+                    "## {}\ncompacted history",
+                    crate::compaction::COMPACTION_SUMMARY_MARKER
+                ),
+                true,
+            ),
+        );
+
+        let body = client.build_anthropic_body(&request, true);
+
+        assert_eq!(
+            body.pointer("/messages/0/role").and_then(Value::as_str),
+            Some("user")
+        );
+        assert!(
+            body.pointer("/messages/0/content/0/text")
+                .and_then(Value::as_str)
+                .is_some_and(|text| text.contains("compacted history"))
         );
     }
 

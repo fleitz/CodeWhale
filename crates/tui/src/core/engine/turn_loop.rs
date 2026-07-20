@@ -111,6 +111,15 @@ or ask for the required input before trying again."
     Some(hint)
 }
 
+pub(super) fn update_live_fork_context_from_request(
+    context: Option<&SharedSubAgentForkContext>,
+    request: &MessageRequest,
+) {
+    if let Some(context) = context {
+        context.write().messages.clone_from(&request.messages);
+    }
+}
+
 fn tool_error_category_allows_degradation(category: ErrorCategory) -> bool {
     matches!(
         category,
@@ -274,6 +283,7 @@ impl Engine {
         count
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub(super) async fn handle_deepseek_turn(
         &mut self,
         turn: &mut TurnContext,
@@ -282,6 +292,7 @@ impl Engine {
         mode: AppMode,
         force_update_plan_first: bool,
         dynamic_active_tools: Vec<&'static str>,
+        live_fork_context: Option<&SharedSubAgentForkContext>,
     ) -> (TurnOutcomeStatus, Option<String>) {
         // Only interactive TUI hosts own terminal chrome. Headless exec,
         // app-server, and stream-json stdout must remain byte-clean.
@@ -329,6 +340,12 @@ impl Engine {
         // the SAME request up to MAX_STREAM_RETRIES times before surfacing
         // the failure to the user.
         let mut stream_retry_attempts: u32 = 0;
+        let mut pending_stream_request: Option<MessageRequest> = None;
+        // Steers received while any concrete request attempt is in flight
+        // belong after that request completes. Keep them across outer
+        // whole-stream retries so they are neither inserted into a retried
+        // request nor silently lost when an attempt is discarded.
+        let mut pending_steers: Vec<String> = Vec::new();
 
         loop {
             if self.cancel_token.is_cancelled() {
@@ -336,347 +353,378 @@ impl Engine {
                 return (TurnOutcomeStatus::Interrupted, None);
             }
 
-            while let Ok(steer) = self.rx_steer.try_recv() {
-                let steer = steer.trim().to_string();
-                if steer.is_empty() {
-                    continue;
+            // A whole-stream retry must bypass every stateful preparation
+            // seam below (steers, child completions, prompt refresh,
+            // compaction, diagnostics, tool activation, and effort routing).
+            // The saved request is the retry contract, not a recipe for
+            // rebuilding a request that merely looks similar.
+            let stream_request = if let Some(retry_request) = pending_stream_request.take() {
+                retry_request
+            } else {
+                while let Ok(steer) = self.rx_steer.try_recv() {
+                    let steer = steer.trim().to_string();
+                    if steer.is_empty() {
+                        continue;
+                    }
+                    self.session
+                        .working_set
+                        .observe_user_message(&steer, &self.session.workspace);
+                    self.add_session_message(
+                        self.user_text_message_with_turn_metadata(steer.clone()),
+                    )
+                    .await;
+                    let _ = self
+                        .tx_event
+                        .send(Event::status(format!(
+                            "Steer input accepted: {}",
+                            summarize_text(&steer, 120)
+                        )))
+                        .await;
                 }
-                self.session
-                    .working_set
-                    .observe_user_message(&steer, &self.session.workspace);
-                self.add_session_message(self.user_text_message_with_turn_metadata(steer.clone()))
-                    .await;
-                let _ = self
-                    .tx_event
-                    .send(Event::status(format!(
-                        "Steer input accepted: {}",
-                        summarize_text(&steer, 120)
-                    )))
-                    .await;
-            }
 
-            // Child agents can finish while the parent model is still taking
-            // tool steps. Surface queued completions before the next provider
-            // request so the parent can use them immediately instead of
-            // discovering them only when it eventually emits no more tools or
-            // the idle handler starts a separate follow-up turn.
-            self.drain_subagent_completion_events("queued").await;
+                // Child agents can finish while the parent model is still taking
+                // tool steps. Surface queued completions before the next provider
+                // request so the parent can use them immediately instead of
+                // discovering them only when it eventually emits no more tools or
+                // the idle handler starts a separate follow-up turn.
+                self.drain_subagent_completion_events("queued").await;
 
-            // Ensure system prompt is up to date with latest session states
-            self.refresh_system_prompt();
+                // Ensure system prompt is up to date with latest session states
+                self.refresh_system_prompt();
 
-            if turn.at_max_steps() {
-                let _ = self
-                    .tx_event
-                    .send(Event::status("Reached maximum steps"))
-                    .await;
-                break;
-            }
+                if turn.at_max_steps() {
+                    let _ = self
+                        .tx_event
+                        .send(Event::status("Reached maximum steps"))
+                        .await;
+                    break;
+                }
 
-            // A tool-producing response can spend the remaining goal budget
-            // before this loop reaches the no-tool continuation check below.
-            // Stop at the provider-request boundary so tool results remain in
-            // the transcript, but no additional model request is authorized.
-            // GoalState remains untouched here: the outer turn bookkeeping
-            // records this usage once, then the normal cross-turn reconciler
-            // publishes the terminal Blocked projection.
-            if let Some(snapshot) = self.goal_snapshot_with_current_turn_usage(&turn.usage)
-                && let Some(budget) = snapshot.token_budget
-                && snapshot.tokens_used >= u64::from(budget)
-            {
-                let _ = self
-                    .tx_event
-                    .send(Event::status(format!(
-                        "Goal token budget reached ({} / {budget} tokens); ending turn before another provider request.",
-                        snapshot.tokens_used
-                    )))
-                    .await;
-                break;
-            }
-
-            let compaction_pins =
-                self.compaction_pins_for_active_turn(turn.active_slop_gate_message.as_ref());
-            let compaction_paths = self.session.working_set.top_paths(24);
-
-            if self.config.compaction.enabled
-                && should_compact(
-                    &self.session.messages,
-                    &self.config.compaction,
-                    Some(&self.session.workspace),
-                    Some(&compaction_pins),
-                    Some(&compaction_paths),
-                )
-            {
-                let compaction_id = format!("compact_{}", &uuid::Uuid::new_v4().to_string()[..8]);
-                self.emit_compaction_started(
-                    compaction_id.clone(),
-                    true,
-                    "Auto context compaction started".to_string(),
-                )
-                .await;
-                let _ = self
-                    .tx_event
-                    .send(Event::status("Auto-compacting context...".to_string()))
-                    .await;
-                let auto_messages_before = self.session.messages.len();
-                match compact_messages_safe(
-                    client.as_ref(),
-                    &self.session.messages,
-                    &self.config.compaction,
-                    Some(&self.session.workspace),
-                    Some(&compaction_pins),
-                    Some(&compaction_paths),
-                )
-                .await
+                // A tool-producing response can spend the remaining goal budget
+                // before this loop reaches the no-tool continuation check below.
+                // Stop at the provider-request boundary so tool results remain in
+                // the transcript, but no additional model request is authorized.
+                // GoalState remains untouched here: the outer turn bookkeeping
+                // records this usage once, then the normal cross-turn reconciler
+                // publishes the terminal Blocked projection.
+                if let Some(snapshot) = self.goal_snapshot_with_current_turn_usage(&turn.usage)
+                    && let Some(budget) = snapshot.token_budget
+                    && snapshot.tokens_used >= u64::from(budget)
                 {
-                    Ok(result) => {
-                        // Only update if we got valid messages (never corrupt state)
-                        if !result.messages.is_empty() || self.session.messages.is_empty() {
-                            let auto_messages_after = result.messages.len();
-                            self.session.replace_messages(result.messages);
-                            self.merge_compaction_summary(result.summary_prompt);
-                            self.emit_session_updated().await;
-                            let removed = auto_messages_before.saturating_sub(auto_messages_after);
-                            let status = if result.retries_used > 0 {
-                                format!(
-                                    "Auto-compaction complete: {auto_messages_before} → {auto_messages_after} messages ({removed} removed, {} retries)",
-                                    result.retries_used
-                                )
-                            } else {
-                                format!(
-                                    "Auto-compaction complete: {auto_messages_before} → {auto_messages_after} messages ({removed} removed)"
-                                )
-                            };
-                            self.emit_compaction_completed(
-                                compaction_id.clone(),
-                                true,
-                                status.clone(),
-                                Some(auto_messages_before),
-                                Some(auto_messages_after),
-                            )
-                            .await;
-                            let _ = self.tx_event.send(Event::status(status)).await;
+                    let _ = self
+                        .tx_event
+                        .send(Event::status(format!(
+                            "Goal token budget reached ({} / {budget} tokens); ending turn before another provider request.",
+                            snapshot.tokens_used
+                        )))
+                        .await;
+                    break;
+                }
+
+                // #136: include pending diagnostics in the exact live history
+                // used by compaction and the subsequent provider request.
+                self.flush_pending_lsp_diagnostics().await;
+
+                // #159: layered seams are append-only history and therefore also
+                // belong in the live request captured for cache-aligned summary.
+                self.layered_context_checkpoint().await;
+
+                let force_update_plan_this_step = force_update_plan_first && !turn.has_tool_calls();
+                let mut active_tools = if tool_catalog.is_empty() {
+                    None
+                } else {
+                    Some(active_tools_for_step(
+                        &tool_catalog,
+                        &active_tool_names,
+                        force_update_plan_this_step,
+                    ))
+                };
+                if self.config.strict_tool_mode
+                    && let Some(tools) = active_tools.as_mut()
+                {
+                    crate::tools::schema_sanitize::prepare_tools_for_strict_mode(tools);
+                }
+
+                // Resolve `auto` once. Compaction and the request that follows it
+                // must project historical reasoning identically.
+                let effective_reasoning_effort = resolve_auto_effort(
+                    self.session.reasoning_effort.as_deref(),
+                    &self.session.messages,
+                    self.api_provider,
+                    &self.api_config.deepseek_base_url(),
+                    &self.config.model,
+                );
+
+                let mut request = MessageRequest {
+                    model: self.session.model.clone(),
+                    messages: self.messages_with_turn_metadata(),
+                    max_tokens: effective_max_output_tokens_for_route(
+                        self.api_provider,
+                        &self.session.model,
+                        self.active_route_limits,
+                    ),
+                    system: self.session.system_prompt.clone(),
+                    tools: active_tools.clone(),
+                    tool_choice: if active_tools.is_some() {
+                        if self.config.strict_tool_mode {
+                            Some(json!("required"))
                         } else {
-                            let message = "Auto-compaction skipped: empty result".to_string();
-                            self.emit_compaction_failed(
-                                compaction_id.clone(),
-                                true,
-                                message.clone(),
-                            )
-                            .await;
+                            Some(json!({ "type": "auto" }))
+                        }
+                    } else {
+                        None
+                    },
+                    metadata: None,
+                    thinking: None,
+                    reasoning_effort: effective_reasoning_effort,
+                    stream: Some(true),
+                    temperature: None,
+                    top_p: None,
+                };
+
+                let compaction_pins =
+                    self.compaction_pins_for_active_turn(turn.active_slop_gate_message.as_ref());
+                let compaction_paths = self.session.working_set.top_paths(24);
+
+                if self.config.compaction.enabled
+                    && should_compact(
+                        &self.session.messages,
+                        &self.config.compaction,
+                        Some(&self.session.workspace),
+                        Some(&compaction_pins),
+                        Some(&compaction_paths),
+                    )
+                {
+                    let compaction_id =
+                        format!("compact_{}", &uuid::Uuid::new_v4().to_string()[..8]);
+                    self.emit_compaction_started(
+                        compaction_id.clone(),
+                        true,
+                        "Auto context compaction started".to_string(),
+                    )
+                    .await;
+                    let _ = self
+                        .tx_event
+                        .send(Event::status("Auto-compacting context...".to_string()))
+                        .await;
+                    let auto_messages_before = self.session.messages.len();
+                    match compact_messages_safe(
+                        client.as_ref(),
+                        &self.session.messages,
+                        &self.config.compaction,
+                        Some(&self.session.workspace),
+                        Some(&compaction_pins),
+                        Some(&compaction_paths),
+                        Some(&request),
+                    )
+                    .await
+                    {
+                        Ok(mut result) => {
+                            // Only update if we got valid messages (never corrupt state)
+                            if !result.messages.is_empty() || self.session.messages.is_empty() {
+                                self.reanchor_compaction_history(&mut result.messages);
+                                let auto_messages_after = result.messages.len();
+                                self.session.replace_messages(result.messages);
+                                self.emit_session_updated().await;
+                                let removed =
+                                    auto_messages_before.saturating_sub(auto_messages_after);
+                                let status = if result.retries_used > 0 {
+                                    format!(
+                                        "Auto-compaction complete: {auto_messages_before} → {auto_messages_after} messages ({removed} removed, {} retries)",
+                                        result.retries_used
+                                    )
+                                } else {
+                                    format!(
+                                        "Auto-compaction complete: {auto_messages_before} → {auto_messages_after} messages ({removed} removed)"
+                                    )
+                                };
+                                self.emit_compaction_completed(
+                                    compaction_id.clone(),
+                                    true,
+                                    status.clone(),
+                                    Some(auto_messages_before),
+                                    Some(auto_messages_after),
+                                )
+                                .await;
+                                let _ = self.tx_event.send(Event::status(status)).await;
+                            } else {
+                                let message = "Auto-compaction skipped: empty result".to_string();
+                                self.emit_compaction_failed(
+                                    compaction_id.clone(),
+                                    true,
+                                    message.clone(),
+                                )
+                                .await;
+                                let _ = self.tx_event.send(Event::status(message)).await;
+                            }
+                        }
+                        Err(err) => {
+                            // Log error but continue with original messages (never corrupt)
+                            let message = format!("Auto-compaction failed: {err}");
+                            self.emit_compaction_failed(compaction_id, true, message.clone())
+                                .await;
                             let _ = self.tx_event.send(Event::status(message)).await;
                         }
                     }
-                    Err(err) => {
-                        // Log error but continue with original messages (never corrupt)
-                        let message = format!("Auto-compaction failed: {err}");
-                        self.emit_compaction_failed(compaction_id, true, message.clone())
-                            .await;
-                        let _ = self.tx_event.send(Event::status(message)).await;
-                    }
                 }
-            }
 
-            if let Some(input_budget) = context_input_budget_for_route(
-                self.api_provider,
-                &self.session.model,
-                self.active_route_limits,
-                0,
-            ) {
-                let estimated_input = self.estimated_input_tokens();
-                if estimated_input > input_budget {
-                    if context_recovery_attempts >= MAX_CONTEXT_RECOVERY_ATTEMPTS {
-                        let message = format!(
-                            "Context remains above model limit after {MAX_CONTEXT_RECOVERY_ATTEMPTS} recovery attempts \
+                // Auto-compaction may have replaced history. Any subsequent
+                // emergency recovery in this same preparation pass must replay
+                // the current concrete live history, not the pre-compaction
+                // snapshot captured above.
+                request.messages = self.messages_with_turn_metadata();
+
+                if let Some(input_budget) = context_input_budget_for_route(
+                    self.api_provider,
+                    &self.session.model,
+                    self.active_route_limits,
+                    0,
+                ) {
+                    let estimated_input = self.estimated_input_tokens();
+                    if estimated_input > input_budget {
+                        if context_recovery_attempts >= MAX_CONTEXT_RECOVERY_ATTEMPTS {
+                            let message = format!(
+                                "Context remains above model limit after {MAX_CONTEXT_RECOVERY_ATTEMPTS} recovery attempts \
                              (~{estimated_input} token estimate, ~{input_budget} budget). Please run /compact or /clear."
-                        );
-                        turn_error = Some(message.clone());
-                        let _ = self
-                            .tx_event
-                            .send(Event::error(ErrorEnvelope::context_overflow(message)))
-                            .await;
-                        return (TurnOutcomeStatus::Failed, turn_error);
-                    }
+                            );
+                            turn_error = Some(message.clone());
+                            let _ = self
+                                .tx_event
+                                .send(Event::error(ErrorEnvelope::context_overflow(message)))
+                                .await;
+                            return (TurnOutcomeStatus::Failed, turn_error);
+                        }
 
-                    if self
-                        .recover_context_overflow(
-                            client.as_ref(),
-                            "preflight token budget",
-                            turn.active_slop_gate_message.as_ref(),
-                        )
-                        .await
-                    {
+                        // Recovery may still reduce history without reaching
+                        // the target budget. Never send the stale pre-recovery
+                        // request in that case: rebuild on the next pass and
+                        // either recover further or fail at the bounded cap.
+                        let _ = self
+                            .recover_context_overflow(
+                                client.as_ref(),
+                                "preflight token budget",
+                                turn.active_slop_gate_message.as_ref(),
+                                Some(&request),
+                            )
+                            .await;
                         context_recovery_attempts = context_recovery_attempts.saturating_add(1);
                         continue;
                     }
                 }
-            }
 
-            // #136: drain any LSP diagnostics collected since the last
-            // request and inject them as a synthetic user message so the
-            // model sees compile errors before its next reasoning step.
-            self.flush_pending_lsp_diagnostics().await;
-
-            // #159: layered context seam checkpoint. This is opt-in for
-            // v0.7.5 while #200 audits cache-hit behavior; when enabled it
-            // appends <archived_context> blocks rather than replacing history.
-            self.layered_context_checkpoint().await;
-
-            // Build the request
-            let force_update_plan_this_step = force_update_plan_first && !turn.has_tool_calls();
-            let mut active_tools = if tool_catalog.is_empty() {
-                None
-            } else {
-                Some(active_tools_for_step(
-                    &tool_catalog,
-                    &active_tool_names,
-                    force_update_plan_this_step,
-                ))
-            };
-            if self.config.strict_tool_mode
-                && let Some(tools) = active_tools.as_mut()
-            {
-                crate::tools::schema_sanitize::prepare_tools_for_strict_mode(tools);
-            }
-
-            // Resolve `auto` reasoning_effort to a concrete tier (#663).
-            let effective_reasoning_effort = resolve_auto_effort(
-                self.session.reasoning_effort.as_deref(),
-                &self.session.messages,
-                self.api_provider,
-                &self.api_config.deepseek_base_url(),
-                &self.config.model,
-            );
-
-            // Check prefix-cache stability before building the request.
-            // This detects system-prompt or tool-set drift that would
-            // invalidate DeepSeek's KV prefix cache for this turn.
-            // Sends an event on EVERY check so the TUI can maintain
-            // its own counter for the stable-checks tally.
-            if let Some(pm) = self.session.prefix_stability.as_mut() {
-                let system_text =
-                    crate::prefix_cache::system_prompt_text(self.session.system_prompt.as_ref());
-                let tools_ref: Option<&[crate::models::Tool]> = active_tools.as_deref();
-                match pm.check_and_update(&system_text, tools_ref) {
-                    Err(change) => {
-                        let pinned_hash = pm
-                            .pinned_fingerprint()
-                            .map(|fp| fp.combined_sha256.clone())
-                            .unwrap_or_default();
-                        tracing::debug!(
-                            target: "prefix_cache",
-                            "{}",
-                            change.description()
-                        );
-                        let _ = self
-                            .tx_event
-                            .send(Event::PrefixCacheChange {
-                                description: change.description(),
-                                system_prompt_changed: change.system_changed,
-                                tools_changed: change.tools_changed,
-                                stability_pct: (pm.stability_ratio() * 100.0).round() as u32,
-                                changed: true,
-                                pinned_combined_hash: pinned_hash,
-                            })
-                            .await;
-                    }
-                    Ok(_) => {
-                        let pinned_hash = pm
-                            .pinned_fingerprint()
-                            .map(|fp| fp.combined_sha256.clone())
-                            .unwrap_or_default();
-                        // Stable check — keep the TUI counter in sync.
-                        let _ = self
-                            .tx_event
-                            .send(Event::PrefixCacheChange {
-                                description: String::new(),
-                                system_prompt_changed: false,
-                                tools_changed: false,
-                                stability_pct: (pm.stability_ratio() * 100.0).round() as u32,
-                                changed: false,
-                                pinned_combined_hash: pinned_hash,
-                            })
-                            .await;
+                // Check prefix-cache stability before building the request.
+                // This detects system-prompt or tool-set drift that would
+                // invalidate DeepSeek's KV prefix cache for this turn.
+                // Sends an event on EVERY check so the TUI can maintain
+                // its own counter for the stable-checks tally.
+                if let Some(pm) = self.session.prefix_stability.as_mut() {
+                    let system_text = crate::prefix_cache::system_prompt_text(
+                        self.session.system_prompt.as_ref(),
+                    );
+                    let tools_ref: Option<&[crate::models::Tool]> = active_tools.as_deref();
+                    match pm.check_and_update(&system_text, tools_ref) {
+                        Err(change) => {
+                            let pinned_hash = pm
+                                .pinned_fingerprint()
+                                .map(|fp| fp.combined_sha256.clone())
+                                .unwrap_or_default();
+                            tracing::debug!(
+                                target: "prefix_cache",
+                                "{}",
+                                change.description()
+                            );
+                            let _ = self
+                                .tx_event
+                                .send(Event::PrefixCacheChange {
+                                    description: change.description(),
+                                    system_prompt_changed: change.system_changed,
+                                    tools_changed: change.tools_changed,
+                                    stability_pct: (pm.stability_ratio() * 100.0).round() as u32,
+                                    changed: true,
+                                    pinned_combined_hash: pinned_hash,
+                                })
+                                .await;
+                        }
+                        Ok(_) => {
+                            let pinned_hash = pm
+                                .pinned_fingerprint()
+                                .map(|fp| fp.combined_sha256.clone())
+                                .unwrap_or_default();
+                            // Stable check — keep the TUI counter in sync.
+                            let _ = self
+                                .tx_event
+                                .send(Event::PrefixCacheChange {
+                                    description: String::new(),
+                                    system_prompt_changed: false,
+                                    tools_changed: false,
+                                    stability_pct: (pm.stability_ratio() * 100.0).round() as u32,
+                                    changed: false,
+                                    pinned_combined_hash: pinned_hash,
+                                })
+                                .await;
+                        }
                     }
                 }
-            }
 
-            // Three-zone prefix contract (#2264): freeze baseline on first
-            // turn, verify against it on subsequent turns. Operates alongside
-            // PrefixStabilityManager as an independent diagnostic layer.
-            // Phase 3: emit a one-shot 'frozen' event on first turn.
-            // Drift is logged (tracing::debug!) but not re-emitted —
-            // PrefixStabilityManager already reports the change above.
-            let system_text =
-                crate::prefix_cache::system_prompt_text(self.session.system_prompt.as_ref());
-            let current_tools: &[crate::models::Tool] = active_tools.as_deref().unwrap_or_default();
+                // Three-zone prefix contract (#2264): freeze baseline on first
+                // turn, verify against it on subsequent turns. Operates alongside
+                // PrefixStabilityManager as an independent diagnostic layer.
+                // Phase 3: emit a one-shot 'frozen' event on first turn.
+                // Drift is logged (tracing::debug!) but not re-emitted —
+                // PrefixStabilityManager already reports the change above.
+                let system_text =
+                    crate::prefix_cache::system_prompt_text(self.session.system_prompt.as_ref());
+                let current_tools: &[crate::models::Tool] =
+                    active_tools.as_deref().unwrap_or_default();
 
-            match &self.session.frozen_prefix {
-                Some(frozen) => {
-                    if let Err(drift) = frozen.verify(&system_text, current_tools) {
-                        tracing::debug!(
-                            target: "prefix_cache",
-                            "three-zone drift: {drift}"
-                        );
+                match &self.session.frozen_prefix {
+                    Some(frozen) => {
+                        if let Err(drift) = frozen.verify(&system_text, current_tools) {
+                            tracing::debug!(
+                                target: "prefix_cache",
+                                "three-zone drift: {drift}"
+                            );
+                            let pinned = PinnedPrefix::new(
+                                self.session.system_prompt.as_ref(),
+                                current_tools.to_vec(),
+                            );
+                            self.session.frozen_prefix = Some(pinned.freeze());
+                        }
+                    }
+                    None => {
                         let pinned = PinnedPrefix::new(
                             self.session.system_prompt.as_ref(),
                             current_tools.to_vec(),
                         );
-                        self.session.frozen_prefix = Some(pinned.freeze());
+                        let frozen = pinned.freeze();
+                        let _ = self
+                            .tx_event
+                            .send(Event::PrefixCacheChange {
+                                description: format!("frozen: {}", frozen.short_id()),
+                                system_prompt_changed: false,
+                                tools_changed: false,
+                                stability_pct: 100,
+                                changed: false,
+                                pinned_combined_hash: frozen.hash().to_string(),
+                            })
+                            .await;
+                        self.session.frozen_prefix = Some(frozen);
                     }
                 }
-                None => {
-                    let pinned = PinnedPrefix::new(
-                        self.session.system_prompt.as_ref(),
-                        current_tools.to_vec(),
-                    );
-                    let frozen = pinned.freeze();
-                    let _ = self
-                        .tx_event
-                        .send(Event::PrefixCacheChange {
-                            description: format!("frozen: {}", frozen.short_id()),
-                            system_prompt_changed: false,
-                            tools_changed: false,
-                            stability_pct: 100,
-                            changed: false,
-                            pinned_combined_hash: frozen.hash().to_string(),
-                        })
-                        .await;
-                    self.session.frozen_prefix = Some(frozen);
-                }
-            }
 
-            let request = MessageRequest {
-                model: self.session.model.clone(),
-                messages: self.messages_with_turn_metadata(),
-                max_tokens: effective_max_output_tokens_for_route(
-                    self.api_provider,
-                    &self.session.model,
-                    self.active_route_limits,
-                ),
-                system: self.session.system_prompt.clone(),
-                tools: active_tools.clone(),
-                tool_choice: if active_tools.is_some() {
-                    if self.config.strict_tool_mode {
-                        Some(json!("required"))
-                    } else {
-                        Some(json!({ "type": "auto" }))
-                    }
-                } else {
-                    None
-                },
-                metadata: None,
-                thinking: None,
-                reasoning_effort: effective_reasoning_effort,
-                stream: Some(true),
-                temperature: None,
-                top_p: None,
+                request
             };
+
+            // A forked child inherits the exact concrete parent request that
+            // produced its spawn call. This step-live snapshot includes any
+            // preceding compaction or synthetic goal continuation, excludes
+            // the dangling assistant ToolUse response, and stays identical
+            // across transparent retries.
+            update_live_fork_context_from_request(live_fork_context, &stream_request);
 
             // Stream the response. Keep the request around (cloned into the
             // first call) so we can resend it on a transparent retry below
             // when the wire dies before any content was streamed (#103).
-            let stream_request = request;
             let stream_result = tokio::select! {
                 biased;
                 () = self.cancel_token.cancelled() => {
@@ -699,6 +747,7 @@ impl Engine {
                                 client.as_ref(),
                                 "provider context-length rejection",
                                 turn.active_slop_gate_message.as_ref(),
+                                Some(&stream_request),
                             )
                             .await
                     {
@@ -757,7 +806,6 @@ impl Engine {
             // content-block delta delivered to the consumer).
             let mut any_content_received = false;
             let mut transparent_stream_retries = 0u32;
-            let mut pending_steers: Vec<String> = Vec::new();
             // `stream_start` is reset on a transparent retry so the wall-clock
             // budget restarts with the fresh stream.
             let mut stream_start = Instant::now();
@@ -913,12 +961,18 @@ impl Engine {
                                         "Stream retry failed: {retry_err}"
                                     ));
                                     turn_error.get_or_insert(retry_msg.clone());
-                                    let _ = self
-                                        .tx_event
-                                        .send(Event::error(ErrorEnvelope::classify(
-                                            retry_msg, true,
-                                        )))
-                                        .await;
+                                    if stream_retry_attempts >= MAX_STREAM_RETRIES {
+                                        let _ = self
+                                            .tx_event
+                                            .send(Event::error(ErrorEnvelope::classify(
+                                                retry_msg, true,
+                                            )))
+                                            .await;
+                                    } else {
+                                        crate::logging::warn(format!(
+                                            "Deferring transient retry-open error until the whole-stream retry budget is exhausted: {retry_msg}"
+                                        ));
+                                    }
                                     break;
                                 }
                             }
@@ -926,10 +980,16 @@ impl Engine {
                         let user_message =
                             stream_read_error_user_message(&message, any_content_received);
                         turn_error.get_or_insert(user_message.clone());
-                        let _ = self
-                            .tx_event
-                            .send(Event::error(ErrorEnvelope::classify(user_message, true)))
-                            .await;
+                        if any_content_received || stream_retry_attempts >= MAX_STREAM_RETRIES {
+                            let _ = self
+                                .tx_event
+                                .send(Event::error(ErrorEnvelope::classify(user_message, true)))
+                                .await;
+                        } else {
+                            crate::logging::warn(format!(
+                                "Deferring transient stream error until the whole-stream retry budget is exhausted: {user_message}"
+                            ));
+                        }
                         if stream_errors >= MAX_STREAM_ERRORS_BEFORE_FAIL {
                             break;
                         }
@@ -1248,6 +1308,7 @@ impl Engine {
                     // about to retry, and a successful retry should not
                     // surface the transient error as the turn outcome.
                     turn_error = None;
+                    pending_stream_request = Some(stream_request.clone());
                     continue;
                 }
                 crate::logging::warn(format!(

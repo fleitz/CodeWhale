@@ -1772,6 +1772,8 @@ pub struct SubAgentForkContext {
     pub structured_state_block: Option<String>,
 }
 
+pub type SharedSubAgentForkContext = Arc<parking_lot::RwLock<SubAgentForkContext>>;
+
 /// Runtime configuration for spawning sub-agents.
 ///
 /// Carries everything a child needs to (a) build its own tool registry —
@@ -1861,6 +1863,10 @@ pub struct SubAgentRuntime {
     pub parent_completion_tx: Option<mpsc::UnboundedSender<SubAgentCompletion>>,
     /// Snapshot of the request prefix visible to an opt-in forked child.
     pub fork_context: Option<SubAgentForkContext>,
+    /// Root-engine fork context updated from the exact concrete request at
+    /// each model step. It is frozen into `fork_context` at the central spawn
+    /// boundary so queued workers cannot drift after admission.
+    pub(crate) live_fork_context: Option<SharedSubAgentForkContext>,
     /// The parent's MCP pool if available.
     pub mcp_pool: Option<std::sync::Arc<tokio::sync::Mutex<crate::mcp::McpPool>>>,
     /// Per-step DeepSeek API timeout for the child's `create_message` call.
@@ -1928,6 +1934,7 @@ impl SubAgentRuntime {
             mailbox: None,
             parent_completion_tx: None,
             fork_context: None,
+            live_fork_context: None,
             mcp_pool: None,
             step_api_timeout: DEFAULT_STEP_API_TIMEOUT,
             tool_timeout: DEFAULT_TOOL_TIMEOUT,
@@ -2013,7 +2020,29 @@ impl SubAgentRuntime {
     #[must_use]
     pub fn with_fork_context(mut self, context: SubAgentForkContext) -> Self {
         self.fork_context = Some(context);
+        self.live_fork_context = None;
         self
+    }
+
+    /// Attach the root engine's step-live parent request prefix.
+    #[must_use]
+    pub(crate) fn with_live_fork_context(mut self, context: SharedSubAgentForkContext) -> Self {
+        self.fork_context = None;
+        self.live_fork_context = Some(context);
+        self
+    }
+
+    pub(crate) fn current_fork_context(&self) -> Option<SubAgentForkContext> {
+        self.live_fork_context
+            .as_ref()
+            .map(|context| context.read().clone())
+            .or_else(|| self.fork_context.clone())
+    }
+
+    fn freeze_live_fork_context(&mut self) {
+        if let Some(context) = self.live_fork_context.take() {
+            self.fork_context = Some(context.read().clone());
+        }
     }
 
     /// Attach a `Mailbox` so this runtime and its derived children publish
@@ -2187,6 +2216,7 @@ impl SubAgentRuntime {
             mailbox: self.mailbox.clone(),
             parent_completion_tx: self.parent_completion_tx.clone(),
             fork_context: self.fork_context.clone(),
+            live_fork_context: self.live_fork_context.clone(),
             mcp_pool: self.mcp_pool.clone(),
             step_api_timeout: self.step_api_timeout,
             tool_timeout: self.tool_timeout,
@@ -3706,6 +3736,12 @@ impl SubAgentManager {
 
         if let Some(model) = options.model.as_deref() {
             runtime.model = model.to_string();
+        }
+        if options.fork_context {
+            // Capture the exact step-live parent prefix now. The worker may
+            // wait behind the launch gate; later parent turns must not mutate
+            // the context assigned to this spawn.
+            runtime.freeze_live_fork_context();
         }
         let effective_model = runtime.model.clone();
         let agent_id = format!("agent_{}", &Uuid::new_v4().to_string()[..8]);
@@ -6999,7 +7035,7 @@ async fn run_subagent(
         build_subagent_system_prompt_with_skills(&agent_type, &assignment, &runtime.context);
     let fork_context_enabled = fork_context;
     let fork_context = fork_context_enabled
-        .then_some(runtime.fork_context.as_ref())
+        .then(|| runtime.current_fork_context())
         .flatten();
     let request_system = subagent_request_system_prompt(&system_prompt);
     let mut messages = build_initial_subagent_messages_with_system(
@@ -7007,7 +7043,7 @@ async fn run_subagent(
         &assignment,
         &agent_type,
         &system_prompt,
-        fork_context,
+        fork_context.as_ref(),
     );
     let mut transcript_artifact =
         match SubAgentTranscriptArtifactWriter::for_runtime(runtime, &agent_id).await {
@@ -7950,13 +7986,13 @@ fn auto_fork_context_default(
     child_provider: crate::config::ApiProvider,
     effective_model: &str,
 ) -> bool {
-    let Some(fork_snapshot) = parent_runtime.fork_context.as_ref() else {
+    let Some(fork_snapshot) = parent_runtime.current_fork_context() else {
         return false;
     };
     if parent_runtime.parent_agent_id.is_some() {
         return false;
     }
-    if estimated_fork_prefix_tokens(fork_snapshot) > AUTO_FORK_MAX_PARENT_PREFIX_TOKENS {
+    if estimated_fork_prefix_tokens(&fork_snapshot) > AUTO_FORK_MAX_PARENT_PREFIX_TOKENS {
         return false;
     }
     let read_only_posture = matches!(

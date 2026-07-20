@@ -36,8 +36,6 @@ const LARGE_CONTEXT_WINDOW_TOKENS: u32 = 500_000;
 /// Max chars to keep from metadata-provided output summaries.
 const TOOL_RESULT_METADATA_SUMMARY_CHARS: usize = 320;
 
-pub(super) const COMPACTION_SUMMARY_MARKER: &str = "Conversation Summary (Auto-Generated)";
-
 #[derive(Debug, Clone, Copy)]
 struct ToolResultContextLimits {
     hard_limit_chars: usize,
@@ -457,32 +455,6 @@ pub(crate) fn compact_tool_result_for_route(
         format!(
             "[{tool_name} output compacted to protect context]\nSnippet: {snippet}\n(Original: {raw_chars} chars, omitted: {omitted} chars.)"
         )
-    }
-}
-
-pub(super) fn extract_compaction_summary_prompt(
-    prompt: Option<SystemPrompt>,
-) -> Option<SystemPrompt> {
-    match prompt {
-        Some(SystemPrompt::Blocks(blocks)) => {
-            let summary_blocks: Vec<_> = blocks
-                .into_iter()
-                .filter(|block| block.text.contains(COMPACTION_SUMMARY_MARKER))
-                .collect();
-            if summary_blocks.is_empty() {
-                None
-            } else {
-                Some(SystemPrompt::Blocks(summary_blocks))
-            }
-        }
-        Some(SystemPrompt::Text(text)) => {
-            if text.contains(COMPACTION_SUMMARY_MARKER) {
-                Some(SystemPrompt::Text(text))
-            } else {
-                None
-            }
-        }
-        None => None,
     }
 }
 

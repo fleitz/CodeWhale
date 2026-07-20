@@ -17304,3 +17304,28 @@ fn backtrack_cut_index_skips_tool_result_user_messages() {
     // depth beyond available prompts.
     assert_eq!(super::backtrack_api_cut_index(&msgs, 2), None);
 }
+
+#[test]
+fn backtrack_cut_index_skips_runtime_compaction_summary() {
+    use crate::models::{ContentBlock, Message};
+
+    let msgs = vec![
+        crate::compaction::compaction_summary_message(
+            format!(
+                "## {}\n\nretained context",
+                crate::compaction::COMPACTION_SUMMARY_MARKER
+            ),
+            true,
+        ),
+        Message {
+            role: "user".into(),
+            content: vec![ContentBlock::Text {
+                text: "real prompt".into(),
+                cache_control: None,
+            }],
+        },
+    ];
+
+    assert_eq!(super::backtrack_api_cut_index(&msgs, 0), Some(1));
+    assert_eq!(super::backtrack_api_cut_index(&msgs, 1), None);
+}

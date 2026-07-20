@@ -447,6 +447,11 @@ impl HistoryCell {
 /// Convert a message into history cells for rendering.
 #[must_use]
 pub fn history_cells_from_message(msg: &Message) -> Vec<HistoryCell> {
+    if let Some(summary) = crate::compaction::compaction_summary_text(msg) {
+        return vec![HistoryCell::System {
+            content: format!("Context compacted\n\n{summary}"),
+        }];
+    }
     if let Some(display) = crate::runtime_handoff::restored_subagent_checkpoint_display(msg) {
         return vec![HistoryCell::System {
             content: display.to_string(),

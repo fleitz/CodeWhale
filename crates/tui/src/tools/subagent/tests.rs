@@ -6200,6 +6200,7 @@ fn stub_runtime() -> SubAgentRuntime {
         parent_agent_id: None,
         parent_completion_tx: None,
         fork_context: None,
+        live_fork_context: None,
         parent_mode: crate::tui::app::AppMode::Agent,
         mcp_pool: None,
         step_api_timeout: DEFAULT_STEP_API_TIMEOUT,
@@ -6207,6 +6208,48 @@ fn stub_runtime() -> SubAgentRuntime {
         speech_output_dir: None,
         todos: crate::tools::todo::new_shared_todo_list(),
     }
+}
+
+#[test]
+fn live_fork_context_freezes_compaction_and_goal_history_at_spawn_boundary() {
+    let summary = crate::compaction::compaction_summary_message(
+        format!(
+            "## {}\n\ncurrent compacted parent history",
+            crate::compaction::COMPACTION_SUMMARY_MARKER
+        ),
+        true,
+    );
+    let goal_continuation = Message {
+        role: "user".to_string(),
+        content: vec![ContentBlock::Text {
+            text: "Continue working toward the active goal.".to_string(),
+            cache_control: None,
+        }],
+    };
+    let shared = Arc::new(parking_lot::RwLock::new(SubAgentForkContext {
+        messages: vec![summary.clone(), goal_continuation.clone()],
+        structured_state_block: Some("stable state".to_string()),
+    }));
+    let mut runtime = stub_runtime().with_live_fork_context(Arc::clone(&shared));
+
+    runtime.freeze_live_fork_context();
+    shared.write().messages.clear();
+    let frozen = runtime
+        .current_fork_context()
+        .expect("spawn should own a frozen fork context");
+    assert!(crate::compaction::is_compaction_summary_message(
+        &frozen.messages[0]
+    ));
+    assert_eq!(
+        frozen
+            .messages
+            .iter()
+            .filter(|message| message == &&goal_continuation)
+            .count(),
+        1,
+        "the synthetic goal continuation must be inherited exactly once"
+    );
+    assert_eq!(frozen.messages[0], summary);
 }
 
 #[test]

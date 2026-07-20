@@ -25,7 +25,9 @@ use tokio_util::sync::CancellationToken;
 
 use crate::client::DeepSeekClient;
 use crate::compaction::{
-    CompactionConfig, compact_messages_safe, merge_system_prompts, should_compact,
+    CompactionConfig, compact_messages_safe, compaction_summary_message, compaction_summary_text,
+    is_compaction_summary_message, replace_compaction_summary_text, should_compact,
+    split_legacy_compaction_summary,
 };
 use crate::config::{ApiProvider, Config, DEFAULT_MAX_SUBAGENTS, DEFAULT_TEXT_MODEL};
 use crate::core::model_client::SharedModelClient;
@@ -57,9 +59,9 @@ use crate::tools::spec::{
     RuntimeToolServices, SharedFileReadTracker, new_shared_file_read_tracker,
 };
 use crate::tools::subagent::{
-    Mailbox, MailboxMessage, SharedSubAgentManager, SubAgentCompletion, SubAgentForkContext,
-    SubAgentResult, SubAgentRuntime, SubAgentStatus, SubAgentThinking, SubAgentType,
-    agent_worker_owner_snapshot, ensure_subagent_model_for_provider,
+    Mailbox, MailboxMessage, SharedSubAgentForkContext, SharedSubAgentManager, SubAgentCompletion,
+    SubAgentForkContext, SubAgentResult, SubAgentRuntime, SubAgentStatus, SubAgentThinking,
+    SubAgentType, agent_worker_owner_snapshot, ensure_subagent_model_for_provider,
     new_shared_subagent_manager_with_timeout, resolve_subagent_assignment_route,
 };
 use crate::tools::todo::{SharedTodoList, TodoListSnapshot, new_shared_todo_list};
@@ -861,22 +863,15 @@ impl Engine {
             .await;
     }
 
-    /// Render the accumulated compaction summary prompt to plain text so it
-    /// can travel in events and be persisted by host layers. All emit sites
-    /// run after `merge_compaction_summary`, so this reflects the summary
-    /// state the engine will use for subsequent requests.
+    /// Render the current history-owned compaction summary for lifecycle/UI
+    /// events. Session persistence already carries this message, so hosts must
+    /// not copy it into the system prompt.
     fn rendered_compaction_summary(&self) -> Option<String> {
         self.session
-            .compaction_summary_prompt
-            .as_ref()
-            .map(|prompt| match prompt {
-                SystemPrompt::Text(text) => text.clone(),
-                SystemPrompt::Blocks(blocks) => blocks
-                    .iter()
-                    .map(|block| block.text.as_str())
-                    .collect::<Vec<_>>()
-                    .join("\n\n"),
-            })
+            .messages
+            .iter()
+            .find_map(compaction_summary_text)
+            .map(str::to_string)
             .filter(|text| !text.trim().is_empty())
     }
 
@@ -2252,10 +2247,22 @@ impl Engine {
                         } else if messages.is_empty() && system_prompt.is_none() {
                             self.session.id = uuid::Uuid::new_v4().to_string();
                         }
-                        self.session.messages =
-                            crate::runtime_handoff::project_messages_for_restore(&messages).into();
-                        self.session.compaction_summary_prompt =
-                            extract_compaction_summary_prompt(system_prompt.clone());
+                        let (system_prompt, legacy_summary) =
+                            split_legacy_compaction_summary(system_prompt);
+                        let mut restored_messages =
+                            crate::runtime_handoff::project_messages_for_restore(&messages);
+                        if let Some(summary) = legacy_summary
+                            && !restored_messages.iter().any(is_compaction_summary_message)
+                        {
+                            restored_messages.insert(
+                                0,
+                                compaction_summary_message(
+                                    summary,
+                                    self.config.compaction.cache_summary,
+                                ),
+                            );
+                        }
+                        self.session.messages = restored_messages.into();
                         self.session.system_prompt = system_prompt;
                         self.session.last_system_prompt_hash =
                             Some(system_prompt_hash(self.session.system_prompt.as_ref()));
@@ -3388,10 +3395,10 @@ impl Engine {
                 Some(&self.subagent_manager),
             )
             .await;
-            Some(SubAgentForkContext {
+            Some(Arc::new(parking_lot::RwLock::new(SubAgentForkContext {
                 messages: self.messages_with_turn_metadata(),
                 structured_state_block: state.to_system_block(),
-            })
+            })))
         } else {
             None
         };
@@ -3490,7 +3497,7 @@ impl Engine {
                 rt.worker_profile.denied_tools =
                     self.config.disallowed_tools.clone().unwrap_or_default();
                 if let Some(context) = fork_context_for_runtime.clone() {
-                    rt = rt.with_fork_context(context);
+                    rt = rt.with_live_fork_context(context);
                 }
                 if let Some((mailbox, cancel_token)) = mailbox_for_runtime.as_ref() {
                     rt = rt
@@ -3589,6 +3596,7 @@ impl Engine {
             input_policy.mode,
             force_update_plan_first,
             input_policy.dynamic_active_tools,
+            fork_context_for_runtime.as_ref(),
         ))
         .catch_unwind()
         .await;
@@ -3720,14 +3728,15 @@ impl Engine {
             Some(&self.session.workspace),
             Some(&compaction_pins),
             Some(&compaction_paths),
+            None,
         )
         .await
         {
-            Ok(result) => {
+            Ok(mut result) => {
                 if !result.messages.is_empty() || self.session.messages.is_empty() {
+                    self.reanchor_compaction_history(&mut result.messages);
                     let messages_after = result.messages.len();
                     self.session.replace_messages(result.messages);
-                    self.merge_compaction_summary(result.summary_prompt);
                     self.emit_session_updated().await;
                     let removed = messages_before.saturating_sub(messages_after);
                     let message = if result.retries_used > 0 {
@@ -3876,14 +3885,92 @@ impl Engine {
         )
     }
 
+    fn tool_linked_message_indices(messages: &[Message], seed: usize) -> HashSet<usize> {
+        fn collect_ids(message: &Message, ids: &mut HashSet<String>) {
+            for block in &message.content {
+                match block {
+                    ContentBlock::ToolUse { id, caller, .. } => {
+                        ids.insert(id.clone());
+                        if let Some(tool_id) =
+                            caller.as_ref().and_then(|caller| caller.tool_id.clone())
+                        {
+                            ids.insert(tool_id);
+                        }
+                    }
+                    ContentBlock::ToolResult { tool_use_id, .. }
+                    | ContentBlock::ToolSearchToolResult { tool_use_id, .. }
+                    | ContentBlock::CodeExecutionToolResult { tool_use_id, .. } => {
+                        ids.insert(tool_use_id.clone());
+                    }
+                    ContentBlock::ServerToolUse { id, .. } => {
+                        ids.insert(id.clone());
+                    }
+                    ContentBlock::Text { .. }
+                    | ContentBlock::ImageUrl { .. }
+                    | ContentBlock::Thinking { .. } => {}
+                }
+            }
+        }
+
+        let mut linked = HashSet::from([seed]);
+        loop {
+            let before = linked.len();
+            let mut ids = HashSet::new();
+            for index in &linked {
+                collect_ids(&messages[*index], &mut ids);
+            }
+            if ids.is_empty() {
+                break;
+            }
+            for (index, message) in messages.iter().enumerate() {
+                let mut message_ids = HashSet::new();
+                collect_ids(message, &mut message_ids);
+                if !ids.is_disjoint(&message_ids) {
+                    linked.insert(index);
+                }
+            }
+            if linked.len() == before {
+                break;
+            }
+        }
+        linked
+    }
+
     fn trim_oldest_messages_to_budget(&mut self, target_input_budget: usize) -> usize {
         let mut removed = 0usize;
-        while self.session.messages.len() > MIN_RECENT_MESSAGES_TO_KEEP
+        while self
+            .session
+            .messages
+            .iter()
+            .filter(|message| !is_compaction_summary_message(message))
+            .count()
+            > MIN_RECENT_MESSAGES_TO_KEEP
             && self.estimated_input_tokens() > target_input_budget
         {
-            self.session.messages.trim_front(1);
-            self.session.bump_messages_revision();
-            removed = removed.saturating_add(1);
+            let Some(remove_index) = self
+                .session
+                .messages
+                .iter()
+                .position(|message| !is_compaction_summary_message(message))
+            else {
+                break;
+            };
+            let mut messages = self.session.messages.to_vec();
+            let ordinary_count = messages
+                .iter()
+                .filter(|message| !is_compaction_summary_message(message))
+                .count();
+            let linked = Self::tool_linked_message_indices(&messages, remove_index);
+            if ordinary_count.saturating_sub(linked.len()) < MIN_RECENT_MESSAGES_TO_KEEP {
+                break;
+            }
+            let mut linked = linked.into_iter().collect::<Vec<_>>();
+            linked.sort_unstable_by(|left, right| right.cmp(left));
+            for index in &linked {
+                messages.remove(*index);
+            }
+            self.session.replace_messages(messages);
+            removed = removed.saturating_add(linked.len());
         }
         removed
     }
@@ -3921,6 +4008,7 @@ impl Engine {
         client: &dyn crate::core::model_client::ModelClient,
         reason: &str,
         active_slop_gate_message: Option<&Message>,
+        live_request: Option<&MessageRequest>,
     ) -> bool {
         let Some(target_budget) = context_input_budget_for_route(
             self.api_provider,
@@ -3940,7 +4028,6 @@ impl Engine {
         let before_count = self.session.messages.len();
 
         let mut retries_used = 0u32;
-        let mut summary_prompt = None;
         let mut compacted_messages: Vec<Message> = self.session.messages.clone().into();
 
         let mut forced_config = self.config.compaction.clone();
@@ -3964,13 +4051,13 @@ impl Engine {
             Some(&self.session.workspace),
             Some(&compaction_pins),
             Some(&compaction_paths),
+            live_request,
         )
         .await
         {
             Ok(result) => {
                 retries_used = result.retries_used;
                 compacted_messages = result.messages;
-                summary_prompt = result.summary_prompt;
             }
             Err(err) => {
                 let _ = self
@@ -3983,9 +4070,9 @@ impl Engine {
         }
 
         if !compacted_messages.is_empty() || self.session.messages.is_empty() {
+            self.reanchor_compaction_history(&mut compacted_messages);
             self.session.replace_messages(compacted_messages);
         }
-        self.merge_compaction_summary(summary_prompt);
 
         let trimmed = self.trim_oldest_messages_to_budget(target_budget);
         self.emit_session_updated().await;
@@ -4468,8 +4555,7 @@ impl Engine {
                 plugin_registry: Some(self.plugin_registry.as_ref()),
             },
         );
-        let stable_prompt =
-            merge_system_prompts(Some(&base), self.session.compaction_summary_prompt.clone());
+        let stable_prompt = Some(base);
 
         let stable_hash = system_prompt_hash(stable_prompt.as_ref());
         if self.session.system_prompt_override {
@@ -4506,65 +4592,44 @@ impl Engine {
         loaded
     }
 
-    /// Merge a compaction summary into the system prompt.
-    ///
-    /// **Zone affiliation (#2264)**: this mutates the system prompt, which is
-    /// part of the `PinnedPrefix` zone in the three-zone contract. Compaction
-    /// is the one intentional mid-session prefix mutation — the engine
-    /// intentionally accepts the cache-invalidation cost because the
-    /// context-reduction benefit outweighs it.
-    fn merge_compaction_summary(&mut self, summary_prompt: Option<SystemPrompt>) {
-        let Some(summary_prompt) = summary_prompt else {
-            return;
-        };
+    /// Refresh the runtime-owned active-operation re-anchor inside the new
+    /// history summary without touching the pinned system/tool prefix.
+    fn reanchor_compaction_history(&self, messages: &mut [Message]) {
         let reanchor = self
             .config
             .runtime_services
             .work
             .as_ref()
-            .and_then(|work| work.active_operation_summary(Some(&self.session.id)))
-            .map(SystemPrompt::Text);
-        let summary_prompt =
-            merge_system_prompts(Some(&summary_prompt), reanchor).or(Some(summary_prompt));
-        let prior_compaction =
-            strip_active_operation_reanchor(self.session.compaction_summary_prompt.as_ref());
-        self.session.compaction_summary_prompt =
-            merge_system_prompts(prior_compaction.as_ref(), summary_prompt.clone());
-        let prior_system = strip_active_operation_reanchor(self.session.system_prompt.as_ref());
-        let merged = merge_system_prompts(prior_system.as_ref(), summary_prompt);
-        self.session.last_system_prompt_hash = Some(system_prompt_hash(merged.as_ref()));
-        self.session.system_prompt = merged;
+            .and_then(|work| work.active_operation_summary(Some(&self.session.id)));
+
+        let Some(summary_index) = messages.iter().position(is_compaction_summary_message) else {
+            return;
+        };
+        let Some(summary) = compaction_summary_text(&messages[summary_index]).map(str::to_string)
+        else {
+            return;
+        };
+
+        let mut summary = strip_active_operation_reanchor_text(summary);
+        if let Some(reanchor) = reanchor {
+            summary.push_str("\n\n");
+            summary.push_str(&reanchor);
+        }
+        let _ = replace_compaction_summary_text(&mut messages[summary_index], summary);
     }
 }
 
-fn strip_active_operation_reanchor(prompt: Option<&SystemPrompt>) -> Option<SystemPrompt> {
-    fn strip_text(mut text: String) -> Option<String> {
-        while let Some(start) = text.find(crate::work_graph::ACTIVE_OPERATION_SUMMARY_START) {
-            let tail = start + crate::work_graph::ACTIVE_OPERATION_SUMMARY_START.len();
-            let end = text[tail..]
-                .find(crate::work_graph::ACTIVE_OPERATION_SUMMARY_END)
-                .map_or(text.len(), |offset| {
-                    tail + offset + crate::work_graph::ACTIVE_OPERATION_SUMMARY_END.len()
-                });
-            text.replace_range(start..end, "");
-        }
-        let text = text.trim().to_string();
-        (!text.is_empty()).then_some(text)
+fn strip_active_operation_reanchor_text(mut text: String) -> String {
+    while let Some(start) = text.find(crate::work_graph::ACTIVE_OPERATION_SUMMARY_START) {
+        let tail = start + crate::work_graph::ACTIVE_OPERATION_SUMMARY_START.len();
+        let end = text[tail..]
+            .find(crate::work_graph::ACTIVE_OPERATION_SUMMARY_END)
+            .map_or(text.len(), |offset| {
+                tail + offset + crate::work_graph::ACTIVE_OPERATION_SUMMARY_END.len()
+            });
+        text.replace_range(start..end, "");
     }
-
-    match prompt.cloned()? {
-        SystemPrompt::Text(text) => strip_text(text).map(SystemPrompt::Text),
-        SystemPrompt::Blocks(blocks) => {
-            let blocks = blocks
-                .into_iter()
-                .filter_map(|mut block| {
-                    block.text = strip_text(block.text)?;
-                    Some(block)
-                })
-                .collect::<Vec<_>>();
-            (!blocks.is_empty()).then_some(SystemPrompt::Blocks(blocks))
-        }
-    }
+    text.trim().to_string()
 }
 
 fn default_plugin_tools_dir() -> PathBuf {
@@ -5026,8 +5091,7 @@ use context::route_context_budget_for_provider;
 use context::{
     MAX_CONTEXT_RECOVERY_ATTEMPTS, MIN_RECENT_MESSAGES_TO_KEEP,
     effective_max_output_tokens_for_route, estimate_input_tokens_conservative,
-    extract_compaction_summary_prompt, is_context_length_error_message,
-    route_context_budget_for_route, summarize_text,
+    is_context_length_error_message, route_context_budget_for_route, summarize_text,
 };
 #[cfg(test)]
 use context::{context_input_budget_for_provider, effective_max_output_tokens};

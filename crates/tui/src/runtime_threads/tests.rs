@@ -1,6 +1,7 @@
 use super::*;
 use crate::core::engine::{MockApprovalEvent, mock_engine_handle};
 use crate::core::events::{Event as EngineEvent, TurnOutcomeStatus};
+use crate::test_support::{EnvVarGuard, lock_test_env};
 use std::time::{Duration, Instant};
 use tokio::sync::{mpsc, oneshot};
 use tokio::time::sleep;
@@ -6979,6 +6980,22 @@ async fn compaction_lifecycle_emits_item_events_with_compaction_counts() -> Resu
                             message: "auto compact begin".to_string(),
                         })
                         .await;
+                    let history_summary = format!(
+                        "## 📋 {}\n\nkey facts.",
+                        crate::compaction::COMPACTION_SUMMARY_MARKER
+                    );
+                    let _ = tx_event
+                        .send(EngineEvent::SessionUpdated {
+                            session_id: "runtime_compaction_session".to_string(),
+                            messages: vec![crate::compaction::compaction_summary_message(
+                                history_summary.clone(),
+                                true,
+                            )],
+                            system_prompt: None,
+                            model: crate::config::DEFAULT_TEXT_MODEL.to_string(),
+                            workspace: PathBuf::from("."),
+                        })
+                        .await;
                     let _ = tx_event
                         .send(EngineEvent::CompactionCompleted {
                             id: "auto_compact_1".to_string(),
@@ -6986,7 +7003,43 @@ async fn compaction_lifecycle_emits_item_events_with_compaction_counts() -> Resu
                             message: "auto compact done".to_string(),
                             messages_before: Some(7),
                             messages_after: Some(3),
-                            summary_prompt: None,
+                            summary_prompt: Some(history_summary.clone()),
+                        })
+                        .await;
+                    let goal_continuation = "Continue working toward the active goal.";
+                    let _ = tx_event
+                        .send(EngineEvent::SessionUpdated {
+                            session_id: "runtime_compaction_session".to_string(),
+                            messages: vec![
+                                crate::compaction::compaction_summary_message(
+                                    history_summary,
+                                    true,
+                                ),
+                                Message {
+                                    role: "assistant".to_string(),
+                                    content: vec![ContentBlock::Text {
+                                        text: "first post-compaction answer".to_string(),
+                                        cache_control: None,
+                                    }],
+                                },
+                                Message {
+                                    role: "user".to_string(),
+                                    content: vec![ContentBlock::Text {
+                                        text: goal_continuation.to_string(),
+                                        cache_control: None,
+                                    }],
+                                },
+                                Message {
+                                    role: "assistant".to_string(),
+                                    content: vec![ContentBlock::Text {
+                                        text: "second post-continuation answer".to_string(),
+                                        cache_control: None,
+                                    }],
+                                },
+                            ],
+                            system_prompt: None,
+                            model: crate::config::DEFAULT_TEXT_MODEL.to_string(),
+                            workspace: PathBuf::from("."),
                         })
                         .await;
                     let _ = tx_event
@@ -7113,15 +7166,414 @@ async fn compaction_lifecycle_emits_item_events_with_compaction_counts() -> Resu
             && ev.payload.get("messages_after").and_then(Value::as_u64) == Some(2)
     }));
 
-    // The manual compact carried a summary_prompt → it must be persisted into
-    // the thread record so engine reloads restore it. The auto compact carried
-    // None → exactly one summary section, from the manual pass.
+    // Compaction lifecycle metadata must never mutate the persisted system
+    // prefix. Real summaries persist through SessionUpdated history instead.
     let record = manager.get_thread(&thread.id).await?;
-    let record_prompt = record.system_prompt.expect("record keeps a system prompt");
-    assert!(record_prompt.contains(COMPACTION_SUMMARY_BEGIN));
-    assert!(record_prompt.contains("Conversation Summary (Auto-Generated)"));
-    assert!(record_prompt.contains("key facts."));
-    assert_eq!(record_prompt.matches(COMPACTION_SUMMARY_BEGIN).count(), 1);
+    assert_eq!(record.system_prompt, None);
+    let turns = manager.store.list_turns_for_thread(&thread.id)?;
+    let reconstructed = manager.reconstruct_messages_from_turns(&turns)?;
+    assert!(
+        reconstructed.iter().any(|message| {
+            crate::compaction::compaction_summary_text(message)
+                .is_some_and(|text| text.contains("key facts."))
+        }),
+        "durable reconstruction must restore the summary as history"
+    );
+    assert_eq!(
+        reconstructed
+            .iter()
+            .flat_map(|message| message.content.iter())
+            .filter(|block| {
+                matches!(block, ContentBlock::Text { text, .. } if text == "Continue working toward the active goal.")
+            })
+            .count(),
+        1,
+        "terminal compaction snapshot must retain the synthetic continuation exactly once"
+    );
+    assert!(reconstructed.iter().any(|message| {
+        message.content.iter().any(|block| {
+            matches!(block, ContentBlock::Text { text, .. } if text == "second post-continuation answer")
+        })
+    }));
+    Ok(())
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn restart_prefers_durable_compaction_snapshot_over_stale_linked_session() -> Result<()> {
+    let _env_lock = lock_test_env();
+    let owned_home = test_runtime_dir();
+    let _home = EnvVarGuard::set("CODEWHALE_HOME", &owned_home);
+    let runtime_dir = owned_home.join("runtime");
+
+    let provider_name = "runtime-restart-test";
+    let config = Config {
+        provider: Some(provider_name.to_string()),
+        providers: Some(crate::config::ProvidersConfig {
+            custom: std::collections::HashMap::from([(
+                provider_name.to_string(),
+                crate::config::ProviderConfig {
+                    kind: Some("openai-compatible".to_string()),
+                    base_url: Some("http://127.0.0.1:18191/v1".to_string()),
+                    model: Some("restart-test-model".to_string()),
+                    api_key: Some("local-test-key".to_string()),
+                    ..Default::default()
+                },
+            )]),
+            ..Default::default()
+        }),
+        ..Default::default()
+    };
+    let manager =
+        RuntimeThreadManager::open(config, PathBuf::from("."), test_manager_config(runtime_dir))?;
+
+    let session_id = "stale_linked_session";
+    let stale_message = Message {
+        role: "user".to_string(),
+        content: vec![ContentBlock::Text {
+            text: "stale linked session history".to_string(),
+            cache_control: None,
+        }],
+    };
+    let sessions_dir = crate::session_manager::default_sessions_dir()?;
+    let sessions = crate::session_manager::SessionManager::new(sessions_dir)?;
+    let stale_session = crate::session_manager::create_saved_session_with_id_and_mode(
+        session_id.to_string(),
+        std::slice::from_ref(&stale_message),
+        "restart-test-model",
+        Path::new("."),
+        0,
+        None,
+        Some("agent"),
+    );
+    sessions.save_session(&stale_session)?;
+
+    let history_summary = crate::compaction::compaction_summary_message(
+        format!(
+            "## 📋 {}\n\ndurable compacted history",
+            crate::compaction::COMPACTION_SUMMARY_MARKER
+        ),
+        true,
+    );
+    let terminal_reply = Message {
+        role: "assistant".to_string(),
+        content: vec![ContentBlock::Text {
+            text: "durable post-compaction reply".to_string(),
+            cache_control: None,
+        }],
+    };
+    let durable_messages = vec![history_summary, terminal_reply];
+
+    let mut thread = sample_thread("thr_compaction_restart");
+    thread.model = "restart-test-model".to_string();
+    thread.model_provider = Some("custom".to_string());
+    thread.model_provider_id = Some(provider_name.to_string());
+    thread.session_id = Some(session_id.to_string());
+    let mut turn = sample_turn(
+        &thread.id,
+        "turn_compaction_restart",
+        RuntimeTurnStatus::Completed,
+    );
+    turn.item_ids = vec!["item_compaction_restart".to_string()];
+    let item = TurnItemRecord {
+        schema_version: CURRENT_RUNTIME_SCHEMA_VERSION,
+        id: turn.item_ids[0].clone(),
+        turn_id: turn.id.clone(),
+        kind: TurnItemKind::ContextCompaction,
+        status: TurnItemLifecycleStatus::Completed,
+        summary: "Context compacted".to_string(),
+        detail: None,
+        metadata: Some(compaction_history_snapshot_metadata(
+            &durable_messages,
+            "turn_terminal",
+            &HashSet::new(),
+        )),
+        artifact_refs: Vec::new(),
+        started_at: turn.started_at,
+        ended_at: turn.started_at,
+    };
+    manager.store.save_thread(&thread)?;
+    manager.store.save_turn(&turn)?;
+    manager.store.save_item(&item)?;
+
+    let engine = manager.get_engine(&thread.id).await?;
+    let (tx, rx) = oneshot::channel();
+    engine
+        .send(Op::GetSessionSnapshot {
+            tx: Arc::new(std::sync::Mutex::new(Some(tx))),
+        })
+        .await?;
+    let restored = tokio::time::timeout(Duration::from_secs(2), rx)
+        .await
+        .context("engine snapshot timed out")?
+        .context("engine snapshot sender dropped")?;
+
+    assert_eq!(restored.messages, durable_messages);
+    assert!(!restored.messages.contains(&stale_message));
+    assert_eq!(
+        restored
+            .messages
+            .iter()
+            .filter(|message| crate::compaction::is_compaction_summary_message(message))
+            .count(),
+        1
+    );
+    engine.send(Op::Shutdown).await?;
+    Ok(())
+}
+
+#[test]
+fn compaction_history_snapshot_redacts_request_user_input_answers() {
+    let secret = "free-text-secret-that-must-not-persist";
+    let pre_compaction = vec![
+        Message {
+            role: "assistant".to_string(),
+            content: vec![ContentBlock::ToolUse {
+                id: "input-call".to_string(),
+                name: REQUEST_USER_INPUT_TOOL_NAME.to_string(),
+                input: json!({"question": "Continue?"}),
+                caller: None,
+            }],
+        },
+        Message {
+            role: "user".to_string(),
+            content: vec![ContentBlock::ToolResult {
+                tool_use_id: "input-call".to_string(),
+                content: format!(r#"{{"answers":{{"continue":"{secret}"}}}}"#),
+                is_error: None,
+                content_blocks: Some(vec![json!({"text": secret})]),
+            }],
+        },
+    ];
+    let mut sensitive_values = HashSet::new();
+    collect_sensitive_user_input_values(&pre_compaction, &mut sensitive_values);
+    let compacted = vec![
+        crate::compaction::compaction_summary_message(
+            format!(
+                "## {}\n\nThe user answered {secret}.",
+                crate::compaction::COMPACTION_SUMMARY_MARKER
+            ),
+            true,
+        ),
+        Message {
+            role: "assistant".to_string(),
+            content: vec![ContentBlock::Text {
+                text: format!("ordinary durable context echoed {secret}"),
+                cache_control: None,
+            }],
+        },
+    ];
+
+    let metadata =
+        compaction_history_snapshot_metadata(&compacted, "turn_terminal", &sensitive_values);
+    let serialized = serde_json::to_string(&metadata).expect("serialize snapshot metadata");
+    assert!(!serialized.contains(secret));
+    assert!(serialized.contains("[redacted user input]"));
+    assert!(serialized.contains("ordinary durable context"));
+}
+
+#[test]
+fn summary_redaction_cannot_damage_runtime_ownership_sentinel() {
+    let sentinel_fragment = "codewhale:compaction_summary";
+    let mut sensitive_values = HashSet::new();
+    sensitive_values.insert(sentinel_fragment.to_string());
+    let messages = vec![crate::compaction::compaction_summary_message(
+        format!(
+            "## {}\n\nThe answer echoed {sentinel_fragment} in the generated body.",
+            crate::compaction::COMPACTION_SUMMARY_MARKER
+        ),
+        true,
+    )];
+
+    let projected = project_messages_for_durable_history_snapshot(&messages, &sensitive_values);
+
+    assert!(crate::compaction::is_compaction_summary_message(
+        &projected[0]
+    ));
+    let payload = crate::compaction::compaction_summary_text(&projected[0])
+        .expect("summary ownership survives redaction");
+    assert!(payload.contains("[redacted user input]"));
+}
+
+#[test]
+fn short_modal_answer_redaction_does_not_corrupt_summary_words() {
+    let pre_compaction = vec![
+        Message {
+            role: "assistant".to_string(),
+            content: vec![ContentBlock::ToolUse {
+                id: "short-answer".to_string(),
+                name: REQUEST_USER_INPUT_TOOL_NAME.to_string(),
+                input: json!({}),
+                caller: None,
+            }],
+        },
+        Message {
+            role: "user".to_string(),
+            content: vec![ContentBlock::ToolResult {
+                tool_use_id: "short-answer".to_string(),
+                content: json!({"answer": "a"}).to_string(),
+                is_error: None,
+                content_blocks: None,
+            }],
+        },
+    ];
+    let mut sensitive_values = HashSet::new();
+    collect_sensitive_user_input_values(&pre_compaction, &mut sensitive_values);
+    let compacted = vec![crate::compaction::compaction_summary_message(
+        format!(
+            "## {}\n\nThe user chose a path and retained data.",
+            crate::compaction::COMPACTION_SUMMARY_MARKER
+        ),
+        true,
+    )];
+
+    let metadata =
+        compaction_history_snapshot_metadata(&compacted, "turn_terminal", &sensitive_values);
+    let serialized = serde_json::to_string(&metadata).expect("serialize snapshot metadata");
+    assert!(serialized.contains("path and retained data"));
+    assert!(serialized.contains("[redacted user input] path"));
+}
+
+#[test]
+fn signed_thinking_with_modal_answer_is_dropped_with_its_signature() {
+    let secret = "signed-secret-answer";
+    let mut sensitive_values = HashSet::new();
+    sensitive_values.insert(secret.to_string());
+    let messages = vec![Message {
+        role: "assistant".to_string(),
+        content: vec![ContentBlock::Thinking {
+            thinking: format!("Reasoning includes {secret}"),
+            signature: Some("provider-signature".to_string()),
+        }],
+    }];
+
+    let projected = project_messages_for_durable_history_snapshot(&messages, &sensitive_values);
+    assert!(matches!(
+        &projected[0].content[0],
+        ContentBlock::Thinking { thinking, signature }
+            if thinking == "[redacted user input]" && signature.is_none()
+    ));
+}
+
+#[tokio::test]
+async fn failed_compaction_persists_partial_history_repair() -> Result<()> {
+    let manager = test_manager(test_runtime_dir())?;
+    let thread = manager
+        .create_thread(CreateThreadRequest {
+            workspace: None,
+            ..Default::default()
+        })
+        .await?;
+    let harness = install_mock_engine(&manager, &thread.id).await;
+    let mut rx_op = harness.rx_op;
+    let tx_event = harness.tx_event;
+    tokio::spawn(async move {
+        while let Some(op) = rx_op.recv().await {
+            if matches!(op, Op::SendMessage { .. }) {
+                let _ = tx_event
+                    .send(EngineEvent::TurnStarted {
+                        turn_id: "failed_compaction_turn".to_string(),
+                        created_at: chrono::Utc::now(),
+                        route: None,
+                    })
+                    .await;
+                let _ = tx_event
+                    .send(EngineEvent::CompactionStarted {
+                        id: "failed_compaction".to_string(),
+                        auto: true,
+                        message: "emergency compact begin".to_string(),
+                    })
+                    .await;
+                let partial_summary = crate::compaction::compaction_summary_message(
+                    format!(
+                        "## {}\n\npartial repair retained",
+                        crate::compaction::COMPACTION_SUMMARY_MARKER
+                    ),
+                    true,
+                );
+                let _ = tx_event
+                    .send(EngineEvent::SessionUpdated {
+                        session_id: "failed_compaction_session".to_string(),
+                        messages: vec![partial_summary],
+                        system_prompt: None,
+                        model: crate::config::DEFAULT_TEXT_MODEL.to_string(),
+                        workspace: PathBuf::from("."),
+                    })
+                    .await;
+                let _ = tx_event
+                    .send(EngineEvent::CompactionFailed {
+                        id: "failed_compaction".to_string(),
+                        auto: true,
+                        message: "still above budget".to_string(),
+                    })
+                    .await;
+                let _ = tx_event
+                    .send(EngineEvent::TurnComplete {
+                        usage: Usage::default(),
+                        status: TurnOutcomeStatus::Failed,
+                        error: Some("still above budget".to_string()),
+                        tool_catalog: None,
+                        base_url: None,
+                    })
+                    .await;
+                break;
+            }
+        }
+    });
+
+    let turn = manager
+        .start_turn(
+            &thread.id,
+            StartTurnRequest {
+                prompt: "trigger failed recovery".to_string(),
+                ..Default::default()
+            },
+        )
+        .await?;
+    let terminal = wait_for_terminal_turn(&manager, &turn.id, Duration::from_secs(2)).await?;
+    assert_eq!(terminal.status, RuntimeTurnStatus::Failed);
+
+    let events = manager.events_since(&thread.id, None)?;
+    let failed_event = events
+        .iter()
+        .find(|event| {
+            event.event == "item.failed"
+                && event
+                    .payload
+                    .get("item")
+                    .and_then(|item| item.get("kind"))
+                    .and_then(Value::as_str)
+                    == Some("context_compaction")
+        })
+        .context("missing failed compaction event")?;
+    assert!(
+        failed_event
+            .payload
+            .get("item")
+            .and_then(|item| item.get("metadata"))
+            .is_none_or(Value::is_null),
+        "public failed event must not duplicate the durable transcript snapshot"
+    );
+
+    let turns = manager.store.list_turns_for_thread(&thread.id)?;
+    let durable_compaction = manager
+        .store
+        .list_items_for_turn(&turn.id)?
+        .into_iter()
+        .find(|item| item.kind == TurnItemKind::ContextCompaction)
+        .context("missing durable failed compaction item")?;
+    assert_eq!(
+        durable_compaction
+            .metadata
+            .as_ref()
+            .and_then(|metadata| metadata.get("history_snapshot_version"))
+            .and_then(Value::as_u64),
+        Some(1)
+    );
+    let reconstructed = manager.reconstruct_messages_from_turns(&turns)?;
+    assert!(reconstructed.iter().any(|message| {
+        crate::compaction::compaction_summary_text(message)
+            .is_some_and(|text| text.contains("partial repair retained"))
+    }));
     Ok(())
 }
 
@@ -7652,67 +8104,4 @@ async fn fork_at_user_message_does_not_mutate_source() -> Result<()> {
         );
     }
     Ok(())
-}
-
-// ── compaction summary persistence (merge_summary_into_prompt) ──
-
-#[test]
-fn summary_merge_appends_section_to_base_prompt() {
-    let merged = merge_summary_into_prompt(
-        Some("You are a helpful agent."),
-        "## 📋 Conversation Summary (Auto-Generated)\n\nUser prefers lists.",
-    );
-    assert!(merged.starts_with("You are a helpful agent."));
-    assert!(merged.contains(COMPACTION_SUMMARY_BEGIN));
-    assert!(merged.contains("User prefers lists."));
-    assert!(merged.ends_with(COMPACTION_SUMMARY_END));
-    // Reload restore keys on the marker: SyncSession maps the record to
-    // SystemPrompt::Text and extract_compaction_summary_prompt checks
-    // `contains("Conversation Summary (Auto-Generated)")`.
-    assert!(merged.contains("Conversation Summary (Auto-Generated)"));
-}
-
-#[test]
-fn summary_merge_replaces_existing_section_idempotently() {
-    let first = merge_summary_into_prompt(Some("Base prompt."), "summary v1");
-    let second = merge_summary_into_prompt(Some(&first), "summary v2");
-    assert!(second.contains("summary v2"));
-    assert!(!second.contains("summary v1"));
-    assert_eq!(
-        second.matches(COMPACTION_SUMMARY_BEGIN).count(),
-        1,
-        "repeated compactions must swap the section, not stack duplicates"
-    );
-    assert!(second.starts_with("Base prompt."));
-}
-
-#[test]
-fn summary_merge_handles_missing_base() {
-    let merged = merge_summary_into_prompt(None, "only summary");
-    assert!(merged.starts_with(COMPACTION_SUMMARY_BEGIN));
-    assert!(merged.contains("only summary"));
-    let empty_base = merge_summary_into_prompt(Some(""), "only summary");
-    assert!(empty_base.starts_with(COMPACTION_SUMMARY_BEGIN));
-}
-
-#[test]
-fn summary_strip_preserves_text_after_section() {
-    let with_tail = format!(
-        "Base.\n\n{COMPACTION_SUMMARY_BEGIN}\nold summary\n{COMPACTION_SUMMARY_END}\n\nTrailing rules."
-    );
-    let stripped = strip_summary_section(&with_tail);
-    assert!(stripped.contains("Base."));
-    assert!(stripped.contains("Trailing rules."));
-    assert!(!stripped.contains("old summary"));
-    // Re-merge keeps the tail intact.
-    let merged = merge_summary_into_prompt(Some(&with_tail), "new summary");
-    assert!(merged.contains("Trailing rules."));
-    assert!(merged.contains("new summary"));
-}
-
-#[test]
-fn summary_strip_handles_missing_end_sentinel() {
-    let broken = format!("Base.\n\n{COMPACTION_SUMMARY_BEGIN}\ntruncated…");
-    let stripped = strip_summary_section(&broken);
-    assert_eq!(stripped, "Base.");
 }

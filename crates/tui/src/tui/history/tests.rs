@@ -14,6 +14,26 @@ use ratatui::style::Modifier;
 use std::time::{Duration, Instant};
 
 #[test]
+fn compaction_summary_projects_as_runtime_context_without_transport_envelope() {
+    let message = crate::compaction::compaction_summary_message(
+        format!(
+            "## {}\n\nimportant retained fact",
+            crate::compaction::COMPACTION_SUMMARY_MARKER
+        ),
+        true,
+    );
+
+    let cells = super::history_cells_from_message(&message);
+
+    assert!(matches!(
+        cells.as_slice(),
+        [HistoryCell::System { content }]
+            if content.contains("important retained fact")
+                && !content.contains("<codewhale:compaction_summary")
+    ));
+}
+
+#[test]
 fn web_search_cell_renders_receipt_source_degradation_and_citations() {
     let cell = WebSearchCell {
         query: "current release".to_string(),
