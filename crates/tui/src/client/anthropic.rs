@@ -741,6 +741,33 @@ mod tests {
     }
 
     #[test]
+    fn combined_goal_compaction_fork_uses_only_valid_anthropic_message_roles() {
+        let client = test_client();
+        let request = crate::tools::subagent::prefix_invariant_fork_request_fixture();
+        let body = client.build_anthropic_body(&request, true);
+
+        assert_eq!(body["system"], "Child verifier identity and authority.");
+        assert!(
+            !body["system"]
+                .as_str()
+                .is_some_and(|text| text.contains("<codewhale:fork_"))
+        );
+        let messages = body["messages"].as_array().expect("Anthropic messages");
+        assert!(
+            messages
+                .iter()
+                .all(|message| { matches!(message["role"].as_str(), Some("user" | "assistant")) })
+        );
+        let serialized = serde_json::to_string(&body).expect("serialize Anthropic final body");
+        assert!(serialized.contains("parent compacted history"));
+        assert!(serialized.contains("Continue working toward the active goal."));
+        assert!(serialized.contains("<codewhale:fork_state>"));
+        assert!(serialized.contains("<codewhale:subagent_context>"));
+        assert!(serialized.contains("verify the remaining goal work"));
+        assert!(!serialized.contains("\"role\":\"system\""));
+    }
+
+    #[test]
     fn body_maps_reasoning_effort_to_adaptive_thinking_and_effort() {
         let client = test_client();
 

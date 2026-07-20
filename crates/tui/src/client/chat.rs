@@ -3500,6 +3500,31 @@ mod prefix_invariant_tests {
             .collect::<Vec<_>>();
         assert_eq!(before_tools, after_tools);
     }
+
+    #[test]
+    fn combined_goal_compaction_fork_projects_runtime_envelopes_to_chat_user_messages() {
+        let request = crate::tools::subagent::prefix_invariant_fork_request_fixture();
+        let wire = build_chat_messages_for_request_and_provider_and_route(
+            &request,
+            ApiProvider::Deepseek,
+            "https://api.deepseek.com",
+        );
+
+        assert_eq!(wire[0]["role"], "system");
+        assert_eq!(wire[0]["content"], "Child verifier identity and authority.");
+        assert!(
+            !wire[0]["content"]
+                .as_str()
+                .is_some_and(|text| text.contains("<codewhale:fork_"))
+        );
+        assert!(wire.iter().skip(1).all(|message| message["role"] == "user"));
+        let serialized = serde_json::to_string(&wire).expect("serialize chat wire body");
+        assert!(serialized.contains("parent compacted history"));
+        assert!(serialized.contains("Continue working toward the active goal."));
+        assert!(serialized.contains("<codewhale:fork_state>"));
+        assert!(serialized.contains("<codewhale:subagent_context>"));
+        assert!(serialized.contains("verify the remaining goal work"));
+    }
 }
 
 #[cfg(test)]

@@ -886,6 +886,34 @@ mod tests {
         );
     }
 
+    #[test]
+    fn combined_goal_compaction_fork_survives_responses_final_body() {
+        let request = crate::tools::subagent::prefix_invariant_fork_request_fixture();
+        let body = build_responses_body(&request);
+
+        assert_eq!(
+            body["instructions"],
+            "Child verifier identity and authority."
+        );
+        assert!(
+            !body["instructions"]
+                .as_str()
+                .is_some_and(|text| text.contains("<codewhale:fork_"))
+        );
+        let input = body["input"].as_array().expect("responses input array");
+        assert!(
+            input
+                .iter()
+                .all(|item| { item["type"] != "message" || item["role"].as_str() == Some("user") })
+        );
+        let serialized = serde_json::to_string(&body).expect("serialize Responses final body");
+        assert!(serialized.contains("parent compacted history"));
+        assert!(serialized.contains("Continue working toward the active goal."));
+        assert!(serialized.contains("<codewhale:fork_state>"));
+        assert!(serialized.contains("<codewhale:subagent_context>"));
+        assert!(serialized.contains("verify the remaining goal work"));
+    }
+
     fn test_codex_config(server: &MockServer) -> Config {
         Config {
             provider: Some("openai-codex".to_string()),

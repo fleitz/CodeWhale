@@ -6119,12 +6119,12 @@ fn build_initial_subagent_messages_with_system(
             .map(str::trim)
             .filter(|state| !state.is_empty())
         {
-            messages.push(system_text_message(format!(
+            messages.push(runtime_history_text_message(format!(
                 "<codewhale:fork_state>\n{state}\n</codewhale:fork_state>"
             )));
         }
 
-        messages.push(system_text_message(format!(
+        messages.push(runtime_history_text_message(format!(
             "<codewhale:subagent_context>\n{}\n</codewhale:subagent_context>",
             subagent_system_prompt
         )));
@@ -6141,13 +6141,66 @@ fn build_initial_subagent_messages_with_system(
     messages
 }
 
-fn system_text_message(text: String) -> Message {
+fn runtime_history_text_message(text: String) -> Message {
     Message {
-        role: "system".to_string(),
+        // Fork envelopes belong to append-only conversation history. Provider
+        // adapters project this internal runtime-owned role to wire `user`;
+        // the child's identity retains top-level system precedence and no
+        // provider receives a mid-history system message.
+        role: crate::compaction::RUNTIME_HISTORY_ROLE.to_string(),
         content: vec![ContentBlock::Text {
             text,
             cache_control: None,
         }],
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn prefix_invariant_fork_request_fixture() -> MessageRequest {
+    let parent_messages = vec![
+        crate::compaction::compaction_summary_message(
+            format!(
+                "## {}\n\nparent compacted history",
+                crate::compaction::COMPACTION_SUMMARY_MARKER
+            ),
+            true,
+        ),
+        Message {
+            role: "user".to_string(),
+            content: vec![ContentBlock::Text {
+                text: "Continue working toward the active goal.".to_string(),
+                cache_control: None,
+            }],
+        },
+    ];
+    let fork_context = SubAgentForkContext {
+        messages: parent_messages,
+        structured_state_block: Some("goal progress: 2/5 complete".to_string()),
+    };
+    let assignment = SubAgentAssignment::new(
+        "verify the remaining goal work".to_string(),
+        Some("verifier".to_string()),
+    );
+    let child_system = "Child verifier identity and authority.";
+    MessageRequest {
+        model: "prefix-fixture-model".to_string(),
+        messages: build_initial_subagent_messages_with_system(
+            &assignment.objective,
+            &assignment,
+            &SubAgentType::Verifier,
+            child_system,
+            Some(&fork_context),
+        ),
+        max_tokens: 1_024,
+        system: Some(SystemPrompt::Text(child_system.to_string())),
+        tools: None,
+        tool_choice: None,
+        metadata: None,
+        thinking: None,
+        reasoning_effort: None,
+        stream: Some(true),
+        temperature: None,
+        top_p: None,
     }
 }
 

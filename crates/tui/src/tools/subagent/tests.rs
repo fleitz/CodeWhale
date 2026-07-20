@@ -2055,9 +2055,9 @@ fn forked_subagent_messages_preserve_parent_prefix_then_append_task() {
     );
     assert_eq!(messages.first(), Some(&parent_message));
     assert_eq!(messages.len(), 4);
-    assert_eq!(messages[1].role, "system");
+    assert_eq!(messages[1].role, crate::compaction::RUNTIME_HISTORY_ROLE);
     assert!(message_text(&messages[1]).contains("<codewhale:fork_state>"));
-    assert_eq!(messages[2].role, "system");
+    assert_eq!(messages[2].role, crate::compaction::RUNTIME_HISTORY_ROLE);
     assert!(message_text(&messages[2]).contains("<codewhale:subagent_context>"));
     assert_eq!(messages[3].role, "user");
     assert!(message_text(&messages[3]).contains("inspect parser"));
@@ -5096,7 +5096,7 @@ fn fresh_forked_and_nested_subagents_share_authority_bound_skill_catalogs() {
     assert!(
         forked
             .iter()
-            .filter(|message| message.role == "system")
+            .filter(|message| message.role == crate::compaction::RUNTIME_HISTORY_ROLE)
             .any(|message| message_text(message).contains("`demo:review`")),
         "forked children must receive the same resolved catalog"
     );
