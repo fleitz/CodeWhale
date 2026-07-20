@@ -486,13 +486,10 @@ mod tests {
             .candidate(ApiProvider::Moonshot, crate::config::KIMI_CODE_K3_MODEL)
             .expect("configured Kimi Code K3 route");
 
-        assert_eq!(candidate.context_window, 1_048_576);
+        assert_eq!(candidate.context_window, 262_144);
         assert!(candidate.thinking_supported);
         assert!(candidate.tags.contains(&"thinking"));
-        assert!(
-            candidate.tags.contains(&"long_context"),
-            "1M K3 routes must surface the long_context tag"
-        );
+        assert!(!candidate.tags.contains(&"long_context"));
     }
 
     #[test]

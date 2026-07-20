@@ -107,15 +107,12 @@ pub const KIMI_CODE_MEMBERSHIP_PLAN_CONSOLE_URL: &str =
 /// Official Kimi Code route model id. It is deliberately distinct from
 /// Moonshot's pay-as-you-go `kimi-k3` catalog id.
 pub const KIMI_CODE_K3_MODEL: &str = "k3";
-/// Kimi K3 context window for every genuine K3 route (direct Moonshot
-/// `kimi-k3`, Kimi Code membership bare `k3`, and OpenCode Go `kimi-k3`).
-/// Official Kimi platform pricing documents 1,048,576 tokens for `kimi-k3`
-/// (verified 2026-07-20 from https://platform.kimi.ai/docs/pricing/chat-k3).
-/// Max output remains 131_072 and must not be conflated with this window.
-pub const KIMI_CODE_K3_CONTEXT_WINDOW_TOKENS: u32 = 1_048_576;
-/// Documented K3 max generation tokens; never use this as a context window.
-#[allow(dead_code)] // Public contract constant for route/budget call sites.
-pub const KIMI_K3_MAX_OUTPUT_TOKENS: u32 = 131_072;
+// The K3 contract constants (`KIMI_CODE_K3_CONTEXT_WINDOW_TOKENS`,
+// `KIMI_K3_CONTEXT_WINDOW_TOKENS`, `KIMI_K3_MAX_OUTPUT_TOKENS`) live in
+// `crate::models` — the model-facts table, which also compiles standalone in
+// integration tests — so the facts have exactly one home. Re-export only the
+// route-owned floor, which existing `crate::config` call sites import.
+pub use crate::models::KIMI_CODE_K3_CONTEXT_WINDOW_TOKENS;
 pub const DEFAULT_SGLANG_MODEL: &str = "deepseek-ai/DeepSeek-V4-Pro";
 pub const DEFAULT_SGLANG_FLASH_MODEL: &str = "deepseek-ai/DeepSeek-V4-Flash";
 pub const DEFAULT_SGLANG_BASE_URL: &str = "http://localhost:30000/v1";

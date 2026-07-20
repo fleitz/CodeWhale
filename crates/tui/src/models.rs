@@ -6,6 +6,25 @@ use serde::{Deserialize, Serialize};
 /// newer V4 alias and do not carry an explicit `*k` suffix.
 pub const LEGACY_DEEPSEEK_CONTEXT_WINDOW_TOKENS: u32 = 128_000;
 pub const DEEPSEEK_V4_CONTEXT_WINDOW_TOKENS: u32 = 1_000_000;
+/// Conservative Kimi Code K3 context baseline. The membership route's real
+/// context is plan-tier dependent (verified 2026-07-20 from
+/// https://www.kimi.com/code/docs/en/kimi-code/models): Moderato/Starter get
+/// 256K, Allegretto/Explorer and above get up to 1M, and the documented
+/// `k3[1m]` id forces the 1M contract. Bare `k3` therefore keeps this safe
+/// floor everywhere; higher plan entitlements must come from an explicit
+/// provider `context_window` configuration, fresh provider facts, or the
+/// explicit `k3[1m]` id.
+pub const KIMI_CODE_K3_CONTEXT_WINDOW_TOKENS: u32 = 262_144;
+/// Kimi K3 context window on the open platform (`kimi-k3` pay-as-you-go and
+/// the explicit Kimi Code `k3[1m]` id). Verified 2026-07-20 from
+/// https://platform.kimi.ai/docs/pricing/chat-k3 (1,048,576 tokens) and
+/// models.dev `moonshotai/kimi-k3`. Max output is a separate fact below and
+/// must never be conflated with this window.
+pub const KIMI_K3_CONTEXT_WINDOW_TOKENS: u32 = 1_048_576;
+/// Documented K3 default max generation tokens (`max_completion_tokens`
+/// defaults to 131,072 per the Kimi K3 quickstart). Never use this as a
+/// context window.
+pub const KIMI_K3_MAX_OUTPUT_TOKENS: u32 = 131_072;
 /// Last-resort compaction trigger when [`context_window_for_model`] returns
 /// `None` (an unrecognised model id). v0.8.11 raised this from `50_000` to
 /// `102_400` (80% of [`LEGACY_DEEPSEEK_CONTEXT_WINDOW_TOKENS`]) so unknown
@@ -298,10 +317,17 @@ fn known_context_window_for_model(model_lower: &str) -> Option<u32> {
         | "qwen/qwen3.6-27b"
         | "tencent/hy3-preview" => Some(262_144),
         // Official Kimi K3 platform pricing (2026-07-20):
-        // https://platform.kimi.ai/docs/pricing/chat-k3 — 1,048,576 context.
-        // Bare `k3` is the Kimi Code membership route id for the same K3
-        // contract; do not fall through to the 128K legacy default.
-        "moonshotai/kimi-k3" | "kimi-k3" | "k3" | "opencode-go/kimi-k3" => Some(1_048_576),
+        // https://platform.kimi.ai/docs/pricing/chat-k3 — 1,048,576 context
+        // for the open platform, and `k3[1m]` is the documented Kimi Code id
+        // that forces the same 1M contract.
+        "moonshotai/kimi-k3" | "kimi-k3" | "opencode-go/kimi-k3" | "k3[1m]" => {
+            Some(KIMI_K3_CONTEXT_WINDOW_TOKENS)
+        }
+        // Bare `k3` is the Kimi Code membership route id whose context is
+        // plan-tier dependent (256K on lower tiers, up to 1M on higher ones)
+        // — keep the safe floor, and never fall through to the 128K legacy
+        // default.
+        "k3" => Some(KIMI_CODE_K3_CONTEXT_WINDOW_TOKENS),
         "moonshotai/kimi-k2.7-code"
         | "moonshotai/kimi-k2.6"
         | "moonshotai/kimi-k2.6:free"
@@ -370,9 +396,12 @@ pub fn max_output_tokens_for_model(model: &str) -> Option<u32> {
         }
         "claude-haiku-4-5" => Some(64_000),
         "arcee-ai/trinity-large-thinking" | "trinity-large-thinking" => Some(262_144),
-        // Kimi K3 max generation is 131K; context is 1M. Keep them separate so
-        // UI/budget code never treats max output as the context window.
-        "moonshotai/kimi-k3" | "kimi-k3" | "k3" | "opencode-go/kimi-k3" => Some(131_072),
+        // Kimi K3's documented default max generation is 131K, distinct from
+        // its context window. Keep them separate so UI/budget code never
+        // treats max output as the context window.
+        "moonshotai/kimi-k3" | "kimi-k3" | "k3" | "opencode-go/kimi-k3" | "k3[1m]" => {
+            Some(KIMI_K3_MAX_OUTPUT_TOKENS)
+        }
         // Kimi K2.7 Code has a 256K context window but its documented default
         // maximum generation is 32K. Keeping those separate prevents the
         // input budget from collapsing to the 1K emergency floor (#4368).
@@ -989,19 +1018,30 @@ mod tests {
     }
 
     #[test]
-    fn bare_k3_membership_id_uses_1m_context_not_legacy_128k() {
-        assert_eq!(context_window_for_model("k3"), Some(1_048_576));
+    fn k3_route_ids_use_verified_contracts_not_legacy_128k() {
+        // Open-platform K3 and the documented `k3[1m]` forcing id carry the
+        // verified 1M contract.
         assert_eq!(context_window_for_model("kimi-k3"), Some(1_048_576));
         assert_eq!(
             context_window_for_model("opencode-go/kimi-k3"),
             Some(1_048_576)
         );
+        assert_eq!(context_window_for_model("k3[1m]"), Some(1_048_576));
+        // Bare `k3` (Kimi Code membership) is plan-tier dependent, so it
+        // keeps the documented safe floor — and must never fall through to
+        // the 128K legacy default.
+        assert_eq!(context_window_for_model("k3"), Some(262_144));
         assert_eq!(max_output_tokens_for_model("k3"), Some(131_072));
         assert_eq!(max_output_tokens_for_model("kimi-k3"), Some(131_072));
+        assert_eq!(max_output_tokens_for_model("k3[1m]"), Some(131_072));
         // Never project max output as the context window.
         assert_ne!(
             context_window_for_model("k3"),
             max_output_tokens_for_model("k3")
+        );
+        assert_ne!(
+            context_window_for_model("kimi-k3"),
+            max_output_tokens_for_model("kimi-k3")
         );
     }
 

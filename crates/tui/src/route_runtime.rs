@@ -604,7 +604,12 @@ mod tests {
     }
 
     #[test]
-    fn kimi_code_bare_k3_uses_1m_k3_route_baseline() {
+    fn kimi_code_bare_k3_keeps_tier_safe_floor_not_legacy_128k() {
+        // Bare `k3` membership context is plan-tier dependent (256K on lower
+        // tiers, up to 1M on higher ones), so the static route baseline stays
+        // the safe floor. Higher entitlements come from an explicit provider
+        // `context_window` override or the documented `k3[1m]` id — never
+        // from assuming the top tier, and never from the 128K legacy default.
         let candidate = resolve_route_candidate(
             ApiProvider::Moonshot,
             Some("k3"),
@@ -615,7 +620,7 @@ mod tests {
         .expect("Kimi Code K3 route");
 
         assert_eq!(candidate.wire_model_id().as_str(), "k3");
-        assert_eq!(candidate.limits().context_tokens, Some(1_048_576));
+        assert_eq!(candidate.limits().context_tokens, Some(262_144));
         // Output is catalog-owned; never project the 131K max-output as context.
         assert_ne!(
             candidate.limits().context_tokens,
@@ -627,7 +632,7 @@ mod tests {
                 crate::config::KIMI_CODE_K3_MODEL
             )
             .context_window,
-            1_048_576
+            262_144
         );
         assert_eq!(
             crate::config::provider_capability(
@@ -651,7 +656,7 @@ mod tests {
             None,
         )
         .expect("Kimi Code route");
-        assert_eq!(static_floor.context_window.tokens, 1_048_576);
+        assert_eq!(static_floor.context_window.tokens, 262_144);
         assert_eq!(
             static_floor.context_window.source,
             ContextWindowSource::StaticKimiCodeSafeFloor

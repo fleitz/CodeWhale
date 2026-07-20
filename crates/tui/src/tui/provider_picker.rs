@@ -4117,7 +4117,7 @@ mod tests {
         );
         assert_eq!(
             row.capabilities.context_window,
-            Some(1_048_576),
+            Some(262_144),
             "the picker must show the route-effective K3 baseline, not the generic fallback"
         );
         assert_eq!(
@@ -4127,7 +4127,7 @@ mod tests {
         );
         assert!(
             row.compact_hint()
-                .contains("ctx:1.0M(static Kimi Code safe floor)"),
+                .contains("ctx:262K(static Kimi Code safe floor)"),
             "the compact picker receipt must retain context provenance"
         );
 
@@ -4148,7 +4148,10 @@ mod tests {
             ProviderReasoningSupport::Supported,
             "generic Moonshot k3 must not inherit Kimi Code's route-owned capability"
         );
-        assert_ne!(direct_row.capabilities.context_window, Some(262_144));
+        // The generic model-facts table now carries the same conservative
+        // number for bare `k3`, so the route-ownership distinction lives in
+        // provenance: the direct Moonshot row must never claim the Kimi Code
+        // route-owned floor as its source.
         assert_ne!(
             direct_row.capabilities.context_window_source.as_deref(),
             Some("static Kimi Code safe floor")
