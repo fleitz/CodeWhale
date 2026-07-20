@@ -96,6 +96,35 @@ pub(super) fn is_external_editor_shortcut(key: &KeyEvent) -> bool {
     ctrl_shift_o || f4
 }
 
+/// Select the whole composer draft. `Ctrl+A` is intentionally NOT select-all:
+/// it keeps its readline meaning (jump to start of input), matching every
+/// other emacs-style binding in the composer. Select-all is therefore:
+///
+/// - `Ctrl+Shift+A` on every platform (mirrors `Ctrl+Shift+O` / `Ctrl+Shift+E`
+///   precedent for shifted-Ctrl chords; requires an enhanced-keyboard
+///   terminal, like those precedents).
+/// - `Cmd+A` on macOS terminals that forward Cmd to the app (kitty, WezTerm,
+///   iTerm2 with "Left/Right Command" remapping). The event-loop macOS
+///   normalization deliberately skips this chord so `Cmd+A` is not collapsed
+///   into readline `Ctrl+A`. `Cmd+Shift+A` also lands here after
+///   normalization.
+pub(super) fn is_select_all_shortcut(key: &KeyEvent) -> bool {
+    let is_a = matches!(key.code, KeyCode::Char('a') | KeyCode::Char('A'));
+    if !is_a {
+        return false;
+    }
+    let cmd_a = key.modifiers.contains(KeyModifiers::SUPER)
+        && !key
+            .modifiers
+            .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT);
+    let ctrl_shift_a = key.modifiers.contains(KeyModifiers::CONTROL)
+        && key.modifiers.contains(KeyModifiers::SHIFT)
+        && !key
+            .modifiers
+            .intersects(KeyModifiers::ALT | KeyModifiers::SUPER);
+    cmd_a || ctrl_shift_a
+}
+
 /// Modifier predicate for the v0.8.30 family of `Alt+<key>` transcript-
 /// nav shortcuts (`Alt+G` / `Alt+[` / `Alt+]` / `Alt+?` / `Alt+L`). Requires
 /// `Alt` and disallows `Ctrl` / `Super` so the
@@ -213,5 +242,30 @@ mod tests {
 
         let editor_legacy_fallback = KeyEvent::new(KeyCode::F(4), KeyModifiers::NONE);
         assert!(is_external_editor_shortcut(&editor_legacy_fallback));
+    }
+
+    #[test]
+    fn select_all_accepts_ctrl_shift_a_and_cmd_a_but_not_readline_ctrl_a() {
+        let ctrl_shift_lower = KeyEvent::new(
+            KeyCode::Char('a'),
+            KeyModifiers::CONTROL | KeyModifiers::SHIFT,
+        );
+        let ctrl_shift_upper = KeyEvent::new(
+            KeyCode::Char('A'),
+            KeyModifiers::CONTROL | KeyModifiers::SHIFT,
+        );
+        let cmd_a = KeyEvent::new(KeyCode::Char('a'), KeyModifiers::SUPER);
+        assert!(is_select_all_shortcut(&ctrl_shift_lower));
+        assert!(is_select_all_shortcut(&ctrl_shift_upper));
+        assert!(is_select_all_shortcut(&cmd_a));
+
+        // Readline home stays readline home.
+        let readline_ctrl_a = KeyEvent::new(KeyCode::Char('a'), KeyModifiers::CONTROL);
+        assert!(!is_select_all_shortcut(&readline_ctrl_a));
+        // Alt combinations and plain typing never select-all.
+        let alt_a = KeyEvent::new(KeyCode::Char('a'), KeyModifiers::ALT);
+        let plain_a = KeyEvent::new(KeyCode::Char('a'), KeyModifiers::NONE);
+        assert!(!is_select_all_shortcut(&alt_a));
+        assert!(!is_select_all_shortcut(&plain_a));
     }
 }

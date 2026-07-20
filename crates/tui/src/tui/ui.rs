@@ -4602,9 +4602,14 @@ async fn run_event_loop(
             // Normalize macOS modifiers: map SUPER (Cmd) to CONTROL so that
             // keyboard shortcuts work consistently across terminal emulators
             // (Terminal.app, iTerm2, Kitty, etc.) that may report different
-            // modifier flags (#2938).
-            let mapped = crate::tui::composer_ui::normalize_macos_modifiers(key.modifiers);
-            key.modifiers = mapped;
+            // modifier flags (#2938). The select-all chord is exempt: `Cmd+A`
+            // must stay distinguishable from readline `Ctrl+A` (start of
+            // input) on terminals that forward Cmd, so it keeps its SUPER
+            // modifier and routes through `is_select_all_shortcut`.
+            if !key_shortcuts::is_select_all_shortcut(&key) {
+                let mapped = crate::tui::composer_ui::normalize_macos_modifiers(key.modifiers);
+                key.modifiers = mapped;
+            }
 
             // Normalize the raw Ctrl+C control byte (0x03) delivered in
             // PTY/raw-mode — and by some kitty-keyboard-protocol terminals —
@@ -6115,6 +6120,18 @@ async fn run_event_loop(
                     app.delete_char_forward();
                 }
                 KeyCode::Delete => {}
+                _ if key_shortcuts::is_select_all_shortcut(&key) => {
+                    app.select_all();
+                }
+                KeyCode::Left
+                    if key.modifiers.contains(KeyModifiers::SHIFT)
+                        && is_word_cursor_modifier(key.modifiers) =>
+                {
+                    if app.selection_anchor.is_none() {
+                        app.selection_anchor = Some(app.cursor_position);
+                    }
+                    app.move_cursor_word_backward();
+                }
                 KeyCode::Left if key.modifiers.contains(KeyModifiers::SHIFT) => {
                     if app.selection_anchor.is_none() {
                         app.selection_anchor = Some(app.cursor_position);
@@ -6129,6 +6146,15 @@ async fn run_event_loop(
                     app.clear_selection();
                     app.move_cursor_left();
                 }
+                KeyCode::Right
+                    if key.modifiers.contains(KeyModifiers::SHIFT)
+                        && is_word_cursor_modifier(key.modifiers) =>
+                {
+                    if app.selection_anchor.is_none() {
+                        app.selection_anchor = Some(app.cursor_position);
+                    }
+                    app.move_cursor_word_forward();
+                }
                 KeyCode::Right if key.modifiers.contains(KeyModifiers::SHIFT) => {
                     if app.selection_anchor.is_none() {
                         app.selection_anchor = Some(app.cursor_position);
@@ -6142,6 +6168,41 @@ async fn run_event_loop(
                 KeyCode::Right => {
                     app.clear_selection();
                     app.move_cursor_right();
+                }
+                // Selection-extending Home/End. Ctrl+Shift extends to the
+                // buffer edge, bare Shift to the logical line edge. These sit
+                // above the Ctrl+Home/Ctrl+End transcript-scroll arms so the
+                // shifted chords always edit the selection, never the
+                // viewport.
+                KeyCode::Home
+                    if key.modifiers.contains(KeyModifiers::SHIFT)
+                        && key.modifiers.contains(KeyModifiers::CONTROL) =>
+                {
+                    if app.selection_anchor.is_none() {
+                        app.selection_anchor = Some(app.cursor_position);
+                    }
+                    app.move_cursor_start();
+                }
+                KeyCode::End
+                    if key.modifiers.contains(KeyModifiers::SHIFT)
+                        && key.modifiers.contains(KeyModifiers::CONTROL) =>
+                {
+                    if app.selection_anchor.is_none() {
+                        app.selection_anchor = Some(app.cursor_position);
+                    }
+                    app.move_cursor_end();
+                }
+                KeyCode::Home if key.modifiers.contains(KeyModifiers::SHIFT) => {
+                    if app.selection_anchor.is_none() {
+                        app.selection_anchor = Some(app.cursor_position);
+                    }
+                    app.move_cursor_line_start();
+                }
+                KeyCode::End if key.modifiers.contains(KeyModifiers::SHIFT) => {
+                    if app.selection_anchor.is_none() {
+                        app.selection_anchor = Some(app.cursor_position);
+                    }
+                    app.move_cursor_line_end();
                 }
                 KeyCode::Home if key.modifiers.contains(KeyModifiers::CONTROL) => {
                     if let Some(anchor) =

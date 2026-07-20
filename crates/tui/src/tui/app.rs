@@ -714,6 +714,54 @@ fn remove_char_at(text: &mut String, char_index: usize) -> bool {
     true
 }
 
+/// Remove the chars in `[start_char, end_char)`. Returns true when anything
+/// was removed. Range endpoints are clamped to the text length.
+fn remove_char_range(text: &mut String, start_char: usize, end_char: usize) -> bool {
+    if start_char >= end_char {
+        return false;
+    }
+    let start = byte_index_at_char(text, start_char);
+    let end = byte_index_at_char(text, end_char);
+    if start >= end {
+        return false;
+    }
+    text.replace_range(start..end, "");
+    true
+}
+
+/// Char index of the grapheme-cluster boundary at or before `char_index - 1` —
+/// i.e. where the cursor lands after one "left" step. Grapheme-aware so a
+/// single step never splits a CJK char + combining mark, emoji ZWJ sequence,
+/// or flag pair. Returns `0` when `char_index` is `0`.
+pub(crate) fn prev_grapheme_boundary(text: &str, char_index: usize) -> usize {
+    use unicode_segmentation::UnicodeSegmentation;
+    let mut acc = 0usize;
+    for g in text.graphemes(true) {
+        let next = acc + g.chars().count();
+        if next >= char_index {
+            return acc;
+        }
+        acc = next;
+    }
+    acc
+}
+
+/// Char index of the first grapheme-cluster boundary strictly after
+/// `char_index` — i.e. where the cursor lands after one "right" step.
+/// Returns the total char count when already at or past the end.
+pub(crate) fn next_grapheme_boundary(text: &str, char_index: usize) -> usize {
+    use unicode_segmentation::UnicodeSegmentation;
+    let mut acc = 0usize;
+    for g in text.graphemes(true) {
+        let next = acc + g.chars().count();
+        if next > char_index {
+            return next;
+        }
+        acc = next;
+    }
+    acc
+}
+
 fn normalize_paste_text(text: &str) -> String {
     if text.contains('\r') {
         text.replace("\r\n", "\n").replace('\r', "\n")
@@ -5507,8 +5555,12 @@ impl App {
         if self.cursor_position == 0 {
             return;
         }
-        let target = self.cursor_position.saturating_sub(1);
-        let removed = remove_char_at(&mut self.input, target);
+        // Grapheme-aware: Backspace removes the whole cluster before the
+        // cursor (emoji ZWJ sequence, flag pair, CJK char + combining mark),
+        // never a lone scalar out of the middle of one.
+        let cursor = self.cursor_position.min(char_count(&self.input));
+        let target = prev_grapheme_boundary(&self.input, cursor);
+        let removed = remove_char_range(&mut self.input, target, cursor);
         if removed {
             self.cursor_position = target;
             self.slash_menu_hidden = false;
@@ -5528,8 +5580,11 @@ impl App {
         if self.input.is_empty() {
             return;
         }
+        // Grapheme-aware: forward-delete removes the whole cluster at the
+        // cursor rather than a single scalar from inside it.
         let target = self.cursor_position;
-        let removed = remove_char_at(&mut self.input, target);
+        let end = next_grapheme_boundary(&self.input, target);
+        let removed = remove_char_range(&mut self.input, target, end);
         if !removed {
             self.cursor_position = char_count(&self.input);
         }
@@ -5728,13 +5783,15 @@ impl App {
     }
 
     pub fn move_cursor_left(&mut self) {
-        self.cursor_position = self.cursor_position.saturating_sub(1);
+        let cursor = self.cursor_position.min(char_count(&self.input));
+        self.cursor_position = prev_grapheme_boundary(&self.input, cursor);
         self.needs_redraw = true;
     }
 
     pub fn move_cursor_right(&mut self) {
-        if self.cursor_position < char_count(&self.input) {
-            self.cursor_position += 1;
+        let total = char_count(&self.input);
+        if self.cursor_position < total {
+            self.cursor_position = next_grapheme_boundary(&self.input, self.cursor_position);
             self.needs_redraw = true;
         }
     }
@@ -5868,12 +5925,37 @@ impl App {
             .unwrap_or_default()
     }
 
+    /// Select the entire composer contents: anchor at the start, cursor at
+    /// the end. Expands an oversized-paste preview first so the selection
+    /// covers the real draft, not a truncated placeholder (#3263).
+    pub fn select_all(&mut self) {
+        self.auto_expand_oversized_paste();
+        if self.input.is_empty() {
+            self.selection_anchor = None;
+            return;
+        }
+        self.selection_anchor = Some(0);
+        self.cursor_position = char_count(&self.input);
+        self.needs_redraw = true;
+    }
+
     /// Delete the selected text, place cursor at the start of the deleted range.
     /// Returns true if a selection was deleted.
+    ///
+    /// When the selection spans the whole draft (e.g. select-all then type or
+    /// Backspace), the outgoing text is stashed exactly like `Ctrl+U` so the
+    /// destruction is recoverable with `Ctrl+Z` / the draft history.
     pub fn delete_selection(&mut self) -> bool {
         let Some((start, end)) = self.selection_range() else {
             return false;
         };
+        if start == 0 && end == char_count(&self.input) {
+            let draft = self.input.clone();
+            if !draft.trim().is_empty() {
+                self.clear_undo_buffer = Some(draft.clone());
+                self.remember_draft_for_recovery(draft);
+            }
+        }
         let sb = byte_index_at_char(&self.input, start);
         let eb = byte_index_at_char(&self.input, end);
         self.input.replace_range(sb..eb, "");
@@ -5937,7 +6019,9 @@ impl App {
             return;
         }
         let pos = self.cursor_position;
-        remove_char_at(&mut self.input, pos);
+        // Grapheme-aware: `x` deletes the whole cluster under the cursor.
+        let end = next_grapheme_boundary(&self.input, pos);
+        remove_char_range(&mut self.input, pos, end);
         // Keep cursor in bounds after deletion.
         let new_total = char_count(&self.input);
         if self.cursor_position > 0 && self.cursor_position >= new_total {

@@ -3957,6 +3957,193 @@ fn delete_selection_noop_when_no_selection() {
     assert_eq!(app.cursor_position, 3);
 }
 
+// === Composer real-editor contract (v0.9.1) ====================================
+
+#[test]
+fn grapheme_boundaries_snap_around_zwj_emoji_and_flags() {
+    // "a👩‍👩‍👧‍👦b" — the family emoji is 7 chars (4 people + 3 ZWJ) but ONE grapheme.
+    let text = "a👩‍👩‍👧‍👦b";
+    let family_chars = "👩‍👩‍👧‍👦".chars().count();
+    assert_eq!(family_chars, 7);
+    // Stepping right from after 'a' jumps over the whole family.
+    assert_eq!(next_grapheme_boundary(text, 1), 1 + family_chars);
+    // Stepping left from before 'b' jumps back to just after 'a'.
+    assert_eq!(prev_grapheme_boundary(text, 1 + family_chars), 1);
+    // A cursor stranded mid-cluster snaps to the cluster edges.
+    assert_eq!(prev_grapheme_boundary(text, 3), 1);
+    assert_eq!(next_grapheme_boundary(text, 3), 1 + family_chars);
+
+    // Flag pair: two regional-indicator chars, one grapheme.
+    let flag = "🇯🇵";
+    assert_eq!(flag.chars().count(), 2);
+    assert_eq!(next_grapheme_boundary(flag, 0), 2);
+    assert_eq!(prev_grapheme_boundary(flag, 2), 0);
+}
+
+#[test]
+fn cursor_moves_by_grapheme_over_emoji_and_cjk() {
+    let mut app = App::new(test_options(false), &Config::default());
+    app.input = "你👍🏽好".to_string(); // CJK + skin-tone emoji (2 chars) + CJK
+    app.cursor_position = 0;
+    app.move_cursor_right();
+    assert_eq!(app.cursor_position, 1); // after 你
+    app.move_cursor_right();
+    assert_eq!(app.cursor_position, 3); // after 👍🏽 (base + modifier)
+    app.move_cursor_right();
+    assert_eq!(app.cursor_position, 4); // after 好
+    app.move_cursor_right();
+    assert_eq!(app.cursor_position, 4); // clamped at end
+    app.move_cursor_left();
+    assert_eq!(app.cursor_position, 3);
+    app.move_cursor_left();
+    assert_eq!(app.cursor_position, 1);
+    app.move_cursor_left();
+    assert_eq!(app.cursor_position, 0);
+    app.move_cursor_left();
+    assert_eq!(app.cursor_position, 0); // clamped at start
+}
+
+#[test]
+fn backspace_removes_whole_emoji_cluster() {
+    let mut app = App::new(test_options(false), &Config::default());
+    app.input = "hi👩‍👩‍👧‍👦".to_string();
+    app.cursor_position = char_count(&app.input);
+    app.delete_char();
+    assert_eq!(app.input, "hi");
+    assert_eq!(app.cursor_position, 2);
+}
+
+#[test]
+fn forward_delete_removes_whole_flag_cluster() {
+    let mut app = App::new(test_options(false), &Config::default());
+    app.input = "🇯🇵ok".to_string();
+    app.cursor_position = 0;
+    app.delete_char_forward();
+    assert_eq!(app.input, "ok");
+    assert_eq!(app.cursor_position, 0);
+}
+
+#[test]
+fn backspace_deletes_cjk_per_character() {
+    let mut app = App::new(test_options(false), &Config::default());
+    app.input = "你好".to_string();
+    app.cursor_position = 2;
+    app.delete_char();
+    assert_eq!(app.input, "你");
+    app.delete_char();
+    assert_eq!(app.input, "");
+}
+
+#[test]
+fn vim_x_removes_whole_grapheme_cluster() {
+    let mut app = App::new(test_options(false), &Config::default());
+    app.input = "👍🏽a".to_string();
+    app.cursor_position = 0;
+    app.vim_delete_char_under_cursor();
+    assert_eq!(app.input, "a");
+    assert_eq!(app.cursor_position, 0);
+}
+
+#[test]
+fn select_all_covers_whole_draft() {
+    let mut app = App::new(test_options(false), &Config::default());
+    app.input = "hello 你好 🇯🇵".to_string();
+    app.cursor_position = 3;
+    app.select_all();
+    assert_eq!(app.selection_anchor, Some(0));
+    assert_eq!(app.cursor_position, char_count(&app.input));
+    assert_eq!(app.selected_text(), "hello 你好 🇯🇵");
+}
+
+#[test]
+fn select_all_on_empty_composer_sets_no_anchor() {
+    let mut app = App::new(test_options(false), &Config::default());
+    app.select_all();
+    assert!(app.selection_anchor.is_none());
+    assert!(app.selection_range().is_none());
+}
+
+#[test]
+fn select_all_then_typing_replaces_everything_recoverably() {
+    let mut app = App::new(test_options(false), &Config::default());
+    app.input = "precious draft".to_string();
+    app.select_all();
+    app.insert_char('x');
+    assert_eq!(app.input, "x");
+    assert_eq!(app.cursor_position, 1);
+    // The overwritten draft is stashed like Ctrl+U would.
+    assert_eq!(app.clear_undo_buffer.as_deref(), Some("precious draft"));
+    assert!(app.draft_history.iter().any(|d| d == "precious draft"));
+}
+
+#[test]
+fn select_all_then_backspace_is_recoverable_with_ctrl_z() {
+    let mut app = App::new(test_options(false), &Config::default());
+    app.input = "do not lose me".to_string();
+    app.select_all();
+    app.delete_char();
+    assert_eq!(app.input, "");
+    assert!(app.restore_last_cleared_input_if_empty());
+    assert_eq!(app.input, "do not lose me");
+    assert_eq!(app.cursor_position, char_count(&app.input));
+}
+
+#[test]
+fn partial_selection_delete_does_not_stash_undo_buffer() {
+    let mut app = App::new(test_options(false), &Config::default());
+    app.input = "hello world".to_string();
+    app.selection_anchor = Some(0);
+    app.cursor_position = 5;
+    assert!(app.delete_selection());
+    assert_eq!(app.input, " world");
+    assert!(app.clear_undo_buffer.is_none());
+}
+
+#[test]
+fn delete_selection_handles_cjk_and_emoji_ranges() {
+    let mut app = App::new(test_options(false), &Config::default());
+    app.input = "a你👩‍👩‍👧‍👦好b".to_string();
+    // Select 你 + family emoji (7 chars) + 好: chars 1..10.
+    app.selection_anchor = Some(1);
+    app.cursor_position = 10;
+    assert_eq!(app.selected_text(), "你👩‍👩‍👧‍👦好");
+    assert!(app.delete_selection());
+    assert_eq!(app.input, "ab");
+    assert_eq!(app.cursor_position, 1);
+}
+
+#[test]
+fn shift_home_end_style_selection_uses_line_bounds() {
+    let mut app = App::new(test_options(false), &Config::default());
+    app.input = "first line\nsecond line".to_string();
+    // Cursor in the middle of the second line ("second ".len() == 7).
+    app.cursor_position = 11 + 7;
+    // Shift+Home: anchor at cursor, move to line start.
+    app.selection_anchor = Some(app.cursor_position);
+    app.move_cursor_line_start();
+    assert_eq!(app.cursor_position, 11);
+    assert_eq!(app.selected_text(), "second ");
+    // Shift+End from the same anchor: move to line end.
+    app.move_cursor_line_end();
+    assert_eq!(app.cursor_position, char_count(&app.input));
+    assert_eq!(app.selected_text(), "line");
+}
+
+#[test]
+fn word_selection_extends_by_word_and_replaces_on_type() {
+    let mut app = App::new(test_options(false), &Config::default());
+    app.input = "alpha beta gamma".to_string();
+    app.cursor_position = 0;
+    // Ctrl/Alt+Shift+Right twice: anchor once, extend word-wise.
+    app.selection_anchor = Some(app.cursor_position);
+    app.move_cursor_word_forward();
+    app.move_cursor_word_forward();
+    assert_eq!(app.selected_text(), "alpha beta ");
+    app.insert_char('X');
+    assert_eq!(app.input, "Xgamma");
+    assert_eq!(app.cursor_position, 1);
+}
+
 // === #2574: capability-aware fallback eligibility ===============================
 
 /// Build an `App` whose fallback chain is `[active, fallbacks...]` with each
