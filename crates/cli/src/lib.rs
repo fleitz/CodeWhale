@@ -4286,10 +4286,16 @@ fn build_tui_command_with_paths(
         );
     }
 
+    // For every forwarded flag below, set both the canonical CODEWHALE_* name
+    // and the legacy DEEPSEEK_* alias so an inherited CODEWHALE_* shell export
+    // cannot outrank the explicit CLI flag when the TUI applies its
+    // CODEWHALE-first environment overrides.
     if let Some(model) = cli.model.as_ref() {
+        cmd.env("CODEWHALE_MODEL", model);
         cmd.env("DEEPSEEK_MODEL", model);
     }
     if let Some(output_mode) = cli.output_mode.as_ref() {
+        cmd.env("CODEWHALE_OUTPUT_MODE", output_mode);
         cmd.env("DEEPSEEK_OUTPUT_MODE", output_mode);
     }
     if let Some(v) = verbosity.as_ref() {
@@ -4297,18 +4303,23 @@ fn build_tui_command_with_paths(
         cmd.env("DEEPSEEK_VERBOSITY", v);
     }
     if let Some(log_level) = cli.log_level.as_ref() {
+        cmd.env("CODEWHALE_LOG_LEVEL", log_level);
         cmd.env("DEEPSEEK_LOG_LEVEL", log_level);
     }
     if let Some(telemetry) = cli.telemetry {
+        cmd.env("CODEWHALE_TELEMETRY", telemetry.to_string());
         cmd.env("DEEPSEEK_TELEMETRY", telemetry.to_string());
     }
     if let Some(policy) = cli.approval_policy.as_ref() {
+        cmd.env("CODEWHALE_APPROVAL_POLICY", policy);
         cmd.env("DEEPSEEK_APPROVAL_POLICY", policy);
     }
     if let Some(mode) = cli.sandbox_mode.as_ref() {
+        cmd.env("CODEWHALE_SANDBOX_MODE", mode);
         cmd.env("DEEPSEEK_SANDBOX_MODE", mode);
     }
     if cli.yolo {
+        cmd.env("CODEWHALE_YOLO", "true");
         cmd.env("DEEPSEEK_YOLO", "true");
     }
     if let Some(api_key) = cli.api_key.as_ref() {
@@ -4330,6 +4341,7 @@ fn build_tui_command_with_paths(
         cmd.env("DEEPSEEK_API_KEY_SOURCE", "cli");
     }
     if let Some(base_url) = cli.base_url.as_ref() {
+        cmd.env("CODEWHALE_BASE_URL", base_url);
         cmd.env("DEEPSEEK_BASE_URL", base_url);
     }
 
@@ -4381,8 +4393,8 @@ to execute it. Common fixes:\n\
 come from the same install directory.\n\
   - If you downloaded release assets manually, keep both `codewhale` and \
 `codewhale-tui` binaries together and make sure the TUI binary is executable.\n\
-  - Set DEEPSEEK_TUI_BIN to the absolute path of a working `codewhale-tui` \
-binary.",
+  - Set CODEWHALE_TUI_BIN (legacy alias: DEEPSEEK_TUI_BIN) to the absolute \
+path of a working `codewhale-tui` binary.",
         tui.display()
     )
 }
@@ -4392,20 +4404,22 @@ binary.",
 /// the npm-distributed Windows package — which ships
 /// `bin/downloads/codewhale-tui.exe` — is found by `Path::exists` (#247).
 ///
-/// `DEEPSEEK_TUI_BIN` is consulted first as an explicit override for
-/// custom installs and CI test layouts. On Windows we additionally try
-/// the suffix-less name as a fallback for users who already manually
-/// renamed the file before this fix landed.
+/// `CODEWHALE_TUI_BIN` (legacy alias: `DEEPSEEK_TUI_BIN`) is consulted first
+/// as an explicit override for custom installs and CI test layouts. On
+/// Windows we additionally try the suffix-less name as a fallback for users
+/// who already manually renamed the file before this fix landed.
 fn locate_sibling_tui_binary() -> Result<PathBuf> {
-    if let Ok(override_path) = std::env::var("DEEPSEEK_TUI_BIN") {
-        let candidate = PathBuf::from(override_path);
-        if candidate.is_file() {
-            return Ok(candidate);
+    for var in ["CODEWHALE_TUI_BIN", "DEEPSEEK_TUI_BIN"] {
+        if let Ok(override_path) = std::env::var(var) {
+            let candidate = PathBuf::from(override_path);
+            if candidate.is_file() {
+                return Ok(candidate);
+            }
+            bail!(
+                "{var} points at {}, which is not a regular file.",
+                candidate.display()
+            );
         }
-        bail!(
-            "DEEPSEEK_TUI_BIN points at {}, which is not a regular file.",
-            candidate.display()
-        );
     }
 
     let current = std::env::current_exe().context("failed to locate current executable path")?;
@@ -4427,7 +4441,8 @@ The `codewhale` dispatcher delegates interactive sessions to a sibling \
 `codewhale-tui-<platform>` from https://github.com/Hmbown/CodeWhale/releases/latest \
 and place them in the same directory.\n\
 \n\
-Or set DEEPSEEK_TUI_BIN to the absolute path of an existing `codewhale-tui` binary.",
+Or set CODEWHALE_TUI_BIN (legacy alias: DEEPSEEK_TUI_BIN) to the absolute path \
+of an existing `codewhale-tui` binary.",
         expected.display()
     );
 }
@@ -8305,5 +8320,30 @@ model = "qwen-2.5-7b"
 
         let resolved = locate_sibling_tui_binary().expect("override must resolve");
         assert_eq!(resolved, custom);
+    }
+
+    /// `CODEWHALE_TUI_BIN` is the canonical override name and outranks the
+    /// legacy `DEEPSEEK_TUI_BIN` alias when both are set.
+    #[test]
+    fn locate_sibling_tui_binary_prefers_codewhale_env_override() {
+        let _lock = env_lock();
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let canonical = dir
+            .path()
+            .join(format!("canonical-tui{}", std::env::consts::EXE_SUFFIX));
+        let legacy = dir
+            .path()
+            .join(format!("legacy-tui{}", std::env::consts::EXE_SUFFIX));
+        std::fs::write(&canonical, b"").unwrap();
+        std::fs::write(&legacy, b"").unwrap();
+        let _canonical_bin = ScopedEnvVar::set(
+            "CODEWHALE_TUI_BIN",
+            &canonical.to_string_lossy().into_owned(),
+        );
+        let _legacy_bin =
+            ScopedEnvVar::set("DEEPSEEK_TUI_BIN", &legacy.to_string_lossy().into_owned());
+
+        let resolved = locate_sibling_tui_binary().expect("override must resolve");
+        assert_eq!(resolved, canonical);
     }
 }

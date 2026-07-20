@@ -823,11 +823,14 @@ fn print_human(rollup: &Rollup) {
 // ──────────────────────────────────────────────────────────────────────────────
 
 fn deepseek_home() -> PathBuf {
-    // Respect DEEPSEEK_HOME env override; fall back to ~/.deepseek.
-    if let Ok(v) = std::env::var("DEEPSEEK_HOME")
-        && !v.is_empty()
-    {
-        return PathBuf::from(v);
+    // Respect CODEWHALE_HOME (canonical) then DEEPSEEK_HOME (legacy alias)
+    // env overrides; fall back to ~/.deepseek.
+    for var in ["CODEWHALE_HOME", "DEEPSEEK_HOME"] {
+        if let Ok(v) = std::env::var(var)
+            && !v.trim().is_empty()
+        {
+            return PathBuf::from(v);
+        }
     }
     dirs::home_dir()
         .unwrap_or_else(|| PathBuf::from("."))
