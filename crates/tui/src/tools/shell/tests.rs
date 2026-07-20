@@ -1846,40 +1846,27 @@ fn issue_1691_quoted_commit_message_round_trips() {
 
     let dispatcher = crate::shell_dispatcher::global_dispatcher();
     // The whole command (with quotes) is a single argv entry. The actual
-    // shell binary can vary by platform, but the payload itself must stay
-    // intact in one shell arg. We never split the command string ourselves.
+    // shell binary can vary by platform — and the dispatcher may wrap the
+    // payload (encoding prefix, exit-code capture) — but the payload itself
+    // must stay intact in ONE shell arg. We never split the command string
+    // ourselves. This single-line ASCII command never takes the PowerShell
+    // temp `-File` path, so the payload stays on the argv.
     assert_eq!(spec.program, dispatcher.kind().binary());
-    if dispatcher.kind().is_powershell() {
-        assert_eq!(
-            spec.args,
-            [
-                dispatcher.kind().command_flag().to_string(),
-                "-Command".to_string(),
-                format!("[Console]::OutputEncoding = [System.Text.Encoding]::UTF8; {cmd}")
-            ]
-        );
-    } else if matches!(dispatcher.kind(), crate::shell_dispatcher::ShellKind::Cmd) {
-        assert_eq!(
-            spec.args,
-            ["/C".to_string(), format!("chcp 65001 >NUL & {cmd}")]
-        );
-    } else {
-        assert_eq!(
-            spec.args,
-            [
-                dispatcher.kind().command_flag().to_string(),
-                cmd.to_string()
-            ]
-        );
-    }
-    assert_eq!(
-        spec.args.len(),
-        if dispatcher.kind().is_powershell() {
-            3
-        } else {
-            2
-        }
+    let carriers = spec
+        .args
+        .iter()
+        .filter(|arg| arg.contains(r#""feat: complete sub-pages""#))
+        .count();
+    assert_eq!(carriers, 1, "args: {:?}", spec.args);
+    assert!(
+        !spec
+            .args
+            .iter()
+            .any(|arg| arg == "feat:" || arg == "complete" || arg == "sub-pages\""),
+        "args: {:?}",
+        spec.args
     );
+    assert_eq!(spec.display_command(), cmd);
 
     let mut built = Command::new(&spec.program);
     push_shell_args(&mut built, &spec.program, &spec.args);
