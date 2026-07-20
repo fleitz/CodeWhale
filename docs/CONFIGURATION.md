@@ -731,47 +731,36 @@ Remaining variables:
 - `OLLAMA_BASE_URL`
 - `OLLAMA_MODEL`
 - `OLLAMA_API_KEY` (optional; many localhost Ollama servers do not require auth)
-- `DEEPSEEK_LOG_LEVEL` or `RUST_LOG` (`info`/`debug`/`trace` enables lightweight verbose logs)
-- `DEEPSEEK_SKILLS_DIR`
-- `DEEPSEEK_MCP_CONFIG`
-- `DEEPSEEK_NOTES_PATH`
-- `DEEPSEEK_MEMORY` (`1|on|true|yes|y|enabled` turns user memory on)
-- `DEEPSEEK_MEMORY_PATH`
-- `DEEPSEEK_ALLOW_SHELL` (`1`/`true` enables)
-- `DEEPSEEK_APPROVAL_POLICY` (`on-request|untrusted|never`)
-- `DEEPSEEK_SANDBOX_MODE` (`read-only|workspace-write|danger-full-access|external-sandbox`)
-- `DEEPSEEK_MANAGED_CONFIG_PATH`
-- `DEEPSEEK_REQUIREMENTS_PATH`
-- `DEEPSEEK_MAX_SUBAGENTS` (clamped to `1..=20`)
-- `DEEPSEEK_TASKS_DIR` (runtime task queue/artifact storage, default
+For every product-level `CODEWHALE_*` variable below, the matching legacy
+`DEEPSEEK_*` name is still read as a compatibility fallback; when both are set,
+the `CODEWHALE_*` value wins.
+
+- `CODEWHALE_LOG_LEVEL` or `RUST_LOG` (`info`/`debug`/`trace` enables lightweight verbose logs)
+- `CODEWHALE_SKILLS_DIR`
+- `CODEWHALE_MCP_CONFIG`
+- `CODEWHALE_NOTES_PATH`
+- `CODEWHALE_MEMORY` (`1|on|true|yes|y|enabled` turns user memory on)
+- `CODEWHALE_MEMORY_PATH`
+- `CODEWHALE_ALLOW_SHELL` (`1`/`true` enables)
+- `CODEWHALE_APPROVAL_POLICY` (`on-request|untrusted|never`)
+- `CODEWHALE_SANDBOX_MODE` (`read-only|workspace-write|danger-full-access|external-sandbox`)
+- `CODEWHALE_MANAGED_CONFIG_PATH`
+- `CODEWHALE_REQUIREMENTS_PATH`
+- `CODEWHALE_MAX_SUBAGENTS` (clamped to `1..=20`)
+- `CODEWHALE_TASKS_DIR` (runtime task queue/artifact storage, default
   `~/.codewhale/tasks`, with legacy `~/.deepseek/tasks` fallback when only the
   legacy directory exists)
-- `DEEPSEEK_ALLOW_INSECURE_HTTP` (`1`/`true` allows non-local `http://` base URLs; default is reject)
-- `DEEPSEEK_FORCE_HTTP1` (`1|true|yes|on` pins the HTTP client to HTTP/1.1, disabling HTTP/2; useful on Windows or behind proxies that mishandle long-lived H2 streams)
+- `CODEWHALE_ALLOW_INSECURE_HTTP` (`1`/`true` allows non-local `http://` base URLs; default is reject)
+- `CODEWHALE_FORCE_HTTP1` (`1|true|yes|on` pins the HTTP client to HTTP/1.1, disabling HTTP/2; useful on Windows or behind proxies that mishandle long-lived H2 streams)
 - `CODEWHALE_HOME` (override the base data directory; defaults to `~/.codewhale`).
   If you previously exported `DEEPSEEK_HOME`, rename it to `CODEWHALE_HOME`;
   the old env var is not used for new Codewhale state paths.
 - `CODEWHALE_RELEASE_BASE_URL` (release asset mirror used by `codewhale update`
   and by TUI startup update checks when `[update].update_uri` is not set, or as
   a fallback when that configured URI cannot be fetched)
-- `DEEPSEEK_AUTOMATIONS_DIR` (override the automations storage directory; uses
+- `CODEWHALE_AUTOMATIONS_DIR` (override the automations storage directory; uses
   `~/.codewhale/automations` by default, with legacy `~/.deepseek/automations`
   fallback when only the legacy directory exists)
-- `DEEPSEEK_CAPACITY_ENABLED`
-- `DEEPSEEK_CAPACITY_LOW_RISK_MAX`
-- `DEEPSEEK_CAPACITY_MEDIUM_RISK_MAX`
-- `DEEPSEEK_CAPACITY_SEVERE_MIN_SLACK`
-- `DEEPSEEK_CAPACITY_SEVERE_VIOLATION_RATIO`
-- `DEEPSEEK_CAPACITY_REFRESH_COOLDOWN_TURNS`
-- `DEEPSEEK_CAPACITY_REPLAN_COOLDOWN_TURNS`
-- `DEEPSEEK_CAPACITY_MAX_REPLAY_PER_TURN`
-- `DEEPSEEK_CAPACITY_MIN_TURNS_BEFORE_GUARDRAIL`
-- `DEEPSEEK_CAPACITY_PROFILE_WINDOW`
-- `DEEPSEEK_CAPACITY_PRIOR_CHAT`
-- `DEEPSEEK_CAPACITY_PRIOR_REASONER`
-- `DEEPSEEK_CAPACITY_PRIOR_V4_PRO`
-- `DEEPSEEK_CAPACITY_PRIOR_V4_FLASH`
-- `DEEPSEEK_CAPACITY_PRIOR_FALLBACK`
 - `NO_ANIMATIONS` (`1|true|yes|on` forces `low_motion = true` and
   `fancy_animations = false` at startup, regardless of the saved
   settings; see [`docs/ACCESSIBILITY.md`](./ACCESSIBILITY.md)).
