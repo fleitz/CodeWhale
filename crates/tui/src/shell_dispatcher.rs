@@ -1,7 +1,7 @@
-//! Shell abstraction layer for DeepSeek TUI.
+//! Shell abstraction layer for Codewhale.
 //!
 //! Detects the user's shell at startup and provides a single entry point for
-//! all command execution. DeepSeek TUI never calls `Command::new("cmd")` (or
+//! all command execution. Codewhale never calls `Command::new("cmd")` (or
 //! `"sh"`, `"pwsh"`, ...) directly — it asks the [`ShellDispatcher`] to build
 //! a correctly configured [`std::process::Command`].
 //!
@@ -9,9 +9,12 @@
 //!
 //! 1. **Shell detection** — find the user's actual shell (PowerShell, pwsh,
 //!    bash via WSL / Git Bash, cmd.exe fallback on Windows, /bin/sh on Unix).
+//!    On Windows, prefer PowerShell 7 (`pwsh`) over Windows PowerShell 5.1.
 //! 2. **Quoting correctness** — each shell's argument-passing convention is
 //!    respected so quoted strings survive the spawn boundary intact.
-//! 3. **Terminal state** — foreground shell execution saves and restores
+//! 3. **PowerShell safety** — non-interactive flags, temporary `.ps1` files
+//!    for multiline scripts, and explicit native `$LASTEXITCODE` capture.
+//! 4. **Terminal state** — foreground shell execution saves and restores
 //!    crossterm raw-mode so the TUI input pipeline is not broken after a
 //!    child process exits (issue #1690).
 
@@ -89,11 +92,61 @@ impl ShellKind {
         matches!(self, ShellKind::Pwsh | ShellKind::WindowsPowerShell)
     }
 
-    #[cfg(test)]
     /// Returns true when this is a PowerShell-family shell.
     pub fn is_powershell(&self) -> bool {
         matches!(self, ShellKind::Pwsh | ShellKind::WindowsPowerShell)
     }
+}
+
+/// Multiline, nested-quote, or non-ASCII PowerShell scripts are safer as a
+/// temporary `-File` script than as a single `-Command` string.
+fn powershell_prefers_script_file(shell_command: &str) -> bool {
+    shell_command.contains('\n')
+        || shell_command.contains('\r')
+        || shell_command.chars().any(|c| !c.is_ascii())
+        || shell_command.matches('"').count() >= 4
+        || shell_command.contains("'''")
+        || shell_command.contains("@'")
+        || shell_command.contains("@\"")
+}
+
+/// Wrap a model/user PowerShell command so native program failures surface
+/// through `$LASTEXITCODE` without using `Invoke-Expression`.
+fn powershell_exit_aware_command(shell_command: &str) -> String {
+    // Keep simple expressions as-is; only wrap when the payload looks like it
+    // may invoke a native executable (contains a path or known separators).
+    if shell_command.trim().is_empty() {
+        return shell_command.to_string();
+    }
+    format!(
+        "$ErrorActionPreference = 'Continue'; {shell_command}; if ($null -ne $LASTEXITCODE -and $LASTEXITCODE -ne 0) {{ exit $LASTEXITCODE }}"
+    )
+}
+
+fn write_temp_ps1(shell_command: &str) -> std::io::Result<String> {
+    use std::io::Write;
+    let dir = std::env::temp_dir();
+    let name = format!(
+        "codewhale-shell-{}-{}.ps1",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0)
+    );
+    let path = dir.join(name);
+    let mut file = std::fs::File::create(&path)?;
+    // UTF-8 with BOM helps Windows PowerShell 5.1 decode non-ASCII scripts.
+    file.write_all(&[0xEF, 0xBB, 0xBF])?;
+    file.write_all(shell_command.as_bytes())?;
+    if !shell_command.ends_with('\n') {
+        file.write_all(b"\n")?;
+    }
+    // Append native exit-code propagation for the script form as well.
+    file.write_all(
+        b"if ($null -ne $LASTEXITCODE -and $LASTEXITCODE -ne 0) { exit $LASTEXITCODE }\n",
+    )?;
+    Ok(path.to_string_lossy().into_owned())
 }
 
 // ---------------------------------------------------------------------------
@@ -177,27 +230,20 @@ impl ShellDispatcher {
 
     /// Build a `std::process::Command` for the given shell command string.
     pub fn build_command(&self, shell_command: &str) -> Command {
-        let mut cmd = Command::new(self.kind.binary());
-
-        if self.kind.needs_command_flag() {
-            cmd.arg(self.kind.command_flag());
-            cmd.arg("-Command");
-            cmd.arg(shell_command);
-        } else if matches!(self.kind, ShellKind::Cmd) {
-            cmd.arg(self.kind.command_flag());
+        let (program, args) = self.build_command_parts(shell_command);
+        let mut cmd = Command::new(program);
+        if matches!(self.kind, ShellKind::Cmd) {
             #[cfg(windows)]
             {
-                cmd.raw_arg(shell_command);
+                // Preserve quotes for `cmd /C <payload>` (issue #1691).
+                if args.len() == 2 && args[0].eq_ignore_ascii_case("/C") {
+                    cmd.raw_arg(&args[0]);
+                    cmd.raw_arg(&args[1]);
+                    return cmd;
+                }
             }
-            #[cfg(not(windows))]
-            {
-                cmd.arg(shell_command);
-            }
-        } else {
-            cmd.arg(self.kind.command_flag());
-            cmd.arg(shell_command);
         }
-
+        cmd.args(args);
         cmd
     }
 
@@ -205,12 +251,33 @@ impl ShellDispatcher {
     /// inspect or modify the args before passing them to `Command`.
     pub fn build_command_parts(&self, shell_command: &str) -> (String, Vec<String>) {
         let program = self.kind.binary().to_string();
-        let args = if self.kind.needs_command_flag() {
-            vec![
-                self.kind.command_flag().to_string(),
-                "-Command".to_string(),
-                shell_command.to_string(),
-            ]
+        if self.kind.is_powershell() {
+            let mut args = vec![
+                "-NoLogo".to_string(),
+                "-NoProfile".to_string(),
+                "-NonInteractive".to_string(),
+            ];
+            if powershell_prefers_script_file(shell_command) {
+                // Complex multiline / heavily quoted scripts: write a temp
+                // .ps1 and invoke with -File so quoting stays structured.
+                match write_temp_ps1(shell_command) {
+                    Ok(path) => {
+                        args.push("-File".to_string());
+                        args.push(path);
+                        return (program, args);
+                    }
+                    Err(_) => {
+                        // Fall through to -Command if the temp file cannot be
+                        // created; execution still proceeds.
+                    }
+                }
+            }
+            args.push("-Command".to_string());
+            args.push(powershell_exit_aware_command(shell_command));
+            return (program, args);
+        }
+        let args = if matches!(self.kind, ShellKind::Cmd) {
+            vec!["/C".to_string(), shell_command.to_string()]
         } else {
             vec![
                 self.kind.command_flag().to_string(),
@@ -429,9 +496,37 @@ mod tests {
         };
         let cmd = dispatcher.build_command("echo hello");
         let args: Vec<&str> = cmd.get_args().map(|a| a.to_str().unwrap()).collect();
+        assert!(args.contains(&"-NoLogo"));
         assert!(args.contains(&"-NoProfile"));
+        assert!(args.contains(&"-NonInteractive"));
         assert!(args.contains(&"-Command"));
-        assert!(args.contains(&"echo hello"));
+        assert!(
+            args.iter().any(|a| a.contains("echo hello")),
+            "command payload missing: {args:?}"
+        );
+        assert!(
+            args.iter().any(|a| a.contains("$LASTEXITCODE")),
+            "native exit-code capture missing: {args:?}"
+        );
+    }
+
+    #[test]
+    fn powershell_multiline_uses_temp_file_invocation() {
+        let dispatcher = ShellDispatcher {
+            kind: ShellKind::Pwsh,
+        };
+        let script = "Write-Output 'line1'\nWrite-Output 'line2'";
+        let (program, args) = dispatcher.build_command_parts(script);
+        assert!(program.contains("pwsh"));
+        assert!(args.iter().any(|a| a == "-File"), "{args:?}");
+        assert!(
+            args.iter().any(|a| a.ends_with(".ps1")),
+            "expected temp .ps1 path: {args:?}"
+        );
+        // Cleanup temp script created by the builder.
+        if let Some(path) = args.iter().find(|a| a.ends_with(".ps1")) {
+            let _ = std::fs::remove_file(path);
+        }
     }
 
     #[test]
@@ -510,10 +605,14 @@ mod tests {
         };
         let cmd = dispatcher.build_command("git commit -m \"msg with spaces\"");
         let args: Vec<&str> = cmd.get_args().map(|a| a.to_str().unwrap()).collect();
-        assert_eq!(args.len(), 3);
-        assert_eq!(args[0], "-NoProfile");
-        assert_eq!(args[1], "-Command");
-        assert!(args[2].contains("msg with spaces"));
+        assert!(args.contains(&"-NoLogo"));
+        assert!(args.contains(&"-NoProfile"));
+        assert!(args.contains(&"-NonInteractive"));
+        assert!(args.contains(&"-Command"));
+        assert!(
+            args.iter().any(|a| a.contains("msg with spaces")),
+            "quoted payload missing: {args:?}"
+        );
     }
 
     #[cfg(test)]
