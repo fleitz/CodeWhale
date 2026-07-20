@@ -996,14 +996,8 @@ mod tests {
             context_window_for_model("opencode-go/kimi-k3"),
             Some(1_048_576)
         );
-        assert_eq!(
-            max_output_tokens_for_model("k3"),
-            Some(131_072)
-        );
-        assert_eq!(
-            max_output_tokens_for_model("kimi-k3"),
-            Some(131_072)
-        );
+        assert_eq!(max_output_tokens_for_model("k3"), Some(131_072));
+        assert_eq!(max_output_tokens_for_model("kimi-k3"), Some(131_072));
         // Never project max output as the context window.
         assert_ne!(
             context_window_for_model("k3"),
