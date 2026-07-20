@@ -555,6 +555,36 @@ mod tests {
     }
 
     #[test]
+    fn opencode_go_kimi_k3_route_uses_1m_context() {
+        // OpenCode Go may not own a models.dev row for kimi-k3; capability and
+        // budget resolution still must use the 1M K3 contract, never the 128K
+        // legacy fallback or the 131K max-output field.
+        let cap = crate::config::provider_capability(ApiProvider::OpencodeGo, "kimi-k3");
+        assert_eq!(cap.context_window, 1_048_576);
+        assert_eq!(cap.max_output, 131_072);
+        assert_ne!(cap.context_window, cap.max_output);
+
+        let candidate =
+            resolve_route_candidate(ApiProvider::OpencodeGo, Some("kimi-k3"), None, None, None)
+                .expect("OpenCode Go Kimi K3 route");
+        assert_eq!(candidate.wire_model_id().as_str(), "kimi-k3");
+        // Prefer catalog/route limits when present; otherwise the capability
+        // path above is the source of truth for picker/budget display.
+        if let Some(ctx) = candidate.limits().context_tokens {
+            assert_eq!(ctx, 1_048_576);
+        } else {
+            assert_eq!(
+                crate::route_budget::route_context_window_tokens(
+                    ApiProvider::OpencodeGo,
+                    "kimi-k3",
+                    Some(candidate.limits()),
+                ),
+                1_048_576
+            );
+        }
+    }
+
+    #[test]
     fn moonshot_k3_route_uses_bundled_1m_context() {
         let candidate =
             resolve_route_candidate(ApiProvider::Moonshot, Some("kimi-k3"), None, None, None)
@@ -574,7 +604,12 @@ mod tests {
     }
 
     #[test]
-    fn kimi_code_bare_k3_uses_conservative_route_baseline() {
+    fn kimi_code_bare_k3_keeps_tier_safe_floor_not_legacy_128k() {
+        // Bare `k3` membership context is plan-tier dependent (256K on lower
+        // tiers, up to 1M on higher ones), so the static route baseline stays
+        // the safe floor. Higher entitlements come from an explicit provider
+        // `context_window` override or the documented `k3[1m]` id — never
+        // from assuming the top tier, and never from the 128K legacy default.
         let candidate = resolve_route_candidate(
             ApiProvider::Moonshot,
             Some("k3"),
@@ -586,6 +621,27 @@ mod tests {
 
         assert_eq!(candidate.wire_model_id().as_str(), "k3");
         assert_eq!(candidate.limits().context_tokens, Some(262_144));
+        // Output is catalog-owned; never project the 131K max-output as context.
+        assert_ne!(
+            candidate.limits().context_tokens,
+            candidate.limits().output_tokens
+        );
+        assert_eq!(
+            crate::config::provider_capability(
+                ApiProvider::Moonshot,
+                crate::config::KIMI_CODE_K3_MODEL
+            )
+            .context_window,
+            262_144
+        );
+        assert_eq!(
+            crate::config::provider_capability(
+                ApiProvider::Moonshot,
+                crate::config::KIMI_CODE_K3_MODEL
+            )
+            .max_output,
+            131_072
+        );
     }
 
     #[test]

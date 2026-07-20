@@ -4148,7 +4148,10 @@ mod tests {
             ProviderReasoningSupport::Supported,
             "generic Moonshot k3 must not inherit Kimi Code's route-owned capability"
         );
-        assert_ne!(direct_row.capabilities.context_window, Some(262_144));
+        // The generic model-facts table now carries the same conservative
+        // number for bare `k3`, so the route-ownership distinction lives in
+        // provenance: the direct Moonshot row must never claim the Kimi Code
+        // route-owned floor as its source.
         assert_ne!(
             direct_row.capabilities.context_window_source.as_deref(),
             Some("static Kimi Code safe floor")

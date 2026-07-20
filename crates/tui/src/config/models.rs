@@ -107,9 +107,12 @@ pub const KIMI_CODE_MEMBERSHIP_PLAN_CONSOLE_URL: &str =
 /// Official Kimi Code route model id. It is deliberately distinct from
 /// Moonshot's pay-as-you-go `kimi-k3` catalog id.
 pub const KIMI_CODE_K3_MODEL: &str = "k3";
-/// Conservative Kimi Code K3 context baseline. Higher plan entitlements must
-/// be supplied by an explicit provider configuration or fresh provider facts.
-pub const KIMI_CODE_K3_CONTEXT_WINDOW_TOKENS: u32 = 262_144;
+// The K3 contract constants (`KIMI_CODE_K3_CONTEXT_WINDOW_TOKENS`,
+// `KIMI_K3_CONTEXT_WINDOW_TOKENS`, `KIMI_K3_MAX_OUTPUT_TOKENS`) live in
+// `crate::models` — the model-facts table, which also compiles standalone in
+// integration tests — so the facts have exactly one home. Re-export only the
+// route-owned floor, which existing `crate::config` call sites import.
+pub use crate::models::KIMI_CODE_K3_CONTEXT_WINDOW_TOKENS;
 pub const DEFAULT_SGLANG_MODEL: &str = "deepseek-ai/DeepSeek-V4-Pro";
 pub const DEFAULT_SGLANG_FLASH_MODEL: &str = "deepseek-ai/DeepSeek-V4-Flash";
 pub const DEFAULT_SGLANG_BASE_URL: &str = "http://localhost:30000/v1";
