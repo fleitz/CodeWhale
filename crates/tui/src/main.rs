@@ -11778,11 +11778,11 @@ mod doctor_setup_state_tests {
         let kimi_report = doctor_setup_report_json(&kimi_config, &workspace);
         assert_eq!(
             kimi_report["provider_model"]["auth"]["credential_url"],
-            "https://platform.kimi.com/console/api-keys"
+            "https://platform.kimi.ai/console/api-keys"
         );
         assert_eq!(
             kimi_report["provider_model"]["auth"]["credential_docs_url"],
-            "https://platform.kimi.com/docs/overview"
+            "https://platform.kimi.ai/docs/overview"
         );
         assert_eq!(
             kimi_report["provider_model"]["auth"]["credential_mode"],

@@ -2713,7 +2713,7 @@ mod tests {
         }
     }
 
-    fn k3_request_fixture(model: &str, effort: &str, stream: bool) -> MessageRequest {
+    fn k3_request_fixture(model: &str, effort: Option<&str>, stream: bool) -> MessageRequest {
         MessageRequest {
             model: model.to_string(),
             messages: vec![Message {
@@ -2729,7 +2729,7 @@ mod tests {
             tool_choice: None,
             metadata: None,
             thinking: None,
-            reasoning_effort: Some(effort.to_string()),
+            reasoning_effort: effort.map(str::to_string),
             stream: Some(stream),
             temperature: Some(0.25),
             top_p: Some(0.75),
@@ -2739,9 +2739,19 @@ mod tests {
     async fn capture_moonshot_chat_request(
         route_base_url: &str,
         model: &str,
-        effort: &str,
+        effort: Option<&str>,
         streaming: bool,
     ) -> Value {
+        let request = k3_request_fixture(model, effort, streaming);
+        capture_moonshot_chat_request_body(route_base_url, model, request).await
+    }
+
+    async fn capture_moonshot_chat_request_body(
+        route_base_url: &str,
+        model: &str,
+        request: MessageRequest,
+    ) -> Value {
+        let streaming = request.stream == Some(true);
         let server = MockServer::start().await;
         let response = if streaming {
             ResponseTemplate::new(200)
@@ -2788,7 +2798,6 @@ mod tests {
         assert_eq!(client.base_url, route_base_url);
         client.test_chat_transport_base_url = Some(server.uri());
 
-        let request = k3_request_fixture(model, effort, streaming);
         if streaming {
             let mut stream = client
                 .create_message_stream(request)
@@ -2814,7 +2823,7 @@ mod tests {
             let body = capture_moonshot_chat_request(
                 crate::config::DEFAULT_MOONSHOT_BASE_URL,
                 crate::config::MOONSHOT_KIMI_K3_MODEL,
-                requested,
+                Some(requested),
                 streaming,
             )
             .await;
@@ -2832,13 +2841,12 @@ mod tests {
 
         for (requested, expected) in [
             ("off", Some(json!({"type": "enabled", "effort": "low"}))),
-            ("auto", None),
             ("max", Some(json!({"type": "enabled", "effort": "max"}))),
         ] {
             let membership = capture_moonshot_chat_request(
                 crate::config::DEFAULT_KIMI_CODE_BASE_URL,
                 crate::config::KIMI_CODE_K3_MODEL,
-                requested,
+                Some(requested),
                 streaming,
             )
             .await;
@@ -2856,10 +2864,23 @@ mod tests {
             assert_eq!(membership["top_p"], json!(0.75), "{membership}");
         }
 
+        let provider_default = capture_moonshot_chat_request(
+            crate::config::DEFAULT_KIMI_CODE_BASE_URL,
+            crate::config::KIMI_CODE_K3_MODEL,
+            None,
+            streaming,
+        )
+        .await;
+        assert!(
+            provider_default.get("thinking").is_none(),
+            "only a genuinely omitted effort leaves the provider default in control: {provider_default}"
+        );
+        assert!(provider_default.get("reasoning_effort").is_none());
+
         let neighbor = capture_moonshot_chat_request(
             "https://proxy.example/v1",
             crate::config::MOONSHOT_KIMI_K3_MODEL,
-            "max",
+            Some("max"),
             streaming,
         )
         .await;
@@ -2879,6 +2900,63 @@ mod tests {
         assert_eq!(neighbor["top_p"], json!(0.75), "{neighbor}");
     }
 
+    async fn assert_kimi_code_raw_off_replays_tool_history(streaming: bool) {
+        let mut request =
+            k3_request_fixture(crate::config::KIMI_CODE_K3_MODEL, Some("off"), streaming);
+        request.messages = vec![
+            Message {
+                role: "assistant".to_string(),
+                content: vec![
+                    ContentBlock::Thinking {
+                        thinking: "Inspect the saved tool state".to_string(),
+                        signature: None,
+                    },
+                    ContentBlock::ToolUse {
+                        id: "call-k3-replay".to_string(),
+                        name: "read_file".to_string(),
+                        input: json!({"path": "src/lib.rs"}),
+                        caller: None,
+                    },
+                ],
+            },
+            Message {
+                role: "user".to_string(),
+                content: vec![ContentBlock::ToolResult {
+                    tool_use_id: "call-k3-replay".to_string(),
+                    content: "file contents".to_string(),
+                    is_error: None,
+                    content_blocks: None,
+                }],
+            },
+        ];
+
+        let body = capture_moonshot_chat_request_body(
+            crate::config::DEFAULT_KIMI_CODE_BASE_URL,
+            crate::config::KIMI_CODE_K3_MODEL,
+            request,
+        )
+        .await;
+        assert_eq!(
+            body["thinking"],
+            json!({"type": "enabled", "effort": "low"}),
+            "raw Off must still normalize to K3's always-thinking low tier: {body}"
+        );
+        let assistant = body["messages"]
+            .as_array()
+            .and_then(|messages| {
+                messages
+                    .iter()
+                    .find(|message| message["role"] == "assistant")
+            })
+            .expect("captured assistant tool-call history");
+        assert_eq!(
+            assistant["reasoning_content"],
+            json!("Inspect the saved tool state"),
+            "exact membership K3 must replay reasoning even for a stale raw Off caller: {body}"
+        );
+        assert!(assistant["tool_calls"].is_array(), "{assistant}");
+    }
+
     #[tokio::test]
     async fn create_message_request_json_honors_exact_k3_route_boundaries() {
         assert_k3_request_json_route_boundaries(false).await;
@@ -2887,6 +2965,16 @@ mod tests {
     #[tokio::test]
     async fn create_message_stream_request_json_honors_exact_k3_route_boundaries() {
         assert_k3_request_json_route_boundaries(true).await;
+    }
+
+    #[tokio::test]
+    async fn create_message_request_replays_kimi_code_history_for_raw_off() {
+        assert_kimi_code_raw_off_replays_tool_history(false).await;
+    }
+
+    #[tokio::test]
+    async fn create_message_stream_replays_kimi_code_history_for_raw_off() {
+        assert_kimi_code_raw_off_replays_tool_history(true).await;
     }
 
     const CONFIG_SECRET_SENTINELS: [&str; 8] = [

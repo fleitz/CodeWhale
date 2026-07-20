@@ -233,7 +233,7 @@ fn apply_route_reasoning_controls(
 /// The direct K3 Chat Completions schema exposes fixed sampling behavior and
 /// omits `temperature` and `top_p`. Strip legacy/generic values only from the
 /// exact first-party route so compatible gateways keep their own contract.
-/// Source: https://platform.kimi.com/docs/api/chat (verified 2026-07-20).
+/// Source: https://platform.kimi.ai/docs/guide/kimi-k3-quickstart (verified 2026-07-20).
 fn apply_direct_moonshot_k3_fixed_sampling(
     body: &mut Value,
     provider: ApiProvider,
@@ -2441,10 +2441,12 @@ fn should_replay_reasoning_content_for_provider_on_route(
     model: &str,
     effort: Option<&str>,
 ) -> bool {
-    // Direct K3 is always-thinking. A stale caller may still carry `off`
-    // before route normalization; retaining the assistant reasoning trace is
-    // required for multi-turn/tool-call continuity regardless.
-    if is_exact_direct_moonshot_k3_route(provider, base_url, model) {
+    // Both exact K3 routes are always-thinking. A stale caller may still carry
+    // `off` before route normalization; retaining the assistant reasoning
+    // trace is required for multi-turn/tool-call continuity regardless.
+    if is_exact_direct_moonshot_k3_route(provider, base_url, model)
+        || is_exact_kimi_code_k3_route(provider, base_url, model)
+    {
         return true;
     }
     if effort
@@ -2457,10 +2459,6 @@ fn should_replay_reasoning_content_for_provider_on_route(
         .unwrap_or(false)
     {
         return false;
-    }
-
-    if is_exact_kimi_code_k3_route(provider, base_url, model) {
-        return true;
     }
 
     if requires_reasoning_content(model) {
@@ -5005,12 +5003,15 @@ mod alias_thinking_detection_tests {
             ),
             ReasoningStreamStyle::None
         );
-        assert!(!should_replay_reasoning_content_for_provider_on_route(
-            ApiProvider::Moonshot,
-            kimi_code,
-            crate::config::KIMI_CODE_K3_MODEL,
-            Some("off"),
-        ));
+        assert!(
+            should_replay_reasoning_content_for_provider_on_route(
+                ApiProvider::Moonshot,
+                kimi_code,
+                crate::config::KIMI_CODE_K3_MODEL,
+                Some("off"),
+            ),
+            "exact membership K3 stays always-thinking even for a stale raw Off caller"
+        );
     }
 
     #[test]

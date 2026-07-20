@@ -15,7 +15,7 @@ pub const DEEPSEEK_V4_CONTEXT_WINDOW_TOKENS: u32 = 1_000_000;
 /// preserving the `k3` wire id.
 pub const KIMI_CODE_K3_CONTEXT_WINDOW_TOKENS: u32 = 262_144;
 /// Kimi K3 context window on the open platform (`kimi-k3` pay-as-you-go).
-/// Verified 2026-07-20 from https://platform.kimi.com/docs/api/chat
+/// Verified 2026-07-20 from https://platform.kimi.ai/docs/guide/kimi-k3-quickstart
 /// (1,048,576 tokens). Max output is a separate fact below and must never be
 /// conflated with this window.
 pub const KIMI_K3_CONTEXT_WINDOW_TOKENS: u32 = 1_048_576;
@@ -26,7 +26,7 @@ pub const KIMI_K3_CONTEXT_WINDOW_TOKENS: u32 = 1_048_576;
 pub const KIMI_K3_DEFAULT_MAX_COMPLETION_TOKENS: u32 = 131_072;
 /// Documented maximum output for the exact direct Kimi K3 API route.
 ///
-/// Source: https://platform.kimi.com/docs/api/chat (verified 2026-07-20).
+/// Source: https://platform.kimi.ai/docs/guide/kimi-k3-quickstart (verified 2026-07-20).
 pub const DIRECT_KIMI_K3_MAX_OUTPUT_TOKENS: u32 = 1_048_576;
 /// Last-resort compaction trigger when [`context_window_for_model`] returns
 /// `None` (an unrecognised model id). v0.8.11 raised this from `50_000` to
@@ -320,7 +320,7 @@ fn known_context_window_for_model(model_lower: &str) -> Option<u32> {
         | "qwen/qwen3.6-27b"
         | "tencent/hy3-preview" => Some(262_144),
         // Official Kimi K3 platform pricing (2026-07-20):
-        // https://platform.kimi.com/docs/api/chat — 1,048,576 context
+        // https://platform.kimi.ai/docs/guide/kimi-k3-quickstart — 1,048,576 context
         // for the open platform.
         "moonshotai/kimi-k3" | "kimi-k3" | "opencode-go/kimi-k3" => {
             Some(KIMI_K3_CONTEXT_WINDOW_TOKENS)

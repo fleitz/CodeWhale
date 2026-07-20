@@ -5133,7 +5133,7 @@ impl Config {
                      \"https://api.kimi.com/coding/v1\" and model = \"kimi-for-coding\".",
                     credential_help
                         .credential_url
-                        .unwrap_or("https://platform.kimi.com/console/api-keys"),
+                        .unwrap_or("https://platform.kimi.ai/console/api-keys"),
                     provider.env_vars_label(),
                     provider_config_table_name(provider)?
                 );

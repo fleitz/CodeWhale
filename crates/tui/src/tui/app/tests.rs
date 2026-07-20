@@ -433,7 +433,7 @@ fn reasoning_effort_normalizes_each_exact_k3_route_without_neighbor_leakage() {
     assert_eq!(
         ReasoningEffort::Auto.normalize_for_route(ApiProvider::Moonshot, kimi_base, "k3"),
         ReasoningEffort::Auto,
-        "auto must leave the Kimi Code provider default in control"
+        "route normalization preserves the Auto sentinel until dispatch selects a concrete tier"
     );
     assert_eq!(
         ReasoningEffort::Low.normalize_for_route(ApiProvider::Moonshot, kimi_base, "k3"),

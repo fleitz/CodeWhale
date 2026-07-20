@@ -3847,6 +3847,42 @@ mod tests {
     }
 
     #[test]
+    fn resolve_auto_effort_selects_a_concrete_kimi_code_tier() {
+        let messages = vec![Message {
+            role: "user".to_string(),
+            content: vec![ContentBlock::Text {
+                text: "inspect this repository and fix the failing tests".to_string(),
+                cache_control: None,
+            }],
+        }];
+
+        let resolved = resolve_auto_effort(
+            Some("auto"),
+            &messages,
+            crate::config::ApiProvider::Moonshot,
+            crate::config::DEFAULT_KIMI_CODE_BASE_URL,
+            crate::config::KIMI_CODE_K3_MODEL,
+        )
+        .expect("Auto dispatch must select a concrete tier");
+
+        assert!(
+            matches!(resolved.as_str(), "low" | "medium" | "high" | "max"),
+            "dispatched Auto must never reach the client as a provider-default sentinel: {resolved}"
+        );
+        assert_eq!(
+            resolve_auto_effort(
+                None,
+                &messages,
+                crate::config::ApiProvider::Moonshot,
+                crate::config::DEFAULT_KIMI_CODE_BASE_URL,
+                crate::config::KIMI_CODE_K3_MODEL,
+            ),
+            None,
+            "only an omitted reasoning setting leaves the provider default in control"
+        );
+    }
+
+    #[test]
     fn allowed_tools_gate_blocks_unlisted_tool() {
         let allowed = vec!["bash".to_string(), "grep".to_string()];
         assert!(!command_allows_tool(Some(&allowed), "read"));
