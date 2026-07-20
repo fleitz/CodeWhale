@@ -602,7 +602,11 @@ fn work_surface_real_rows_own_click_wheel_and_resize() -> anyhow::Result<()> {
         .frame()
         .find_text("todo-mouse-00")
         .expect("real rendered first To-do row");
-    h.send(keys::mouse::wheel_down(first_row, first_col))?;
+    for _ in 0..8 {
+        h.send(keys::mouse::wheel_down(first_row, first_col))?;
+        h.wait_for_idle(Duration::from_millis(40), Duration::from_secs(1))?;
+    }
+    h.wait_for_text("todo-mouse-13", KEY_TIMEOUT)?;
     h.wait_for_idle(Duration::from_millis(200), Duration::from_secs(3))?;
     assert!(
         !h.debug_dump().contains("[<65"),
@@ -612,11 +616,8 @@ fn work_surface_real_rows_own_click_wheel_and_resize() -> anyhow::Result<()> {
 
     h.resize(24, 80)?;
     h.wait_for_idle(Duration::from_millis(200), Duration::from_secs(3))?;
-    let target = if h.frame().contains("todo-mouse-02") {
-        "todo-mouse-02"
-    } else {
-        "todo-mouse-00"
-    };
+    h.wait_for_text("todo-mouse-13", KEY_TIMEOUT)?;
+    let target = "todo-mouse-13";
     let (row, col) = h.frame().find_text(target).expect("row survived resize");
     h.send(keys::mouse::click(row, col))?;
     h.wait_for_text("Work", KEY_TIMEOUT)?;

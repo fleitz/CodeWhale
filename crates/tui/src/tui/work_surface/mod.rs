@@ -199,6 +199,7 @@ mod tests {
         let rows = super::model::project(&mut app);
 
         assert!(rows[0].label.starts_with("Work · 1 running · 3 ready"));
+        assert_eq!(rows[1].label, "To-do 0/4 · 4 left");
         for index in 0..4 {
             assert!(
                 rows.iter()
@@ -206,6 +207,21 @@ mod tests {
             );
         }
         assert!(rows.iter().all(|row| !row.id.0.starts_with("todo:")));
+    }
+
+    #[test]
+    fn todo_heading_reports_completed_total_and_remaining() {
+        let mut app = app();
+        {
+            let mut todos = app.todos.try_lock().expect("todos");
+            todos.add("finished".to_string(), TodoStatus::Completed);
+            todos.add("current".to_string(), TodoStatus::InProgress);
+            todos.add("next".to_string(), TodoStatus::Pending);
+        }
+
+        let rows = super::model::project(&mut app);
+
+        assert_eq!(rows[1].label, "To-do 1/3 · 2 left");
     }
 
     #[test]
@@ -461,6 +477,101 @@ mod tests {
         assert!(outcome.consumed);
         assert_eq!(app.viewport.pending_scroll_delta, transcript_delta);
         assert!(app.work_surface.scroll_offset > 0);
+    }
+
+    #[test]
+    fn mouse_wheel_reaches_last_todo_across_top_surface_heights() {
+        for height in [3, 5, 6, 8] {
+            let mut app = app();
+            add_todos(&mut app, 10);
+            let _ = render_text(&mut app, 80, height);
+            assert!(app.work_surface.total_rows > app.work_surface.visible_rows);
+            let transcript_delta = app.viewport.pending_scroll_delta;
+
+            let mut text = String::new();
+            for _ in 0..16 {
+                let outcome = super::handle_mouse(
+                    &mut app,
+                    MouseEvent {
+                        kind: MouseEventKind::ScrollDown,
+                        column: 10,
+                        row: 1,
+                        modifiers: KeyModifiers::NONE,
+                    },
+                );
+                assert!(outcome.consumed, "height {height}");
+                text = render_text(&mut app, 80, height);
+            }
+
+            assert!(
+                text.contains("work item 9"),
+                "last To-do was unreachable at surface height {height}: {text:?}"
+            );
+            assert_eq!(
+                app.work_surface.scroll_offset,
+                app.work_surface
+                    .total_rows
+                    .saturating_sub(app.work_surface.visible_rows.max(1)),
+                "wheel did not reach the legal tail at surface height {height}"
+            );
+            assert_eq!(app.viewport.pending_scroll_delta, transcript_delta);
+        }
+    }
+
+    #[test]
+    fn mouse_wheel_reaches_last_todo_in_side_rail_placements() {
+        for placement in [
+            super::WorkSurfacePlacement::Left,
+            super::WorkSurfacePlacement::Right,
+        ] {
+            let mut app = app();
+            add_todos(&mut app, 10);
+            app.work_surface.placement = placement;
+            app.work_surface.effective_placement = placement;
+            let _ = render_text(&mut app, 30, 6);
+
+            let mut text = String::new();
+            for _ in 0..16 {
+                let outcome = super::handle_mouse(
+                    &mut app,
+                    MouseEvent {
+                        kind: MouseEventKind::ScrollDown,
+                        column: 10,
+                        row: 1,
+                        modifiers: KeyModifiers::NONE,
+                    },
+                );
+                assert!(outcome.consumed, "placement {placement:?}");
+                text = render_text(&mut app, 30, 6);
+            }
+
+            assert!(
+                text.contains("work item 9"),
+                "last To-do was unreachable in {placement:?}: {text:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn keyboard_end_reveals_last_todo_after_redraw() {
+        let mut app = app();
+        add_todos(&mut app, 10);
+        let _ = render_text(&mut app, 80, 5);
+        let _ = super::handle_key(
+            &mut app,
+            KeyEvent::new(KeyCode::Char('w'), KeyModifiers::ALT),
+        );
+        let _ = super::handle_key(&mut app, KeyEvent::new(KeyCode::End, KeyModifiers::NONE));
+
+        let text = render_text(&mut app, 80, 5);
+
+        assert!(text.contains("work item 9"), "{text:?}");
+        assert_eq!(
+            app.work_surface.scroll_offset,
+            app.work_surface
+                .total_rows
+                .saturating_sub(app.work_surface.visible_rows.max(1))
+        );
     }
 
     #[test]

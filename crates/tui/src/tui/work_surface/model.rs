@@ -3,6 +3,7 @@ use std::fmt::Write as _;
 
 use ratatui::layout::Rect;
 
+use crate::localization::MessageId;
 use crate::tui::app::{App, SidebarRowAction};
 use crate::work_graph::{
     AcceptanceRequirement, EdgeKind, EvidenceKind, EvidenceKindTag, NodeKind, NodeState,
@@ -145,7 +146,11 @@ impl WorkSurfaceState {
             .and_then(|selected| rows.iter().position(|row| &row.id == selected))
     }
 
-    pub(super) fn clamp_selection(&mut self, rows: &[WorkRow]) {
+    /// Keep row identity and the viewport offset valid without moving the
+    /// viewport to the remembered keyboard selection. Mouse-wheel scrolling
+    /// is allowed to leave that selection off-screen until keyboard
+    /// navigation resumes.
+    pub(super) fn clamp_viewport(&mut self, rows: &[WorkRow]) {
         let selectable = rows.iter().filter(|row| row.selectable).collect::<Vec<_>>();
         if selectable.is_empty() {
             self.selected = None;
@@ -159,7 +164,19 @@ impl WorkSurfaceState {
         {
             self.selected = Some(selectable[0].id.clone());
         }
-        let selected = self.selected_index(rows).unwrap_or_default();
+        self.scroll_offset = self
+            .scroll_offset
+            .min(rows.len().saturating_sub(self.visible_rows.max(1)));
+    }
+
+    /// Reveal the remembered selection after keyboard navigation. Rendering
+    /// alone must use `clamp_viewport`; otherwise every redraw undoes a mouse
+    /// wheel offset when the selection is above the viewport.
+    pub(super) fn clamp_selection(&mut self, rows: &[WorkRow]) {
+        self.clamp_viewport(rows);
+        let Some(selected) = self.selected_index(rows) else {
+            return;
+        };
         if selected < self.scroll_offset {
             self.scroll_offset = selected;
         } else if self.visible_rows > 0
@@ -174,6 +191,9 @@ impl WorkSurfaceState {
 }
 
 pub(super) fn project(app: &mut App) -> Vec<WorkRow> {
+    let todo_label = app.tr(MessageId::SidebarTodoLabel).into_owned();
+    let todo_progress = app.tr(MessageId::WorkSurfaceTodoProgress).into_owned();
+    let plan_label = app.tr(MessageId::AppModePlan).into_owned();
     let active_session = app.current_session_id.is_some();
     let capture = app.runtime_services.work.as_ref().map(|work| {
         work.try_capture(app.current_session_id.as_deref())
@@ -200,9 +220,16 @@ pub(super) fn project(app: &mut App) -> Vec<WorkRow> {
     };
 
     let rows = match graph {
-        Some(graph) => graph_rows(&graph, source_state.as_ref()),
+        Some(graph) => graph_rows(
+            &graph,
+            source_state.as_ref(),
+            &todo_label,
+            &todo_progress,
+            &plan_label,
+        ),
         None => source_state.map_or_else(Vec::new, |state| {
-            vec![heading(
+            vec![section_heading(
+                "work",
                 &format!("Work · {}", state.label()),
                 state.detail(),
             )]
@@ -220,6 +247,9 @@ pub(super) fn project(app: &mut App) -> Vec<WorkRow> {
 fn graph_rows(
     snapshot: &WorkGraphSnapshot,
     source_state: Option<&WorkSourceState>,
+    todo_label: &str,
+    todo_progress: &str,
+    plan_label: &str,
 ) -> Vec<WorkRow> {
     let visible = snapshot
         .nodes
@@ -230,6 +260,7 @@ fn graph_rows(
                 NodeKind::PlanStep | NodeKind::Operation | NodeKind::Blocker
             )
         })
+        .filter(|node| !is_settled_transient_operation(node))
         .collect::<Vec<_>>();
     let running = visible
         .iter()
@@ -259,21 +290,110 @@ fn graph_rows(
     } else {
         String::new()
     };
-    let mut rows = vec![heading(
+    let mut rows = vec![section_heading(
+        "work",
         &format!("Work · {running} running{waiting} · {ready} ready · {blocked} blocked{status}"),
         &detail,
     )];
+
+    // Runtime operations and blockers are live/attention state. Cleanly
+    // settled non-durable operations are graph receipts, not permanent chrome,
+    // and were filtered above. Keep the remaining operational rows first.
     rows.extend(
         visible
-            .into_iter()
+            .iter()
+            .copied()
+            .filter(|node| node.kind != NodeKind::PlanStep)
             .map(|node| graph_node_row(snapshot, node)),
     );
+
+    // The Work Graph is authoritative, but the explicit To-do grouping is a
+    // useful projection contract. Preserve compat ordering and do not flatten
+    // durable checklist rows into transient shell activity.
+    let mut rendered_plan_nodes = HashSet::new();
+    let todo_nodes = snapshot
+        .compat
+        .todos
+        .iter()
+        .filter_map(|binding| snapshot.node(&binding.node))
+        .filter(|node| visible.iter().any(|candidate| candidate.id == node.id))
+        .collect::<Vec<_>>();
+    if !todo_nodes.is_empty() {
+        let completed = todo_nodes
+            .iter()
+            .filter(|node| matches!(node.state, NodeState::Completed | NodeState::Verified))
+            .count();
+        let total = todo_nodes.len();
+        let progress = todo_progress
+            .replace("{label}", todo_label)
+            .replace("{completed}", &completed.to_string())
+            .replace("{total}", &total.to_string())
+            .replace("{remaining}", &total.saturating_sub(completed).to_string());
+        rows.push(section_heading("todo", &progress, todo_label));
+        for node in todo_nodes {
+            rendered_plan_nodes.insert(node.id.clone());
+            rows.push(graph_node_row(snapshot, node));
+        }
+    }
+
+    // Plan-only steps remain visible without duplicating nodes that also back
+    // the To-do compatibility projection.
+    let mut strategy_nodes = snapshot
+        .compat
+        .plan_order
+        .iter()
+        .filter(|id| !rendered_plan_nodes.contains(*id))
+        .filter_map(|id| snapshot.node(id))
+        .filter(|node| visible.iter().any(|candidate| candidate.id == node.id))
+        .collect::<Vec<_>>();
+    for node in visible
+        .iter()
+        .copied()
+        .filter(|node| node.kind == NodeKind::PlanStep)
+    {
+        if !rendered_plan_nodes.contains(&node.id)
+            && !strategy_nodes
+                .iter()
+                .any(|candidate| candidate.id == node.id)
+        {
+            strategy_nodes.push(node);
+        }
+    }
+    if !strategy_nodes.is_empty() {
+        let completed = strategy_nodes
+            .iter()
+            .filter(|node| matches!(node.state, NodeState::Completed | NodeState::Verified))
+            .count();
+        rows.push(section_heading(
+            "strategy",
+            &format!("{plan_label} {completed}/{}", strategy_nodes.len()),
+            plan_label,
+        ));
+        rows.extend(
+            strategy_nodes
+                .into_iter()
+                .map(|node| graph_node_row(snapshot, node)),
+        );
+    }
     rows
 }
 
-fn heading(label: &str, detail: &str) -> WorkRow {
+fn is_settled_transient_operation(node: &WorkNode) -> bool {
+    node.kind == NodeKind::Operation
+        && node
+            .binding
+            .as_ref()
+            .is_some_and(|binding| !binding.durable)
+        && match node.state {
+            NodeState::Completed => node.acceptance.is_empty(),
+            NodeState::Verified | NodeState::Superseded | NodeState::Cancelled => true,
+            _ => false,
+        }
+}
+
+fn section_heading(id: &str, label: &str, detail: &str) -> WorkRow {
     WorkRow {
-        id: WorkRowId("section:work".to_string()),
+        id: WorkRowId(format!("section:{id}")),
         mark: "▾",
         label: label.to_string(),
         detail: detail.to_string(),
@@ -703,7 +823,7 @@ fn section_list(out: &mut String, title: &str, items: Vec<String>) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::work_graph::{OperationBinding, WorkNodeId};
+    use crate::work_graph::{CompatTodoBinding, OperationBinding, WorkNodeId};
 
     fn operation(state: NodeState, suffix: &str) -> WorkNode {
         WorkNode {
@@ -736,11 +856,108 @@ mod tests {
             operation(NodeState::Ready, "ready"),
         ];
 
-        let rows = graph_rows(&snapshot, None);
+        let rows = graph_rows(
+            &snapshot,
+            None,
+            "To-do",
+            "{label} {completed}/{total} · {remaining} left",
+            "Plan",
+        );
 
         assert_eq!(
             rows.first().map(|row| row.label.as_str()),
             Some("Work · 2 running · 1 ready · 0 blocked")
         );
+    }
+
+    #[test]
+    fn live_projection_hides_clean_transient_receipts_and_restores_todo_group() {
+        let todo_id = WorkNodeId::derive("work-surface-test", "todo:1");
+        let todo = WorkNode {
+            id: todo_id.clone(),
+            kind: NodeKind::PlanStep,
+            title: "Keep the durable checklist visible".to_string(),
+            state: NodeState::Ready,
+            acceptance: Vec::new(),
+            binding: None,
+            evidence: None,
+            provenance: Provenance::ToolUpdate {
+                tool: "work_update".to_string(),
+                call_id: "todo-1".to_string(),
+            },
+            created_at: 1,
+            updated_at: 1,
+        };
+        let mut snapshot = WorkGraphSnapshot::new();
+        snapshot.nodes = vec![
+            operation(NodeState::Completed, "settled"),
+            operation(NodeState::Active, "running"),
+            todo,
+        ];
+        snapshot.compat.todos.push(CompatTodoBinding {
+            legacy_id: 1,
+            node: todo_id,
+            plan_index: None,
+        });
+
+        let rows = graph_rows(
+            &snapshot,
+            None,
+            "To-do",
+            "{label} {completed}/{total} · {remaining} left",
+            "Plan",
+        );
+        let labels = rows
+            .iter()
+            .map(|row| row.label.as_str())
+            .collect::<Vec<_>>();
+
+        assert!(labels.contains(&"operation running"), "{labels:?}");
+        assert!(!labels.contains(&"operation settled"), "{labels:?}");
+        assert!(labels.contains(&"To-do 0/1 · 1 left"), "{labels:?}");
+        assert!(
+            labels.contains(&"Keep the durable checklist visible"),
+            "{labels:?}"
+        );
+        assert!(
+            snapshot
+                .nodes
+                .iter()
+                .any(|node| node.title == "operation settled"),
+            "projection filtering must retain the historical graph receipt"
+        );
+    }
+
+    #[test]
+    fn projection_keeps_durable_and_attention_terminal_operations() {
+        let mut durable = operation(NodeState::Completed, "durable");
+        durable.binding.as_mut().expect("binding").durable = true;
+        let failed = operation(NodeState::Failed, "failed");
+        let mut evidence_pending = operation(NodeState::Completed, "evidence-pending");
+        evidence_pending.acceptance = vec![AcceptanceRequirement::EvidenceOfKind {
+            kind: EvidenceKindTag::ToolRun,
+        }];
+        let mut snapshot = WorkGraphSnapshot::new();
+        snapshot.nodes = vec![durable, failed, evidence_pending];
+
+        let rows = graph_rows(
+            &snapshot,
+            None,
+            "To-do",
+            "{label} {completed}/{total} · {remaining} left",
+            "Plan",
+        );
+        let labels = rows
+            .iter()
+            .map(|row| row.label.as_str())
+            .collect::<Vec<_>>();
+
+        for expected in [
+            "operation durable",
+            "operation failed",
+            "operation evidence-pending",
+        ] {
+            assert!(labels.contains(&expected), "missing {expected}: {labels:?}");
+        }
     }
 }

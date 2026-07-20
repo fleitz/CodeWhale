@@ -1131,6 +1131,7 @@ pub enum MessageId {
     SidebarTodoLabel,
     SidebarStopControl,
     SidebarDestructiveArmed,
+    WorkSurfaceTodoProgress,
     WorkSurfaceStopConfirmHint,
     // Composer slash menu.
     ComposerSlashMenuHint,
@@ -2148,6 +2149,7 @@ pub const ALL_MESSAGE_IDS: &[MessageId] = &[
     MessageId::SidebarTodoLabel,
     MessageId::SidebarStopControl,
     MessageId::SidebarDestructiveArmed,
+    MessageId::WorkSurfaceTodoProgress,
     MessageId::WorkSurfaceStopConfirmHint,
     MessageId::ComposerSlashMenuHint,
     MessageId::ApprovalRepoLawBadge,

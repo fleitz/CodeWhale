@@ -175,7 +175,10 @@ pub fn render(frame: &mut Frame, area: Rect, app: &mut App) {
 
     app.work_surface.visible_rows = body_height;
     app.work_surface.total_rows = rows.len();
-    app.work_surface.clamp_selection(&rows);
+    // A redraw may clamp an obsolete offset, but it must not reveal the
+    // remembered keyboard selection: doing so undoes mouse-wheel scrolling
+    // whenever that selection is above the viewport (#4594).
+    app.work_surface.clamp_viewport(&rows);
     let max_offset = rows.len().saturating_sub(body_height.max(1));
     app.work_surface.scroll_offset = app.work_surface.scroll_offset.min(max_offset);
 

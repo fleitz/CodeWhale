@@ -992,6 +992,7 @@
     "WorkflowDebrief": "総括: {done}/{total} 確定 · {failed} 失敗 · {cancelled} キャンセル · {elapsed}",
     "SidebarTasksLabel": "タスク",
     "SidebarTodoLabel": "To-do",
+    "WorkSurfaceTodoProgress": "{label} {completed}/{total} · 残り{remaining}",
     "SidebarStopControl": "停止",
     "SidebarDestructiveArmed": "破壊的操作が実行待ちです — Enter で確定、取り消すには下書きをクリアしてください",
     "WorkSurfaceStopConfirmHint": "停止を確認 · Esc でキャンセル",
