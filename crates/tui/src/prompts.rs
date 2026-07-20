@@ -2947,6 +2947,8 @@ mod tests {
             "type: \"explore\"",
             "fork_context",
             "rlm_open",
+            "Bare `/workflow` means orchestrate current work without re-asking",
+            "stop and synthesize",
             "Do NOT explain, announce, or mention to the user that you are running in Agent mode",
         ] {
             assert!(
@@ -2976,12 +2978,12 @@ mod tests {
             let word_count = normalized.split_whitespace().count();
             let estimated_tokens =
                 crate::compaction::estimate_text_tokens_conservative(&normalized);
-            // 2026-07-20: agent mode compressed (661 -> ~540 words) while
+            // 2026-07-20: agent mode compressed (661 -> ~560 words) while
             // preserving every tested approval, orchestration, subagent-brief,
-            // sentinel, and fork-context invariant. Keep the budget tight so
-            // procedural detail stays out of the system prefix.
-            let max_words = if name == "agent" { 560 } else { 350 };
-            let max_tokens = if name == "agent" { 1300 } else { 700 };
+            // sentinel, workflow, and fork-context invariant. Keep the budget
+            // tight so procedural detail stays out of the system prefix.
+            let max_words = if name == "agent" { 580 } else { 350 };
+            let max_tokens = if name == "agent" { 1350 } else { 700 };
 
             assert!(
                 word_count <= max_words,
