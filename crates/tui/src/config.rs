@@ -3237,7 +3237,9 @@ impl Config {
             }
         }
 
-        if std::env::var_os("DEEPSEEK_APPROVAL_POLICY").is_some() {
+        if std::env::var_os("CODEWHALE_APPROVAL_POLICY").is_some()
+            || std::env::var_os("DEEPSEEK_APPROVAL_POLICY").is_some()
+        {
             return ApprovalPolicyControl::Environment;
         }
 
@@ -3314,7 +3316,9 @@ impl Config {
             }
         }
 
-        if std::env::var_os("DEEPSEEK_ALLOW_SHELL").is_some() {
+        if std::env::var_os("CODEWHALE_ALLOW_SHELL").is_some()
+            || std::env::var_os("DEEPSEEK_ALLOW_SHELL").is_some()
+        {
             return ShellAccessControl::Environment;
         }
 
@@ -3389,7 +3393,8 @@ impl Config {
 
     #[must_use]
     pub fn search_provider_resolution(&self) -> SearchProviderResolution {
-        if let Ok(raw) = std::env::var("DEEPSEEK_SEARCH_PROVIDER")
+        if let Ok(raw) = std::env::var("CODEWHALE_SEARCH_PROVIDER")
+            .or_else(|_| std::env::var("DEEPSEEK_SEARCH_PROVIDER"))
             && let Some(provider) = SearchProvider::parse(&raw)
         {
             return SearchProviderResolution {
@@ -5555,8 +5560,9 @@ impl Config {
 
     /// Resolved per-SSE-chunk idle timeout in seconds.
     ///
-    /// Reads `[tui].stream_chunk_timeout_secs`, falling back to the legacy
-    /// `DEEPSEEK_STREAM_IDLE_TIMEOUT_SECS` env var when the config key is
+    /// Reads `[tui].stream_chunk_timeout_secs`, falling back to the
+    /// `CODEWHALE_STREAM_IDLE_TIMEOUT_SECS` env var (legacy alias:
+    /// `DEEPSEEK_STREAM_IDLE_TIMEOUT_SECS`) when the config key is
     /// omitted. `None` or `0` resolve to the default 900 seconds; explicit
     /// values are clamped to `1..=3600`.
     #[must_use]
@@ -5567,6 +5573,7 @@ impl Config {
             .and_then(|cfg| cfg.stream_chunk_timeout_secs)
             .or_else(|| {
                 std::env::var(STREAM_CHUNK_TIMEOUT_ENV)
+                    .or_else(|_| std::env::var(LEGACY_STREAM_CHUNK_TIMEOUT_ENV))
                     .ok()
                     .and_then(|value| value.parse::<u64>().ok())
             })
@@ -6428,7 +6435,8 @@ fn apply_env_overrides(config: &mut Config) {
             .xai
             .base_url = Some(value);
     }
-    if let Ok(value) = std::env::var("DEEPSEEK_HTTP_HEADERS")
+    if let Ok(value) =
+        std::env::var("CODEWHALE_HTTP_HEADERS").or_else(|_| std::env::var("DEEPSEEK_HTTP_HEADERS"))
         && let Ok(headers) = parse_http_headers(&value)
         && !headers.is_empty()
     {
@@ -6758,19 +6766,29 @@ fn apply_env_overrides(config: &mut Config) {
     {
         config.default_text_model = Some(value);
     }
-    if let Ok(value) = std::env::var("DEEPSEEK_SKILLS_DIR") {
+    if let Ok(value) =
+        std::env::var("CODEWHALE_SKILLS_DIR").or_else(|_| std::env::var("DEEPSEEK_SKILLS_DIR"))
+    {
         config.skills_dir = Some(value);
     }
-    if let Ok(value) = std::env::var("DEEPSEEK_MCP_CONFIG") {
+    if let Ok(value) =
+        std::env::var("CODEWHALE_MCP_CONFIG").or_else(|_| std::env::var("DEEPSEEK_MCP_CONFIG"))
+    {
         config.mcp_config_path = Some(value);
     }
-    if let Ok(value) = std::env::var("DEEPSEEK_NOTES_PATH") {
+    if let Ok(value) =
+        std::env::var("CODEWHALE_NOTES_PATH").or_else(|_| std::env::var("DEEPSEEK_NOTES_PATH"))
+    {
         config.notes_path = Some(value);
     }
-    if let Ok(value) = std::env::var("DEEPSEEK_MEMORY_PATH") {
+    if let Ok(value) =
+        std::env::var("CODEWHALE_MEMORY_PATH").or_else(|_| std::env::var("DEEPSEEK_MEMORY_PATH"))
+    {
         config.memory_path = Some(value);
     }
-    if let Ok(value) = std::env::var("DEEPSEEK_MEMORY") {
+    if let Ok(value) =
+        std::env::var("CODEWHALE_MEMORY").or_else(|_| std::env::var("DEEPSEEK_MEMORY"))
+    {
         let on = matches!(
             value.trim().to_ascii_lowercase().as_str(),
             "1" | "on" | "true" | "yes" | "y" | "enabled"
@@ -6780,16 +6798,22 @@ fn apply_env_overrides(config: &mut Config) {
             .get_or_insert_with(MemoryConfig::default)
             .enabled = Some(on);
     }
-    if let Ok(value) = std::env::var("DEEPSEEK_ALLOW_SHELL") {
+    if let Ok(value) =
+        std::env::var("CODEWHALE_ALLOW_SHELL").or_else(|_| std::env::var("DEEPSEEK_ALLOW_SHELL"))
+    {
         config.allow_shell = Some(value == "1" || value.eq_ignore_ascii_case("true"));
     }
-    if let Ok(value) = std::env::var("DEEPSEEK_APPROVAL_POLICY") {
+    if let Ok(value) = std::env::var("CODEWHALE_APPROVAL_POLICY")
+        .or_else(|_| std::env::var("DEEPSEEK_APPROVAL_POLICY"))
+    {
         config.approval_policy = Some(value);
     }
-    if let Ok(value) = std::env::var("DEEPSEEK_SANDBOX_MODE") {
+    if let Ok(value) =
+        std::env::var("CODEWHALE_SANDBOX_MODE").or_else(|_| std::env::var("DEEPSEEK_SANDBOX_MODE"))
+    {
         config.sandbox_mode = Some(value);
     }
-    if let Ok(value) = std::env::var("DEEPSEEK_YOLO") {
+    if let Ok(value) = std::env::var("CODEWHALE_YOLO").or_else(|_| std::env::var("DEEPSEEK_YOLO")) {
         config.yolo = Some(value == "1" || value.eq_ignore_ascii_case("true"));
     }
     if let Ok(value) =
@@ -6797,19 +6821,28 @@ fn apply_env_overrides(config: &mut Config) {
     {
         config.verbosity = Some(value);
     }
-    if let Ok(value) = std::env::var("DEEPSEEK_SANDBOX_BACKEND") {
+    if let Ok(value) = std::env::var("CODEWHALE_SANDBOX_BACKEND")
+        .or_else(|_| std::env::var("DEEPSEEK_SANDBOX_BACKEND"))
+    {
         config.sandbox_backend = Some(value);
     }
-    if let Ok(value) = std::env::var("DEEPSEEK_SANDBOX_URL") {
+    if let Ok(value) =
+        std::env::var("CODEWHALE_SANDBOX_URL").or_else(|_| std::env::var("DEEPSEEK_SANDBOX_URL"))
+    {
         config.sandbox_url = Some(value);
     }
-    if let Ok(value) = std::env::var("DEEPSEEK_SANDBOX_API_KEY") {
+    if let Ok(value) = std::env::var("CODEWHALE_SANDBOX_API_KEY")
+        .or_else(|_| std::env::var("DEEPSEEK_SANDBOX_API_KEY"))
+    {
         config.sandbox_api_key = Some(value);
     }
-    if let Ok(value) = std::env::var("DEEPSEEK_MANAGED_CONFIG_PATH") {
+    if let Ok(value) = std::env::var("CODEWHALE_MANAGED_CONFIG_PATH")
+        .or_else(|_| std::env::var("DEEPSEEK_MANAGED_CONFIG_PATH"))
+    {
         config.managed_config_path = Some(value);
     }
-    if let Ok(value) = std::env::var("DEEPSEEK_SEARCH_API_KEY")
+    if let Ok(value) = std::env::var("CODEWHALE_SEARCH_API_KEY")
+        .or_else(|_| std::env::var("DEEPSEEK_SEARCH_API_KEY"))
         && !value.trim().is_empty()
     {
         config
@@ -6823,10 +6856,13 @@ fn apply_env_overrides(config: &mut Config) {
             .get_or_insert_with(SearchConfig::default)
             .base_url = Some(value);
     }
-    if let Ok(value) = std::env::var("DEEPSEEK_REQUIREMENTS_PATH") {
+    if let Ok(value) = std::env::var("CODEWHALE_REQUIREMENTS_PATH")
+        .or_else(|_| std::env::var("DEEPSEEK_REQUIREMENTS_PATH"))
+    {
         config.requirements_path = Some(value);
     }
-    if let Ok(value) = std::env::var("DEEPSEEK_MAX_SUBAGENTS")
+    if let Ok(value) = std::env::var("CODEWHALE_MAX_SUBAGENTS")
+        .or_else(|_| std::env::var("DEEPSEEK_MAX_SUBAGENTS"))
         && let Ok(parsed) = value.parse::<usize>()
     {
         config.max_subagents = Some(parsed.clamp(1, MAX_SUBAGENTS));
