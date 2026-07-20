@@ -119,14 +119,29 @@ fn powershell_exit_aware_command(shell_command: &str) -> String {
     if shell_command.trim().is_empty() {
         return shell_command.to_string();
     }
+    // The exit-code check goes on its own line: a trailing unquoted `#`
+    // comment in the payload would otherwise swallow a `;`-joined check to
+    // end-of-line and silently report success for failing native commands.
+    // `-Command` accepts embedded newlines inside one argv string.
     format!(
-        "$ErrorActionPreference = 'Continue'; {shell_command}; if ($null -ne $LASTEXITCODE -and $LASTEXITCODE -ne 0) {{ exit $LASTEXITCODE }}"
+        "$ErrorActionPreference = 'Continue'; {shell_command}\nif ($null -ne $LASTEXITCODE -and $LASTEXITCODE -ne 0) {{ exit $LASTEXITCODE }}"
     )
 }
+
+/// Tail appended to every temp `-File` script: capture the native exit code,
+/// remove the script itself (PowerShell reads the whole file before running,
+/// so self-deletion is safe), then propagate the exit code.
+const TEMP_PS1_TAIL: &str = concat!(
+    "$__codewhaleExit = if ($null -ne $LASTEXITCODE) { $LASTEXITCODE } else { 0 }\n",
+    "Remove-Item -LiteralPath $MyInvocation.MyCommand.Path -Force ",
+    "-ErrorAction SilentlyContinue\n",
+    "if ($__codewhaleExit -ne 0) { exit $__codewhaleExit }\n",
+);
 
 fn write_temp_ps1(shell_command: &str) -> std::io::Result<String> {
     use std::io::Write;
     let dir = std::env::temp_dir();
+    sweep_stale_temp_ps1(&dir);
     let name = format!(
         "codewhale-shell-{}-{}.ps1",
         std::process::id(),
@@ -143,11 +158,38 @@ fn write_temp_ps1(shell_command: &str) -> std::io::Result<String> {
     if !shell_command.ends_with('\n') {
         file.write_all(b"\n")?;
     }
-    // Append native exit-code propagation for the script form as well.
-    file.write_all(
-        b"if ($null -ne $LASTEXITCODE -and $LASTEXITCODE -ne 0) { exit $LASTEXITCODE }\n",
-    )?;
+    // Native exit-code propagation plus self-cleanup for the script form.
+    file.write_all(TEMP_PS1_TAIL.as_bytes())?;
     Ok(path.to_string_lossy().into_owned())
+}
+
+/// Best-effort removal of leftover `codewhale-shell-*.ps1` scripts (for
+/// example after a killed process, which skips the in-script self-delete).
+/// Only files older than one hour are touched so a concurrently starting
+/// invocation is never raced.
+fn sweep_stale_temp_ps1(dir: &std::path::Path) {
+    const STALE_AFTER: std::time::Duration = std::time::Duration::from_secs(60 * 60);
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else {
+            continue;
+        };
+        if !name.starts_with("codewhale-shell-") || !name.ends_with(".ps1") {
+            continue;
+        }
+        let stale = entry
+            .metadata()
+            .and_then(|meta| meta.modified())
+            .ok()
+            .and_then(|modified| modified.elapsed().ok())
+            .is_some_and(|age| age > STALE_AFTER);
+        if stale {
+            let _ = std::fs::remove_file(entry.path());
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -520,14 +562,58 @@ mod tests {
         let (program, args) = dispatcher.build_command_parts(script);
         assert!(program.contains("pwsh"));
         assert!(args.iter().any(|a| a == "-File"), "{args:?}");
+        let path = args
+            .iter()
+            .find(|a| a.ends_with(".ps1"))
+            .unwrap_or_else(|| panic!("expected temp .ps1 path: {args:?}"));
+        // The script must clean up after itself and still propagate the
+        // native exit code — self-delete before the exit line, so a nonzero
+        // exit cannot skip the removal.
+        let contents = std::fs::read_to_string(path).expect("read temp script");
+        let remove_at = contents
+            .find("Remove-Item -LiteralPath $MyInvocation.MyCommand.Path")
+            .expect("self-delete line present");
+        let exit_at = contents
+            .find("if ($__codewhaleExit -ne 0) { exit $__codewhaleExit }")
+            .expect("exit propagation present");
+        assert!(remove_at < exit_at, "self-delete must precede exit");
+        // Cleanup temp script created by the builder (the test never runs it).
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn powershell_trailing_comment_cannot_swallow_exit_capture() {
+        // An unquoted `#` in a single-line payload comments to end-of-line;
+        // the appended $LASTEXITCODE check must live on its own line so a
+        // failing native command can never silently report success.
+        let dispatcher = ShellDispatcher {
+            kind: ShellKind::Pwsh,
+        };
+        let (_, args) = dispatcher.build_command_parts("git log --oneline -5 # recent");
+        let payload = args.last().expect("command payload");
+        assert!(payload.contains("# recent"), "{payload}");
         assert!(
-            args.iter().any(|a| a.ends_with(".ps1")),
-            "expected temp .ps1 path: {args:?}"
+            payload.contains("\nif ($null -ne $LASTEXITCODE"),
+            "exit-code capture must start on a fresh line: {payload}"
         );
-        // Cleanup temp script created by the builder.
-        if let Some(path) = args.iter().find(|a| a.ends_with(".ps1")) {
-            let _ = std::fs::remove_file(path);
-        }
+    }
+
+    #[test]
+    fn stale_temp_ps1_scripts_are_swept() {
+        let dir = std::env::temp_dir();
+        let stale = dir.join("codewhale-shell-0-stale-test.ps1");
+        std::fs::write(&stale, "Write-Output 'stale'\n").expect("write stale script");
+        // Backdate the file beyond the sweep horizon.
+        let old = std::time::SystemTime::now() - std::time::Duration::from_secs(2 * 60 * 60);
+        let file = std::fs::File::options()
+            .append(true)
+            .open(&stale)
+            .expect("open stale script");
+        file.set_modified(old).expect("backdate stale script");
+        drop(file);
+
+        sweep_stale_temp_ps1(&dir);
+        assert!(!stale.exists(), "stale script should be removed");
     }
 
     #[test]
