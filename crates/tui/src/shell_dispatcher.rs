@@ -87,7 +87,8 @@ impl ShellKind {
     }
 
     /// Whether this shell needs an extra `-Command` flag after the profile
-    /// flag (PowerShell-specific).
+    /// flag (PowerShell-specific). Only exercised by shell-flag unit tests.
+    #[cfg(test)]
     pub fn needs_command_flag(&self) -> bool {
         matches!(self, ShellKind::Pwsh | ShellKind::WindowsPowerShell)
     }
@@ -103,7 +104,7 @@ impl ShellKind {
 fn powershell_prefers_script_file(shell_command: &str) -> bool {
     shell_command.contains('\n')
         || shell_command.contains('\r')
-        || shell_command.chars().any(|c| !c.is_ascii())
+        || !shell_command.is_ascii()
         || shell_command.matches('"').count() >= 4
         || shell_command.contains("'''")
         || shell_command.contains("@'")
