@@ -11,9 +11,7 @@ use serde_json::{Value, json};
 use crate::models::{ContentBlock, Message};
 #[cfg(test)]
 use crate::runtime_threads::TurnItemKind;
-use crate::runtime_threads::{
-    CreateThreadRequest, RuntimeTurnStatus, ThreadDetail, ThreadListFilter, TurnItemLifecycleStatus,
-};
+use crate::runtime_threads::{CreateThreadRequest, ThreadDetail, ThreadListFilter};
 use crate::session_manager::{
     SavedSession, SessionManager, SessionMetadata, create_saved_session_with_id_and_mode,
 };
@@ -204,26 +202,13 @@ pub(super) async fn create_session_from_thread(
         return Err(ApiError::bad_request("thread_id is required"));
     }
 
-    let detail = state
+    let export = state
         .runtime_threads
-        .get_thread_detail(thread_id)
+        .completed_thread_export_snapshot(thread_id)
         .await
         .map_err(map_thread_err)?;
-
-    if thread_detail_has_live_work(&detail) {
-        return Err(ApiError {
-            status: StatusCode::CONFLICT,
-            message: format!(
-                "Thread {thread_id} has a queued or active turn; wait for completion before saving as a session"
-            ),
-        });
-    }
-
-    let messages = state
-        .runtime_threads
-        .messages_for_session_export(thread_id)
-        .await
-        .map_err(map_thread_err)?;
+    let detail = export.detail;
+    let messages = export.messages;
     if messages.is_empty() {
         return Err(ApiError::bad_request(format!(
             "Thread {thread_id} has no user or assistant messages to save"
@@ -332,20 +317,6 @@ pub(super) fn stamp_session_provider_from_thread(
         provider_identity.persisted_id(),
     );
     Ok(())
-}
-
-fn thread_detail_has_live_work(detail: &ThreadDetail) -> bool {
-    detail.turns.iter().any(|turn| {
-        matches!(
-            turn.status,
-            RuntimeTurnStatus::Queued | RuntimeTurnStatus::InProgress
-        )
-    }) || detail.items.iter().any(|item| {
-        matches!(
-            item.status,
-            TurnItemLifecycleStatus::Queued | TurnItemLifecycleStatus::InProgress
-        )
-    })
 }
 
 #[cfg(test)]

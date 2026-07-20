@@ -7575,6 +7575,184 @@ async fn checkpoint_retirement_scans_items_once_and_same_item_update_skips_scan(
     Ok(())
 }
 
+#[tokio::test(flavor = "current_thread")]
+async fn export_and_engine_load_scan_once_without_blocking_runtime_heartbeat() -> Result<()> {
+    let manager = test_manager(test_runtime_dir())?;
+    let thread = manager
+        .create_thread(CreateThreadRequest::default())
+        .await?;
+    let mut messages = Vec::new();
+    for index in 0..12 {
+        messages.push(Message {
+            role: "user".to_string(),
+            content: vec![ContentBlock::Text {
+                text: format!("user turn {index}"),
+                cache_control: None,
+            }],
+        });
+        messages.push(Message {
+            role: "assistant".to_string(),
+            content: vec![ContentBlock::Text {
+                text: format!("assistant turn {index}"),
+                cache_control: None,
+            }],
+        });
+    }
+    manager
+        .seed_thread_from_messages(&thread.id, &messages)
+        .await?;
+
+    manager.store.reset_item_directory_scan_count();
+    let (entered_tx, entered_rx) = oneshot::channel();
+    let (resume_tx, resume_rx) = std::sync::mpsc::channel();
+    manager
+        .store
+        .set_item_directory_scan_test_hook(entered_tx, resume_rx);
+    let export_manager = manager.clone();
+    let thread_id = thread.id.clone();
+    let export = tokio::spawn(async move {
+        export_manager
+            .completed_thread_export_snapshot(&thread_id)
+            .await
+    });
+    tokio::time::timeout(Duration::from_secs(2), entered_rx)
+        .await?
+        .context("export did not enter its item scan")?;
+
+    // This test uses a single-thread Tokio runtime. The timer can fire only
+    // when filesystem scanning is on spawn_blocking rather than this worker.
+    tokio::time::timeout(Duration::from_millis(250), async {
+        sleep(Duration::from_millis(10)).await;
+    })
+    .await
+    .context("runtime heartbeat stalled behind export reconstruction")?;
+    resume_tx
+        .send(())
+        .map_err(|_| anyhow!("export scan resume channel closed"))?;
+    let snapshot = export.await.context("export task panicked")??;
+    assert_eq!(snapshot.messages.len(), messages.len());
+    for message in &messages {
+        assert!(snapshot.messages.contains(message));
+    }
+    assert_eq!(
+        manager.store.item_directory_scan_count(),
+        1,
+        "export must scan the item directory once, independent of turn count"
+    );
+
+    manager.store.reset_item_directory_scan_count();
+    let (history_entered_tx, history_entered_rx) = oneshot::channel();
+    let (history_resume_tx, history_resume_rx) = std::sync::mpsc::channel();
+    manager
+        .store
+        .set_item_directory_scan_test_hook(history_entered_tx, history_resume_rx);
+    let history_manager = manager.clone();
+    let history_thread_id = thread.id.clone();
+    let history = tokio::spawn(async move {
+        history_manager
+            .durable_thread_history(&history_thread_id)
+            .await
+    });
+    tokio::time::timeout(Duration::from_secs(2), history_entered_rx)
+        .await?
+        .context("engine-load reconstruction did not enter its item scan")?;
+    tokio::time::timeout(Duration::from_millis(250), async {
+        sleep(Duration::from_millis(10)).await;
+    })
+    .await
+    .context("runtime heartbeat stalled behind engine-load reconstruction")?;
+    history_resume_tx
+        .send(())
+        .map_err(|_| anyhow!("engine-load scan resume channel closed"))?;
+    let (_, reconstructed) = history.await.context("history task panicked")??;
+    assert_eq!(reconstructed.len(), messages.len());
+    assert_eq!(
+        manager.store.item_directory_scan_count(),
+        1,
+        "engine-load reconstruction must scan once, independent of turn count"
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn completed_export_conflicts_when_turn_starts_after_prevalidation() -> Result<()> {
+    let manager = test_manager(test_runtime_dir())?;
+    let thread = manager
+        .create_thread(CreateThreadRequest::default())
+        .await?;
+    manager
+        .seed_thread_from_messages(
+            &thread.id,
+            &[Message {
+                role: "user".to_string(),
+                content: vec![ContentBlock::Text {
+                    text: "completed history".to_string(),
+                    cache_control: None,
+                }],
+            }],
+        )
+        .await?;
+    let mut harness = install_mock_engine(&manager, &thread.id).await;
+    let (hook_tx, mut hook_rx) = mpsc::unbounded_channel();
+    manager.set_export_snapshot_test_hook(hook_tx);
+    let export_manager = manager.clone();
+    let export_thread_id = thread.id.clone();
+    let export = tokio::spawn(async move {
+        export_manager
+            .completed_thread_export_snapshot(&export_thread_id)
+            .await
+    });
+    let point = tokio::time::timeout(Duration::from_secs(2), hook_rx.recv())
+        .await?
+        .context("export did not reach post-validation barrier")?;
+    assert_eq!(point.thread_id, thread.id);
+
+    let turn = manager
+        .start_turn(
+            &thread.id,
+            StartTurnRequest {
+                prompt: "race the export".to_string(),
+                ..Default::default()
+            },
+        )
+        .await?;
+    assert!(matches!(
+        harness.rx_op.recv().await,
+        Some(Op::SendMessage { .. })
+    ));
+    point
+        .resume
+        .send(())
+        .map_err(|_| anyhow!("export barrier receiver closed"))?;
+    let error = export
+        .await
+        .context("export task panicked")?
+        .expect_err("export admitted a newly active turn")
+        .to_string();
+    assert!(error.contains("already has an active turn"), "{error}");
+
+    harness
+        .tx_event
+        .send(EngineEvent::TurnStarted {
+            turn_id: turn.id.clone(),
+            created_at: Utc::now(),
+            route: None,
+        })
+        .await?;
+    harness
+        .tx_event
+        .send(EngineEvent::TurnComplete {
+            usage: Usage::default(),
+            status: TurnOutcomeStatus::Completed,
+            error: None,
+            tool_catalog: None,
+            base_url: None,
+        })
+        .await?;
+    wait_for_terminal_turn(&manager, &turn.id, Duration::from_secs(2)).await?;
+    Ok(())
+}
+
 #[tokio::test]
 async fn seeded_runtime_history_reconstructs_when_linked_session_is_missing() -> Result<()> {
     let mut custom = std::collections::HashMap::new();

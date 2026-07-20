@@ -307,12 +307,20 @@ fn collect_sensitive_user_input_response_values(
 fn redact_sensitive_json_string_leaves(value: &mut Value, sensitive_values: &[String]) -> bool {
     match value {
         Value::String(text) => redact_sensitive_user_input_values(text, sensitive_values),
-        Value::Array(values) => values.iter_mut().fold(false, |changed, value| {
-            redact_sensitive_json_string_leaves(value, sensitive_values) || changed
-        }),
-        Value::Object(values) => values.values_mut().fold(false, |changed, value| {
-            redact_sensitive_json_string_leaves(value, sensitive_values) || changed
-        }),
+        Value::Array(values) => {
+            let mut changed = false;
+            for value in values {
+                changed |= redact_sensitive_json_string_leaves(value, sensitive_values);
+            }
+            changed
+        }
+        Value::Object(values) => {
+            let mut changed = false;
+            for value in values.values_mut() {
+                changed |= redact_sensitive_json_string_leaves(value, sensitive_values);
+            }
+            changed
+        }
         Value::Null | Value::Bool(_) | Value::Number(_) => false,
     }
 }
@@ -886,6 +894,15 @@ pub struct RuntimeThreadStore {
     turn_mutation: Arc<parking_lot::Mutex<()>>,
     #[cfg(test)]
     item_directory_scans: Arc<std::sync::atomic::AtomicUsize>,
+    #[cfg(test)]
+    item_directory_scan_test_hook: Arc<std::sync::Mutex<Option<ItemDirectoryScanTestHook>>>,
+}
+
+#[cfg(test)]
+#[derive(Debug)]
+struct ItemDirectoryScanTestHook {
+    entered: oneshot::Sender<()>,
+    resume: std::sync::mpsc::Receiver<()>,
 }
 
 impl RuntimeThreadStore {
@@ -924,6 +941,8 @@ impl RuntimeThreadStore {
             turn_mutation: Arc::new(parking_lot::Mutex::new(())),
             #[cfg(test)]
             item_directory_scans: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            #[cfg(test)]
+            item_directory_scan_test_hook: Arc::new(std::sync::Mutex::new(None)),
         })
     }
 
@@ -943,6 +962,28 @@ impl RuntimeThreadStore {
     fn record_item_directory_scan(&self) {
         self.item_directory_scans
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let hook = self
+            .item_directory_scan_test_hook
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take();
+        if let Some(hook) = hook {
+            let _ = hook.entered.send(());
+            let _ = hook.resume.recv();
+        }
+    }
+
+    #[cfg(test)]
+    fn set_item_directory_scan_test_hook(
+        &self,
+        entered: oneshot::Sender<()>,
+        resume: std::sync::mpsc::Receiver<()>,
+    ) {
+        *self
+            .item_directory_scan_test_hook
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) =
+            Some(ItemDirectoryScanTestHook { entered, resume });
     }
 
     fn record_path(base: &Path, id: &str, extension: &str, label: &str) -> Result<PathBuf> {
@@ -1603,6 +1644,12 @@ pub struct ThreadDetail {
     pub pending_dynamic_tool_calls: Vec<DynamicToolCallParams>,
 }
 
+#[derive(Debug, Clone)]
+pub struct CompletedThreadExportSnapshot {
+    pub detail: ThreadDetail,
+    pub messages: Vec<Message>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PendingApprovalRequest {
     pub id: String,
@@ -1759,7 +1806,7 @@ struct RecoveredTurnReceipt {
 ///
 /// # Lock ordering invariant
 ///
-/// Runtime state uses eight lock classes:
+/// Runtime state uses nine lock classes:
 /// - `RuntimeThreadManager::engine_load` — serializes cache-miss engine builds.
 ///   It may cross awaits and is always acquired before `active`.
 /// - `RuntimeThreadManager::event_emit` — preserves append-to-broadcast event
@@ -1768,6 +1815,10 @@ struct RecoveredTurnReceipt {
 ///   held while a streamed item checkpoint and its event are published or
 ///   while a terminal turn projection, receipt, and active-claim cleanup are
 ///   published, or while a snapshot captures its cursor and reads projections.
+/// - `RuntimeThreadManager::admission_locks` — one async lock per thread,
+///   serializing turn/compaction claims with completed-thread exports. Export
+///   acquires admission before projection; turn admission never acquires
+///   projection while holding this gate.
 /// - `RuntimeThreadManager::recovery_flush` — serializes deferred receipt
 ///   reconciliation before it acquires a projection lock and `event_emit`.
 /// - `RuntimeThreadStore::state` — protects the monotonic event sequence counter.
@@ -1795,6 +1846,7 @@ pub struct RuntimeThreadManager {
     active: Arc<Mutex<ActiveThreads>>,
     event_emit: Arc<Mutex<()>>,
     projection_locks: Arc<parking_lot::Mutex<HashMap<String, Arc<Mutex<()>>>>>,
+    admission_locks: Arc<parking_lot::Mutex<HashMap<String, Arc<Mutex<()>>>>>,
     event_tx: broadcast::Sender<RuntimeEventRecord>,
     manager_cfg: RuntimeThreadManagerConfig,
     cancel_token: CancellationToken,
@@ -1808,12 +1860,21 @@ pub struct RuntimeThreadManager {
     recovery_flush: Arc<Mutex<()>>,
     #[cfg(test)]
     snapshot_test_hook: Arc<parking_lot::Mutex<Option<mpsc::UnboundedSender<SnapshotTestPoint>>>>,
+    #[cfg(test)]
+    export_snapshot_test_hook:
+        Arc<parking_lot::Mutex<Option<mpsc::UnboundedSender<ExportSnapshotTestPoint>>>>,
 }
 
 #[cfg(test)]
 pub(crate) struct SnapshotTestPoint {
     pub thread_id: String,
     pub latest_seq: u64,
+    pub resume: oneshot::Sender<()>,
+}
+
+#[cfg(test)]
+pub(crate) struct ExportSnapshotTestPoint {
+    pub thread_id: String,
     pub resume: oneshot::Sender<()>,
 }
 
@@ -2126,6 +2187,7 @@ impl RuntimeThreadManager {
             active: Arc::new(Mutex::new(ActiveThreads::default())),
             event_emit: Arc::new(Mutex::new(())),
             projection_locks: Arc::new(parking_lot::Mutex::new(HashMap::new())),
+            admission_locks: Arc::new(parking_lot::Mutex::new(HashMap::new())),
             event_tx,
             manager_cfg,
             cancel_token: CancellationToken::new(),
@@ -2138,6 +2200,8 @@ impl RuntimeThreadManager {
             recovery_flush: Arc::new(Mutex::new(())),
             #[cfg(test)]
             snapshot_test_hook: Arc::new(parking_lot::Mutex::new(None)),
+            #[cfg(test)]
+            export_snapshot_test_hook: Arc::new(parking_lot::Mutex::new(None)),
         };
         manager.recover_interrupted_state()?;
         Ok(manager)
@@ -2838,6 +2902,15 @@ impl RuntimeThreadManager {
         )
     }
 
+    fn admission_lock(&self, thread_id: &str) -> Arc<Mutex<()>> {
+        let mut locks = self.admission_locks.lock();
+        Arc::clone(
+            locks
+                .entry(thread_id.to_string())
+                .or_insert_with(|| Arc::new(Mutex::new(()))),
+        )
+    }
+
     async fn emit_event(
         &self,
         thread_id: &str,
@@ -3275,6 +3348,14 @@ impl RuntimeThreadManager {
     #[cfg(test)]
     pub(crate) fn set_snapshot_test_hook(&self, hook: mpsc::UnboundedSender<SnapshotTestPoint>) {
         *self.snapshot_test_hook.lock() = Some(hook);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn set_export_snapshot_test_hook(
+        &self,
+        hook: mpsc::UnboundedSender<ExportSnapshotTestPoint>,
+    ) {
+        *self.export_snapshot_test_hook.lock() = Some(hook);
     }
 
     pub async fn create_thread(&self, req: CreateThreadRequest) -> Result<ThreadRecord> {
@@ -4928,6 +5009,8 @@ impl RuntimeThreadManager {
             .await
             .map_err(|_| anyhow!("Failed to start turn: engine operation channel closed"))?;
 
+        let admission_lock = self.admission_lock(thread_id);
+        let admission = admission_lock.lock().await;
         let acceptance_rx = {
             // Lock order is active -> thread_mutation. Neither guard crosses
             // an await, and spawning the owned lifecycle task is synchronous.
@@ -4988,6 +5071,7 @@ impl RuntimeThreadManager {
                 ClaimedTurnKind::Message,
             )
         };
+        drop(admission);
 
         acceptance_rx
             .await
@@ -5202,6 +5286,8 @@ impl RuntimeThreadManager {
             anyhow!("Failed to trigger compaction: engine operation channel closed")
         })?;
 
+        let admission_lock = self.admission_lock(thread_id);
+        let admission = admission_lock.lock().await;
         let acceptance_rx = {
             let mut active = self.active.lock().await;
             let Some(state) = active.engines.get_mut(thread_id) else {
@@ -5253,6 +5339,7 @@ impl RuntimeThreadManager {
                 ClaimedTurnKind::Compaction,
             )
         };
+        drop(admission);
 
         acceptance_rx
             .await
@@ -5476,9 +5563,8 @@ impl RuntimeThreadManager {
                 Arc::clone(&self.config),
             );
 
-            let turns = self.store.list_turns_for_thread(&thread.id)?;
-            let has_durable_history_snapshot =
-                self.turns_contain_compaction_history_snapshot(&turns)?;
+            let (has_durable_history_snapshot, durable_messages) =
+                self.durable_thread_history(&thread.id).await?;
             // A Runtime compaction snapshot is newer and more authoritative
             // than a linked TUI session file, which Runtime does not rewrite.
             // Once one exists, reconstruction preserves that exact compacted
@@ -5486,7 +5572,7 @@ impl RuntimeThreadManager {
             // compaction, prefer the linked session because it retains richer
             // thinking/tool blocks than ordinary item reconstruction.
             let session_messages = if has_durable_history_snapshot {
-                self.reconstruct_messages_from_turns(&turns)?
+                durable_messages
             } else if let Some(ref sid) = thread.session_id {
                 match crate::session_manager::default_sessions_dir() {
                     Ok(sessions_dir) => {
@@ -5499,14 +5585,14 @@ impl RuntimeThreadManager {
                                         sid,
                                         thread.id
                                     );
-                                    self.reconstruct_messages_from_turns(&turns)?
+                                    durable_messages.clone()
                                 }
                             },
                             Err(e) => {
                                 tracing::warn!(
                                     "Failed to open sessions dir: {e}; falling back to turn reconstruction"
                                 );
-                                self.reconstruct_messages_from_turns(&turns)?
+                                durable_messages.clone()
                             }
                         }
                     }
@@ -5514,11 +5600,11 @@ impl RuntimeThreadManager {
                         tracing::warn!(
                             "Failed to resolve sessions dir: {e}; falling back to turn reconstruction"
                         );
-                        self.reconstruct_messages_from_turns(&turns)?
+                        durable_messages.clone()
                     }
                 }
             } else {
-                self.reconstruct_messages_from_turns(&turns)?
+                durable_messages
             };
             let sys_prompt = thread
                 .system_prompt
@@ -5595,27 +5681,116 @@ impl RuntimeThreadManager {
         self.ensure_engine_loaded(&thread).await
     }
 
-    /// Reconstruct the authoritative durable conversation for session export.
+    /// Capture one completed-thread view for session export.
     ///
-    /// This deliberately shares the same private checkpoint-aware path used
-    /// by engine restart. Public `ThreadDetail` projections strip checkpoint
-    /// payloads and must never be used to rebuild a model conversation.
-    pub async fn messages_for_session_export(&self, thread_id: &str) -> Result<Vec<Message>> {
+    /// Turn admission and manual compaction share `admission_lock`, while the
+    /// existing projection boundary excludes terminal/stream publication.
+    /// The public detail and private checkpoint-aware messages therefore come
+    /// from the same single-scan durable snapshot.
+    pub async fn completed_thread_export_snapshot(
+        &self,
+        thread_id: &str,
+    ) -> Result<CompletedThreadExportSnapshot> {
         self.flush_recovery_receipts_for_thread(thread_id).await?;
+        #[cfg(test)]
+        let export_snapshot_test_hook = { self.export_snapshot_test_hook.lock().take() };
+        #[cfg(test)]
+        if let Some(hook) = export_snapshot_test_hook {
+            let store = self.store.clone();
+            let validated_thread_id = thread_id.to_string();
+            tokio::task::spawn_blocking(move || store.load_thread(&validated_thread_id))
+                .await
+                .context("Runtime export prevalidation task failed")??;
+            let (resume, wait_for_resume) = oneshot::channel();
+            hook.send(ExportSnapshotTestPoint {
+                thread_id: thread_id.to_string(),
+                resume,
+            })
+            .map_err(|_| anyhow!("export snapshot test hook closed"))?;
+            wait_for_resume
+                .await
+                .map_err(|_| anyhow!("export snapshot test hook dropped resume"))?;
+        }
+        let admission_lock = self.admission_lock(thread_id);
+        let _admission = admission_lock.lock().await;
         let projection_lock = self.projection_lock(thread_id);
         let _projection = projection_lock.lock().await;
-        let manager = self.clone();
-        let thread_id = thread_id.to_string();
-        tokio::task::spawn_blocking(move || {
-            manager
-                .store
-                .load_thread(&thread_id)
-                .with_context(|| format!("Thread not found: {thread_id}"))?;
-            let turns = manager.store.list_turns_for_thread(&thread_id)?;
-            manager.reconstruct_messages_from_turns(&turns)
+        {
+            let active = self.active.lock().await;
+            if active
+                .engines
+                .get(thread_id)
+                .and_then(|state| state.active_turn.as_ref())
+                .is_some()
+            {
+                bail!(
+                    "Thread already has an active turn; a queued or active turn must complete before saving as a session"
+                );
+            }
+        }
+        let latest_seq = self.store.current_seq().await;
+        let store = self.store.clone();
+        let snapshot_thread_id = thread_id.to_string();
+        let (thread, turns, mut items, messages) = tokio::task::spawn_blocking(move || {
+            let thread = store
+                .load_thread(&snapshot_thread_id)
+                .with_context(|| format!("Thread not found: {snapshot_thread_id}"))?;
+            let turns = store.list_turns_for_thread(&snapshot_thread_id)?;
+            let turn_ids = turns.iter().map(|turn| turn.id.clone()).collect::<Vec<_>>();
+            let items_by_turn = store.list_items_for_turns_map(&turn_ids)?;
+            let mut items = Vec::new();
+            for turn in &turns {
+                if let Some(turn_items) = items_by_turn.get(&turn.id) {
+                    items.extend(turn_items.iter().cloned());
+                }
+            }
+            if turns.iter().any(|turn| {
+                matches!(
+                    turn.status,
+                    RuntimeTurnStatus::Queued | RuntimeTurnStatus::InProgress
+                )
+            }) || items.iter().any(|item| {
+                matches!(
+                    item.status,
+                    TurnItemLifecycleStatus::Queued | TurnItemLifecycleStatus::InProgress
+                )
+            }) {
+                bail!(
+                    "Thread already has an active turn; a queued or active turn must complete before saving as a session"
+                );
+            }
+            let messages =
+                Self::reconstruct_messages_from_turns_map(&turns, items_by_turn)?;
+            Ok::<_, anyhow::Error>((thread, turns, items, messages))
         })
         .await
-        .context("Runtime session-export reconstruction task failed")?
+        .context("Runtime completed-thread export task failed")??;
+        for item in &mut items {
+            strip_compaction_history_snapshot_metadata(item);
+        }
+        let (pending_approvals, pending_user_inputs) = self.pending_requests_for_thread(thread_id);
+        let pending_dynamic_tool_calls = self.pending_dynamic_tool_calls_for_thread(thread_id);
+        Ok(CompletedThreadExportSnapshot {
+            detail: ThreadDetail {
+                thread,
+                turns,
+                items,
+                latest_seq,
+                pending_approvals,
+                pending_user_inputs,
+                pending_dynamic_tool_calls,
+            },
+            messages,
+        })
+    }
+
+    /// Compatibility helper for callers that only need the messages.
+    #[cfg(test)]
+    pub async fn messages_for_session_export(&self, thread_id: &str) -> Result<Vec<Message>> {
+        Ok(self
+            .completed_thread_export_snapshot(thread_id)
+            .await?
+            .messages)
     }
 
     fn clear_compaction_history_snapshots_for_thread(
@@ -5693,10 +5868,20 @@ impl RuntimeThreadManager {
         Ok(())
     }
 
+    #[cfg(test)]
     fn reconstruct_messages_from_turns(&self, turns: &[TurnRecord]) -> Result<Vec<Message>> {
+        let turn_ids = turns.iter().map(|turn| turn.id.clone()).collect::<Vec<_>>();
+        let items_by_turn = self.store.list_items_for_turns_map(&turn_ids)?;
+        Self::reconstruct_messages_from_turns_map(turns, items_by_turn)
+    }
+
+    fn reconstruct_messages_from_turns_map(
+        turns: &[TurnRecord],
+        mut items_by_turn: HashMap<String, Vec<TurnItemRecord>>,
+    ) -> Result<Vec<Message>> {
         let mut messages = Vec::new();
         for turn in turns {
-            let stored_items = self.store.list_items_for_turn(&turn.id)?;
+            let stored_items = items_by_turn.remove(&turn.id).unwrap_or_default();
             let items = if turn.item_ids.is_empty() {
                 stored_items
             } else {
@@ -5853,16 +6038,22 @@ impl RuntimeThreadManager {
         Ok(messages)
     }
 
-    fn turns_contain_compaction_history_snapshot(&self, turns: &[TurnRecord]) -> Result<bool> {
-        for turn in turns {
-            for item_id in &turn.item_ids {
-                let item = self.store.load_item(item_id)?;
-                if item_has_compaction_history_snapshot(&item) {
-                    return Ok(true);
-                }
-            }
-        }
-        Ok(false)
+    async fn durable_thread_history(&self, thread_id: &str) -> Result<(bool, Vec<Message>)> {
+        let store = self.store.clone();
+        let thread_id = thread_id.to_string();
+        tokio::task::spawn_blocking(move || {
+            let turns = store.list_turns_for_thread(&thread_id)?;
+            let turn_ids = turns.iter().map(|turn| turn.id.clone()).collect::<Vec<_>>();
+            let items_by_turn = store.list_items_for_turns_map(&turn_ids)?;
+            let has_history_snapshot = items_by_turn
+                .values()
+                .flatten()
+                .any(item_has_compaction_history_snapshot);
+            let messages = Self::reconstruct_messages_from_turns_map(&turns, items_by_turn)?;
+            Ok::<_, anyhow::Error>((has_history_snapshot, messages))
+        })
+        .await
+        .context("Runtime durable-history reconstruction task failed")?
     }
 
     async fn monitor_turn(
