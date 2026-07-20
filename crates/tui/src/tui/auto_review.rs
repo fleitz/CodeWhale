@@ -342,10 +342,17 @@ impl AutoReviewPolicy {
 /// still hold in every mode.
 fn safety_floor(ctx: &AutoReviewContext<'_>) -> Option<AutoReviewDecision> {
     match (ctx.action_kind, ctx.run_origin) {
-        (ToolActionKind::Publish, _) => Some(AutoReviewDecision::new(
-            AutoReviewAction::HoldForReview,
-            "publish-like action requires durable review",
-        )),
+        // Full Access (Bypass) means exactly that: the user granted publish
+        // authority to this session, so the publish floor prompts only in
+        // the Ask/Auto-Review postures (#4595). The catastrophic-destroyer
+        // floor below still applies in every posture — it guards against
+        // model error, not user intent.
+        (ToolActionKind::Publish, _) if ctx.approval_mode != ApprovalMode::Bypass => {
+            Some(AutoReviewDecision::new(
+                AutoReviewAction::HoldForReview,
+                "publish-like action requires durable review",
+            ))
+        }
         (
             ToolActionKind::Destructive | ToolActionKind::Secret,
             RunOrigin::Background | RunOrigin::Headless,
@@ -565,10 +572,107 @@ fn shell_tokens_are_publish_like(tokens: &[&str]) -> bool {
     }
 
     let canonical = crate::command_safety::classify_command(tokens);
-    matches!(
-        canonical.as_str(),
-        "git push" | "gh release" | "npm publish" | "cargo publish"
-    )
+    match canonical.as_str() {
+        // A git push is publish-like only when it can reach a protected or
+        // ambiguous target. A routine explicit feature-branch push follows
+        // normal shell posture rules instead of the every-posture publish
+        // hold (#4595).
+        "git push" => git_push_tokens_are_publish_like(tokens),
+        "gh release" | "npm publish" | "cargo publish" => true,
+        _ => false,
+    }
+}
+
+/// Publish-like `git push` forms — everything except an explicit, non-force
+/// push whose refspec destinations are all plain feature branches.
+///
+/// Fail closed: any flag, shape, or ref we do not positively recognise keeps
+/// the durable-review hold. The direction that must stay impossible is a
+/// protected-ref push slipping through as routine (#4595).
+fn git_push_tokens_are_publish_like(tokens: &[&str]) -> bool {
+    let Some(push_index) = git_subcommand_index(tokens).filter(|index| {
+        tokens
+            .get(*index)
+            .is_some_and(|token| shell_token_eq(token, "push"))
+    }) else {
+        // The command-safety classifier called it a push but we cannot find
+        // the subcommand — keep the hold.
+        return true;
+    };
+
+    let mut positionals: Vec<&str> = Vec::new();
+    for raw in tokens.iter().skip(push_index + 1) {
+        let token = shell_token_trim(raw);
+        if let Some(flag) = token.strip_prefix("--") {
+            let flag_name = flag.split('=').next().unwrap_or(flag);
+            match flag_name {
+                // Value-free flags that keep a push routine.
+                "set-upstream" | "verbose" | "quiet" | "porcelain" | "no-verify" | "dry-run" => {}
+                // Force, delete, tags, mirror, all, prune, push-options, and
+                // anything unrecognised (which could also swallow the next
+                // token as its value and shift the refspec parse).
+                _ => return true,
+            }
+        } else if let Some(flags) = token.strip_prefix('-') {
+            if flags.is_empty()
+                || !flags
+                    .chars()
+                    .all(|flag| matches!(flag, 'u' | 'v' | 'q' | 'n'))
+            {
+                return true;
+            }
+        } else {
+            positionals.push(token);
+        }
+    }
+
+    // `git push` and `git push <remote>` target the configured upstream ref,
+    // which we cannot see statically — keep the hold.
+    if positionals.len() < 2 {
+        return true;
+    }
+
+    // positionals[0] is the remote; every explicit refspec destination after
+    // it must be a plain unprotected branch.
+    positionals
+        .iter()
+        .skip(1)
+        .any(|refspec| git_push_refspec_is_protected(refspec))
+}
+
+fn git_push_refspec_is_protected(refspec: &str) -> bool {
+    // `+refspec` forces the update; wildcards fan out beyond one branch.
+    if refspec.starts_with('+') || refspec.contains('*') {
+        return true;
+    }
+    // The remote side of `src:dst` is what publication protects — but an
+    // empty side on either end is a delete (`:branch`) or malformed form.
+    let (src, dst) = match refspec.split_once(':') {
+        Some((src, dst)) => (src, dst),
+        None => (refspec, refspec),
+    };
+    if src.is_empty() || dst.is_empty() || dst.contains(':') {
+        return true;
+    }
+    let dst = dst.strip_prefix("refs/heads/").unwrap_or(dst);
+    if dst.starts_with("refs/") {
+        // Tags, notes, or any namespace outside refs/heads.
+        return true;
+    }
+    let lower = dst.to_ascii_lowercase();
+    if matches!(lower.as_str(), "main" | "master" | "head") {
+        return true;
+    }
+    if lower.starts_with("release") {
+        return true;
+    }
+    // Tag-like names (`v1`, `v0.9.1`): git resolves branch-vs-tag on the
+    // server, so treat them as publishes.
+    let mut chars = lower.chars();
+    if chars.next() == Some('v') && chars.next().is_some_and(|ch| ch.is_ascii_digit()) {
+        return true;
+    }
+    false
 }
 
 fn git_tag_tokens_are_publish_like(tokens: &[&str]) -> bool {
@@ -1052,6 +1156,114 @@ mod tests {
             policy.evaluate(&ctx).action,
             AutoReviewAction::HoldForReview
         );
+    }
+
+    #[test]
+    fn full_access_bypass_skips_the_publish_floor_entirely() {
+        // #4595: Full Access is truly full access — the user granted publish
+        // authority, so even protected-ref pushes and registry publishes do
+        // not trip the durable-review floor under Bypass. Ask/Auto-Review
+        // postures keep the hold (covered below).
+        let policy = AutoReviewPolicy::default();
+        for command in [
+            "git push origin main",
+            "git push --force origin feature-x",
+            "cargo publish",
+            "npm publish",
+        ] {
+            let ctx = ctx_for(
+                "exec_shell",
+                json!({ "command": command }),
+                RunOrigin::Interactive,
+                ApprovalMode::Bypass,
+            );
+            assert_ne!(
+                policy.evaluate(&ctx).action,
+                AutoReviewAction::HoldForReview,
+                "expected no publish hold under Full Access for {command}"
+            );
+        }
+    }
+
+    #[test]
+    fn shell_feature_branch_push_is_not_publish_like() {
+        // #4595: explicit non-force feature-branch pushes are routine
+        // development, not publication — they follow normal shell posture
+        // rules instead of the every-posture publish hold.
+        for command in [
+            "git push origin feature-x",
+            "git push origin agent/091-push-gate",
+            "git push -u origin agent/091-push-gate",
+            "git push --set-upstream origin codex/fix-thing",
+            "git push origin local-main:feature-x",
+            "git -C /repo push origin feature-x",
+        ] {
+            let ctx = ctx_for(
+                "exec_shell",
+                json!({ "command": command }),
+                RunOrigin::Interactive,
+                ApprovalMode::Auto,
+            );
+            assert_eq!(
+                ctx.action_kind,
+                ToolActionKind::Shell,
+                "expected routine shell classification for {command}"
+            );
+            assert_ne!(
+                AutoReviewPolicy::default().evaluate(&ctx).action,
+                AutoReviewAction::HoldForReview,
+                "expected no publish hold for {command}"
+            );
+        }
+    }
+
+    #[test]
+    fn shell_protected_or_ambiguous_push_stays_publish_like() {
+        for command in [
+            // Protected destinations.
+            "git push origin main",
+            "git push origin master",
+            "git push origin HEAD",
+            "git push origin feature-x:main",
+            "git push origin release/0.9.1",
+            "git push origin release-lane",
+            "git push origin v0.9.1",
+            "git push origin refs/tags/v0.9.1",
+            // Force, delete, bulk, wildcard, options.
+            "git push --force origin feature-x",
+            "git push -f origin feature-x",
+            "git push --force-with-lease origin feature-x",
+            "git push origin +feature-x",
+            "git push --delete origin feature-x",
+            "git push origin :feature-x",
+            "git push --tags origin",
+            "git push --mirror origin",
+            "git push --all origin",
+            "git push origin 'refs/heads/qa/*'",
+            "git push -o ci.skip origin feature-x",
+            // Ambiguous upstream targets.
+            "git push",
+            "git push origin",
+            // Compound commands keep the publish segment authoritative.
+            "cargo test && git push origin main",
+        ] {
+            let ctx = ctx_for(
+                "exec_shell",
+                json!({ "command": command }),
+                RunOrigin::Interactive,
+                ApprovalMode::Auto,
+            );
+            assert_eq!(
+                ctx.action_kind,
+                ToolActionKind::Publish,
+                "expected publish hold classification for {command}"
+            );
+            assert_eq!(
+                AutoReviewPolicy::default().evaluate(&ctx).action,
+                AutoReviewAction::HoldForReview,
+                "expected publish hold for {command}"
+            );
+        }
     }
 
     #[test]
