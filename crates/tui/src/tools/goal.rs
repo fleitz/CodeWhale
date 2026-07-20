@@ -109,6 +109,11 @@ impl GoalState {
             Some(objective) => {
                 let changed = self.objective.as_deref() != Some(objective);
                 let status_changed = self.status != Some(status);
+                let resumed = !changed
+                    && status == GoalStatus::Active
+                    && self
+                        .status
+                        .is_some_and(|previous| previous != GoalStatus::Active);
                 if changed {
                     self.objective = Some(objective.to_string());
                     self.token_budget = token_budget;
@@ -121,6 +126,12 @@ impl GoalState {
                     self.completion_verification = None;
                 } else if self.token_budget != token_budget {
                     self.token_budget = token_budget;
+                }
+
+                if resumed {
+                    self.evidence = None;
+                    self.blocker = None;
+                    self.completion_verification = None;
                 }
 
                 if changed || status_changed || self.status.is_none() {
@@ -719,6 +730,58 @@ mod tests {
                 "status {status:?} must preserve the entire goal snapshot"
             );
         }
+    }
+
+    #[test]
+    fn same_objective_goal_host_resume_clears_terminal_payloads_and_preserves_progress() {
+        let mut blocked = GoalState::default();
+        blocked
+            .create("resume the release goal".to_string(), Some(4_000))
+            .expect("create blocked fixture");
+        blocked.record_usage(750, 44);
+        blocked.record_continuation();
+        blocked
+            .mark_blocked("provider failed".to_string())
+            .expect("block goal");
+
+        blocked.sync_from_host_status(
+            Some("resume the release goal"),
+            Some(4_000),
+            GoalStatus::Active,
+        );
+
+        let resumed = blocked.snapshot();
+        assert_eq!(resumed.status, "active");
+        assert_eq!(resumed.tokens_used, 750);
+        assert_eq!(resumed.time_used_seconds, 44);
+        assert_eq!(resumed.continuation_count, 1);
+        assert_eq!(resumed.evidence, None);
+        assert_eq!(resumed.blocker, None);
+        assert_eq!(resumed.completion_verification, None);
+        let prompt = render_continuation_prompt(&resumed, resumed.continuation_count);
+        assert!(prompt.contains("\"blocker\": null"), "{prompt}");
+
+        let mut completed = GoalState::default();
+        completed
+            .create("resume verified work".to_string(), None)
+            .expect("create completed fixture");
+        completed
+            .mark_complete(
+                "focused tests passed".to_string(),
+                GoalCompletionVerification {
+                    status: "passed".to_string(),
+                    check: "cargo test".to_string(),
+                    summary: "goal tests passed".to_string(),
+                },
+            )
+            .expect("complete goal");
+
+        completed.sync_from_host_status(Some("resume verified work"), None, GoalStatus::Active);
+        let resumed = completed.snapshot();
+        assert_eq!(resumed.status, "active");
+        assert_eq!(resumed.evidence, None);
+        assert_eq!(resumed.blocker, None);
+        assert_eq!(resumed.completion_verification, None);
     }
 
     #[test]

@@ -81,6 +81,9 @@ use super::session::Session;
 use super::tool_parser;
 use super::turn::{TurnContext, post_turn_snapshot, pre_turn_snapshot};
 
+const ENGINE_OP_CHANNEL_CAPACITY: usize = 32;
+const GOAL_CONTINUATION_FAILURE_DETAIL_MAX_BYTES: usize = 512;
+
 /// Snapshot of parent state that can be passed to forked sub-agents without
 /// rewriting the parent transcript.
 #[derive(Debug, Clone, Default)]
@@ -645,6 +648,10 @@ pub struct Engine {
     /// Clone of the op-channel sender, so the engine can self-dispatch ops
     /// (e.g. a goal-continuation `SendMessage` after a turn completes).
     tx_op: mpsc::Sender<Op>,
+    /// At most one continuation waiting for op-channel capacity. Keeping this
+    /// on the sole consumer avoids awaiting a channel that only this engine can
+    /// drain while preserving FIFO behind controls already in the mailbox.
+    pending_goal_continuation: Option<PendingGoalContinuation>,
     rx_approval: mpsc::Receiver<ApprovalDecision>,
     rx_user_input: mpsc::Receiver<UserInputDecision>,
     rx_steer: mpsc::Receiver<String>,
@@ -725,6 +732,24 @@ enum GoalContinuationAction {
     Stopped {
         message: String,
     },
+}
+
+struct PendingGoalContinuation {
+    dynamic_tools: Vec<DynamicToolSpec>,
+}
+
+enum SendMessageOutcome {
+    NotStarted,
+    Finished {
+        status: TurnOutcomeStatus,
+        error: Option<String>,
+    },
+}
+
+impl SendMessageOutcome {
+    fn started(&self) -> bool {
+        matches!(self, Self::Finished { .. })
+    }
 }
 
 // === Internal tool helpers ===
@@ -1019,7 +1044,7 @@ impl Engine {
             );
         }
 
-        let (tx_op, rx_op) = mpsc::channel(32);
+        let (tx_op, rx_op) = mpsc::channel(ENGINE_OP_CHANNEL_CAPACITY);
         let (tx_event, rx_event) = mpsc::channel(256);
         let (tx_approval, rx_approval) = mpsc::channel(64);
         let (tx_user_input, rx_user_input) = mpsc::channel(32);
@@ -1215,6 +1240,7 @@ impl Engine {
             active_route_capabilities: codewhale_config::route::RouteCapabilities::default(),
             rx_op,
             tx_op: tx_op.clone(),
+            pending_goal_continuation: None,
             rx_approval,
             rx_user_input,
             rx_steer,
@@ -1561,6 +1587,62 @@ impl Engine {
             || self.session.approval_mode == crate::tui::approval::ApprovalMode::Bypass;
     }
 
+    fn schedule_goal_continuation(&mut self, dynamic_tools: Vec<DynamicToolSpec>) {
+        // Coalesce a continuation that could not enter a saturated mailbox.
+        // The most recent completed turn owns the freshest dynamic-tool set.
+        self.pending_goal_continuation = Some(PendingGoalContinuation { dynamic_tools });
+        self.try_flush_pending_goal_continuation();
+    }
+
+    fn goal_continuation_failure_message(&self, error: Option<&str>) -> String {
+        let detail = error.map(str::trim).filter(|detail| !detail.is_empty());
+        match detail {
+            Some(detail) => {
+                // This message becomes durable goal state. Reuse the model
+                // boundary's exact configured-secret redactor when available,
+                // with the config persistence redactor as the universal
+                // backstop, before bounding the retained provider detail.
+                let detail = self.deepseek_client.as_ref().map_or_else(
+                    || codewhale_config::persistence::redact_secrets(detail),
+                    |client| client.redact_model_bound_text(detail),
+                );
+                let detail = crate::utils::truncate_with_ellipsis(
+                    &detail,
+                    GOAL_CONTINUATION_FAILURE_DETAIL_MAX_BYTES,
+                    "…",
+                );
+                format!(
+                    "Goal continuation blocked because the model turn failed: {detail}. Fix the failure, then resume the goal."
+                )
+            }
+            None => {
+                "Goal continuation blocked because the model turn failed without a provider reason. Fix the provider route or credentials, then resume the goal."
+                    .to_string()
+            }
+        }
+    }
+
+    fn try_flush_pending_goal_continuation(&mut self) {
+        let Some(pending) = self.pending_goal_continuation.take() else {
+            return;
+        };
+
+        match self.tx_op.try_send(Op::ContinueGoal {
+            dynamic_tools: pending.dynamic_tools,
+        }) {
+            Ok(()) => {}
+            Err(mpsc::error::TrySendError::Full(Op::ContinueGoal { dynamic_tools })) => {
+                self.pending_goal_continuation = Some(PendingGoalContinuation { dynamic_tools });
+            }
+            Err(mpsc::error::TrySendError::Closed(_)) => {
+                tracing::warn!("goal continuation dropped because the engine mailbox is closed");
+            }
+            Err(mpsc::error::TrySendError::Full(_)) => {
+                unreachable!("goal continuation scheduler only sends ContinueGoal operations")
+            }
+        }
+    }
+
     /// Run the engine event loop
     #[allow(clippy::too_many_lines)]
     pub async fn run(mut self) {
@@ -1577,6 +1659,10 @@ impl Engine {
         let host_managed_turns = self.host_managed_turns();
 
         loop {
+            // A full mailbox means queued controls must run first. Retrying at
+            // the top of the loop appends the continuation behind the
+            // remaining controls as soon as one slot becomes available.
+            self.try_flush_pending_goal_continuation();
             let input = tokio::select! {
                 op = self.rx_op.recv() => op.map(|op| EngineRunInput::Operation(Box::new(op))),
                 completion = self.rx_subagent_completion.recv(), if !host_managed_turns => {
@@ -1676,7 +1762,7 @@ impl Engine {
                             }
                         };
 
-                        let dispatched = self
+                        let outcome = self
                             .handle_send_message(
                                 content,
                                 self.current_mode,
@@ -1701,12 +1787,27 @@ impl Engine {
                                 UserInputProvenance::Runtime,
                             )
                             .await;
-                        if !dispatched {
-                            self.block_goal_continuation(
-                                "Goal continuation blocked because the next model turn could not be started. Fix the provider route or credentials, then resume the goal."
-                                    .to_string(),
-                            )
-                            .await;
+                        match outcome {
+                            SendMessageOutcome::NotStarted => {
+                                self.block_goal_continuation(
+                                    "Goal continuation blocked because the next model turn could not be started. Fix the provider route or credentials, then resume the goal."
+                                        .to_string(),
+                                )
+                                .await;
+                            }
+                            SendMessageOutcome::Finished {
+                                status: TurnOutcomeStatus::Failed,
+                                error,
+                            } => {
+                                let message =
+                                    self.goal_continuation_failure_message(error.as_deref());
+                                self.block_goal_continuation(message).await;
+                            }
+                            SendMessageOutcome::Finished {
+                                status:
+                                    TurnOutcomeStatus::Completed | TurnOutcomeStatus::Interrupted,
+                                ..
+                            } => {}
                         }
                     }
                     Op::RunShellCommand {
@@ -2629,7 +2730,7 @@ impl Engine {
             )))
             .await;
 
-        let recorded = self
+        let outcome = self
             .handle_send_message(
                 content,
                 self.current_mode,
@@ -2654,7 +2755,7 @@ impl Engine {
                 UserInputProvenance::SubAgentHandoff,
             )
             .await;
-        if !recorded {
+        if !outcome.started() {
             for agent_id in claimed_ids {
                 self.delivered_subagent_completion_ids.remove(&agent_id);
             }
@@ -2871,7 +2972,7 @@ impl Engine {
         hook_executor: Option<std::sync::Arc<crate::hooks::HookExecutor>>,
         verbosity: Option<String>,
         provenance: UserInputProvenance,
-    ) -> bool {
+    ) -> SendMessageOutcome {
         let effective_provider = route.identity.provider;
         let provider_identity = route.identity.key.clone();
         let model = route.model.clone();
@@ -2883,7 +2984,7 @@ impl Engine {
                     "Cannot start the turn because its provider route is not ready: {err}"
                 ))))
                 .await;
-            return false;
+            return SendMessageOutcome::NotStarted;
         }
 
         let input_policy = effective_input_policy(
@@ -2986,7 +3087,7 @@ impl Engine {
                     base_url: None,
                 })
                 .await;
-            return false;
+            return SendMessageOutcome::NotStarted;
         }
 
         self.session
@@ -3303,7 +3404,7 @@ impl Engine {
             .send(Event::TurnComplete {
                 usage: turn.usage,
                 status,
-                error,
+                error: error.clone(),
                 tool_catalog: tool_catalog_for_event,
                 base_url: base_url_for_event,
             })
@@ -3339,14 +3440,9 @@ impl Engine {
             // Queue a typed continuation instead of freezing an Active goal
             // snapshot into a generic message. The operation re-reads the live
             // state when consumed, after any already-queued goal controls.
-            let _ = self
-                .tx_op
-                .send(Op::ContinueGoal {
-                    dynamic_tools: dynamic_tools.clone(),
-                })
-                .await;
+            self.schedule_goal_continuation(dynamic_tools);
         }
-        true
+        SendMessageOutcome::Finished { status, error }
     }
 
     async fn handle_manual_compaction(&mut self) {

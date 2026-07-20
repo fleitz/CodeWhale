@@ -293,6 +293,89 @@ struct GatedGoalModelClient {
     release_second_request: std::sync::Arc<tokio::sync::Notify>,
 }
 
+struct FirstRequestGatedGoalModelClient {
+    calls: std::sync::atomic::AtomicUsize,
+    request_entered: std::sync::Arc<tokio::sync::Notify>,
+    release_request: std::sync::Arc<tokio::sync::Notify>,
+}
+
+#[async_trait::async_trait]
+impl crate::core::model_client::ModelClient for FirstRequestGatedGoalModelClient {
+    fn provider_name(&self) -> &str {
+        "deterministic-goal"
+    }
+
+    fn model(&self) -> &str {
+        "local-model"
+    }
+
+    async fn create_message(
+        &self,
+        _request: crate::models::MessageRequest,
+    ) -> anyhow::Result<crate::models::MessageResponse> {
+        anyhow::bail!("mailbox regression uses the streaming model boundary")
+    }
+
+    async fn create_message_stream(
+        &self,
+        _request: crate::models::MessageRequest,
+    ) -> anyhow::Result<crate::llm_client::StreamEventBox> {
+        let call = self
+            .calls
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst)
+            .saturating_add(1);
+        if call > 1 {
+            anyhow::bail!("unexpected mailbox regression model request #{call}");
+        }
+        self.request_entered.notify_one();
+        self.release_request.notified().await;
+
+        let events = crate::llm_client::mock::canned::simple_text_turn("still working")
+            .into_iter()
+            .map(Ok);
+        Ok(Box::pin(futures_util::stream::iter(events)))
+    }
+
+    async fn health_check(&self) -> anyhow::Result<bool> {
+        Ok(true)
+    }
+}
+
+struct FailingGoalModelClient {
+    calls: std::sync::atomic::AtomicUsize,
+    message: String,
+}
+
+#[async_trait::async_trait]
+impl crate::core::model_client::ModelClient for FailingGoalModelClient {
+    fn provider_name(&self) -> &str {
+        "deterministic-goal"
+    }
+
+    fn model(&self) -> &str {
+        "local-model"
+    }
+
+    async fn create_message(
+        &self,
+        _request: crate::models::MessageRequest,
+    ) -> anyhow::Result<crate::models::MessageResponse> {
+        anyhow::bail!("failure regression uses the streaming model boundary")
+    }
+
+    async fn create_message_stream(
+        &self,
+        _request: crate::models::MessageRequest,
+    ) -> anyhow::Result<crate::llm_client::StreamEventBox> {
+        self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        anyhow::bail!(self.message.clone())
+    }
+
+    async fn health_check(&self) -> anyhow::Result<bool> {
+        Ok(true)
+    }
+}
+
 impl GatedGoalModelClient {
     fn captured_requests(&self) -> Vec<crate::models::MessageRequest> {
         self.requests
@@ -606,6 +689,119 @@ async fn goal_continuation_preserves_goal_and_resolves_updated_authoritative_rou
 
     handle.send(Op::Shutdown).await.expect("queue shutdown");
     run_task.await.expect("engine task");
+}
+
+#[tokio::test]
+async fn saturated_mailbox_does_not_deadlock_goal_continuation_self_dispatch() {
+    let request_entered = std::sync::Arc::new(tokio::sync::Notify::new());
+    let release_request = std::sync::Arc::new(tokio::sync::Notify::new());
+    let model = std::sync::Arc::new(FirstRequestGatedGoalModelClient {
+        calls: std::sync::atomic::AtomicUsize::new(0),
+        request_entered: std::sync::Arc::clone(&request_entered),
+        release_request: std::sync::Arc::clone(&release_request),
+    });
+    let config = goal_custom_route_config();
+    let engine_config = EngineConfig {
+        model: "local-model".to_string(),
+        max_steps: 1,
+        snapshots_enabled: false,
+        terminal_chrome_enabled: false,
+        goal_objective: Some("survive a saturated mailbox".to_string()),
+        ..EngineConfig::default()
+    };
+    let client: crate::core::model_client::SharedModelClient = model.clone();
+    let (engine, handle) = Engine::new_with_model_client(engine_config, &config, client);
+    let goal_state = engine.config.goal_state.clone();
+    let run_task = tokio::spawn(engine.run());
+
+    handle
+        .send(Op::SendMessage {
+            content: "start the saturated goal turn".to_string(),
+            mode: AppMode::Agent,
+            route: resolved_route_for_test(&config, "local-model"),
+            compaction: Box::new(CompactionConfig::default()),
+            goal_objective: Some("survive a saturated mailbox".to_string()),
+            goal_token_budget: None,
+            goal_status: crate::tools::goal::GoalStatus::Active,
+            reasoning_effort: None,
+            reasoning_effort_auto: false,
+            auto_model: false,
+            allow_shell: false,
+            trust_mode: false,
+            auto_approve: false,
+            approval_mode: crate::tui::approval::ApprovalMode::Suggest,
+            translation_enabled: false,
+            show_thinking: false,
+            allowed_tools: None,
+            dynamic_tools: Vec::new(),
+            hook_executor: None,
+            verbosity: None,
+            provenance: UserInputProvenance::ExternalUser,
+        })
+        .await
+        .expect("send saturated goal turn");
+    tokio::time::timeout(model_turn_event_timeout(), request_entered.notified())
+        .await
+        .expect("first goal request was never entered");
+
+    // The engine has consumed the SendMessage and is gated inside the model
+    // request, so every slot below belongs to a queued control operation. The
+    // final pause must remain ahead of the synthetic continuation.
+    for index in 0..ENGINE_OP_CHANNEL_CAPACITY {
+        let status = if index + 1 == ENGINE_OP_CHANNEL_CAPACITY {
+            crate::tools::goal::GoalStatus::Paused
+        } else {
+            crate::tools::goal::GoalStatus::Active
+        };
+        handle
+            .tx_op
+            .try_send(Op::SetGoalStatus {
+                status,
+                clear: false,
+            })
+            .unwrap_or_else(|error| panic!("fill op mailbox slot {index}: {error}"));
+    }
+    assert_eq!(handle.tx_op.capacity(), 0, "fixture must saturate mailbox");
+
+    release_request.notify_one();
+    let session = tokio::time::timeout(model_turn_event_timeout(), handle.get_session_snapshot())
+        .await
+        .expect("saturated mailbox deadlocked the engine")
+        .expect("post-saturation session snapshot");
+
+    let prompt = match session.system_prompt.expect("paused system prompt") {
+        SystemPrompt::Text(text) => text,
+        SystemPrompt::Blocks(blocks) => blocks
+            .into_iter()
+            .map(|block| block.text)
+            .collect::<Vec<_>>()
+            .join("\n"),
+    };
+    assert!(!prompt.contains("<session_goal>"), "{prompt}");
+    let goal = goal_state.lock().expect("goal lock").snapshot();
+    assert_eq!(goal.status, "paused");
+    assert_eq!(
+        model.calls.load(std::sync::atomic::Ordering::SeqCst),
+        1,
+        "the queued pause must suppress the stale continuation"
+    );
+
+    let mut starts = 0;
+    {
+        let mut events = handle.rx_event.write().await;
+        while let Ok(event) = events.try_recv() {
+            if matches!(event, Event::TurnStarted { .. }) {
+                starts += 1;
+            }
+        }
+    }
+    assert_eq!(starts, 1, "only the original goal turn may start");
+
+    handle.send(Op::Shutdown).await.expect("shutdown engine");
+    tokio::time::timeout(model_turn_event_timeout(), run_task)
+        .await
+        .expect("engine did not shut down after mailbox saturation")
+        .expect("engine task");
 }
 
 #[tokio::test]
@@ -1185,6 +1381,125 @@ async fn rejected_continuation_dispatch_blocks_goal_after_failed_turn() {
     );
     assert!(saw_blocked_goal, "sidebar must receive blocked state");
     assert!(saw_blocked_status, "blocked reason must remain visible");
+
+    handle.send(Op::Shutdown).await.expect("shutdown engine");
+    run_task.await.expect("engine task");
+}
+
+#[tokio::test]
+async fn started_nonretryable_continuation_failure_blocks_goal_with_bounded_reason() {
+    let failure_marker = "HTTP 400 Bad Request: deterministic continuation failure";
+    let leaked_secret = "sk-goal-secret-sentinel-123456";
+    let failure_message = format!(
+        "{failure_marker}: {leaked_secret} {}",
+        "provider detail ".repeat(80)
+    );
+    let model = std::sync::Arc::new(FailingGoalModelClient {
+        calls: std::sync::atomic::AtomicUsize::new(0),
+        message: failure_message.clone(),
+    });
+    let config = goal_custom_route_config();
+    let engine_config = EngineConfig {
+        model: "local-model".to_string(),
+        snapshots_enabled: false,
+        terminal_chrome_enabled: false,
+        goal_objective: Some("block a failed continuation truthfully".to_string()),
+        ..EngineConfig::default()
+    };
+    let client: crate::core::model_client::SharedModelClient = model.clone();
+    let (engine, handle) = Engine::new_with_model_client(engine_config, &config, client);
+    let goal_state = engine.config.goal_state.clone();
+    let run_task = tokio::spawn(engine.run());
+
+    handle
+        .send(Op::ContinueGoal {
+            dynamic_tools: Vec::new(),
+        })
+        .await
+        .expect("queue failing continuation");
+    let session = tokio::time::timeout(model_turn_event_timeout(), handle.get_session_snapshot())
+        .await
+        .expect("failed continuation did not terminalize")
+        .expect("post-failure session snapshot");
+
+    let prompt = match session.system_prompt.expect("blocked system prompt") {
+        SystemPrompt::Text(text) => text,
+        SystemPrompt::Blocks(blocks) => blocks
+            .into_iter()
+            .map(|block| block.text)
+            .collect::<Vec<_>>()
+            .join("\n"),
+    };
+    assert!(!prompt.contains("<session_goal>"), "{prompt}");
+    let snapshot = goal_state.lock().expect("goal lock").snapshot();
+    assert_eq!(snapshot.status, "blocked");
+    let blocker = snapshot.blocker.as_deref().expect("failure blocker");
+    assert!(blocker.contains(failure_marker), "{blocker}");
+    assert!(blocker.contains("resume the goal"), "{blocker}");
+    assert!(!blocker.contains(leaked_secret), "{blocker}");
+    assert!(
+        blocker.contains(codewhale_config::persistence::REDACTED),
+        "{blocker}"
+    );
+    assert!(
+        blocker.len() <= GOAL_CONTINUATION_FAILURE_DETAIL_MAX_BYTES + 160,
+        "failure reason must remain bounded: {} bytes",
+        blocker.len()
+    );
+    assert!(
+        blocker.len() < failure_message.len(),
+        "long provider detail must be truncated"
+    );
+    assert_eq!(
+        model.calls.load(std::sync::atomic::Ordering::SeqCst),
+        1,
+        "a nonretryable started failure must not dispatch again"
+    );
+
+    let mut starts = 0;
+    let mut saw_failed_turn = false;
+    let mut saw_provider_error = false;
+    let mut saw_blocked_goal = false;
+    let mut saw_blocked_status = false;
+    {
+        let mut events = handle.rx_event.write().await;
+        while let Ok(event) = events.try_recv() {
+            match event {
+                Event::TurnStarted { .. } => starts += 1,
+                Event::TurnComplete { status, error, .. } => {
+                    assert_eq!(status, TurnOutcomeStatus::Failed);
+                    assert!(
+                        error
+                            .as_deref()
+                            .is_some_and(|message| message.contains(failure_marker)),
+                        "{error:?}"
+                    );
+                    saw_failed_turn = true;
+                }
+                Event::Error { envelope, .. } => {
+                    if envelope.message.contains(failure_marker) {
+                        saw_provider_error = true;
+                    }
+                }
+                Event::GoalUpdated { snapshot } if snapshot.status == "blocked" => {
+                    saw_blocked_goal = true;
+                }
+                Event::Status { message } if message.contains(failure_marker) => {
+                    assert!(message.contains("resume the goal"), "{message}");
+                    saw_blocked_status = true;
+                }
+                _ => {}
+            }
+        }
+    }
+    assert_eq!(starts, 1, "exactly one continuation turn must start");
+    assert!(saw_failed_turn, "failed turn receipt must remain visible");
+    assert!(
+        saw_provider_error,
+        "provider error event must remain visible"
+    );
+    assert!(saw_blocked_goal, "goal must publish its blocked snapshot");
+    assert!(saw_blocked_status, "bounded failure must remain visible");
 
     handle.send(Op::Shutdown).await.expect("shutdown engine");
     run_task.await.expect("engine task");
