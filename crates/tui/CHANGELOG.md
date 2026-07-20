@@ -7,19 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-### Fixed
-
-- Preserve Solarized Light's canonical Base3 (`#fdf6e3`) shell background
-  instead of tinting it green-grey through the default underwater Ombre
-  treatment, while retaining foreground ambient life (#4457 by
-  @AiurArtanis).
-
 ## [0.9.1] - 2026-07-17
 
 Codewhale v0.9.1 ships a first-class local web client over the Runtime API,
 first-class OpenCode Go and restored xAI device login on the provider surface,
-calendar-correct hourly automations, and a hardening pass over the community
-site's draft, feed, login, and content-watch boundaries.
+calendar-correct hourly automations, a buildable OpenHarmony workflow-js
+target, reviewed Skill and MCP plugin bundles, and hardening for Auto routing,
+remote-terminal clipboard transport, restart recovery, and the community site's
+content boundaries.
 
 ### Added
 
@@ -45,9 +40,56 @@ site's draft, feed, login, and content-watch boundaries.
   archives. Build and smoke them on GitHub's native Windows 11 ARM runner,
   and move Linux ARM64 release builds to the native Ubuntu ARM runner to
   remove the slower multi-arch cross-link setup (#4267 by @w1w218).
+- Activate reviewed, namespaced Skill and MCP plugin bundles across plain,
+  resume, fork, exec, worker, and serve paths while keeping trust separate from
+  enablement. The bounded v0.9.1 lifecycle builds on @pkeging's plugin
+  foundation (PRs #3708, #3709, and #3710), with @codepgq's compatibility
+  request shaping the explicit migration boundary (#1172, #4533).
 
 ### Fixed
 
+- Make doctor and setup distinguish static configuration, command availability,
+  MCP protocol readiness, and backend health instead of presenting configured
+  routes as live-healthy. Ordinary doctor runs no longer wake loopback or
+  self-hosted providers unless `--probe-local` is requested (#4485; partial
+  #4406).
+- Add a read-only legacy-session diagnostic that compares bounded filename
+  samples without reading chat payloads, following symlinks, or crossing an
+  explicit `CODEWHALE_HOME` boundary. Recovery remains additive and the wider
+  constitution-policy report stays open (#4539; session-recovery report in
+  #4032 by @stream2stream).
+- Serialize test-only configuration-path readers with temporary environment
+  redirects so the Windows provider-persistence matrix cannot observe another
+  test's transient `CODEWHALE_HOME` or config path (#4483, closing #4463).
+- Align every K3 route with its verified provider contract: direct Moonshot
+  `kimi-k3` exposes a 1,048,576-token context and 131,072-token output limit;
+  Kimi Code's bare `k3` keeps its static 262K safe floor while an explicit
+  provider context override exposes 1M with provenance (#4481, #4592).
+- Keep read-before-edit snapshots in the engine session so a file read remains
+  valid across turns and context compaction, while a new session still starts
+  with an empty tracker (#4475 by @Angel-Hair).
+- Make `apply_patch` expose the canonical `replace` operation while continuing
+  to accept deprecated `changes` payloads through one validation path. Mixed
+  patch, replacement, and compatibility modes fail before any write (#4476 by
+  @Angel-Hair).
+- Show the prompt-cache hit rate in the phase strip when the Cache status item
+  is enabled, using overflow-safe rounded integer math and leaving compact or
+  disabled status layouts unchanged (#4474 by @dmitri-0).
+- Preserve Solarized Light's canonical Base3 (`#fdf6e3`) shell background
+  instead of tinting it green-grey through the default underwater Ombre
+  treatment, while retaining foreground ambient life (#4457 by @AiurArtanis;
+  PR #4471 by @nightt5879).
+- Honor `[auto] cost_saving = true` in provider-aware heuristic and classifier
+  routing, using only validated same-provider fast siblings. Providers without
+  a known fast sibling stay on the active model (#4486; partial #4405).
+- Make terminal-client clipboard behavior truthful over SSH: use OSC 52 outside
+  tmux, stock `tmux load-buffer -w` inside tmux, and bracketed paste for
+  client-to-remote text. Graphical clipboard access still requires credible
+  forwarding or an explicit override (#4484).
+- Keep a fresh TUI Work surface from rendering prior-session worker snapshots
+  or durable-task terminal receipts that predate the current app start. Active
+  durable tasks remain visible and shared history stays in `/tasks` and
+  archived agent views (#4488; partial #4416).
 - Fail closed on legacy Kimi CLI credential imports: remove Codewhale's
   hard-coded first-party-client impersonation and refresh request, never
   auto-enable or rewrite imported credentials, and label the compatibility
@@ -89,9 +131,9 @@ site's draft, feed, login, and content-watch boundaries.
   longer read as completed in the TUI (#4408).
 - Give host applications a cancellation boundary for MCP OAuth login so a
   stalled or abandoned provider login no longer hangs the calling session
-  (#4380).
+  (#4380; PR #4379 by @h3c-hexin).
 - Avoid blocked reader joins after Windows process kills so terminated shell
-  sessions cannot hang their readers (#4383).
+  sessions cannot hang their readers (PR #4383 by @h3c-hexin).
 - Give stdin-less observer hooks immediate EOF and contain timed-out hook
   process trees so descendants and pipe readers cannot leak after the parent
   shell exits (#4489 by @luismateusvargas).
@@ -102,12 +144,22 @@ site's draft, feed, login, and content-watch boundaries.
 - Keep the Hotbar Setup action list synchronized with keyboard focus when the
   selection moves beyond the visible rows, including Down past `/export`
   (#4418).
-- Route Windows OpenHarmony Cargo links through the repository's target-aware
-  clang launcher so the final Rust link keeps its target, sysroot, and MUSL
-  flags, and extend the no-SDK release guard to protect that contract. This
-  completes [@shenjackyuanjie](https://github.com/shenjackyuanjie)'s PR #4470
-  setup alongside [@shenyongqing](https://github.com/shenyongqing)'s original
-  bindgen approach in PR #4384.
+- Generate QuickJS bindings for `aarch64-unknown-linux-ohos` with the native
+  SDK's libclang and sysroot, keep unsupported persistent PTY dependencies out
+  of the target while retaining non-PTY `exec_shell`, and route final Windows
+  links through the target-aware clang launcher. This completes
+  [@shenjackyuanjie](https://github.com/shenjackyuanjie)'s PR #4470 alongside
+  [@shenyongqing](https://github.com/shenyongqing)'s original bindgen approach
+  in PR #4384.
+- Measure TUI wrapping, slicing, truncation, and selection at extended-grapheme
+  boundaries so keycaps, ZWJ emoji, modifiers, and combining sequences stay
+  intact (#4479; PR #4510 by @SparkofSpike).
+- Initialize the plugin registry and merge enabled plugin MCP servers on every
+  launch path, after trusted project configuration and outside workspace
+  dotenv authority (#3916; PR #4519 by @nightt5879).
+- Keep MCP tools immediately visible when the effective turn authority carries
+  Full Access or bypass approval, matching the non-MCP approval contract
+  instead of forcing deferred discovery (#4582 by @Angel-Hair).
 - Reconcile the website roadmap with reality: the retired share-link
   direction is now an explicit non-goal, Workrooms is the considered
   direction, and the local web client appears as underway, in English and
@@ -124,8 +176,8 @@ site's draft, feed, login, and content-watch boundaries.
 Thank you to the contributors whose code, reports, and reviews shaped v0.9.1:
 
 - [@h3c-hexin](https://github.com/h3c-hexin) — calendar-anchored hourly
-  automation recurrence (PR #4381) and the MCP OAuth cancellation report
-  (#4380).
+  automation recurrence (PR #4381), cancellable MCP OAuth (PR #4379 / #4380),
+  and nonblocking Windows killed-shell cleanup (PR #4383).
 - [@zhangweiii](https://github.com/zhangweiii) and
   [@sternelee](https://github.com/sternelee) — the original first-class
   OpenCode Go implementations (PRs #773 and #1050), harvested into the
@@ -134,7 +186,8 @@ Thank you to the contributors whose code, reports, and reviews shaped v0.9.1:
   canonical OpenCode Go/Zen provider request and acceptance direction
   (#1481).
 - [@nightt5879](https://github.com/nightt5879) — the Solarized Light
-  background preservation fix (PR #4471).
+  background preservation fix (PR #4471) and plugin initialization across
+  every launch path (PR #4519).
 - [@AiurArtanis](https://github.com/AiurArtanis) — the Solarized Light
   regression report and reproduction (#4457).
 - [@shenjackyuanjie](https://github.com/shenjackyuanjie) — the HarmonyOS
@@ -142,6 +195,21 @@ Thank you to the contributors whose code, reports, and reviews shaped v0.9.1:
   (PR #4470).
 - [@shenyongqing](https://github.com/shenyongqing) — the original HarmonyOS
   bindgen approach (PR #4384), carried into the landed implementation.
+- [@Angel-Hair](https://github.com/Angel-Hair) — session-owned read-before-edit
+  tracking, the backwards-compatible `apply_patch` replacement contract, and
+  Full Access MCP tool visibility (PRs #4475, #4476, and #4582).
+- [@dmitri-0](https://github.com/dmitri-0) — configurable cache-hit visibility
+  in the phase strip (PR #4474).
+- [@SparkofSpike](https://github.com/SparkofSpike) — the Ctrl+O and Vim-space
+  reproductions (#4482 and PR #4477), plus the keycap/emoji grapheme fix in PR
+  #4510 for #4479.
+- [@pkeging](https://github.com/pkeging) — the original plugin manifest,
+  discovery, CLI, and MCP foundation (PRs #3708, #3709, and #3710), preserved
+  as co-authored groundwork for #4533.
+- [@codepgq](https://github.com/codepgq) — the plugin compatibility request
+  that shaped the explicit v0.9.1 migration boundary (#1172, #4533).
+- [@stream2stream](https://github.com/stream2stream) — the legacy-session
+  recovery report that led to the read-only doctor diagnostic (#4032, #4539).
 - [@luismateusvargas](https://github.com/luismateusvargas) — the Windows hook
   process-leak reproduction, process-tree analysis, and EOF fix direction
   (#4489).
@@ -149,9 +217,6 @@ Thank you to the contributors whose code, reports, and reviews shaped v0.9.1:
   report that exposed lossy high-bit process-status handling (#4100).
 - [@w1w218](https://github.com/w1w218) — the Windows ARM64 release request and
   real-device motivation (#4267).
-- [@SparkofSpike](https://github.com/SparkofSpike) — the Windows Ctrl+O
-  reproduction that exposed pre-pager result truncation and conflicting composer
-  shortcut routing (#4482).
 
 ## [0.9.0] - 2026-07-16
 

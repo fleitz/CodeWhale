@@ -28,20 +28,22 @@ notes, and relevant issue/PR comments.
 ## Contributors by time
 
 <details open>
-<summary><strong>v0.9.1 — provider and runtime hardening</strong></summary>
+<summary><strong>v0.9.1 — provider, runtime, and plugin hardening</strong></summary>
 
 - **[h3c-hexin](https://github.com/h3c-hexin)** — calendar-anchored hourly
-  automation recurrence across DST and lifecycle transitions (PR #4381)
+  automation recurrence across DST and lifecycle transitions (PR #4381),
+  cancellable MCP OAuth (PR #4379 / #4380), and nonblocking Windows
+  killed-shell cleanup (PR #4383)
 - **[zhangweiii](https://github.com/zhangweiii)** and
   **[Sterne Lee / sternelee](https://github.com/sternelee)** — the original
   first-class OpenCode Go implementations in PRs #773 and #1050, harvested
-  into the current provider architecture with co-authorship planned for the
-  landing commit
+  into the current provider architecture with co-authorship preserved
 - **[Sean Tse / seanthefuturegorilla](https://github.com/seanthefuturegorilla)**
   — the canonical OpenCode Go/Zen provider request and acceptance direction in
   #1481
 - **[nightt5879](https://github.com/nightt5879)** — the Solarized Light
-  background preservation fix for the underwater shell (PR #4471)
+  background preservation fix for the underwater shell (PR #4471) and plugin
+  initialization across every launch path (PR #4519)
 - **[AiurArtanis](https://github.com/AiurArtanis)** — the Solarized Light
   v0.9.0 regression report and reproduction (#4457)
 - **[shenjackyuanjie](https://github.com/shenjackyuanjie)** — the HarmonyOS
@@ -50,6 +52,22 @@ notes, and relevant issue/PR comments.
 - **[shenyongqing](https://github.com/shenyongqing)** — the original HarmonyOS
   workflow-js bindgen approach (PR #4384), carried into the landed
   implementation with credit
+- **[Lu Shihan / Angel-Hair](https://github.com/Angel-Hair)** — session-owned
+  read-before-edit tracking, the backwards-compatible `apply_patch`
+  replacement contract, and Full Access MCP tool visibility (PRs #4475,
+  #4476, and #4582)
+- **[dmitri-0](https://github.com/dmitri-0)** — configurable cache-hit
+  visibility in the phase strip (PR #4474)
+- **[Sh1Zuku / SparkofSpike](https://github.com/SparkofSpike)** — the Windows
+  Ctrl+O and Vim-space reproductions (#4482 and PR #4477), plus the
+  keycap/emoji grapheme fix in PR #4510 for #4479
+- **[pkeging](https://github.com/pkeging)** — the original plugin manifest,
+  discovery, CLI, and MCP foundation (PRs #3708, #3709, and #3710), preserved
+  as co-authored groundwork for #4533
+- **[codepgq](https://github.com/codepgq)** — the plugin compatibility request
+  that shaped the explicit v0.9.1 migration boundary (#1172, #4533)
+- **[stream2stream](https://github.com/stream2stream)** — the legacy-session
+  recovery report that led to the read-only doctor diagnostic (#4032, #4539)
 - **[Luis Mateus Vargas / luismateusvargas](https://github.com/luismateusvargas)**
   — the Windows hook-process leak reproduction, process-tree analysis, and EOF
   fix direction (#4489)
@@ -58,9 +76,6 @@ notes, and relevant issue/PR comments.
 - **[w1w218](https://github.com/w1w218)** — the Windows ARM64 release request
   and cross-compilation report that led to native release, npm, updater, and
   archive support (#4267)
-- **[Sh1Zuku / SparkofSpike](https://github.com/SparkofSpike)** — the Windows
-  Ctrl+O reproduction that exposed pre-pager result truncation and conflicting
-  composer shortcut routing (#4482)
 
 </details>
 
