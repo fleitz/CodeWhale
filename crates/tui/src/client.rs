@@ -192,7 +192,9 @@ const RECOVERY_PROBE_COOLDOWN: Duration = Duration::from_secs(15);
 
 const DEFAULT_CLIENT_RATE_LIMIT_RPS: f64 = 8.0;
 const DEFAULT_CLIENT_RATE_LIMIT_BURST: f64 = 16.0;
-const ALLOW_INSECURE_HTTP_ENV: &str = "DEEPSEEK_ALLOW_INSECURE_HTTP";
+const ALLOW_INSECURE_HTTP_ENV: &str = "CODEWHALE_ALLOW_INSECURE_HTTP";
+/// Legacy alias for [`ALLOW_INSECURE_HTTP_ENV`].
+const LEGACY_ALLOW_INSECURE_HTTP_ENV: &str = "DEEPSEEK_ALLOW_INSECURE_HTTP";
 
 fn client_user_agent(api_provider: ApiProvider) -> &'static str {
     // The ChatGPT Codex backend is the sole route with a documented
@@ -621,6 +623,7 @@ fn validate_base_url_security(base_url: &str) -> Result<()> {
 
     if base_url.starts_with("http://")
         && std::env::var(ALLOW_INSECURE_HTTP_ENV)
+            .or_else(|_| std::env::var(LEGACY_ALLOW_INSECURE_HTTP_ENV))
             .ok()
             .as_deref()
             .is_some_and(|v| v == "1" || v.eq_ignore_ascii_case("true"))
@@ -637,9 +640,9 @@ fn validate_base_url_security(base_url: &str) -> Result<()> {
              \n\
              Loopback hosts (localhost, 127.0.0.1, [::1]) are auto-allowed.\n\
              For other trusted local hosts (LAN, llama.cpp on a private IP, etc.)\n\
-             set the env var `{ALLOW_INSECURE_HTTP_ENV}=1` in the shell that runs deepseek and re-run.\n\
+             set the env var `{ALLOW_INSECURE_HTTP_ENV}=1` in the shell that runs codewhale and re-run.\n\
              \n\
-             Example: `{ALLOW_INSECURE_HTTP_ENV}=1 deepseek` (note the underscores).",
+             Example: `{ALLOW_INSECURE_HTTP_ENV}=1 codewhale` (note the underscores).",
         );
     }
 
@@ -6249,12 +6252,18 @@ mod tests {
 
     struct AllowInsecureHttpEnvGuard {
         prior: Option<std::ffi::OsString>,
+        prior_legacy: Option<std::ffi::OsString>,
     }
     impl AllowInsecureHttpEnvGuard {
         fn capture() -> Self {
-            Self {
+            let guard = Self {
                 prior: std::env::var_os(ALLOW_INSECURE_HTTP_ENV),
-            }
+                prior_legacy: std::env::var_os(LEGACY_ALLOW_INSECURE_HTTP_ENV),
+            };
+            // Clear the legacy alias so ambient shell state cannot satisfy
+            // the CODEWHALE-first fallback chain behind a test's back.
+            unsafe { std::env::remove_var(LEGACY_ALLOW_INSECURE_HTTP_ENV) };
+            guard
         }
     }
     impl Drop for AllowInsecureHttpEnvGuard {
@@ -6262,6 +6271,10 @@ mod tests {
             match &self.prior {
                 Some(v) => unsafe { std::env::set_var(ALLOW_INSECURE_HTTP_ENV, v) },
                 None => unsafe { std::env::remove_var(ALLOW_INSECURE_HTTP_ENV) },
+            }
+            match &self.prior_legacy {
+                Some(v) => unsafe { std::env::set_var(LEGACY_ALLOW_INSECURE_HTTP_ENV, v) },
+                None => unsafe { std::env::remove_var(LEGACY_ALLOW_INSECURE_HTTP_ENV) },
             }
         }
     }
