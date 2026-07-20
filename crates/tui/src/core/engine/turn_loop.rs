@@ -373,6 +373,27 @@ impl Engine {
                 break;
             }
 
+            // A tool-producing response can spend the remaining goal budget
+            // before this loop reaches the no-tool continuation check below.
+            // Stop at the provider-request boundary so tool results remain in
+            // the transcript, but no additional model request is authorized.
+            // GoalState remains untouched here: the outer turn bookkeeping
+            // records this usage once, then the normal cross-turn reconciler
+            // publishes the terminal Blocked projection.
+            if let Some(snapshot) = self.goal_snapshot_with_current_turn_usage(&turn.usage)
+                && let Some(budget) = snapshot.token_budget
+                && snapshot.tokens_used >= u64::from(budget)
+            {
+                let _ = self
+                    .tx_event
+                    .send(Event::status(format!(
+                        "Goal token budget reached ({} / {budget} tokens); ending turn before another provider request.",
+                        snapshot.tokens_used
+                    )))
+                    .await;
+                break;
+            }
+
             let compaction_pins =
                 self.compaction_pins_for_active_turn(turn.active_slop_gate_message.as_ref());
             let compaction_paths = self.session.working_set.top_paths(24);
@@ -3002,6 +3023,31 @@ impl Engine {
         (TurnOutcomeStatus::Completed, None)
     }
 
+    fn goal_snapshot_with_current_turn_usage(
+        &self,
+        current_turn_usage: &Usage,
+    ) -> Option<GoalSnapshot> {
+        let mut snapshot = match self.config.goal_state.lock() {
+            Ok(state) => state.snapshot(),
+            Err(err) => {
+                tracing::warn!("goal state lock poisoned during current-turn budget check: {err}");
+                return None;
+            }
+        };
+        if !snapshot.is_active() {
+            return None;
+        }
+
+        // GoalState is updated once, after the full engine turn finishes. Add
+        // this turn's cumulative provider usage only to a transient snapshot
+        // so request and continuation decisions see already-spent tokens
+        // without recording the same usage twice later.
+        let current_turn_tokens = u64::from(current_turn_usage.input_tokens)
+            .saturating_add(u64::from(current_turn_usage.output_tokens));
+        snapshot.tokens_used = snapshot.tokens_used.saturating_add(current_turn_tokens);
+        Some(snapshot)
+    }
+
     async fn goal_continuation_message_if_needed(
         &self,
         tool_registry: Option<&crate::tools::ToolRegistry>,
@@ -3013,25 +3059,9 @@ impl Engine {
             return None;
         }
 
-        let mut snapshot = match self.config.goal_state.lock() {
-            Ok(state) => state.snapshot(),
-            Err(err) => {
-                tracing::warn!("goal state lock poisoned during continuation check: {err}");
-                return None;
-            }
-        };
-
-        if !snapshot.is_active() {
-            return None;
-        }
-
-        // GoalState is updated once, after the full engine turn finishes. Add
-        // the current turn's cumulative provider usage only to this transient
-        // decision/prompt snapshot so an already-spent budget cannot authorize
-        // more provider calls, without recording the same tokens twice later.
+        let mut snapshot = self.goal_snapshot_with_current_turn_usage(current_turn_usage)?;
         let current_turn_tokens = u64::from(current_turn_usage.input_tokens)
             .saturating_add(u64::from(current_turn_usage.output_tokens));
-        snapshot.tokens_used = snapshot.tokens_used.saturating_add(current_turn_tokens);
 
         let per_turn_max = crate::tools::goal::MAX_GOAL_CONTINUATIONS_PER_TURN;
         if *continuations_this_turn >= per_turn_max {

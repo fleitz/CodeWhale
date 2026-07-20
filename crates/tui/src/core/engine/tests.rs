@@ -1717,6 +1717,111 @@ async fn current_turn_usage_stops_budgeted_goal_after_one_provider_call() {
 }
 
 #[tokio::test]
+async fn tool_response_crossing_goal_budget_does_not_issue_second_provider_request() {
+    use crate::llm_client::mock::{MockLlmClient, canned};
+
+    let objective = "stop after a budget-crossing goal tool response";
+    let budget_tool_turn = vec![
+        canned::message_start("mock_goal_tool_budget"),
+        canned::tool_use_block_start(0, "call-get-goal", "get_goal"),
+        canned::tool_input_delta(0, "{}"),
+        canned::block_stop(0),
+        canned::message_delta(
+            "tool_use",
+            Some(Usage {
+                input_tokens: 8,
+                output_tokens: 3,
+                ..Usage::default()
+            }),
+        ),
+        canned::message_stop(),
+    ];
+    let model = std::sync::Arc::new(MockLlmClient::new(vec![
+        budget_tool_turn,
+        canned::simple_text_turn("this second provider response must remain unused"),
+    ]));
+    let client: crate::core::model_client::SharedModelClient = model.clone();
+    let config = goal_custom_route_config();
+    let (engine, handle) = Engine::new_with_model_client(
+        EngineConfig {
+            model: "local-model".to_string(),
+            snapshots_enabled: false,
+            subagents_enabled: false,
+            terminal_chrome_enabled: false,
+            goal_objective: Some(objective.to_string()),
+            goal_token_budget: Some(10),
+            ..EngineConfig::default()
+        },
+        &config,
+        client,
+    );
+    let goal_state = engine.config.goal_state.clone();
+    let run_task = tokio::spawn(engine.run());
+
+    handle
+        .send(active_goal_message_op(
+            &config,
+            "inspect the goal without overspending",
+            objective,
+            Some(10),
+        ))
+        .await
+        .expect("send budgeted goal tool turn");
+
+    let mut saw_get_goal = false;
+    let mut saw_terminal_goal = false;
+    while !saw_terminal_goal {
+        let event = tokio::time::timeout(model_turn_event_timeout(), async {
+            handle.rx_event.write().await.recv().await
+        })
+        .await
+        .expect("budget-crossing goal tool turn did not settle")
+        .expect("budget-crossing goal tool event");
+        match event {
+            Event::ToolCallComplete { name, result, .. } if name == "get_goal" => {
+                assert!(result.expect("get_goal result").success);
+                saw_get_goal = true;
+            }
+            Event::GoalUpdated { snapshot } if snapshot.status == "blocked" => {
+                saw_terminal_goal = true;
+            }
+            _ => {}
+        }
+    }
+
+    assert!(saw_get_goal, "the first response's goal tool must execute");
+    assert_eq!(
+        model.call_count(),
+        1,
+        "the provider-request boundary must stop the second model call"
+    );
+    assert_eq!(
+        model.remaining_turns(),
+        1,
+        "the second canned response must remain unused"
+    );
+    let goal = goal_state.lock().expect("goal lock").snapshot();
+    assert_eq!(goal.status, "blocked");
+    assert_eq!(goal.tokens_used, 11, "usage must be durably recorded once");
+    assert_eq!(goal.token_budget, Some(10));
+    assert!(
+        goal.blocker
+            .as_deref()
+            .is_some_and(|blocker| blocker.contains("11 / 10 tokens")),
+        "{goal:?}"
+    );
+    let session = handle
+        .get_session_snapshot()
+        .await
+        .expect("post-budget tool session snapshot");
+    let prompt = system_prompt_text(session.system_prompt.expect("blocked system prompt"));
+    assert!(!prompt.contains("<session_goal>"), "{prompt}");
+
+    handle.send(Op::Shutdown).await.expect("shutdown engine");
+    run_task.await.expect("engine task");
+}
+
+#[tokio::test]
 async fn queued_goal_clear_refreshes_prompt_and_cancels_stale_continuation() {
     let config = Config::default();
     let engine_config = EngineConfig {
