@@ -7876,7 +7876,7 @@ async fn run_mcp_command(
             );
             save_mcp_config(&config_path, &cfg)?;
             println!(
-                "Registered DeepSeek as MCP server '{name}' in {}",
+                "Registered Codewhale as MCP server '{name}' in {}",
                 config_path.display()
             );
             println!("  command: {exe_str}");

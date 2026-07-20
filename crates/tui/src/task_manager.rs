@@ -1,4 +1,4 @@
-//! Persistent background task manager for DeepSeek agent work.
+//! Persistent background task manager for Codewhale agent work.
 //!
 //! Tasks are durable across restarts and execute with a bounded worker pool.
 //! Execution stays DeepSeek-only and now links every task to runtime

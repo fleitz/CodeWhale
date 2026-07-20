@@ -177,13 +177,13 @@ impl McpServer {
                 "deepseek" => {
                     tools.push(json!({
                         "name": "deepseek",
-                        "description": "Send a prompt to DeepSeek and get a response. Creates a new conversation thread.",
+                        "description": "Send a prompt to Codewhale and get a response. Creates a new conversation thread.",
                         "inputSchema": {
                             "type": "object",
                             "properties": {
                                 "prompt": {
                                     "type": "string",
-                                    "description": "The user prompt to send to DeepSeek"
+                                    "description": "The user prompt to send to Codewhale"
                                 },
                                 "model": {
                                     "type": "string",
@@ -201,7 +201,7 @@ impl McpServer {
                 "deepseek-reply" => {
                     tools.push(json!({
                         "name": "deepseek-reply",
-                        "description": "Continue an existing conversation thread with DeepSeek. Requires a thread_id from a previous deepseek call.",
+                        "description": "Continue an existing conversation thread with Codewhale. Requires a thread_id from a previous deepseek call.",
                         "inputSchema": {
                             "type": "object",
                             "properties": {

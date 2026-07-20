@@ -9893,7 +9893,7 @@ async fn apply_command_result(
                 app.status_message = Some(message);
             }
             AppAction::CacheWarmup => {
-                app.status_message = Some("Warming DeepSeek cache...".to_string());
+                app.status_message = Some("Warming prompt cache...".to_string());
                 match run_cache_warmup(app, config).await {
                     Ok((usage, base_url, inspection)) => {
                         app.session.last_base_url = Some(base_url.clone());
