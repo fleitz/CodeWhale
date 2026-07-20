@@ -723,7 +723,6 @@ enum GoalContinuationAction {
         snapshot: Box<GoalSnapshot>,
     },
     Stopped {
-        status: GoalStatus,
         message: String,
     },
 }
@@ -1651,18 +1650,8 @@ impl Engine {
                             GoalContinuationAction::Dispatch { content, snapshot } => {
                                 (content, *snapshot)
                             }
-                            GoalContinuationAction::Stopped { status, message } => {
-                                // Keep the host-side mirror and stable prompt in
-                                // sync with the terminal SharedGoalState before
-                                // publishing the stop receipt. This prevents the
-                                // sidebar from claiming an exhausted goal is
-                                // still running and removes stale <session_goal>
-                                // instructions from the persisted session.
-                                self.config.goal_status = status;
-                                self.refresh_system_prompt();
-                                self.emit_session_updated().await;
-                                self.emit_goal_updated().await;
-                                let _ = self.tx_event.send(Event::status(message)).await;
+                            GoalContinuationAction::Stopped { message } => {
+                                self.block_goal_continuation(message).await;
                                 continue;
                             }
                         };
@@ -1673,40 +1662,52 @@ impl Engine {
                         let route = match self.current_runtime_route() {
                             Ok(route) => route,
                             Err(err) => {
+                                let message = format!(
+                                    "Goal continuation blocked because its provider route is no longer valid: {err}. Fix the route, then resume the goal."
+                                );
                                 let _ = self
                                     .tx_event
                                     .send(Event::error(ErrorEnvelope::fatal_auth(format!(
                                         "Goal continuation stopped because its provider route is no longer valid: {err}"
                                     ))))
                                     .await;
+                                self.block_goal_continuation(message).await;
                                 continue;
                             }
                         };
 
-                        self.handle_send_message(
-                            content,
-                            self.current_mode,
-                            route,
-                            self.config.compaction.clone(),
-                            goal_snapshot.objective,
-                            goal_snapshot.token_budget,
-                            GoalStatus::Active,
-                            self.session.reasoning_effort.clone(),
-                            self.session.reasoning_effort_auto,
-                            self.session.auto_model,
-                            self.session.allow_shell,
-                            self.session.trust_mode,
-                            self.session.auto_approve,
-                            self.session.approval_mode,
-                            self.config.translation_enabled,
-                            self.config.show_thinking,
-                            self.config.allowed_tools.clone(),
-                            dynamic_tools,
-                            self.config.hook_executor.clone(),
-                            self.config.verbosity.clone(),
-                            UserInputProvenance::Runtime,
-                        )
-                        .await;
+                        let dispatched = self
+                            .handle_send_message(
+                                content,
+                                self.current_mode,
+                                route,
+                                self.config.compaction.clone(),
+                                goal_snapshot.objective,
+                                goal_snapshot.token_budget,
+                                GoalStatus::Active,
+                                self.session.reasoning_effort.clone(),
+                                self.session.reasoning_effort_auto,
+                                self.session.auto_model,
+                                self.session.allow_shell,
+                                self.session.trust_mode,
+                                self.session.auto_approve,
+                                self.session.approval_mode,
+                                self.config.translation_enabled,
+                                self.config.show_thinking,
+                                self.config.allowed_tools.clone(),
+                                dynamic_tools,
+                                self.config.hook_executor.clone(),
+                                self.config.verbosity.clone(),
+                                UserInputProvenance::Runtime,
+                            )
+                            .await;
+                        if !dispatched {
+                            self.block_goal_continuation(
+                                "Goal continuation blocked because the next model turn could not be started. Fix the provider route or credentials, then resume the goal."
+                                    .to_string(),
+                            )
+                            .await;
+                        }
                     }
                     Op::RunShellCommand {
                         command,
@@ -2741,16 +2742,47 @@ impl Engine {
                         return GoalContinuationAction::Inactive;
                     }
                 };
-                if let Err(err) = state.mark_blocked(message.clone()) {
-                    tracing::warn!("failed to mark stopped goal blocked: {err}");
-                    return GoalContinuationAction::Inactive;
-                }
-                GoalContinuationAction::Stopped {
-                    status: GoalStatus::Blocked,
-                    message,
-                }
+                GoalContinuationAction::Stopped { message }
             }
         }
+    }
+
+    /// Transition a still-active interactive goal to Blocked and publish every
+    /// host projection in one ordered path. Continuation failures happen
+    /// outside a model tool call, so without this bridge the loop can stop while
+    /// the prompt and sidebar continue to claim the goal is actively running.
+    async fn block_goal_continuation(&mut self, message: String) {
+        let snapshot = match self.config.goal_state.lock() {
+            Ok(mut state) => {
+                if state.is_active()
+                    && let Err(err) = state.mark_blocked(message.clone())
+                {
+                    tracing::warn!("failed to mark goal continuation blocked: {err}");
+                    return;
+                }
+                let snapshot = state.snapshot();
+                if snapshot.status != GoalStatus::Blocked.as_str() {
+                    tracing::warn!(
+                        status = %snapshot.status,
+                        "goal changed before continuation blocker could be published"
+                    );
+                    return;
+                }
+                snapshot
+            }
+            Err(err) => {
+                tracing::warn!("goal state lock poisoned while blocking continuation: {err}");
+                return;
+            }
+        };
+
+        self.config.goal_objective.clone_from(&snapshot.objective);
+        self.config.goal_token_budget = snapshot.token_budget;
+        self.config.goal_status = GoalStatus::Blocked;
+        self.refresh_system_prompt();
+        self.emit_session_updated().await;
+        let _ = self.tx_event.send(Event::GoalUpdated { snapshot }).await;
+        let _ = self.tx_event.send(Event::status(message)).await;
     }
 
     /// Handle `/goal pause|resume|clear|complete|blocked` by writing the new

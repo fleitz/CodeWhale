@@ -853,8 +853,7 @@ async fn queued_goal_clear_refreshes_prompt_and_cancels_stale_continuation() {
     run_task.await.expect("engine task");
 }
 
-#[tokio::test]
-async fn exhausted_goal_terminalizes_before_invalid_route_resolution() {
+fn goal_custom_route_config() -> Config {
     let mut custom = HashMap::new();
     custom.insert(
         "custom-a".to_string(),
@@ -866,14 +865,29 @@ async fn exhausted_goal_terminalizes_before_invalid_route_resolution() {
             ..crate::config::ProviderConfig::default()
         },
     );
-    let config = Config {
+    Config {
         provider: Some("custom-a".to_string()),
         providers: Some(crate::config::ProvidersConfig {
             custom,
             ..crate::config::ProvidersConfig::default()
         }),
         ..Config::default()
-    };
+    }
+}
+
+fn without_named_custom_route(mut config: Config) -> Config {
+    config
+        .providers
+        .as_mut()
+        .expect("custom providers")
+        .custom
+        .clear();
+    config
+}
+
+#[tokio::test]
+async fn exhausted_goal_terminalizes_before_invalid_route_resolution() {
+    let config = goal_custom_route_config();
     let engine_config = EngineConfig {
         model: "local-model".to_string(),
         snapshots_enabled: false,
@@ -886,13 +900,7 @@ async fn exhausted_goal_terminalizes_before_invalid_route_resolution() {
     let goal_state = engine.config.goal_state.clone();
     goal_state.lock().expect("goal lock").record_usage(11, 0);
 
-    let mut invalid_route_config = config;
-    invalid_route_config
-        .providers
-        .as_mut()
-        .expect("custom providers")
-        .custom
-        .clear();
+    let invalid_route_config = without_named_custom_route(config);
     engine.authoritative_route_config =
         Some(Arc::new(parking_lot::RwLock::new(invalid_route_config)));
     assert!(
@@ -954,6 +962,229 @@ async fn exhausted_goal_terminalizes_before_invalid_route_resolution() {
         goal_state.lock().expect("goal lock").snapshot().status,
         "blocked"
     );
+
+    handle.send(Op::Shutdown).await.expect("shutdown engine");
+    run_task.await.expect("engine task");
+}
+
+#[tokio::test]
+async fn invalid_route_blocks_active_goal_and_refreshes_projections() {
+    let config = goal_custom_route_config();
+    let engine_config = EngineConfig {
+        model: "local-model".to_string(),
+        snapshots_enabled: false,
+        terminal_chrome_enabled: false,
+        goal_objective: Some("keep going across route drift".to_string()),
+        ..EngineConfig::default()
+    };
+    let (mut engine, handle) = Engine::new(engine_config, &config);
+    let goal_state = engine.config.goal_state.clone();
+    engine.authoritative_route_config = Some(Arc::new(parking_lot::RwLock::new(
+        without_named_custom_route(config),
+    )));
+    assert!(
+        engine.current_runtime_route().is_err(),
+        "fixture must fail before dispatch"
+    );
+    let run_task = tokio::spawn(engine.run());
+
+    handle
+        .send(Op::ContinueGoal {
+            dynamic_tools: Vec::new(),
+        })
+        .await
+        .expect("queue active continuation");
+    let session = handle
+        .get_session_snapshot()
+        .await
+        .expect("post-route-failure session snapshot");
+
+    let prompt = match session.system_prompt.expect("blocked system prompt") {
+        SystemPrompt::Text(text) => text,
+        SystemPrompt::Blocks(blocks) => blocks
+            .into_iter()
+            .map(|block| block.text)
+            .collect::<Vec<_>>()
+            .join("\n"),
+    };
+    assert!(!prompt.contains("<session_goal>"), "{prompt}");
+    let snapshot = goal_state.lock().expect("goal lock").snapshot();
+    assert_eq!(snapshot.status, "blocked");
+    assert!(
+        snapshot
+            .blocker
+            .as_deref()
+            .is_some_and(|blocker| blocker.contains("provider route is no longer valid")),
+        "{snapshot:?}"
+    );
+
+    let mut saw_route_error = false;
+    let mut saw_blocked_session = false;
+    let mut saw_blocked_goal = false;
+    let mut saw_blocked_status = false;
+    {
+        let mut events = handle.rx_event.write().await;
+        while let Ok(event) = events.try_recv() {
+            match event {
+                Event::TurnStarted { .. } => {
+                    panic!("invalid route must not start a continuation turn")
+                }
+                Event::Error { envelope, .. } => {
+                    assert!(format!("{envelope:?}").contains("provider route is no longer valid"));
+                    saw_route_error = true;
+                }
+                Event::SessionUpdated {
+                    system_prompt: Some(system_prompt),
+                    ..
+                } => {
+                    let prompt = match system_prompt {
+                        SystemPrompt::Text(text) => text,
+                        SystemPrompt::Blocks(blocks) => blocks
+                            .into_iter()
+                            .map(|block| block.text)
+                            .collect::<Vec<_>>()
+                            .join("\n"),
+                    };
+                    assert!(!prompt.contains("<session_goal>"), "{prompt}");
+                    saw_blocked_session = true;
+                }
+                Event::GoalUpdated { snapshot } if snapshot.status == "blocked" => {
+                    saw_blocked_goal = true;
+                }
+                Event::Status { message }
+                    if message.contains("provider route is no longer valid") =>
+                {
+                    assert!(message.contains("resume the goal"), "{message}");
+                    saw_blocked_status = true;
+                }
+                _ => {}
+            }
+        }
+    }
+    assert!(saw_route_error, "route failure must remain visible");
+    assert!(
+        saw_blocked_session,
+        "session prompt projection must refresh"
+    );
+    assert!(saw_blocked_goal, "sidebar must receive blocked state");
+    assert!(saw_blocked_status, "blocked reason must remain visible");
+
+    handle.send(Op::Shutdown).await.expect("shutdown engine");
+    run_task.await.expect("engine task");
+}
+
+#[tokio::test]
+async fn rejected_continuation_dispatch_blocks_goal_after_failed_turn() {
+    let config = goal_custom_route_config();
+    let engine_config = EngineConfig {
+        model: "local-model".to_string(),
+        snapshots_enabled: false,
+        terminal_chrome_enabled: false,
+        goal_objective: Some("keep going after dispatch".to_string()),
+        ..EngineConfig::default()
+    };
+    let (mut engine, handle) = Engine::new(engine_config, &config);
+    let goal_state = engine.config.goal_state.clone();
+    assert!(engine.current_runtime_route().is_ok());
+    // Exercise the continuation caller's `false` boundary deterministically:
+    // the route installs, but the injected-model authority has no client with
+    // which to start the request.
+    engine.model_client_injected = true;
+    engine.model_client = None;
+    let run_task = tokio::spawn(engine.run());
+
+    handle
+        .send(Op::ContinueGoal {
+            dynamic_tools: Vec::new(),
+        })
+        .await
+        .expect("queue rejected continuation");
+    let session = handle
+        .get_session_snapshot()
+        .await
+        .expect("post-rejection session snapshot");
+
+    let prompt = match session.system_prompt.expect("blocked system prompt") {
+        SystemPrompt::Text(text) => text,
+        SystemPrompt::Blocks(blocks) => blocks
+            .into_iter()
+            .map(|block| block.text)
+            .collect::<Vec<_>>()
+            .join("\n"),
+    };
+    assert!(!prompt.contains("<session_goal>"), "{prompt}");
+    let snapshot = goal_state.lock().expect("goal lock").snapshot();
+    assert_eq!(snapshot.status, "blocked");
+    assert!(
+        snapshot
+            .blocker
+            .as_deref()
+            .is_some_and(|blocker| blocker.contains("next model turn could not be started")),
+        "{snapshot:?}"
+    );
+
+    let mut starts = 0;
+    let mut saw_failed_turn = false;
+    let mut saw_dispatch_error = false;
+    let mut saw_blocked_session = false;
+    let mut saw_blocked_goal = false;
+    let mut saw_blocked_status = false;
+    {
+        let mut events = handle.rx_event.write().await;
+        while let Ok(event) = events.try_recv() {
+            match event {
+                Event::TurnStarted { .. } => starts += 1,
+                Event::TurnComplete { status, .. } => {
+                    assert_eq!(status, TurnOutcomeStatus::Failed);
+                    saw_failed_turn = true;
+                }
+                Event::Error { .. } => saw_dispatch_error = true,
+                Event::SessionUpdated {
+                    system_prompt: Some(system_prompt),
+                    ..
+                } => {
+                    let prompt = match system_prompt {
+                        SystemPrompt::Text(text) => text,
+                        SystemPrompt::Blocks(blocks) => blocks
+                            .into_iter()
+                            .map(|block| block.text)
+                            .collect::<Vec<_>>()
+                            .join("\n"),
+                    };
+                    assert!(!prompt.contains("<session_goal>"), "{prompt}");
+                    saw_blocked_session = true;
+                }
+                Event::GoalUpdated { snapshot } if snapshot.status == "blocked" => {
+                    saw_blocked_goal = true;
+                }
+                Event::Status { message }
+                    if message.contains("next model turn could not be started") =>
+                {
+                    assert!(message.contains("resume the goal"), "{message}");
+                    saw_blocked_status = true;
+                }
+                _ => {}
+            }
+        }
+    }
+    assert_eq!(
+        starts, 1,
+        "dispatch reached exactly one engine turn boundary"
+    );
+    assert!(
+        saw_failed_turn,
+        "rejected dispatch must surface a failed turn"
+    );
+    assert!(
+        saw_dispatch_error,
+        "rejected dispatch must surface its error"
+    );
+    assert!(
+        saw_blocked_session,
+        "session prompt projection must refresh"
+    );
+    assert!(saw_blocked_goal, "sidebar must receive blocked state");
+    assert!(saw_blocked_status, "blocked reason must remain visible");
 
     handle.send(Op::Shutdown).await.expect("shutdown engine");
     run_task.await.expect("engine task");
