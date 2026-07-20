@@ -288,12 +288,48 @@ async fn exact_turn_snapshot_restores_custom_endpoint_and_turn_receipt_after_bui
 
 #[tokio::test]
 async fn goal_continuation_preserves_goal_and_resolves_updated_authoritative_route() {
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    let first_server = MockServer::start().await;
+    let second_server = MockServer::start().await;
+    let done_sse = concat!(
+        "data: {\"id\":\"chatcmpl-goal\",\"choices\":[{\"index\":0,",
+        "\"delta\":{\"content\":\"still working\"},\"finish_reason\":null}]}\n\n",
+        "data: {\"id\":\"chatcmpl-goal\",\"choices\":[{\"index\":0,\"delta\":{},",
+        "\"finish_reason\":\"stop\"}]}\n\n",
+        "data: [DONE]\n\n",
+    );
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .insert_header("content-type", "text/event-stream")
+                .set_body_string(done_sse),
+        )
+        .expect(1)
+        .mount(&first_server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .insert_header("content-type", "text/event-stream")
+                .set_delay(Duration::from_millis(150))
+                .set_body_string(done_sse),
+        )
+        .expect(1)
+        .mount(&second_server)
+        .await;
+
+    let first_base_url = format!("{}/v1", first_server.uri());
+    let second_base_url = format!("{}/v1", second_server.uri());
     let mut custom = HashMap::new();
     custom.insert(
         "custom-a".to_string(),
         crate::config::ProviderConfig {
             kind: Some("openai-compatible".to_string()),
-            base_url: Some("http://127.0.0.1:18181/v1".to_string()),
+            base_url: Some(first_base_url.clone()),
             model: Some("local-model".to_string()),
             api_key: Some("local-test-key".to_string()),
             ..crate::config::ProviderConfig::default()
@@ -308,10 +344,11 @@ async fn goal_continuation_preserves_goal_and_resolves_updated_authoritative_rou
         ..Config::default()
     };
     let engine_config = EngineConfig {
-        max_steps: 0,
+        max_steps: 1,
         snapshots_enabled: false,
         terminal_chrome_enabled: false,
         goal_objective: Some("keep going".to_string()),
+        goal_token_budget: Some(50_000),
         ..EngineConfig::default()
     };
     let authoritative = Arc::new(parking_lot::RwLock::new(config.clone()));
@@ -326,7 +363,7 @@ async fn goal_continuation_preserves_goal_and_resolves_updated_authoritative_rou
             route: resolved_route_for_test(&config, "local-model"),
             compaction: Box::new(CompactionConfig::default()),
             goal_objective: Some("keep going".to_string()),
-            goal_token_budget: None,
+            goal_token_budget: Some(50_000),
             goal_status: crate::tools::goal::GoalStatus::Active,
             reasoning_effort: None,
             reasoning_effort_auto: false,
@@ -352,12 +389,14 @@ async fn goal_continuation_preserves_goal_and_resolves_updated_authoritative_rou
         .as_mut()
         .and_then(|providers| providers.custom.get_mut("custom-a"))
         .expect("custom route")
-        .base_url = Some("http://127.0.0.1:18182/v1".to_string());
+        .base_url = Some(second_base_url.clone());
     *authoritative.write() = reloaded;
     let run_task = tokio::spawn(engine.run());
 
     let mut starts = 0;
     let mut completes = 0;
+    let mut awaiting_second_sync = false;
+    let mut verified_synthetic_goal = false;
     while completes < 2 {
         let event = tokio::time::timeout(Duration::from_secs(3), async {
             handle.rx_event.write().await.recv().await
@@ -372,25 +411,68 @@ async fn goal_continuation_preserves_goal_and_resolves_updated_authoritative_rou
                 starts += 1;
                 assert_eq!(route.provider_identity, "custom-a");
                 if starts == 2 {
-                    let snapshot = goal_state.lock().expect("goal lock").snapshot();
-                    assert_eq!(snapshot.objective.as_deref(), Some("keep going"));
-                    assert!(snapshot.is_active(), "synthetic turn must retain the goal");
-                    handle
-                        .send(Op::SetGoalStatus {
-                            status: crate::tools::goal::GoalStatus::Paused,
-                            clear: false,
-                        })
-                        .await
-                        .expect("queue goal pause");
-                    handle.send(Op::Shutdown).await.expect("queue shutdown");
+                    awaiting_second_sync = true;
                 }
+            }
+            Event::SessionUpdated {
+                messages,
+                system_prompt,
+                ..
+            } if awaiting_second_sync => {
+                awaiting_second_sync = false;
+                let snapshot = goal_state.lock().expect("goal lock").snapshot();
+                assert_eq!(snapshot.objective.as_deref(), Some("keep going"));
+                assert_eq!(snapshot.token_budget, Some(50_000));
+                // The first turn records one bounded intra-turn pass, then the
+                // synthetic boundary records the second pass before dispatch.
+                assert_eq!(snapshot.continuation_count, 2);
+                assert!(snapshot.is_active(), "synthetic turn must retain the goal");
+
+                let continuation = messages
+                    .last()
+                    .expect("synthetic continuation message")
+                    .content
+                    .iter()
+                    .find_map(|block| match block {
+                        ContentBlock::Text { text, .. }
+                            if text.contains("## Active Goal State") =>
+                        {
+                            Some(text.as_str())
+                        }
+                        _ => None,
+                    })
+                    .expect("durable goal state in synthetic message");
+                assert!(continuation.contains("\"objective\": \"keep going\""));
+                assert!(continuation.contains("\"token_budget\": 50000"));
+                assert!(continuation.contains("\"continuation_count\": 2"));
+                assert!(continuation.contains("Continuation pass #2."));
+
+                let system_prompt = match system_prompt.expect("synthetic system prompt") {
+                    SystemPrompt::Text(text) => text,
+                    SystemPrompt::Blocks(blocks) => blocks
+                        .into_iter()
+                        .map(|block| block.text)
+                        .collect::<Vec<_>>()
+                        .join("\n"),
+                };
+                assert!(system_prompt.contains("<session_goal>"));
+                assert!(system_prompt.contains("keep going"));
+                verified_synthetic_goal = true;
+
+                handle
+                    .send(Op::SetGoalStatus {
+                        status: crate::tools::goal::GoalStatus::Paused,
+                        clear: false,
+                    })
+                    .await
+                    .expect("queue goal pause");
             }
             Event::TurnComplete { base_url, .. } => {
                 completes += 1;
                 let expected = if completes == 1 {
-                    "http://127.0.0.1:18181/v1"
+                    first_base_url.as_str()
                 } else {
-                    "http://127.0.0.1:18182/v1"
+                    second_base_url.as_str()
                 };
                 assert_eq!(base_url.as_deref(), Some(expected));
             }
@@ -398,6 +480,50 @@ async fn goal_continuation_preserves_goal_and_resolves_updated_authoritative_rou
         }
     }
     assert_eq!(starts, 2);
+    assert!(verified_synthetic_goal);
+
+    // The pause was queued while the second turn was still running. Wait for
+    // that control operation, then put a snapshot receipt behind the already
+    // queued continuation. Receiving the receipt proves the continuation was
+    // consumed; no third TurnStarted may have been emitted.
+    loop {
+        let event = tokio::time::timeout(Duration::from_secs(3), async {
+            handle.rx_event.write().await.recv().await
+        })
+        .await
+        .expect("goal pause event timeout")
+        .expect("goal pause event");
+        if matches!(event, Event::Status { ref message } if message == "Goal paused.") {
+            break;
+        }
+        assert!(
+            !matches!(event, Event::TurnStarted { .. }),
+            "queued pause must prevent an additional goal turn"
+        );
+    }
+
+    let (snapshot_tx, snapshot_rx) = tokio::sync::oneshot::channel();
+    handle
+        .send(Op::GetSessionSnapshot {
+            tx: std::sync::Arc::new(std::sync::Mutex::new(Some(snapshot_tx))),
+        })
+        .await
+        .expect("queue post-continuation receipt");
+    tokio::time::timeout(Duration::from_secs(3), snapshot_rx)
+        .await
+        .expect("post-continuation receipt timeout")
+        .expect("post-continuation receipt");
+    {
+        let mut events = handle.rx_event.write().await;
+        while let Ok(event) = events.try_recv() {
+            assert!(
+                !matches!(event, Event::TurnStarted { .. }),
+                "paused goal continuation started a stale turn"
+            );
+        }
+    }
+
+    handle.send(Op::Shutdown).await.expect("queue shutdown");
     run_task.await.expect("engine task");
 }
 
