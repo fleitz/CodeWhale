@@ -769,19 +769,93 @@ impl Settings {
         }
 
         let serialized = toml::to_string_pretty(self).context("Failed to serialize settings")?;
-        let body = if path.exists() {
-            let raw = std::fs::read_to_string(&path)
-                .with_context(|| format!("Failed to read settings at {}", path.display()))?;
-            codewhale_config::merge_and_preserve_comments(&serialized, &raw).unwrap_or_else(|e| {
-                tracing::warn!("failed to merge settings comments, saving without them: {e:#}");
-                serialized
-            })
+        let original = if path.exists() {
+            Some(
+                std::fs::read_to_string(&path)
+                    .with_context(|| format!("Failed to read settings at {}", path.display()))?,
+            )
         } else {
-            serialized
+            None
         };
-        std::fs::write(&path, body)
+        let body = original.as_deref().map_or_else(
+            || serialized.clone(),
+            |raw| {
+                codewhale_config::merge_and_preserve_comments(&serialized, raw).unwrap_or_else(
+                    |e| {
+                        tracing::warn!(
+                            "failed to merge settings comments, saving without them: {e:#}"
+                        );
+                        serialized.clone()
+                    },
+                )
+            },
+        );
+        // A full typed snapshot is inherently stale-able. Coordinate it with
+        // every narrow settings mutation and replace it only if the bytes we
+        // merged are still current. The shared adjacent lock plus atomic
+        // rename prevents both lost concurrent authority changes and a
+        // crash-truncated settings.toml.
+        codewhale_config::replace_config_document_if_unchanged(&path, original.as_deref(), &body)
             .with_context(|| format!("Failed to write settings to {}", path.display()))?;
         Ok(())
+    }
+
+    /// Persist the user-visible startup mode as a narrow, serialized delta.
+    ///
+    /// Mode and permission posture are authority-bearing settings. They must
+    /// never use a load/modify/whole-file-save sequence: two Codewhale
+    /// processes doing that could silently overwrite each other's newer
+    /// choice. `mutate_config_document` acquires the same adjacent lock used
+    /// by full snapshot CAS writes, re-reads after locking, and renames the
+    /// result atomically.
+    pub(crate) fn persist_default_mode(value: &str) -> Result<()> {
+        let normalized = match value.trim().to_ascii_lowercase().as_str() {
+            "agent" | "act" | "normal" => "agent",
+            "plan" => "plan",
+            "operate" | "operation" | "ops" => "operate",
+            _ => anyhow::bail!(
+                "Failed to update setting: invalid mode '{value}'. Expected: act, plan, or operate."
+            ),
+        };
+        Self::mutate_authority_setting("default_mode", Some(normalized))
+    }
+
+    /// Persist (or roll back) the independent TUI permission posture as one
+    /// narrow, serialized delta.
+    pub(crate) fn persist_permission_posture(value: Option<&str>) -> Result<()> {
+        let normalized = match value {
+            Some(value) => Some(normalize_permission_posture(value).ok_or_else(|| {
+                anyhow::anyhow!(
+                    "Failed to update setting: invalid permission posture '{value}'. Expected: ask, auto-review, or full-access."
+                )
+            })?),
+            None => None,
+        };
+        Self::mutate_authority_setting("permission_posture", normalized.as_deref())
+    }
+
+    fn mutate_authority_setting(key: &str, value: Option<&str>) -> Result<()> {
+        // Preserve the existing legacy-file migration contract before the
+        // canonical file is mutated. Once present, all writers coordinate on
+        // the canonical adjacent lock.
+        let _ = Self::load_persisted()?;
+        let path = Self::path()?;
+        Self::mutate_authority_setting_at(&path, key, value)
+    }
+
+    fn mutate_authority_setting_at(path: &Path, key: &str, value: Option<&str>) -> Result<()> {
+        codewhale_config::mutate_config_document(path, |doc| {
+            match value {
+                Some(value) => {
+                    codewhale_config::set_config_document_value(doc, &[key], value)?;
+                }
+                None => {
+                    codewhale_config::unset_config_document_value(doc, &[key])?;
+                }
+            }
+            Ok(())
+        })
+        .with_context(|| format!("Failed to persist {key} in {}", path.display()))
     }
 
     /// Update and persist sidebar width percentage (10-50) — used by the
@@ -3115,6 +3189,68 @@ mod tests {
                 .set("default_mode", removed)
                 .expect_err("permission aliases must not become saved startup modes");
             assert!(err.to_string().contains("act, plan, or operate"), "{err}");
+        }
+    }
+
+    #[test]
+    fn authority_settings_mutations_are_serialized_atomic_and_parseable() {
+        let _g = config_path_test_guard();
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let codewhale_home = tmp.path().join(".codewhale");
+        let _config_override = EnvVarRestore::remove("DEEPSEEK_CONFIG_PATH");
+        let _codewhale_home = EnvVarRestore::set("CODEWHALE_HOME", &codewhale_home);
+        let _home = EnvVarRestore::set("HOME", tmp.path());
+
+        Settings::persist_default_mode("act").expect("seed mode");
+        Settings::persist_permission_posture(Some("ask")).expect("seed posture");
+
+        let settings_path = codewhale_home.join("settings.toml");
+        let mode_path = settings_path.clone();
+        let mode_writer = std::thread::spawn(move || {
+            for mode in ["plan", "operate", "agent"].into_iter().cycle().take(90) {
+                Settings::mutate_authority_setting_at(&mode_path, "default_mode", Some(mode))
+                    .expect("atomic mode mutation");
+            }
+        });
+        let posture_path = settings_path.clone();
+        let posture_writer = std::thread::spawn(move || {
+            for posture in ["ask", "auto-review", "full-access"]
+                .into_iter()
+                .cycle()
+                .take(90)
+            {
+                Settings::mutate_authority_setting_at(
+                    &posture_path,
+                    "permission_posture",
+                    Some(posture),
+                )
+                .expect("atomic posture mutation");
+            }
+        });
+        let reader = std::thread::spawn(move || {
+            for _ in 0..180 {
+                let body = std::fs::read_to_string(&settings_path).expect("atomic file visible");
+                toml::from_str::<toml::Value>(&body)
+                    .unwrap_or_else(|error| panic!("reader observed torn TOML: {error}: {body}"));
+            }
+        });
+
+        mode_writer.join().expect("mode writer");
+        posture_writer.join().expect("posture writer");
+        reader.join().expect("concurrent reader");
+
+        let loaded = Settings::load_persisted().expect("final settings parse");
+        assert_eq!(loaded.default_mode, "agent");
+        assert_eq!(loaded.permission_posture.as_deref(), Some("full-access"));
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(codewhale_home.join("settings.toml"))
+                .expect("settings metadata")
+                .permissions()
+                .mode()
+                & 0o777;
+            assert_eq!(mode, 0o600, "authority settings must remain owner-only");
         }
     }
 

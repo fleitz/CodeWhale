@@ -309,6 +309,53 @@ mod tests {
     }
 
     #[test]
+    fn child_review_hold_is_selectable_from_parent_work() {
+        let mut app = app();
+        app.current_session_id = Some(SESSION.to_string());
+        app.subagent_cache
+            .push(crate::tools::subagent::SubAgentResult {
+                name: "Verifier".to_string(),
+                agent_id: "agent-needs-review".to_string(),
+                context_mode: "fresh".to_string(),
+                fork_context: false,
+                workspace: None,
+                git_branch: None,
+                agent_type: crate::tools::subagent::SubAgentType::General,
+                assignment: crate::tools::subagent::SubAgentAssignment {
+                    objective: "verify release".to_string(),
+                    role: Some("verifier".to_string()),
+                },
+                model: String::new(),
+                nickname: None,
+                status: crate::tools::subagent::SubAgentStatus::Interrupted(
+                    "waiting for parent input".to_string(),
+                ),
+                worker_status: Some(crate::tools::subagent::AgentWorkerStatus::WaitingForUser),
+                parent_run_id: None,
+                spawn_depth: 1,
+                result: None,
+                steps_taken: 2,
+                checkpoint: None,
+                needs_input: Some(crate::tools::subagent::SubAgentNeedsInput {
+                    question: "Review gh pr merge 4609 before continuing".to_string(),
+                }),
+                duration_ms: 10,
+                from_prior_session: false,
+            });
+
+        let rows = super::model::project(&mut app);
+
+        assert_eq!(rows[0].label, "Work · 1 needs input");
+        assert_eq!(rows[1].label, "Review gh pr merge 4609 before continuing");
+        assert!(matches!(
+            rows[1].primary_action.as_ref(),
+            Some(SidebarRowAction::OpenAgentDetail { agent_id })
+                if agent_id == "agent-needs-review"
+        ));
+        assert!(app.view_stack.is_empty());
+    }
+
+    #[test]
     fn missing_runtime_renders_disconnected_state() {
         let mut app = app();
         app.current_session_id = Some(SESSION.to_string());

@@ -97,6 +97,10 @@ impl UserInputView {
         }
     }
 
+    pub(crate) fn request_id(&self) -> &str {
+        &self.tool_id
+    }
+
     fn current_question(&self) -> &UserInputQuestion {
         &self.request.questions[self.question_index]
     }

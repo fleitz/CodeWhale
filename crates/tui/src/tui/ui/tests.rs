@@ -2977,7 +2977,7 @@ fn forced_approval_prompt_bypasses_session_approval_shortcut() {
 fn auto_review_queues_forced_requests_while_full_access_fails_closed() {
     let mut app = create_test_app();
     app.approval_mode = ApprovalMode::Auto;
-    assert!(should_auto_approve_approval_request(
+    assert!(!should_auto_approve_approval_request(
         &app,
         "exec_shell",
         "shell:exec_shell:cargo test",
@@ -3109,6 +3109,49 @@ fn exceptional_auto_review_request_is_queued_without_opening_view() {
         app.status_message.as_deref(),
         Some("Needs input in Work: review mcp_vendor_mutate_account to continue")
     );
+    assert_eq!(
+        app.active_approval_request_id.as_deref(),
+        Some("approval-queued")
+    );
+}
+
+#[test]
+fn request_completion_dismisses_exact_open_approval_and_question_views() {
+    let mut app = create_test_app();
+    queue_approval_request_in_work(
+        &mut app,
+        "approval-finished",
+        "exec_shell",
+        "Run command",
+        &serde_json::json!({"command": "cargo test"}),
+        "approval-key",
+        None,
+    );
+    let approval = app.pending_work_approval.clone().expect("approval");
+    app.view_stack.push(ApprovalView::new(approval));
+    invalidate_pending_request(&mut app, "approval-finished");
+    assert!(app.pending_work_approval.is_none());
+    assert!(app.active_approval_request_id.is_none());
+    assert!(app.view_stack.is_empty());
+
+    let question = crate::tools::user_input::UserInputRequest::from_value(&serde_json::json!({
+        "questions": [{
+            "header": "Choice",
+            "id": "choice",
+            "question": "Continue?",
+            "options": [
+                {"label": "Yes", "description": "Continue"},
+                {"label": "No", "description": "Stop"}
+            ]
+        }]
+    }))
+    .expect("question");
+    app.pending_user_input_prompt = Some(("question-finished".to_string(), question.clone()));
+    app.view_stack
+        .push(UserInputView::new("question-finished", question));
+    invalidate_pending_request(&mut app, "question-finished");
+    assert!(app.pending_user_input_prompt.is_none());
+    assert!(app.view_stack.is_empty());
 }
 
 fn create_test_options() -> TuiOptions {
@@ -4593,6 +4636,36 @@ async fn deliberate_operate_selection_becomes_the_restart_default() {
             ..
         })
     ));
+}
+
+#[tokio::test]
+async fn deliberate_modes_survive_restart_under_every_permission_posture() {
+    let _home = SettingsHomeGuard::new();
+    for (posture, posture_setting, mode) in [
+        (ApprovalMode::Suggest, "ask", AppMode::Plan),
+        (ApprovalMode::Auto, "auto-review", AppMode::Operate),
+        (ApprovalMode::Bypass, "full-access", AppMode::Agent),
+    ] {
+        Settings::persist_permission_posture(Some(posture_setting)).expect("persist posture");
+        let mut app = create_test_app();
+        app.set_agent_approval_posture(posture);
+        if app.mode == mode {
+            let _ = app.set_mode(AppMode::Operate);
+        }
+        let mut engine = crate::core::engine::mock_engine_handle();
+
+        assert!(apply_mode_update(&mut app, &engine.handle, mode, true).await);
+        let _ = engine.rx_op.recv().await;
+
+        let saved = Settings::load_persisted().expect("saved settings");
+        assert_eq!(AppMode::from_setting(&saved.default_mode), mode);
+        assert_eq!(saved.permission_posture.as_deref(), Some(posture_setting));
+        let mut restart_options = create_test_options();
+        restart_options.start_in_agent_mode = false;
+        let restarted = App::new(restart_options, &Config::default());
+        assert_eq!(restarted.mode, mode, "{posture:?}");
+        assert_eq!(restarted.approval_mode, posture, "{mode:?}");
+    }
 }
 
 #[tokio::test]
@@ -9034,6 +9107,46 @@ fn local_cancel_marks_late_stream_events_for_suppression() {
             message: "Request cancelled".to_string(),
         }
     ));
+}
+
+#[test]
+fn local_cancel_clears_pending_decisions_and_their_views() {
+    let _retry_guard = crate::retry_status::test_guard();
+    let mut app = create_test_app();
+    app.is_loading = true;
+    queue_approval_request_in_work(
+        &mut app,
+        "approval-cancelled",
+        "exec_shell",
+        "Run command",
+        &serde_json::json!({"command": "cargo test"}),
+        "approval-key",
+        None,
+    );
+    let approval = app.pending_work_approval.clone().expect("approval");
+    app.view_stack.push(ApprovalView::new(approval));
+    let question = crate::tools::user_input::UserInputRequest::from_value(&serde_json::json!({
+        "questions": [{
+            "header": "Choice",
+            "id": "choice",
+            "question": "Continue?",
+            "options": [
+                {"label": "Yes", "description": "Continue"},
+                {"label": "No", "description": "Stop"}
+            ]
+        }]
+    }))
+    .expect("question");
+    app.pending_user_input_prompt = Some(("question-cancelled".to_string(), question.clone()));
+    app.view_stack
+        .push(UserInputView::new("question-cancelled", question));
+
+    mark_active_turn_cancelled_locally(&mut app);
+
+    assert!(app.pending_work_approval.is_none());
+    assert!(app.pending_user_input_prompt.is_none());
+    assert!(app.active_approval_request_id.is_none());
+    assert!(app.view_stack.is_empty());
 }
 
 #[test]

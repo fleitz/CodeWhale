@@ -1487,23 +1487,21 @@ pub fn set_config_value(app: &mut App, key: &str, value: &str, persist: bool) ->
                 ));
             }
 
-            let mut settings = match Settings::load_persisted() {
-                Ok(settings) => settings,
+            let previous = match Settings::load_persisted() {
+                Ok(settings) => settings.permission_posture,
                 Err(err) => {
                     return CommandResult::error(format!(
                         "Failed to load saved permission posture: {err}"
                     ));
                 }
             };
-            let previous = settings.permission_posture.clone();
             let saved = match mode {
                 ApprovalMode::Suggest => "ask",
                 ApprovalMode::Auto => "auto-review",
                 ApprovalMode::Bypass => "full-access",
                 ApprovalMode::Never => unreachable!("Never rejected above"),
             };
-            settings.permission_posture = Some(saved.to_string());
-            if let Err(err) = settings.save() {
+            if let Err(err) = Settings::persist_permission_posture(Some(saved)) {
                 return CommandResult::error(format!("Failed to save permission posture: {err}"));
             }
 
@@ -1511,8 +1509,7 @@ pub fn set_config_value(app: &mut App, key: &str, value: &str, persist: bool) ->
                 && let Err(err) =
                     persist_unset_root_key(app.config_path.as_deref(), "approval_policy")
             {
-                settings.permission_posture = previous;
-                let rollback = settings.save().err();
+                let rollback = Settings::persist_permission_posture(previous.as_deref()).err();
                 let rollback_note = rollback
                     .map(|rollback| format!("; settings rollback also failed: {rollback}"))
                     .unwrap_or_default();
@@ -2112,7 +2109,12 @@ pub fn set_config_value(app: &mut App, key: &str, value: &str, persist: bool) ->
     };
 
     let mut message = if persist {
-        if let Err(e) = settings.save() {
+        let save_result = if matches!(key.as_str(), "default_mode" | "mode") {
+            Settings::persist_default_mode(&settings.default_mode)
+        } else {
+            settings.save()
+        };
+        if let Err(e) = save_result {
             return CommandResult::error(format!("Failed to save: {e}"));
         }
         format!("{key} = {display_value} (saved)")

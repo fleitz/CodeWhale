@@ -9378,6 +9378,13 @@ enum ExecStreamEvent {
         reason: String,
         outcome: String,
     },
+    #[serde(rename = "user_input_required")]
+    UserInputRequired {
+        tool_id: String,
+        question_count: usize,
+        outcome: String,
+        reason: String,
+    },
     #[serde(rename = "workflow_event")]
     WorkflowEvent {
         run_id: String,
@@ -9416,6 +9423,49 @@ fn exec_stream_value(event: &ExecStreamEvent) -> Result<serde_json::Value> {
         );
     }
     Ok(value)
+}
+
+fn exec_user_input_hold_receipt(
+    tool_id: &str,
+    request: &crate::tools::user_input::UserInputRequest,
+) -> ExecStreamEvent {
+    // Never copy question/option text into this control-plane receipt. It is
+    // deliberately suitable for shared Prime/CI verifier logs without
+    // leaking model-supplied or workspace-derived prompt content.
+    ExecStreamEvent::UserInputRequired {
+        tool_id: tool_id.to_string(),
+        question_count: request.questions.len(),
+        outcome: "approval_required".to_string(),
+        reason: "headless exec cannot answer interactive questions; rerun interactively"
+            .to_string(),
+    }
+}
+
+fn exec_user_input_hold_text(
+    tool_id: &str,
+    request: &crate::tools::user_input::UserInputRequest,
+) -> String {
+    format!(
+        "user input required ({tool_id}, {} question(s)): headless exec cannot answer interactive questions; rerun interactively",
+        request.questions.len()
+    )
+}
+
+fn exec_user_input_hold_stream_events(
+    tool_id: &str,
+    request: &crate::tools::user_input::UserInputRequest,
+    metadata: ExecStreamMeta,
+) -> [ExecStreamEvent; 4] {
+    let reason =
+        "headless exec cannot answer interactive questions; rerun interactively".to_string();
+    [
+        exec_user_input_hold_receipt(tool_id, request),
+        ExecStreamEvent::Error { error: reason },
+        ExecStreamEvent::Metadata {
+            meta: Box::new(metadata),
+        },
+        ExecStreamEvent::Done,
+    ]
 }
 
 fn tool_error_receipt_category(error: &crate::tools::spec::ToolError) -> &'static str {
@@ -9837,6 +9887,18 @@ async fn build_direct_workflow_tool(
         Some(event_tx),
         manager.clone(),
     )
+    .with_approval_policy(
+        if yolo {
+            crate::tui::approval::ApprovalMode::Bypass
+        } else {
+            config
+                .approval_policy
+                .as_deref()
+                .and_then(crate::tui::approval::ApprovalMode::from_config_value)
+                .unwrap_or_default()
+        },
+        config.auto_review_policy(),
+    )
     .with_locale_tag(
         crate::localization::resolve_locale(
             &crate::settings::Settings::load_persisted()
@@ -10159,6 +10221,39 @@ struct ExecSummary {
     termination_reason: Option<String>,
     error_category: Option<String>,
     error: Option<String>,
+}
+
+fn mark_exec_user_input_required(summary: &mut ExecSummary) {
+    let reason =
+        "headless exec cannot answer interactive questions; rerun interactively".to_string();
+    summary.outcomes.push(ExecOutcome {
+        kind: "user_input_required".to_string(),
+        outcome: "approval_required".to_string(),
+        tool_name: "request_user_input".to_string(),
+        reason: reason.clone(),
+    });
+    summary.status = Some("blocked".to_string());
+    summary.termination_reason = Some("approval_required".to_string());
+    summary.error_category = Some("user_input_required".to_string());
+    summary.error = Some(reason);
+}
+
+fn validate_exec_summary_exit(summary: &ExecSummary) -> Result<()> {
+    if let Some(error) = summary.error.as_ref()
+        && !error.trim().is_empty()
+    {
+        bail!("exec turn failed: {error}");
+    }
+
+    if matches!(
+        summary.status.as_deref(),
+        Some("failed" | "canceled" | "interrupted" | "blocked")
+    ) {
+        let status = summary.status.as_deref().unwrap_or("unknown");
+        bail!("exec turn ended with status {status}");
+    }
+
+    Ok(())
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -10649,6 +10744,67 @@ async fn run_exec_agent(
                     let _ = engine_handle.deny_tool_call(id).await;
                 }
             }
+            Event::UserInputRequired { id, request } => {
+                mark_exec_user_input_required(&mut summary);
+
+                if output_format == ExecOutputFormat::StreamJson {
+                    let terminal_metadata = ExecStreamMeta {
+                        receipt_kind: "terminal",
+                        provider: effective_provider_kind.clone(),
+                        provider_id: effective_stream_provider_id.clone(),
+                        model: latest_model.clone(),
+                        route_source: route_source.clone(),
+                        input_tokens: None,
+                        output_tokens: None,
+                        prompt_cache_hit_tokens: None,
+                        prompt_cache_miss_tokens: None,
+                        prompt_cache_write_tokens: None,
+                        reasoning_tokens: None,
+                        duration_ms: u64::try_from(exec_started.elapsed().as_millis())
+                            .unwrap_or(u64::MAX),
+                        retry_count: None,
+                        approval_posture: approval_posture.clone(),
+                        sandbox_posture: sandbox_posture.clone(),
+                        binary_sha256: binary_sha256.clone(),
+                        config_sha256: None,
+                        prompt_sha256: prompt_sha256.clone(),
+                        tool_catalog_sha256: None,
+                        input_analysis: exec_stream_input_analysis(
+                            &latest_messages,
+                            latest_system_prompt.as_ref(),
+                        ),
+                        visible_final_answer_chars: summary.output.chars().count(),
+                        session_id: latest_session_id
+                            .as_deref()
+                            .map(exec_stream_session_ref)
+                            .unwrap_or_default(),
+                        resume_command: latest_session_id
+                            .as_deref()
+                            .map(exec_stream_resume_hint)
+                            .unwrap_or_default(),
+                        workspace: latest_workspace.display().to_string(),
+                        message_count: latest_messages.len(),
+                        status: summary.status.clone(),
+                        termination_reason: summary.termination_reason.clone(),
+                        error_category: summary.error_category.clone(),
+                    };
+                    for event in
+                        exec_user_input_hold_stream_events(&id, &request, terminal_metadata)
+                    {
+                        emit_exec_stream_event(&event)?;
+                    }
+                } else if !json_output {
+                    eprintln!("{}", exec_user_input_hold_text(&id, &request));
+                }
+
+                // Release the exact waiter first, then cancel and shut down the
+                // turn. Do not leave headless exec parked on the interactive
+                // engine's 300-second question timeout.
+                let _ = engine_handle.cancel_user_input(id).await;
+                engine_handle.cancel();
+                let _ = engine_handle.send(Op::Shutdown).await;
+                break;
+            }
             Event::ElevationRequired {
                 tool_id,
                 tool_name,
@@ -10851,21 +11007,7 @@ async fn run_exec_agent(
         println!("{}", serde_json::to_string_pretty(&summary)?);
     }
 
-    if let Some(error) = summary.error.as_ref()
-        && !error.trim().is_empty()
-    {
-        bail!("exec turn failed: {error}");
-    }
-
-    if matches!(
-        summary.status.as_deref(),
-        Some("failed" | "canceled" | "interrupted")
-    ) {
-        let status = summary.status.as_deref().unwrap_or("unknown");
-        bail!("exec turn ended with status {status}");
-    }
-
-    Ok(())
+    validate_exec_summary_exit(&summary)
 }
 
 #[cfg(test)]
@@ -14043,6 +14185,104 @@ mod terminal_mode_tests {
         assert_eq!(parsed["schema_version"], 1);
         assert_eq!(parsed["duration_ms"], 1000);
         assert_eq!(parsed["side_effect_status"], "not_started");
+    }
+
+    #[test]
+    fn prime_verifier_user_input_hold_receipt_is_provider_free_and_non_secret() {
+        let request = crate::tools::user_input::UserInputRequest {
+            questions: vec![crate::tools::user_input::UserInputQuestion {
+                header: "Secret header".to_string(),
+                id: "credential-choice".to_string(),
+                question: "Should I use super-secret-token?".to_string(),
+                options: vec![
+                    crate::tools::user_input::UserInputOption {
+                        label: "Yes".to_string(),
+                        description: "Use the secret".to_string(),
+                    },
+                    crate::tools::user_input::UserInputOption {
+                        label: "No".to_string(),
+                        description: "Do not use it".to_string(),
+                    },
+                ],
+                allow_free_text: false,
+                multi_select: false,
+            }],
+        };
+
+        let mut summary = ExecSummary::default();
+        mark_exec_user_input_required(&mut summary);
+        let metadata = ExecStreamMeta {
+            receipt_kind: "terminal",
+            provider: "fixture".to_string(),
+            provider_id: None,
+            model: "fixture-model".to_string(),
+            route_source: "provider_free_fixture".to_string(),
+            input_tokens: None,
+            output_tokens: None,
+            prompt_cache_hit_tokens: None,
+            prompt_cache_miss_tokens: None,
+            prompt_cache_write_tokens: None,
+            reasoning_tokens: None,
+            duration_ms: 7,
+            retry_count: None,
+            approval_posture: "auto-review".to_string(),
+            sandbox_posture: "workspace-write".to_string(),
+            binary_sha256: Some("sha256:fixture".to_string()),
+            config_sha256: None,
+            prompt_sha256: "sha256:prompt".to_string(),
+            tool_catalog_sha256: None,
+            input_analysis: ExecStreamInputAnalysis::default(),
+            visible_final_answer_chars: 0,
+            session_id: String::new(),
+            resume_command: String::new(),
+            workspace: "/tmp/provider-free-fixture".to_string(),
+            message_count: 1,
+            status: summary.status.clone(),
+            termination_reason: summary.termination_reason.clone(),
+            error_category: summary.error_category.clone(),
+        };
+        let events = exec_user_input_hold_stream_events("call_7", &request, metadata);
+        let values = events
+            .iter()
+            .map(exec_stream_value)
+            .collect::<Result<Vec<_>>>()
+            .expect("provider-free stream serializes");
+        let event_types = values
+            .iter()
+            .map(|value| value["type"].as_str().expect("typed event"))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            event_types,
+            ["user_input_required", "error", "metadata", "done"],
+            "terminal metadata must be immediately before the sole Done"
+        );
+        assert_eq!(
+            event_types.iter().filter(|kind| **kind == "done").count(),
+            1
+        );
+        assert_eq!(values[0]["tool_id"], "call_7");
+        assert_eq!(values[0]["question_count"], 1);
+        assert_eq!(values[0]["outcome"], "approval_required");
+        assert_eq!(values[0]["schema"], "codewhale.exec-stream");
+        assert_eq!(values[2]["meta"]["status"], "blocked");
+        assert_eq!(values[2]["meta"]["termination_reason"], "approval_required");
+        assert_eq!(values[2]["meta"]["error_category"], "user_input_required");
+
+        let encoded = serde_json::to_string(&values).expect("stream is valid json");
+        let text = exec_user_input_hold_text("call_7", &request);
+        for secret in [
+            "super-secret-token",
+            "Secret header",
+            "credential-choice",
+            "Use the secret",
+        ] {
+            assert!(!encoded.contains(secret), "stream leaked {secret}");
+            assert!(!text.contains(secret), "text receipt leaked {secret}");
+        }
+        assert!(text.contains("user input required (call_7, 1 question(s))"));
+        let exit_error = validate_exec_summary_exit(&summary)
+            .expect_err("interactive question must produce a nonzero exec result");
+        assert!(exit_error.to_string().contains("exec turn failed"));
     }
 
     #[test]

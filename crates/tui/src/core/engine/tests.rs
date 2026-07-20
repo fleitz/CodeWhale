@@ -3700,7 +3700,7 @@ fn auto_review_routes_publish_to_deliberate_work_review() {
 }
 
 #[test]
-fn auto_review_policy_does_not_force_prompt_for_shell_git_tag_list_probe() {
+fn auto_review_preserves_command_safety_for_chained_shell_probe() {
     let (decision, audit) = auto_review_plan_decision(
         &crate::tui::auto_review::AutoReviewPolicy::default(),
         "exec_shell",
@@ -3712,9 +3712,60 @@ fn auto_review_policy_does_not_force_prompt_for_shell_git_tag_list_probe() {
         false,
     );
 
-    assert_eq!(decision, AutoReviewPlanDecision::AutoApprove);
-    assert_eq!(audit["decision"], "allow");
+    assert_eq!(
+        decision,
+        AutoReviewPlanDecision::ForcePrompt(
+            "shell command safety requires deliberate approval".to_string()
+        )
+    );
+    assert_eq!(audit["decision"], "ask_user");
     assert_eq!(audit["action_kind"], "shell");
+}
+
+#[test]
+fn auto_review_keeps_external_mutations_in_needs_input() {
+    for command in [
+        "gh pr merge 4609 --merge",
+        "kubectl apply -f deployment.yaml",
+        "terraform apply -auto-approve",
+        "unknown-deployer mutate production",
+    ] {
+        let (decision, audit) = auto_review_plan_decision(
+            &crate::tui::auto_review::AutoReviewPolicy::default(),
+            "exec_shell",
+            &json!({"command": command}),
+            crate::tui::auto_review::RunOrigin::Interactive,
+            crate::tui::approval::ApprovalMode::Auto,
+            Some("make an external change"),
+            true,
+            false,
+        );
+
+        assert!(
+            matches!(decision, AutoReviewPlanDecision::ForcePrompt(_)),
+            "{command} must remain a visible review hold"
+        );
+        assert_eq!(audit["decision"], "ask_user", "{command}");
+    }
+}
+
+#[test]
+fn auto_review_auto_runs_routine_reversible_shell_work() {
+    for command in ["cargo test -p codewhale-tui", "git commit --dry-run"] {
+        let (decision, audit) = auto_review_plan_decision(
+            &crate::tui::auto_review::AutoReviewPolicy::default(),
+            "exec_shell",
+            &json!({"command": command}),
+            crate::tui::auto_review::RunOrigin::Interactive,
+            crate::tui::approval::ApprovalMode::Auto,
+            Some("verify local work"),
+            true,
+            false,
+        );
+
+        assert_eq!(decision, AutoReviewPlanDecision::AutoApprove, "{command}");
+        assert_eq!(audit["decision"], "allow", "{command}");
+    }
 }
 
 #[test]

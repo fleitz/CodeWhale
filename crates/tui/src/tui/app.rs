@@ -2245,6 +2245,11 @@ pub struct App {
     pub hooks: HookExecutor,
     #[allow(dead_code)]
     pub yolo: bool,
+    /// True only when the current authority came from the legacy YOLO
+    /// compatibility entry point. Deliberately selecting Full Access also
+    /// makes `yolo` true for runtime compatibility, but must not suppress
+    /// persistence of the independently selected Plan/Act/Operate mode.
+    pub(crate) legacy_yolo_compat_active: bool,
     /// One-shot YOLO→Act+Bypass migration notice for this session (#0.8.68 M6).
     yolo_compat_notified: bool,
     /// One-shot Shift+Tab/Ctrl+T rebinding notice for this session (#0.8.68 M3).
@@ -2280,6 +2285,10 @@ pub struct App {
     /// settled automatically; this keeps elevated review discoverable without
     /// throwing an unsolicited modal over the transcript.
     pub pending_work_approval: Option<crate::tui::approval::ApprovalRequest>,
+    /// Request currently represented by an approval view or Work row. The ID
+    /// makes completion/cancellation invalidation exact and lets stale modal
+    /// events fail closed instead of appearing accepted.
+    pub(crate) active_approval_request_id: Option<String>,
     /// Last `request_user_input` prompt, retained so a failed modal submit can reopen (#1198).
     pub pending_user_input_prompt: Option<(String, crate::tools::user_input::UserInputRequest)>,
     /// Esc-Esc backtrack state machine (#133). `Inactive` by default; first
@@ -3450,6 +3459,7 @@ impl App {
             api_key_cursor: 0,
             hooks,
             yolo: yolo_compat,
+            legacy_yolo_compat_active: yolo_compat,
             yolo_compat_notified: false,
             keybinding_migration_notified: false,
             mode_prefs,
@@ -3466,6 +3476,7 @@ impl App {
             },
             view_stack: ViewStack::new(),
             pending_work_approval: None,
+            active_approval_request_id: None,
             pending_user_input_prompt: None,
             backtrack: crate::tui::backtrack::BacktrackState::new(),
             current_session_id: None,
@@ -3714,7 +3725,7 @@ impl App {
         };
         let yolo_compat = requested_mode == AppMode::Yolo;
         let previous_mode = self.mode;
-        if previous_mode == mode && !yolo_compat && !self.yolo {
+        if previous_mode == mode && !yolo_compat && !self.legacy_yolo_compat_active {
             return false;
         }
 
@@ -3729,7 +3740,7 @@ impl App {
         // cross-mode hops (Plan -> YOLO, YOLO -> Plan) do not touch the baseline,
         // so YOLO's elevated authority never bleeds into the restored Agent
         // surface (#3279).
-        if previous_mode.uses_agent_baseline() && !self.yolo {
+        if previous_mode.uses_agent_baseline() && !self.legacy_yolo_compat_active {
             self.mode_prefs = ModeSessionPrefs {
                 agent_allow_shell: self.allow_shell,
                 agent_trust_mode: self.trust_mode,
@@ -3744,6 +3755,7 @@ impl App {
             self.trust_mode = true;
             self.approval_mode = ApprovalMode::Bypass;
             self.yolo = true;
+            self.legacy_yolo_compat_active = true;
             self.notify_yolo_compat_once();
         } else {
             let policy = base_policy_for_mode(mode, &self.mode_prefs);
@@ -3751,6 +3763,7 @@ impl App {
             self.trust_mode = policy.trust_mode;
             self.approval_mode = policy.approval_mode;
             self.yolo = matches!(policy.approval_mode, ApprovalMode::Bypass);
+            self.legacy_yolo_compat_active = false;
         }
 
         if mode != AppMode::Plan {
@@ -3935,8 +3948,8 @@ impl App {
             return false;
         }
 
-        let mut settings = match Settings::load_persisted() {
-            Ok(settings) => settings,
+        let previous = match Settings::load_persisted() {
+            Ok(settings) => settings.permission_posture,
             Err(err) => {
                 self.push_status_toast(
                     format!("Permissions were not changed: could not load TUI settings ({err})"),
@@ -3946,9 +3959,9 @@ impl App {
                 return false;
             }
         };
-        let previous = settings.permission_posture.clone();
-        settings.permission_posture = Some(Self::approval_posture_setting(next).to_string());
-        if let Err(err) = settings.save() {
+        if let Err(err) =
+            Settings::persist_permission_posture(Some(Self::approval_posture_setting(next)))
+        {
             self.push_status_toast(
                 format!("Permissions were not changed: could not save TUI posture ({err})"),
                 StatusToastLevel::Warning,
@@ -3962,8 +3975,7 @@ impl App {
             active_config_path.as_deref(),
             "approval_policy",
         ) {
-            settings.permission_posture = previous;
-            let rollback = settings.save().err();
+            let rollback = Settings::persist_permission_posture(previous.as_deref()).err();
             let rollback_note = rollback
                 .map(|rollback| format!("; settings rollback also failed: {rollback}"))
                 .unwrap_or_default();
@@ -4012,9 +4024,7 @@ impl App {
     }
 
     fn persist_permission_posture(next: ApprovalMode) -> anyhow::Result<()> {
-        let mut settings = Settings::load_persisted()?;
-        settings.permission_posture = Some(Self::approval_posture_setting(next).to_string());
-        settings.save()
+        Settings::persist_permission_posture(Some(Self::approval_posture_setting(next)))
     }
 
     fn finish_approval_posture_change(&mut self, next: ApprovalMode) {
@@ -4067,6 +4077,9 @@ impl App {
     /// Update the durable Act approval choice without changing its saved shell
     /// or trust choices. Plan remains read-only.
     pub fn set_agent_approval_posture(&mut self, next: ApprovalMode) {
+        // A deliberate posture selection exits the legacy compatibility
+        // provenance even when the selected posture is Full Access.
+        self.legacy_yolo_compat_active = false;
         self.set_agent_runtime_baseline(
             self.mode_prefs.agent_allow_shell,
             self.mode_prefs.agent_trust_mode,

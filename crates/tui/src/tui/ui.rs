@@ -323,12 +323,11 @@ fn should_auto_approve_approval_request(
     grouping_key: &str,
     approval_force_prompt: bool,
 ) -> bool {
-    // Fresh Auto-Review decisions are resolved in the engine. This UI backstop
-    // applies the same no-modal contract to an ordinary request emitted just
-    // before a posture change or by a legacy child.
+    // Fresh Auto-Review decisions are resolved in the engine. If an approval
+    // still reaches the UI in Auto-Review it is, by definition, an exception
+    // that belongs in Work; never erase the engine's RequiresApproval result.
     !approval_force_prompt
         && (app_auto_approve_enabled(app)
-            || app_auto_review_enabled(app)
             || is_session_approved_for_tool(app, tool_name, grouping_key))
 }
 
@@ -2747,22 +2746,7 @@ async fn run_event_loop(
                     // pulse; it must not alter transcript or status copy.
                     EngineEvent::ToolCallHeartbeat => {}
                     EngineEvent::ToolCallComplete { id, name, result } => {
-                        if app
-                            .pending_work_approval
-                            .as_ref()
-                            .is_some_and(|request| request.id == id)
-                        {
-                            app.pending_work_approval = None;
-                            app.work_surface.opened = None;
-                        }
-                        if app
-                            .pending_user_input_prompt
-                            .as_ref()
-                            .is_some_and(|(tool_id, _)| tool_id == &id)
-                        {
-                            app.pending_user_input_prompt = None;
-                            app.work_surface.opened = None;
-                        }
+                        invalidate_pending_request(app, &id);
                         if name == "update_plan" {
                             app.plan_tool_used_in_turn = true;
                         }
@@ -8884,14 +8868,10 @@ fn persist_user_selected_mode(app: &mut App) {
     // Legacy YOLO is a transient compatibility shortcut for Act + Full Access,
     // not a fourth startup mode. Permission persistence remains Shift+Tab's
     // responsibility, so never turn a one-off shortcut into durable authority.
-    if app.yolo {
+    if app.legacy_yolo_compat_active {
         return;
     }
-    let result = (|| -> anyhow::Result<()> {
-        let mut settings = Settings::load_persisted()?;
-        settings.set("default_mode", app.mode.as_setting())?;
-        settings.save()
-    })();
+    let result = Settings::persist_default_mode(app.mode.as_setting());
     if let Err(err) = result {
         app.push_status_toast(
             format!("Mode changed for this session, but the startup mode was not saved: {err}"),
@@ -12460,14 +12440,15 @@ async fn handle_view_events(
                 approval_grouping_key,
                 persistent_ask_rules,
             } => {
-                if app
-                    .pending_work_approval
-                    .as_ref()
-                    .is_some_and(|request| request.id == tool_id)
-                {
-                    app.pending_work_approval = None;
-                    app.work_surface.opened = None;
+                if app.active_approval_request_id.as_deref() != Some(tool_id.as_str()) {
+                    app.push_status_toast(
+                        "That approval is no longer waiting; no action was sent".to_string(),
+                        StatusToastLevel::Warning,
+                        Some(6_000),
+                    );
+                    continue;
                 }
+                invalidate_pending_request(app, &tool_id);
                 apply_approval_decision(
                     app,
                     engine_handle,
@@ -12527,6 +12508,18 @@ async fn handle_view_events(
                 }
             }
             ViewEvent::UserInputSubmitted { tool_id, response } => {
+                if !app
+                    .pending_user_input_prompt
+                    .as_ref()
+                    .is_some_and(|(pending_id, _)| pending_id == &tool_id)
+                {
+                    app.push_status_toast(
+                        "That question is no longer waiting; no response was sent".to_string(),
+                        StatusToastLevel::Warning,
+                        Some(6_000),
+                    );
+                    continue;
+                }
                 match engine_handle
                     .submit_user_input(tool_id.clone(), response)
                     .await
@@ -12551,6 +12544,18 @@ async fn handle_view_events(
                 }
             }
             ViewEvent::UserInputCancelled { tool_id } => {
+                if !app
+                    .pending_user_input_prompt
+                    .as_ref()
+                    .is_some_and(|(pending_id, _)| pending_id == &tool_id)
+                {
+                    app.push_status_toast(
+                        "That question is no longer waiting; no cancellation was sent".to_string(),
+                        StatusToastLevel::Warning,
+                        Some(6_000),
+                    );
+                    continue;
+                }
                 let _ = engine_handle.cancel_user_input(tool_id).await;
                 app.pending_user_input_prompt = None;
                 app.work_surface.opened = None;
@@ -13349,6 +13354,7 @@ fn push_approval_request_view(
     approval_key: &str,
     intent_summary: Option<&str>,
 ) {
+    app.active_approval_request_id = Some(id.to_string());
     if tool_name == "apply_patch" {
         maybe_add_patch_preview(app, tool_input);
     }
@@ -13395,6 +13401,7 @@ fn queue_approval_request_in_work(
     approval_key: &str,
     intent_summary: Option<&str>,
 ) {
+    app.active_approval_request_id = Some(id.to_string());
     app.pending_work_approval = Some(build_approval_request(
         app,
         id,
@@ -13684,10 +13691,50 @@ fn mark_active_turn_cancelled_locally(app: &mut App) {
     app.turn_last_activity_at = None;
     app.runtime_turn_id = None;
     app.runtime_turn_status = None;
+    if let Some(request_id) = app.active_approval_request_id.take() {
+        app.view_stack.dismiss_request(&request_id);
+    }
+    if let Some((request_id, _)) = app.pending_user_input_prompt.take() {
+        app.view_stack.dismiss_request(&request_id);
+    }
+    app.pending_work_approval = None;
+    app.work_surface.opened = None;
     app.suppress_stream_events_until_turn_complete = true;
     crate::retry_status::clear();
     crate::tui::notifications::clear_taskbar_progress();
     crate::tui::notifications::stop_title_animation_quietly();
+}
+
+fn invalidate_pending_request(app: &mut App, request_id: &str) {
+    let approval_matches = app.active_approval_request_id.as_deref() == Some(request_id);
+    if approval_matches {
+        app.active_approval_request_id = None;
+    }
+    if app
+        .pending_work_approval
+        .as_ref()
+        .is_some_and(|request| request.id == request_id)
+    {
+        app.pending_work_approval = None;
+    }
+    if app
+        .pending_user_input_prompt
+        .as_ref()
+        .is_some_and(|(tool_id, _)| tool_id == request_id)
+    {
+        app.pending_user_input_prompt = None;
+    }
+    if approval_matches
+        || app
+            .work_surface
+            .opened
+            .as_ref()
+            .is_some_and(|opened| opened.0.ends_with(request_id))
+    {
+        app.work_surface.opened = None;
+    }
+    app.view_stack.dismiss_request(request_id);
+    app.needs_redraw = true;
 }
 
 fn suppress_engine_event_after_local_cancel(event: &EngineEvent) -> bool {

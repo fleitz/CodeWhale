@@ -5539,6 +5539,174 @@ fn child_runtime_increments_depth_and_preserves_auto_approve() {
         auto_child.context.auto_approve,
         "auto-approved parents should still create auto-approved children"
     );
+
+    parent.context.auto_approve = false;
+    parent.approval_mode = ApprovalMode::Auto;
+    parent.auto_review_policy.block_rules.push(
+        crate::tui::auto_review::AutoReviewRule::block("deny-shell", "blocked in parent")
+            .tool_name("exec_shell"),
+    );
+    let auto_review_child = parent.child_runtime();
+    assert_eq!(auto_review_child.approval_mode, ApprovalMode::Auto);
+    assert_eq!(auto_review_child.auto_review_policy.block_rules.len(), 1);
+    assert!(
+        !auto_review_child.context.auto_approve,
+        "Auto-Review policy must propagate without becoming blanket approval"
+    );
+}
+
+#[tokio::test]
+async fn auto_review_general_child_runs_routine_work_and_holds_external_mutation() {
+    let tmp = tempdir().expect("tempdir");
+    let mut runtime = stub_runtime();
+    runtime.context = ToolContext::new(tmp.path().to_path_buf());
+    runtime.context.auto_approve = false;
+    runtime.approval_mode = ApprovalMode::Auto;
+    let registry = SubAgentToolRegistry::new(
+        runtime,
+        SubAgentType::General,
+        None,
+        Arc::new(Mutex::new(TodoList::new())),
+        Arc::new(Mutex::new(PlanState::default())),
+    );
+
+    registry
+        .execute(
+            "agent_test",
+            "write_file",
+            json!({"path": "auto-review.txt", "content": "reviewed"}),
+        )
+        .await
+        .expect("reversible workspace write should run");
+    assert_eq!(
+        std::fs::read_to_string(tmp.path().join("auto-review.txt")).expect("written file"),
+        "reviewed"
+    );
+
+    let hold = registry
+        .execute(
+            "agent_test",
+            "exec_shell",
+            json!({"command": "gh pr merge 4609 --merge"}),
+        )
+        .await
+        .expect_err("external mutation must wait for parent review");
+    assert!(hold.downcast_ref::<SubAgentToolNeedsInput>().is_some());
+    assert!(hold.to_string().contains("Review exec_shell"), "{hold}");
+}
+
+#[tokio::test]
+async fn child_question_bridges_as_needs_input_without_executing_tool() {
+    let mut runtime = stub_runtime();
+    runtime.context.auto_approve = false;
+    runtime.approval_mode = ApprovalMode::Auto;
+    let registry = SubAgentToolRegistry::new(
+        runtime,
+        SubAgentType::General,
+        None,
+        Arc::new(Mutex::new(TodoList::new())),
+        Arc::new(Mutex::new(PlanState::default())),
+    );
+    let hold = registry
+        .execute(
+            "agent_test",
+            "request_user_input",
+            json!({
+                "questions": [{
+                    "header": "Scope",
+                    "id": "scope",
+                    "question": "Which scope should I use?",
+                    "options": [
+                        {"label": "Narrow", "description": "Only this file"},
+                        {"label": "Broad", "description": "Whole module"}
+                    ]
+                }]
+            }),
+        )
+        .await
+        .expect_err("child question must bridge to parent");
+    assert!(hold.downcast_ref::<SubAgentToolNeedsInput>().is_some());
+    assert_eq!(hold.to_string(), "Which scope should I use?");
+}
+
+#[tokio::test]
+async fn inherited_auto_review_explicit_block_fails_closed() {
+    let mut runtime = stub_runtime();
+    runtime.context.auto_approve = false;
+    runtime.approval_mode = ApprovalMode::Auto;
+    runtime.auto_review_policy.block_rules.push(
+        crate::tui::auto_review::AutoReviewRule::block("deny-shell", "operator deny")
+            .tool_name("exec_shell"),
+    );
+    let registry = SubAgentToolRegistry::new(
+        runtime,
+        SubAgentType::General,
+        None,
+        Arc::new(Mutex::new(TodoList::new())),
+        Arc::new(Mutex::new(PlanState::default())),
+    );
+    let blocked = registry
+        .execute(
+            "agent_test",
+            "exec_shell",
+            json!({"command": "echo should-not-run"}),
+        )
+        .await
+        .expect_err("explicit block must fail closed");
+    assert!(blocked.downcast_ref::<SubAgentToolNeedsInput>().is_none());
+    assert!(
+        blocked
+            .to_string()
+            .contains("blocked by inherited Auto-Review safety policy")
+    );
+}
+
+#[tokio::test]
+async fn inherited_full_access_allows_bounded_temp_cleanup_but_not_broad_rm() {
+    let workspace = tempfile::Builder::new()
+        .prefix("codewhale-full-access-child-")
+        .tempdir_in("/tmp")
+        .expect("dedicated temp workspace");
+    let cleanup_target = workspace.path().join("cleanup-before-build");
+    std::fs::create_dir(&cleanup_target).expect("cleanup target");
+    std::fs::write(cleanup_target.join("marker"), "remove me").expect("cleanup marker");
+
+    let mut runtime = stub_runtime();
+    runtime.context = ToolContext::new(workspace.path().to_path_buf());
+    runtime.context.auto_approve = true;
+    runtime.approval_mode = ApprovalMode::Bypass;
+    let registry = SubAgentToolRegistry::new(
+        runtime,
+        SubAgentType::General,
+        None,
+        Arc::new(Mutex::new(TodoList::new())),
+        Arc::new(Mutex::new(PlanState::default())),
+    );
+
+    registry
+        .execute(
+            "agent_test",
+            "exec_shell",
+            json!({"command": format!("rm -rf {}", cleanup_target.display())}),
+        )
+        .await
+        .expect("Full Access child should run bounded cleanup in its sandbox");
+    assert!(!cleanup_target.exists(), "bounded target should be removed");
+
+    let blocked = registry
+        .execute(
+            "agent_test",
+            "exec_shell",
+            json!({"command": "rm -rf /tmp"}),
+        )
+        .await
+        .expect_err("Full Access must not blanket-approve broad recursive deletion");
+    assert!(
+        blocked
+            .to_string()
+            .contains("blocked by inherited Full Access safety policy"),
+        "unexpected broad-rm result: {blocked}"
+    );
 }
 
 #[test]
@@ -5566,7 +5734,11 @@ async fn subagent_registry_blocks_approval_tools_without_parent_auto_approve() {
     );
 
     let err = registry
-        .execute("agent_test", "exec_shell", json!({"command": "echo hi"}))
+        .execute(
+            "agent_test",
+            "exec_shell",
+            json!({"command": "gh pr merge 1 --merge"}),
+        )
         .await
         .expect_err("approval-gated child tool should be blocked");
 
@@ -5702,7 +5874,11 @@ async fn workflow_accept_edits_allows_general_file_write_without_parent_auto_app
     assert!(!result.contains("requires approval"), "{result}");
 
     let err = registry
-        .execute("agent_test", "exec_shell", json!({"command": "echo hi"}))
+        .execute(
+            "agent_test",
+            "exec_shell",
+            json!({"command": "gh pr merge 1 --merge"}),
+        )
         .await
         .expect_err("shell must still require parent auto-approve");
     assert!(
@@ -5835,7 +6011,11 @@ async fn delegated_write_role_still_blocks_required_tools() {
     );
 
     let err = registry
-        .execute("agent_test", "exec_shell", json!({"command": "echo hi"}))
+        .execute(
+            "agent_test",
+            "exec_shell",
+            json!({"command": "gh pr merge 1 --merge"}),
+        )
         .await
         .expect_err("Required-level shell must still need parent auto-approve");
     assert!(
@@ -6186,6 +6366,8 @@ fn stub_runtime() -> SubAgentRuntime {
         role_models: std::collections::HashMap::new(),
         fleet_roster: std::sync::Arc::new(crate::fleet::roster::FleetRoster::built_ins_only()),
         context,
+        approval_mode: ApprovalMode::Suggest,
+        auto_review_policy: AutoReviewPolicy::default(),
         allow_shell: true,
         accept_edits: false,
         accept_verification: false,
@@ -6271,7 +6453,11 @@ async fn root_operate_dispatch_delegates_builtin_verification_but_not_shell() {
     assert!(targeted_err.to_string().contains("requires approval"));
 
     let shell_err = registry
-        .execute("agent_test", "exec_shell", json!({"command": "echo nope"}))
+        .execute(
+            "agent_test",
+            "exec_shell",
+            json!({"command": "gh pr merge 1 --merge"}),
+        )
         .await
         .expect_err("Operate verification delegation must not grant raw shell");
     assert!(shell_err.to_string().contains("requires approval"));

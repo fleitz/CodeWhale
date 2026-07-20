@@ -1248,6 +1248,10 @@ impl ApprovalView {
         }
     }
 
+    pub(crate) fn request_id(&self) -> &str {
+        &self.request.id
+    }
+
     fn select_prev(&mut self) {
         self.selected = self.selected.saturating_sub(1);
     }

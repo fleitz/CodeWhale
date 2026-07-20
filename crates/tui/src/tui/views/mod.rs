@@ -998,6 +998,29 @@ impl ViewStack {
         popped
     }
 
+    /// Remove approval/question views for an exact engine request. A request
+    /// may finish or time out while its modal is open; keeping that view alive
+    /// would let a stale keypress look accepted after the engine moved on.
+    pub(crate) fn dismiss_request(&mut self, request_id: &str) -> bool {
+        let before = self.views.len();
+        self.views.retain_mut(|view| match view.kind() {
+            ModalKind::Approval => view
+                .as_any_mut()
+                .downcast_mut::<crate::tui::approval::ApprovalView>()
+                .is_none_or(|approval| approval.request_id() != request_id),
+            ModalKind::UserInput => view
+                .as_any_mut()
+                .downcast_mut::<crate::tui::user_input::UserInputView>()
+                .is_none_or(|question| question.request_id() != request_id),
+            _ => true,
+        });
+        let dismissed = before != self.views.len();
+        if dismissed {
+            tracing::debug!(target: "codewhale_tui::view_stack", action = "dismiss_request", request_id, depth = self.views.len(), "stale request view dismissed");
+        }
+        dismissed
+    }
+
     pub fn render(&self, area: Rect, buf: &mut Buffer) {
         // Dim each view's own occupied region rather than the whole frame, so
         // an inline modal (the approval prompt) leaves the transcript above it

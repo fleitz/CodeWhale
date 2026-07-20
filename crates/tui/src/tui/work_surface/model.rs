@@ -268,7 +268,7 @@ pub(super) fn project(app: &mut App) -> Vec<WorkRow> {
 }
 
 fn pending_attention_rows(app: &App) -> Vec<WorkRow> {
-    let mut rows = Vec::with_capacity(2);
+    let mut rows = Vec::with_capacity(2 + app.subagent_cache.len());
     let waiting_detail = app.tr(MessageId::WorkSurfaceDecisionWaiting).into_owned();
     if let Some(request) = app.pending_work_approval.as_ref() {
         rows.push(WorkRow {
@@ -296,11 +296,32 @@ fn pending_attention_rows(app: &App) -> Vec<WorkRow> {
             id: WorkRowId(format!("question:{tool_id}")),
             mark: "?",
             label: question,
-            detail: waiting_detail,
+            detail: waiting_detail.clone(),
             tone: WorkTone::Attention,
             selectable: true,
             primary_action: Some(SidebarRowAction::AnswerUserInput {
                 tool_id: tool_id.clone(),
+            }),
+        });
+    }
+    for agent in &app.subagent_cache {
+        let Some(needs_input) = agent.needs_input.as_ref() else {
+            continue;
+        };
+        let question = compact_attention_label(&needs_input.question);
+        rows.push(WorkRow {
+            id: WorkRowId(format!("agent-input:{}", agent.agent_id)),
+            mark: "?",
+            label: if question.is_empty() {
+                format!("{} needs input", agent.name)
+            } else {
+                question
+            },
+            detail: waiting_detail.clone(),
+            tone: WorkTone::Attention,
+            selectable: true,
+            primary_action: Some(SidebarRowAction::OpenAgentDetail {
+                agent_id: agent.agent_id.clone(),
             }),
         });
     }

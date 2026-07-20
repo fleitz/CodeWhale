@@ -6,6 +6,7 @@
 
 #![allow(dead_code)]
 
+use crate::command_safety::SafetyLevel;
 use crate::tui::approval::{
     ApprovalMode, RiskLevel, ToolCategory, classify_risk, get_tool_category,
 };
@@ -167,6 +168,9 @@ pub struct AutoReviewContext<'a> {
     pub user_intent: Option<&'a str>,
     pub workspace_trusted: bool,
     pub dirty_worktree: bool,
+    /// Existing shell safety verdict, retained so Auto-Review cannot flatten
+    /// `RequiresApproval` into a generic reversible-shell allow.
+    pub command_safety: Option<SafetyLevel>,
 }
 
 impl<'a> AutoReviewContext<'a> {
@@ -183,6 +187,16 @@ impl<'a> AutoReviewContext<'a> {
         let category = get_tool_category(tool_name);
         let risk = classify_risk(tool_name, category, params);
         let action_kind = ToolActionKind::from_tool_call(tool_name, params, category);
+        let command_safety = if matches!(category, ToolCategory::Shell) {
+            params
+                .get("command")
+                .or_else(|| params.get("cmd"))
+                .and_then(Value::as_str)
+                .map(crate::command_safety::analyze_command)
+                .map(|analysis| analysis.level)
+        } else {
+            None
+        };
         Self {
             tool_name,
             category,
@@ -193,6 +207,7 @@ impl<'a> AutoReviewContext<'a> {
             user_intent,
             workspace_trusted,
             dirty_worktree,
+            command_safety,
         }
     }
 }
@@ -363,6 +378,18 @@ fn safety_floor(ctx: &AutoReviewContext<'_>) -> Option<AutoReviewDecision> {
             AutoReviewAction::HoldForReview,
             "destructive background/headless action requires durable review",
         )),
+        (ToolActionKind::Shell, _)
+            if ctx.approval_mode != ApprovalMode::Bypass
+                && matches!(
+                    ctx.command_safety,
+                    Some(SafetyLevel::RequiresApproval | SafetyLevel::Dangerous)
+                ) =>
+        {
+            Some(AutoReviewDecision::new(
+                AutoReviewAction::AskUser,
+                "shell command safety requires deliberate approval",
+            ))
+        }
         _ => None,
     }
 }
@@ -468,10 +495,56 @@ fn shell_params_are_destructive_like(params: &Value) -> bool {
     split_shell_segments_for_review(command)
         .iter()
         .any(|segment| {
-            crate::command_safety::analyze_command(segment).level
+            (crate::command_safety::analyze_command(segment).level
                 == crate::command_safety::SafetyLevel::Dangerous
+                && !segment_is_bounded_temp_cleanup(segment))
                 || segment_is_device_or_filesystem_destroyer(segment)
         })
+}
+
+/// Whether this shell segment is exactly a forced recursive cleanup whose
+/// absolute targets are all dedicated descendants of the canonical temp root.
+/// This exception only affects catastrophic-action classification; Ask and
+/// Auto-Review still honor the command-safety approval verdict, while Full
+/// Access may proceed through the normal sandboxed shell executor.
+fn segment_is_bounded_temp_cleanup(segment: &str) -> bool {
+    let raw_tokens: Vec<&str> = segment.split_whitespace().collect();
+    let tokens = effective_command_tokens(&raw_tokens);
+    let Some(cmd) = tokens
+        .first()
+        .map(|token| unquote_token(token).trim_start_matches("./"))
+    else {
+        return false;
+    };
+    if cmd.rsplit('/').next().unwrap_or(cmd) != "rm" {
+        return false;
+    }
+
+    let mut recursive = false;
+    let mut force = false;
+    let mut targets = Vec::new();
+    for token in &tokens[1..] {
+        let token = unquote_token(token);
+        if token.starts_with("--") {
+            match token {
+                "--recursive" | "--dir" => recursive = true,
+                "--force" => force = true,
+                _ => {}
+            }
+        } else if let Some(flags) = token.strip_prefix('-') {
+            recursive |= flags.contains('r') || flags.contains('R');
+            force |= flags.contains('f');
+        } else {
+            targets.push(token);
+        }
+    }
+
+    recursive
+        && force
+        && !targets.is_empty()
+        && targets
+            .iter()
+            .all(|target| is_bounded_dedicated_temp_target(target))
 }
 
 /// The non-bypassable floor must hold genuinely catastrophic writes even when
@@ -586,10 +659,15 @@ fn stage_is_device_or_filesystem_destroyer(stage: &str) -> bool {
     // Forced recursive deletion aimed at an absolute path outside the
     // workspace (e.g. `rm -rf /etc`, `/usr`, `/var`): command_safety only
     // flags root/home/parent-escape, so catch absolute-system targets here.
+    // One narrow exception supports cleanup-before-build in Full Access: an
+    // exact, dedicated descendant of /tmp (or macOS' canonical /private/tmp)
+    // is bounded. The helper rejects the temp root itself, interpolation,
+    // globs/traversal, and any existing/deepest symlink ancestor that escapes
+    // the canonical temp root.
     if base == "rm" {
         let mut recursive = false;
         let mut force = false;
-        let mut abs_system_target = false;
+        let mut absolute_targets = Vec::new();
         for token in &tokens[1..] {
             let token = unquote_token(token);
             if token.starts_with("--") {
@@ -602,12 +680,86 @@ fn stage_is_device_or_filesystem_destroyer(stage: &str) -> bool {
                 recursive |= flags.contains('r') || flags.contains('R');
                 force |= flags.contains('f');
             } else if token.starts_with('/') {
-                abs_system_target = true;
+                absolute_targets.push(token);
             }
         }
-        return recursive && force && abs_system_target;
+        return recursive
+            && force
+            && absolute_targets
+                .iter()
+                .any(|target| !is_bounded_dedicated_temp_target(target));
     }
     false
+}
+
+fn is_bounded_dedicated_temp_target(raw: &str) -> bool {
+    use std::path::{Component, Path};
+
+    let raw = unquote_token(raw);
+    if raw.is_empty()
+        || raw.ends_with('/')
+        || raw.contains("//")
+        || raw.contains("/./")
+        || raw
+            .chars()
+            .any(|ch| matches!(ch, '$' | '*' | '?' | '[' | ']' | '{' | '}' | '`' | '\\'))
+    {
+        return false;
+    }
+    let path = Path::new(raw);
+    if path
+        .components()
+        .any(|component| matches!(component, Component::ParentDir | Component::CurDir))
+    {
+        return false;
+    }
+    let lexical_root = if raw.starts_with("/private/tmp/") {
+        Path::new("/private/tmp")
+    } else if raw.starts_with("/tmp/") {
+        Path::new("/tmp")
+    } else {
+        return false;
+    };
+    if path == lexical_root {
+        return false;
+    }
+
+    let canonical_root = match lexical_root.canonicalize() {
+        Ok(root) => root,
+        Err(_) => return false,
+    };
+    let mut ancestor = path;
+    let metadata = loop {
+        if let Ok(metadata) = std::fs::symlink_metadata(ancestor) {
+            break metadata;
+        }
+        let Some(parent) = ancestor.parent() else {
+            return false;
+        };
+        ancestor = parent;
+    };
+    // macOS exposes `/tmp` itself as a symlink to `/private/tmp`; that exact
+    // root alias is expected and was canonicalized above. Any descendant
+    // symlink remains an identity/escape hazard.
+    if metadata.file_type().is_symlink() && ancestor != lexical_root {
+        return false;
+    }
+    let Ok(canonical_ancestor) = ancestor.canonicalize() else {
+        return false;
+    };
+    if canonical_ancestor != canonical_root && !canonical_ancestor.starts_with(&canonical_root) {
+        return false;
+    }
+
+    // If the target exists, reject a symlinked leaf even when it points back
+    // inside /tmp. This keeps authorization tied to the exact lexical object
+    // that was reviewed, and avoids a check/execute identity surprise.
+    if path.exists()
+        && std::fs::symlink_metadata(path).is_ok_and(|metadata| metadata.file_type().is_symlink())
+    {
+        return false;
+    }
+    true
 }
 
 fn shell_tokens_are_publish_like(tokens: &[&str]) -> bool {
@@ -1095,6 +1247,111 @@ mod tests {
                 decision.action,
                 AutoReviewAction::HoldForReview,
                 "{command} must not hold"
+            );
+        }
+    }
+
+    #[test]
+    fn full_access_background_allows_only_canonical_dedicated_temp_cleanup() {
+        let policy = AutoReviewPolicy::default();
+        let existing = tempfile::Builder::new()
+            .prefix("codewhale-full-access-cleanup-")
+            .tempdir_in("/tmp")
+            .expect("dedicated /tmp fixture");
+        let existing_path = existing.path().to_string_lossy().into_owned();
+        let canonical_path = existing
+            .path()
+            .canonicalize()
+            .expect("canonical temp fixture")
+            .to_string_lossy()
+            .into_owned();
+        let absent_path = existing.path().join("cleanup-before-build");
+
+        for command in [
+            format!("rm -rf {existing_path}"),
+            format!("rm -rf {canonical_path}"),
+            format!("rm -rf {}", absent_path.display()),
+            "rm -rf /tmp/braid-phase-iii-baseline && python3 -m examples.harbor.build --out /tmp/braid-phase-iii-baseline && python3 -m examples.harbor.demo --world /tmp/braid-phase-iii-baseline".to_string(),
+        ] {
+            let bypass = ctx_for(
+                "exec_shell",
+                json!({ "command": command, "background": true }),
+                RunOrigin::Background,
+                ApprovalMode::Bypass,
+            );
+            assert_eq!(
+                policy.evaluate(&bypass).action,
+                AutoReviewAction::Allow,
+                "Full Access should honor bounded cleanup-before-build: {command}"
+            );
+
+            let auto = ctx_for(
+                "exec_shell",
+                json!({ "command": command.clone(), "background": true }),
+                RunOrigin::Background,
+                ApprovalMode::Auto,
+            );
+            assert_eq!(
+                policy.evaluate(&auto).action,
+                AutoReviewAction::AskUser,
+                "Auto-Review still preserves command-safety approval: {command}"
+            );
+        }
+    }
+
+    #[test]
+    fn broad_or_unresolved_temp_recursive_delete_remains_fail_closed() {
+        let policy = AutoReviewPolicy::default();
+        for command in [
+            "rm -rf /tmp",
+            "rm -rf /private/tmp",
+            "rm -rf /tmp/../etc",
+            "rm -rf /tmp/*",
+            "rm -rf /tmp/$TARGET",
+            "rm -rf /tmp/{one,two}",
+            "rm -rf /etc/nginx",
+        ] {
+            let ctx = ctx_for(
+                "exec_shell",
+                json!({ "command": command, "background": true }),
+                RunOrigin::Background,
+                ApprovalMode::Bypass,
+            );
+            assert_eq!(
+                policy.evaluate(&ctx).action,
+                AutoReviewAction::HoldForReview,
+                "unsafe target must remain non-bypassable: {command}"
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn symlinked_temp_leaf_or_ancestor_remains_fail_closed() {
+        use std::os::unix::fs::symlink;
+
+        let policy = AutoReviewPolicy::default();
+        let parent = tempfile::Builder::new()
+            .prefix("codewhale-temp-symlink-")
+            .tempdir_in("/tmp")
+            .expect("temp parent");
+        let external = tempfile::tempdir().expect("external target");
+        let leaf = parent.path().join("leaf-link");
+        symlink(external.path(), &leaf).expect("symlinked leaf");
+        let nested = leaf.join("not-created-yet");
+
+        for target in [leaf, nested] {
+            let command = format!("rm -rf {}", target.display());
+            let ctx = ctx_for(
+                "exec_shell",
+                json!({ "command": command, "background": true }),
+                RunOrigin::Background,
+                ApprovalMode::Bypass,
+            );
+            assert_eq!(
+                policy.evaluate(&ctx).action,
+                AutoReviewAction::HoldForReview,
+                "symlink identity/escape must remain a hold: {command}"
             );
         }
     }

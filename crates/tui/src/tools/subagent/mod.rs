@@ -48,6 +48,8 @@ use crate::tools::todo::TodoList;
 use crate::tools::truncate::{SPILLOVER_HEAD_BYTES, SPILLOVER_THRESHOLD_BYTES, maybe_spillover};
 use crate::tui::app::AppMode;
 use crate::tui::app::ReasoningEffort;
+use crate::tui::approval::ApprovalMode;
+use crate::tui::auto_review::{AutoReviewAction, AutoReviewContext, AutoReviewPolicy, RunOrigin};
 use crate::utils::spawn_supervised;
 use crate::work_graph::{
     EvidenceKind, EvidenceRef, OperationIntent, OperationOwnerSnapshot, OwnerState,
@@ -1809,6 +1811,10 @@ pub struct SubAgentRuntime {
     /// dispatch resolve the same party. Cloned into child runtimes.
     pub fleet_roster: std::sync::Arc<crate::fleet::roster::FleetRoster>,
     pub context: ToolContext,
+    /// Parent permission posture and deterministic policy. Auto-Review is
+    /// inherited as policy, never collapsed into `context.auto_approve`.
+    pub approval_mode: ApprovalMode,
+    pub auto_review_policy: AutoReviewPolicy,
     pub allow_shell: bool,
     /// When true, Suggest-level file writes auto-accept for write-capable roles
     /// without full parent auto-approve. Shell/network/MCP still gated.
@@ -1912,6 +1918,8 @@ impl SubAgentRuntime {
             role_models: HashMap::new(),
             fleet_roster: std::sync::Arc::new(crate::fleet::roster::FleetRoster::built_ins_only()),
             context,
+            approval_mode: ApprovalMode::Suggest,
+            auto_review_policy: AutoReviewPolicy::default(),
             allow_shell,
             accept_edits: false,
             accept_verification: false,
@@ -1941,6 +1949,17 @@ impl SubAgentRuntime {
     #[must_use]
     pub fn with_parent_mode(mut self, mode: AppMode) -> Self {
         self.parent_mode = mode;
+        self
+    }
+
+    #[must_use]
+    pub fn with_approval_policy(
+        mut self,
+        approval_mode: ApprovalMode,
+        auto_review_policy: AutoReviewPolicy,
+    ) -> Self {
+        self.approval_mode = approval_mode;
+        self.auto_review_policy = auto_review_policy;
         self
     }
 
@@ -2151,10 +2170,10 @@ impl SubAgentRuntime {
     /// and deriving a child cancellation token. Used at spawn entry to
     /// construct the runtime the new sub-agent will see.
     ///
-    /// Children inherit the parent's approval state. A non-auto parent can
-    /// still delegate read-only investigation, but approval-gated child tools
-    /// are blocked by the sub-agent registry instead of being silently run
-    /// without a prompt.
+    /// Children inherit the parent's approval state and deterministic review
+    /// policy. Auto-Review holds bridge back to parent Work; Full Access keeps
+    /// non-bypassable safety-floor actions blocked rather than turning either
+    /// posture into blanket child auto-approval.
     #[must_use]
     pub fn child_runtime(&self) -> Self {
         let mut child_context = self.context.clone();
@@ -2170,6 +2189,8 @@ impl SubAgentRuntime {
             role_models: self.role_models.clone(),
             fleet_roster: self.fleet_roster.clone(),
             context: child_context,
+            approval_mode: self.approval_mode,
+            auto_review_policy: self.auto_review_policy.clone(),
             allow_shell: self.allow_shell,
             accept_edits: self.accept_edits,
             // A parent-approved Operate verification lease belongs to its
@@ -6981,6 +7002,80 @@ and distinguish that from evidence you personally verified.\n",
     }
 }
 
+#[allow(clippy::too_many_arguments)]
+async fn finish_subagent_tool_hold(
+    runtime: &SubAgentRuntime,
+    agent_id: &str,
+    agent_type: &SubAgentType,
+    assignment: &SubAgentAssignment,
+    transcript_artifact: &mut Option<SubAgentTranscriptArtifactWriter>,
+    messages: &[Message],
+    steps: u32,
+    started_at: Instant,
+    fork_context_enabled: bool,
+    reason: String,
+) -> SubAgentResult {
+    let checkpoint = checkpoint_subagent_progress(
+        runtime,
+        agent_id,
+        "tool_needs_parent_input",
+        messages,
+        steps,
+        true,
+    )
+    .await;
+    let status = SubAgentStatus::Interrupted(format!("waiting for parent input: {reason}"));
+    let duration_ms = u64::try_from(started_at.elapsed().as_millis()).unwrap_or(u64::MAX);
+    insert_subagent_full_transcript_handle(
+        runtime,
+        agent_id,
+        agent_type,
+        assignment,
+        &status,
+        Some(&reason),
+        Some(&checkpoint),
+        transcript_artifact.as_mut(),
+        messages,
+        steps,
+        duration_ms,
+        fork_context_enabled,
+    )
+    .await;
+    record_agent_progress(
+        runtime,
+        agent_id,
+        format!("step {steps}: waiting for user; {reason}"),
+    );
+    release_resident_leases_for(agent_id);
+    SubAgentResult {
+        name: agent_id.to_string(),
+        agent_id: agent_id.to_string(),
+        context_mode: if fork_context_enabled {
+            "forked"
+        } else {
+            "fresh"
+        }
+        .to_string(),
+        fork_context: fork_context_enabled,
+        workspace: Some(runtime.context.workspace.clone()),
+        git_branch: current_git_branch(&runtime.context.workspace),
+        agent_type: agent_type.clone(),
+        assignment: assignment.clone(),
+        model: runtime.model.clone(),
+        nickname: None,
+        status,
+        worker_status: None,
+        parent_run_id: runtime.parent_agent_id.clone(),
+        spawn_depth: runtime.spawn_depth,
+        result: Some(reason.clone()),
+        steps_taken: steps,
+        checkpoint: Some(checkpoint),
+        needs_input: Some(SubAgentNeedsInput { question: reason }),
+        duration_ms,
+        from_prior_session: false,
+    }
+}
+
 #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
 async fn run_subagent(
     runtime: &SubAgentRuntime,
@@ -7655,13 +7750,49 @@ async fn run_subagent(
                     step: steps,
                 });
             }
-            let result = match tokio::time::timeout(runtime.tool_timeout, async {
+            let execution = tokio::time::timeout(runtime.tool_timeout, async {
                 tool_registry
                     .execute(&agent_id, &tool_name, tool_input)
                     .await
             })
-            .await
+            .await;
+            if let Ok(Err(error)) = &execution
+                && let Some(hold) = error.downcast_ref::<SubAgentToolNeedsInput>()
             {
+                let reason = hold.reason.clone();
+                let tool_result = ContentBlock::ToolResult {
+                    tool_use_id: tool_id,
+                    content: format!("Needs parent input: {reason}"),
+                    is_error: Some(true),
+                    content_blocks: None,
+                };
+                messages.push(Message {
+                    role: "user".to_string(),
+                    content: vec![tool_result],
+                });
+                if let Some(mb) = runtime.mailbox.as_ref() {
+                    let _ = mb.send(MailboxMessage::ToolCallCompleted {
+                        agent_id: agent_id.clone(),
+                        tool_name: tool_name.clone(),
+                        step: steps,
+                        ok: false,
+                    });
+                }
+                return Ok(finish_subagent_tool_hold(
+                    runtime,
+                    &agent_id,
+                    &agent_type,
+                    &assignment,
+                    &mut transcript_artifact,
+                    &messages,
+                    steps,
+                    started_at,
+                    fork_context_enabled,
+                    reason,
+                )
+                .await);
+            }
+            let result = match execution {
                 Ok(Ok(output)) => output,
                 Ok(Err(e)) => format!("Error: {e}"),
                 Err(_) => format!("Error: Tool {tool_name} timed out"),
@@ -9563,6 +9694,19 @@ fn role_posture_permits(agent_type: &SubAgentType, approval: ApprovalRequirement
     }
 }
 
+#[derive(Debug)]
+struct SubAgentToolNeedsInput {
+    reason: String,
+}
+
+impl std::fmt::Display for SubAgentToolNeedsInput {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(&self.reason)
+    }
+}
+
+impl std::error::Error for SubAgentToolNeedsInput {}
+
 struct SubAgentToolRegistry {
     /// `None` → full inheritance (no allowlist filter applied). `Some(list)` →
     /// only the listed tools are visible to the model and callable.
@@ -9573,6 +9717,8 @@ struct SubAgentToolRegistry {
     /// `command_denies_tool` (exact + `prefix*`, case-insensitive).
     disallowed_tools: Vec<String>,
     auto_approve: bool,
+    approval_mode: ApprovalMode,
+    auto_review_policy: AutoReviewPolicy,
     /// Workflow-spawned children auto-accept Suggest-level file edits.
     accept_edits: bool,
     /// Root Operate workers may run only the built-in verifier surfaces after
@@ -9657,6 +9803,8 @@ impl SubAgentToolRegistry {
             allowed_tools: explicit_allowed_tools,
             disallowed_tools: runtime.worker_profile.denied_tools.clone(),
             auto_approve: runtime.context.auto_approve,
+            approval_mode: runtime.approval_mode,
+            auto_review_policy: runtime.auto_review_policy,
             accept_edits: runtime.accept_edits,
             accept_verification: runtime.accept_verification,
             agent_type,
@@ -9710,6 +9858,26 @@ impl SubAgentToolRegistry {
         }
         match self.registry.get(name) {
             Some(spec) => match spec.approval_requirement() {
+                ApprovalRequirement::Auto => true,
+                ApprovalRequirement::Suggest => {
+                    self.runtime_profile.permissions.write
+                        && role_posture_permits(&self.agent_type, ApprovalRequirement::Suggest)
+                }
+                ApprovalRequirement::Required => {
+                    matches!(self.runtime_profile.shell, ShellPolicy::Full)
+                        && role_posture_permits(&self.agent_type, ApprovalRequirement::Required)
+                }
+            },
+            None => true,
+        }
+    }
+
+    fn posture_permits_tool_input(&self, name: &str, input: &Value) -> bool {
+        if name == "agent" {
+            return true;
+        }
+        match self.registry.get(name) {
+            Some(spec) => match spec.approval_requirement_for(input) {
                 ApprovalRequirement::Auto => true,
                 ApprovalRequirement::Suggest => {
                     self.runtime_profile.permissions.write
@@ -9802,17 +9970,79 @@ impl SubAgentToolRegistry {
         // and non-`Full`-shell roles cannot run shell, regardless of whether
         // the parent session is auto-approved. This closes the auto-approve
         // bypass where a read-only child could quietly write or shell out.
-        if !self.posture_permits_tool(name) {
+        if !self.posture_permits_tool_input(name, &input) {
             return Err(anyhow!(
                 "Tool {name} is not permitted for the read-only `{role}` sub-agent role. Use an `implementer` or `general` role (or a `custom` role with an explicit allowed_tools list) to mutate the workspace or run shell commands.",
                 role = self.agent_type.as_str()
             ));
         }
-        if !self.auto_approve {
-            let Some(spec) = self.registry.get(name) else {
-                return Err(anyhow!("Tool {name} is not registered"));
-            };
-            match spec.approval_requirement() {
+        let Some(spec) = self.registry.get(name) else {
+            return Err(anyhow!("Tool {name} is not registered"));
+        };
+
+        let inherited_policy_allowed = if matches!(
+            self.approval_mode,
+            ApprovalMode::Auto | ApprovalMode::Bypass
+        ) {
+            let context = AutoReviewContext::from_tool_call(
+                name,
+                &input,
+                RunOrigin::Background,
+                self.approval_mode,
+                None,
+                self.registry.context().trust_mode,
+                false,
+            );
+            let decision = self.auto_review_policy.evaluate(&context);
+            match (self.approval_mode, decision.action) {
+                (_, AutoReviewAction::Allow)
+                | (ApprovalMode::Bypass, AutoReviewAction::AskUser) => true,
+                (
+                    ApprovalMode::Auto,
+                    AutoReviewAction::AskUser | AutoReviewAction::HoldForReview,
+                ) => {
+                    return Err(anyhow!(SubAgentToolNeedsInput {
+                        reason: format!(
+                            "Review {name} before the child can continue: {}",
+                            decision.reason
+                        ),
+                    }));
+                }
+                (ApprovalMode::Bypass, AutoReviewAction::HoldForReview)
+                | (_, AutoReviewAction::Block) => {
+                    return Err(anyhow!(
+                        "Tool {name} blocked by inherited {} safety policy: {}",
+                        self.approval_mode.permission_chip_label(),
+                        decision.reason
+                    ));
+                }
+                // The surrounding guard limits this match to Auto/Bypass.
+                (ApprovalMode::Suggest | ApprovalMode::Never, _) => false,
+            }
+        } else {
+            false
+        };
+
+        if name == "request_user_input" {
+            let request = crate::tools::user_input::UserInputRequest::from_value(&input)
+                .map_err(|error| anyhow!(error))?;
+            let question = request
+                .questions
+                .first()
+                .map(|question| {
+                    question
+                        .question
+                        .split_whitespace()
+                        .collect::<Vec<_>>()
+                        .join(" ")
+                })
+                .filter(|question| !question.is_empty())
+                .unwrap_or_else(|| "Sub-agent has a question".to_string());
+            return Err(anyhow!(SubAgentToolNeedsInput { reason: question }));
+        }
+
+        if !self.auto_approve && !inherited_policy_allowed {
+            match spec.approval_requirement_for(&input) {
                 ApprovalRequirement::Auto => {}
                 ApprovalRequirement::Suggest => {
                     // Write/edit/patch tools land here. Explicit
