@@ -716,6 +716,18 @@ fn claim_subagent_completion(
         .then_some(completion)
 }
 
+enum GoalContinuationAction {
+    Inactive,
+    Dispatch {
+        content: String,
+        snapshot: Box<GoalSnapshot>,
+    },
+    Stopped {
+        status: GoalStatus,
+        message: String,
+    },
+}
+
 // === Internal tool helpers ===
 
 fn subagent_mailbox_message_is_best_effort(message: &MailboxMessage) -> bool {
@@ -1656,9 +1668,25 @@ impl Engine {
                                 continue;
                             }
                         };
-                        let Some((content, goal_snapshot)) = self.goal_continuation_if_active()
-                        else {
-                            continue;
+                        let (content, goal_snapshot) = match self.goal_continuation_if_active() {
+                            GoalContinuationAction::Inactive => continue,
+                            GoalContinuationAction::Dispatch { content, snapshot } => {
+                                (content, *snapshot)
+                            }
+                            GoalContinuationAction::Stopped { status, message } => {
+                                // Keep the host-side mirror and stable prompt in
+                                // sync with the terminal SharedGoalState before
+                                // publishing the stop receipt. This prevents the
+                                // sidebar from claiming an exhausted goal is
+                                // still running and removes stale <session_goal>
+                                // instructions from the persisted session.
+                                self.config.goal_status = status;
+                                self.refresh_system_prompt();
+                                self.emit_session_updated().await;
+                                self.emit_goal_updated().await;
+                                let _ = self.tx_event.send(Event::status(message)).await;
+                                continue;
+                            }
                         };
 
                         self.handle_send_message(
@@ -2640,18 +2668,24 @@ impl Engine {
 
     /// Handle a send message operation
     #[allow(clippy::too_many_arguments)]
-    /// After a turn completes, check whether an active goal should keep going.
-    /// Returns a continuation message to re-dispatch as a new turn, or `None`
-    /// if the goal is complete, blocked, paused, or over an optional budget.
+    /// After a turn completes, decide whether an active goal should keep going.
+    /// Returns a continuation to dispatch, an explicit terminal budget stop,
+    /// or `Inactive` when no follow-up turn belongs in the queue.
     ///
     /// There is no continuation cap — a goal runs until the model self-reports
     /// done/blocked, the user pauses or clears, or an optional token/time
     /// budget is exhausted. The loop is "until done," not "until N turns."
-    fn goal_continuation_if_active(&self) -> Option<(String, GoalSnapshot)> {
-        let mut state = self.config.goal_state.lock().ok()?;
+    fn goal_continuation_if_active(&self) -> GoalContinuationAction {
+        let mut state = match self.config.goal_state.lock() {
+            Ok(state) => state,
+            Err(err) => {
+                tracing::warn!("goal state lock poisoned during continuation check: {err}");
+                return GoalContinuationAction::Inactive;
+            }
+        };
         let snapshot = state.snapshot();
         if !snapshot.is_active() {
-            return None;
+            return GoalContinuationAction::Inactive;
         }
 
         // The snapshot status is a string ("active", "paused", "complete",
@@ -2660,7 +2694,7 @@ impl Engine {
             "active" => crate::goal_loop::GoalRunStatus::Active,
             "complete" => crate::goal_loop::GoalRunStatus::Completed,
             // Paused / Blocked / unknown → no continuation.
-            _ => return None,
+            _ => return GoalContinuationAction::Inactive,
         };
 
         let decision = crate::goal_loop::decide_continuation(
@@ -2684,19 +2718,43 @@ impl Engine {
                 // telemetry, and next host sync all agree on the pass number.
                 state.record_continuation();
                 let snapshot = state.snapshot();
-                Some((
-                    crate::tools::goal::render_continuation_prompt(
+                GoalContinuationAction::Dispatch {
+                    content: crate::tools::goal::render_continuation_prompt(
                         &snapshot,
                         snapshot.continuation_count,
                     ),
-                    snapshot,
-                ))
+                    snapshot: Box::new(snapshot),
+                }
             }
-            // All stop reasons → no continuation. The caller (the async turn
-            // completion path) emits a status message for budget-exhaustion.
             crate::goal_loop::ContinuationDecision::Stop(reason) => {
                 tracing::info!(?reason, "goal continuation stopped");
-                None
+                let message = match reason {
+                    crate::goal_loop::StopReason::TokenBudget => format!(
+                        "Goal token budget reached ({} / {} tokens); automatic continuation stopped and the goal is blocked.",
+                        snapshot.tokens_used,
+                        snapshot.token_budget.unwrap_or_default(),
+                    ),
+                    crate::goal_loop::StopReason::TimeBudget => format!(
+                        "Goal time budget reached ({} seconds); automatic continuation stopped and the goal is blocked.",
+                        snapshot.time_used_seconds,
+                    ),
+                    crate::goal_loop::StopReason::ContinuationLimit => {
+                        "Goal continuation limit reached; automatic continuation stopped and the goal is blocked."
+                            .to_string()
+                    }
+                    crate::goal_loop::StopReason::Completed
+                    | crate::goal_loop::StopReason::Blocked => {
+                        return GoalContinuationAction::Inactive;
+                    }
+                };
+                if let Err(err) = state.mark_blocked(message.clone()) {
+                    tracing::warn!("failed to mark stopped goal blocked: {err}");
+                    return GoalContinuationAction::Inactive;
+                }
+                GoalContinuationAction::Stopped {
+                    status: GoalStatus::Blocked,
+                    message,
+                }
             }
         }
     }

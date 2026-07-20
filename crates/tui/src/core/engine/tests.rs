@@ -286,44 +286,81 @@ async fn exact_turn_snapshot_restores_custom_endpoint_and_turn_receipt_after_bui
     run_task.await.expect("engine task");
 }
 
+struct GatedGoalModelClient {
+    calls: std::sync::atomic::AtomicUsize,
+    requests: std::sync::Mutex<Vec<crate::models::MessageRequest>>,
+    second_request_entered: std::sync::Arc<tokio::sync::Notify>,
+    release_second_request: std::sync::Arc<tokio::sync::Notify>,
+}
+
+impl GatedGoalModelClient {
+    fn captured_requests(&self) -> Vec<crate::models::MessageRequest> {
+        self.requests
+            .lock()
+            .expect("goal model request lock")
+            .clone()
+    }
+}
+
+#[async_trait::async_trait]
+impl crate::core::model_client::ModelClient for GatedGoalModelClient {
+    fn provider_name(&self) -> &str {
+        "deterministic-goal"
+    }
+
+    fn model(&self) -> &str {
+        "local-model"
+    }
+
+    async fn create_message(
+        &self,
+        _request: crate::models::MessageRequest,
+    ) -> anyhow::Result<crate::models::MessageResponse> {
+        anyhow::bail!("goal regression uses the streaming model boundary")
+    }
+
+    async fn create_message_stream(
+        &self,
+        request: crate::models::MessageRequest,
+    ) -> anyhow::Result<crate::llm_client::StreamEventBox> {
+        let call = self
+            .calls
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst)
+            .saturating_add(1);
+        self.requests
+            .lock()
+            .expect("goal model request lock")
+            .push(request);
+        if call == 2 {
+            self.second_request_entered.notify_one();
+            self.release_second_request.notified().await;
+        } else if call > 2 {
+            anyhow::bail!("unexpected goal model request #{call}");
+        }
+
+        let events = crate::llm_client::mock::canned::simple_text_turn("still working")
+            .into_iter()
+            .map(Ok);
+        Ok(Box::pin(futures_util::stream::iter(events)))
+    }
+
+    async fn health_check(&self) -> anyhow::Result<bool> {
+        Ok(true)
+    }
+}
+
 #[tokio::test]
 async fn goal_continuation_preserves_goal_and_resolves_updated_authoritative_route() {
-    use wiremock::matchers::{method, path};
-    use wiremock::{Mock, MockServer, ResponseTemplate};
-
-    let first_server = MockServer::start().await;
-    let second_server = MockServer::start().await;
-    let done_sse = concat!(
-        "data: {\"id\":\"chatcmpl-goal\",\"choices\":[{\"index\":0,",
-        "\"delta\":{\"content\":\"still working\"},\"finish_reason\":null}]}\n\n",
-        "data: {\"id\":\"chatcmpl-goal\",\"choices\":[{\"index\":0,\"delta\":{},",
-        "\"finish_reason\":\"stop\"}]}\n\n",
-        "data: [DONE]\n\n",
-    );
-    Mock::given(method("POST"))
-        .and(path("/v1/chat/completions"))
-        .respond_with(
-            ResponseTemplate::new(200)
-                .insert_header("content-type", "text/event-stream")
-                .set_body_string(done_sse),
-        )
-        .expect(1)
-        .mount(&first_server)
-        .await;
-    Mock::given(method("POST"))
-        .and(path("/v1/chat/completions"))
-        .respond_with(
-            ResponseTemplate::new(200)
-                .insert_header("content-type", "text/event-stream")
-                .set_delay(Duration::from_millis(150))
-                .set_body_string(done_sse),
-        )
-        .expect(1)
-        .mount(&second_server)
-        .await;
-
-    let first_base_url = format!("{}/v1", first_server.uri());
-    let second_base_url = format!("{}/v1", second_server.uri());
+    let first_base_url = "http://127.0.0.1:18181/v1".to_string();
+    let second_base_url = "http://127.0.0.1:18182/v1".to_string();
+    let second_request_entered = std::sync::Arc::new(tokio::sync::Notify::new());
+    let release_second_request = std::sync::Arc::new(tokio::sync::Notify::new());
+    let model = std::sync::Arc::new(GatedGoalModelClient {
+        calls: std::sync::atomic::AtomicUsize::new(0),
+        requests: std::sync::Mutex::new(Vec::new()),
+        second_request_entered: std::sync::Arc::clone(&second_request_entered),
+        release_second_request: std::sync::Arc::clone(&release_second_request),
+    });
     let mut custom = HashMap::new();
     custom.insert(
         "custom-a".to_string(),
@@ -352,7 +389,8 @@ async fn goal_continuation_preserves_goal_and_resolves_updated_authoritative_rou
         ..EngineConfig::default()
     };
     let authoritative = Arc::new(parking_lot::RwLock::new(config.clone()));
-    let (mut engine, handle) = Engine::new(engine_config, &config);
+    let client: crate::core::model_client::SharedModelClient = model.clone();
+    let (mut engine, handle) = Engine::new_with_model_client(engine_config, &config, client);
     engine.authoritative_route_config = Some(Arc::clone(&authoritative));
     let goal_state = engine.config.goal_state.clone();
 
@@ -459,6 +497,12 @@ async fn goal_continuation_preserves_goal_and_resolves_updated_authoritative_rou
                 assert!(system_prompt.contains("keep going"));
                 verified_synthetic_goal = true;
 
+                tokio::time::timeout(
+                    model_turn_event_timeout(),
+                    second_request_entered.notified(),
+                )
+                .await
+                .expect("second goal model request was never entered");
                 handle
                     .send(Op::SetGoalStatus {
                         status: crate::tools::goal::GoalStatus::Paused,
@@ -466,6 +510,10 @@ async fn goal_continuation_preserves_goal_and_resolves_updated_authoritative_rou
                     })
                     .await
                     .expect("queue goal pause");
+                // The model future cannot finish until the pause operation is
+                // already in the engine mailbox, making the queue-order proof
+                // deterministic under arbitrarily loaded CI runners.
+                release_second_request.notify_one();
             }
             Event::TurnComplete { base_url, .. } => {
                 completes += 1;
@@ -481,6 +529,7 @@ async fn goal_continuation_preserves_goal_and_resolves_updated_authoritative_rou
     }
     assert_eq!(starts, 2);
     assert!(verified_synthetic_goal);
+    assert_eq!(model.captured_requests().len(), 2);
 
     // The pause was queued while the second turn was still running. Wait for
     // that control operation, then put a snapshot receipt behind the already
@@ -524,6 +573,152 @@ async fn goal_continuation_preserves_goal_and_resolves_updated_authoritative_rou
     }
 
     handle.send(Op::Shutdown).await.expect("queue shutdown");
+    run_task.await.expect("engine task");
+}
+
+#[tokio::test]
+async fn cross_turn_token_budget_exhaustion_blocks_goal_and_refreshes_prompt() {
+    use crate::llm_client::mock::{MockLlmClient, canned};
+
+    let budget_turn = vec![
+        canned::message_start("mock_goal_budget"),
+        canned::text_block_start(0),
+        canned::text_delta(0, "budget spent"),
+        canned::block_stop(0),
+        canned::message_delta(
+            "end_turn",
+            Some(Usage {
+                input_tokens: 8,
+                output_tokens: 3,
+                ..Usage::default()
+            }),
+        ),
+        canned::message_stop(),
+    ];
+    let model = std::sync::Arc::new(MockLlmClient::new(vec![budget_turn]));
+    let client: crate::core::model_client::SharedModelClient = model.clone();
+    let config = Config::default();
+    let engine_config = EngineConfig {
+        max_steps: 1,
+        snapshots_enabled: false,
+        subagents_enabled: false,
+        terminal_chrome_enabled: false,
+        goal_objective: Some("finish within budget".to_string()),
+        goal_token_budget: Some(10),
+        ..EngineConfig::default()
+    };
+    let (engine, handle) = Engine::new_with_model_client(engine_config, &config, client);
+    let goal_state = engine.config.goal_state.clone();
+    let run_task = tokio::spawn(engine.run());
+
+    handle
+        .send(Op::SendMessage {
+            content: "start budgeted goal".to_string(),
+            mode: AppMode::Agent,
+            route: resolved_route_for_test(&config, crate::config::DEFAULT_TEXT_MODEL),
+            compaction: Box::new(CompactionConfig::default()),
+            goal_objective: Some("finish within budget".to_string()),
+            goal_token_budget: Some(10),
+            goal_status: crate::tools::goal::GoalStatus::Active,
+            reasoning_effort: None,
+            reasoning_effort_auto: false,
+            auto_model: false,
+            allow_shell: false,
+            trust_mode: false,
+            auto_approve: false,
+            approval_mode: crate::tui::approval::ApprovalMode::Suggest,
+            translation_enabled: false,
+            show_thinking: false,
+            allowed_tools: None,
+            dynamic_tools: Vec::new(),
+            hook_executor: None,
+            verbosity: None,
+            provenance: UserInputProvenance::ExternalUser,
+        })
+        .await
+        .expect("send budgeted goal turn");
+
+    let mut starts = 0;
+    let mut saw_turn_complete = false;
+    let mut saw_terminal_goal = false;
+    let mut saw_prompt_refresh = false;
+    let mut saw_budget_status = false;
+    while !(saw_terminal_goal && saw_prompt_refresh && saw_budget_status) {
+        let event = tokio::time::timeout(model_turn_event_timeout(), async {
+            handle.rx_event.write().await.recv().await
+        })
+        .await
+        .expect("budget goal event timeout")
+        .expect("budget goal event");
+        match event {
+            Event::TurnStarted { .. } => starts += 1,
+            Event::TurnComplete { status, error, .. } => {
+                assert_eq!(status, TurnOutcomeStatus::Completed, "{error:?}");
+                saw_turn_complete = true;
+            }
+            Event::SessionUpdated {
+                system_prompt: Some(system_prompt),
+                ..
+            } if saw_turn_complete => {
+                let prompt = match system_prompt {
+                    SystemPrompt::Text(text) => text,
+                    SystemPrompt::Blocks(blocks) => blocks
+                        .into_iter()
+                        .map(|block| block.text)
+                        .collect::<Vec<_>>()
+                        .join("\n"),
+                };
+                assert!(
+                    !prompt.contains("<session_goal>"),
+                    "blocked budget goal must leave the active system prompt: {prompt}"
+                );
+                saw_prompt_refresh = true;
+            }
+            Event::GoalUpdated { snapshot } if snapshot.status == "blocked" => {
+                assert_eq!(snapshot.objective.as_deref(), Some("finish within budget"));
+                assert_eq!(snapshot.token_budget, Some(10));
+                assert_eq!(snapshot.tokens_used, 11);
+                assert!(
+                    snapshot
+                        .blocker
+                        .as_deref()
+                        .is_some_and(|blocker| blocker.contains("token budget reached")),
+                    "{snapshot:?}"
+                );
+                saw_terminal_goal = true;
+            }
+            Event::Status { message } if message.contains("Goal token budget reached") => {
+                assert!(message.contains("11 / 10 tokens"), "{message}");
+                assert!(message.contains("goal is blocked"), "{message}");
+                saw_budget_status = true;
+            }
+            _ => {}
+        }
+    }
+
+    let session = handle
+        .get_session_snapshot()
+        .await
+        .expect("post-budget session snapshot");
+    let prompt = match session.system_prompt.expect("post-budget system prompt") {
+        SystemPrompt::Text(text) => text,
+        SystemPrompt::Blocks(blocks) => blocks
+            .into_iter()
+            .map(|block| block.text)
+            .collect::<Vec<_>>()
+            .join("\n"),
+    };
+    assert!(!prompt.contains("<session_goal>"), "{prompt}");
+    let snapshot = goal_state.lock().expect("goal lock").snapshot();
+    assert_eq!(snapshot.status, "blocked");
+    assert_eq!(starts, 1, "budget stop must not start another turn");
+    assert_eq!(
+        model.call_count(),
+        1,
+        "budget stop must not call the model again"
+    );
+
+    handle.send(Op::Shutdown).await.expect("shutdown engine");
     run_task.await.expect("engine task");
 }
 
