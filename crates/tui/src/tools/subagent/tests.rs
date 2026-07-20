@@ -1899,7 +1899,8 @@ fn auto_fork_context_default_forks_only_same_route_read_only_engine_children() {
     runtime.fork_context = Some(SubAgentForkContext {
         messages: Vec::new(),
         structured_state_block: None,
-        sensitive_user_input_values: std::collections::HashSet::new(),
+        sensitive_user_input_provenance:
+            crate::runtime_threads::SensitiveUserInputProvenance::default(),
     });
 
     // Read-only postures on the parent route in the parent workspace fork.
@@ -1972,7 +1973,8 @@ fn auto_fork_context_default_forks_only_same_route_read_only_engine_children() {
             }],
         }],
         structured_state_block: None,
-        sensitive_user_input_values: std::collections::HashSet::new(),
+        sensitive_user_input_provenance:
+            crate::runtime_threads::SensitiveUserInputProvenance::default(),
     });
     assert!(!auto_fork_context_default(
         &SubAgentType::Explore,
@@ -1986,7 +1988,8 @@ fn auto_fork_context_default_forks_only_same_route_read_only_engine_children() {
     runtime.fork_context = Some(SubAgentForkContext {
         messages: Vec::new(),
         structured_state_block: None,
-        sensitive_user_input_values: std::collections::HashSet::new(),
+        sensitive_user_input_provenance:
+            crate::runtime_threads::SensitiveUserInputProvenance::default(),
     });
 
     // Nested spawners stay fresh — their snapshot is the root prefix, not
@@ -2042,7 +2045,8 @@ fn forked_subagent_messages_preserve_parent_prefix_then_append_task() {
     let fork_context = SubAgentForkContext {
         messages: vec![parent_message.clone()],
         structured_state_block: Some("## Fork State\n- Mode: `AGENT`".to_string()),
-        sensitive_user_input_values: std::collections::HashSet::new(),
+        sensitive_user_input_provenance:
+            crate::runtime_threads::SensitiveUserInputProvenance::default(),
     };
 
     let assignment = SubAgentAssignment::new("inspect parser".to_string(), Some("worker".into()));
@@ -2712,7 +2716,9 @@ fn child_name_followup_interrupt_and_state_are_projected_from_runtime_taint() {
         manager.current_session_boot_id.clone(),
     );
     agent.session_name = format!("PIN{SECRET}");
-    agent.sensitive_user_input_values = HashSet::from([SECRET.to_string()]);
+    agent
+        .sensitive_user_input_provenance
+        .extend([SECRET.to_string()]);
     manager.agents.insert(agent_id.clone(), agent);
     manager.register_worker(make_worker_spec(&agent_id, tmp.path().to_path_buf()));
 
@@ -5177,7 +5183,8 @@ fn fresh_forked_and_nested_subagents_share_authority_bound_skill_catalogs() {
             }],
         }],
         structured_state_block: None,
-        sensitive_user_input_values: std::collections::HashSet::new(),
+        sensitive_user_input_provenance:
+            crate::runtime_threads::SensitiveUserInputProvenance::default(),
     };
     let forked = build_initial_subagent_messages_with_system(
         "review",
@@ -5202,7 +5209,8 @@ fn fresh_forked_and_nested_subagents_share_authority_bound_skill_catalogs() {
         SubAgentForkContext {
             messages: Vec::new(),
             structured_state_block: None,
-            sensitive_user_input_values: std::collections::HashSet::new(),
+            sensitive_user_input_provenance:
+                crate::runtime_threads::SensitiveUserInputProvenance::default(),
         },
     );
     let nested_system = build_subagent_system_prompt_with_skills(
@@ -6323,7 +6331,8 @@ fn live_fork_context_freezes_compaction_and_goal_history_at_spawn_boundary() {
     let shared = Arc::new(parking_lot::RwLock::new(SubAgentForkContext {
         messages: vec![summary.clone(), goal_continuation.clone()],
         structured_state_block: Some("stable state".to_string()),
-        sensitive_user_input_values: std::collections::HashSet::new(),
+        sensitive_user_input_provenance:
+            crate::runtime_threads::SensitiveUserInputProvenance::default(),
     }));
     let mut runtime = stub_runtime().with_live_fork_context(Arc::clone(&shared));
 
@@ -7671,7 +7680,8 @@ fn nested_tool_runtime_routes_child_completions_to_local_inbox() {
     let fork_context = SubAgentForkContext {
         messages: Vec::new(),
         structured_state_block: None,
-        sensitive_user_input_values: std::collections::HashSet::new(),
+        sensitive_user_input_provenance:
+            crate::runtime_threads::SensitiveUserInputProvenance::default(),
     };
 
     let (tool_runtime, mut local_rx) =
@@ -9042,7 +9052,7 @@ async fn complete_transcript_artifact_survives_resident_handle_compaction() {
     let mut artifact = SubAgentTranscriptArtifactWriter::for_runtime(
         &runtime,
         agent_id,
-        std::collections::HashSet::new(),
+        crate::runtime_threads::SensitiveUserInputProvenance::default(),
     )
     .await
     .expect("create private transcript artifact");
@@ -9147,7 +9157,7 @@ async fn forked_child_transcript_redacts_typed_secret_and_echo_but_provider_cont
         },
     ];
     let fork_context = SubAgentForkContext::new(parent_messages, None);
-    assert!(fork_context.sensitive_user_input_values.contains(SECRET));
+    assert!(fork_context.sensitive_user_input_values().contains(SECRET));
     let assignment = SubAgentAssignment::new(
         format!("inspect the parent state containing {SECRET}"),
         Some(format!("verifier for {SECRET}")),
@@ -9168,7 +9178,7 @@ async fn forked_child_transcript_redacts_typed_secret_and_echo_but_provider_cont
     let mut artifact = SubAgentTranscriptArtifactWriter::for_runtime(
         &runtime,
         agent_id,
-        fork_context.sensitive_user_input_values.clone(),
+        fork_context.sensitive_user_input_provenance.clone(),
     )
     .await
     .expect("create private transcript artifact");
@@ -9185,7 +9195,7 @@ async fn forked_child_transcript_redacts_typed_secret_and_echo_but_provider_cont
         &provider_messages,
         1,
         true,
-        &fork_context.sensitive_user_input_values,
+        &fork_context.sensitive_user_input_values(),
     );
     assert!(
         !serde_json::to_string(&checkpoint)
@@ -9255,14 +9265,94 @@ async fn forked_child_transcript_redacts_typed_secret_and_echo_but_provider_cont
     assert!(!payload.to_string().contains(SECRET));
     drop(store);
     assert!(
-        artifact.sensitive_user_input_values.is_empty(),
-        "terminal transcript publication must clear its runtime-only taint"
+        artifact
+            .sensitive_user_input_provenance
+            .snapshot()
+            .contains(SECRET),
+        "session-live taint must survive terminal transcript publication"
     );
     assert!(
         serde_json::to_string(&provider_messages)
             .expect("serialize raw provider messages after persistence")
             .contains(SECRET),
         "durable redaction must never mutate the provider request history"
+    );
+}
+
+#[test]
+fn late_parent_taint_rewrites_started_child_transcript_and_manager_state() {
+    const SECRET: &str = "late-child-secret-482915";
+    let tmp = tempdir().expect("tempdir");
+    let provenance = crate::runtime_threads::SensitiveUserInputProvenance::default();
+    let agent_id = "agent_late_private";
+    let messages = vec![text_message(
+        "assistant",
+        &format!("child guessed {SECRET} before the modal settled"),
+    )];
+    let mut artifact =
+        SubAgentTranscriptArtifactWriter::create(tmp.path(), agent_id, provenance.clone())
+            .expect("create transcript");
+    artifact
+        .sync_messages(&messages, true)
+        .expect("initial transcript");
+    assert!(
+        std::fs::read_to_string(&artifact.path)
+            .expect("raw transcript")
+            .contains(SECRET)
+    );
+
+    let state_path = tmp.path().join("subagents.v1.json");
+    let mut manager =
+        SubAgentManager::new(tmp.path().to_path_buf(), 2).with_state_path(state_path.clone());
+    let (input_tx, _input_rx) = mpsc::unbounded_channel();
+    let mut agent = SubAgent::new(
+        agent_id.to_string(),
+        SubAgentType::General,
+        format!("prompt guessed {SECRET}"),
+        SubAgentAssignment::new(format!("objective {SECRET}"), None),
+        "deepseek-v4-flash".to_string(),
+        None,
+        None,
+        input_tx,
+        tmp.path().to_path_buf(),
+        manager.current_session_boot_id.clone(),
+    );
+    agent.result = Some(format!("result {SECRET}"));
+    agent.sensitive_user_input_provenance = provenance.clone();
+    manager.agents.insert(agent_id.to_string(), agent);
+    manager
+        .persist_state()
+        .expect("raw persist")
+        .join()
+        .expect("raw persist thread");
+    assert!(
+        std::fs::read_to_string(&state_path)
+            .expect("raw state")
+            .contains(SECRET)
+    );
+
+    provenance.extend([SECRET.to_string()]);
+    artifact
+        .sync_messages(&messages, true)
+        .expect("late transcript rewrite");
+    manager
+        .refresh_sensitive_user_input_provenance(&provenance)
+        .expect("late manager rewrite");
+
+    assert!(
+        !std::fs::read_to_string(&artifact.path)
+            .expect("projected transcript")
+            .contains(SECRET)
+    );
+    assert!(
+        !std::fs::read_to_string(state_path)
+            .expect("projected state")
+            .contains(SECRET)
+    );
+    assert!(
+        !serde_json::to_string(&manager.get_result(agent_id).expect("result"))
+            .expect("serialize result")
+            .contains(SECRET)
     );
 }
 
@@ -9274,7 +9364,7 @@ fn child_local_taint_rewrites_earlier_append_only_transcript_records() {
     let mut writer = SubAgentTranscriptArtifactWriter::create(
         tmp.path(),
         agent_id,
-        std::collections::HashSet::new(),
+        crate::runtime_threads::SensitiveUserInputProvenance::default(),
     )
     .expect("create transcript writer");
     let mut provider_messages = vec![Message {
@@ -9335,6 +9425,148 @@ fn child_local_taint_rewrites_earlier_append_only_transcript_records() {
         serde_json::to_string(&provider_messages)
             .expect("serialize live provider messages")
             .contains(SECRET)
+    );
+}
+
+#[test]
+fn active_transcript_append_and_late_reprojection_share_one_io_boundary() {
+    const SECRET: &str = "shared-boundary-secret-482915";
+    let tmp = tempdir().expect("tempdir");
+    let agent_id = "agent_transcript_io_race";
+    let provenance = crate::runtime_threads::SensitiveUserInputProvenance::default();
+    provenance.extend([SECRET.to_string()]);
+    let first_message = text_message("assistant", &format!("earlier echo {SECRET}"));
+    let second_message = text_message("assistant", "new message appended during reprojection");
+    let mut writer =
+        SubAgentTranscriptArtifactWriter::create(tmp.path(), agent_id, provenance.clone())
+            .expect("create transcript writer");
+    writer
+        .sync_messages(std::slice::from_ref(&first_message), true)
+        .expect("persist initial transcript");
+
+    // Hold the shared boundary while both real mutation paths reach it. This
+    // makes the regression deterministic: neither the active append nor the
+    // manager rewriter may complete until the same guard is released.
+    let io_guard = lock_subagent_transcript_io();
+    let (ready_tx, ready_rx) = std::sync::mpsc::channel();
+    let (done_tx, done_rx) = std::sync::mpsc::channel();
+
+    let append_ready = ready_tx.clone();
+    let append_done = done_tx.clone();
+    let append_messages = vec![first_message, second_message];
+    let append_thread = std::thread::spawn(move || {
+        append_ready.send(()).expect("signal append ready");
+        let result = writer.sync_messages(&append_messages, true);
+        append_done.send(()).expect("signal append done");
+        result
+    });
+
+    let rewrite_ready = ready_tx.clone();
+    let rewrite_done = done_tx.clone();
+    let rewrite_workspace = tmp.path().to_path_buf();
+    let rewrite_thread = std::thread::spawn(move || {
+        rewrite_ready.send(()).expect("signal rewrite ready");
+        let result = reproject_subagent_transcript_artifact(
+            &rewrite_workspace,
+            agent_id,
+            &HashSet::from([SECRET.to_string()]),
+        );
+        rewrite_done.send(()).expect("signal rewrite done");
+        result
+    });
+    drop(ready_tx);
+    drop(done_tx);
+
+    ready_rx.recv().expect("append reached the boundary");
+    ready_rx.recv().expect("rewrite reached the boundary");
+    let wait_deadline = Instant::now() + Duration::from_secs(5);
+    while SUBAGENT_TRANSCRIPT_IO_WAITERS.load(Ordering::SeqCst) < 2
+        && Instant::now() < wait_deadline
+    {
+        std::thread::yield_now();
+    }
+    assert!(
+        SUBAGENT_TRANSCRIPT_IO_WAITERS.load(Ordering::SeqCst) >= 2,
+        "both transcript mutation paths must wait on the shared boundary"
+    );
+    assert!(
+        done_rx.try_recv().is_err(),
+        "no transcript mutation may bypass the shared boundary"
+    );
+    drop(io_guard);
+
+    append_thread
+        .join()
+        .expect("append thread")
+        .expect("append transcript");
+    rewrite_thread
+        .join()
+        .expect("rewrite thread")
+        .expect("rewrite transcript");
+    assert_eq!(done_rx.iter().count(), 2);
+
+    let durable = std::fs::read_to_string(
+        checked_subagent_transcript_artifact_path(tmp.path(), agent_id).expect("transcript path"),
+    )
+    .expect("read serialized transcript");
+    assert!(!durable.contains(SECRET));
+    assert!(durable.contains("new message appended during reprojection"));
+    let restored = load_subagent_transcript_artifact(tmp.path(), agent_id)
+        .expect("load complete serialized transcript");
+    assert_eq!(restored.len(), 2, "late rewrite must not lose the append");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+
+        let path = checked_subagent_transcript_artifact_path(tmp.path(), agent_id)
+            .expect("transcript path");
+        let metadata = std::fs::metadata(path).expect("transcript metadata");
+        assert_eq!(metadata.permissions().mode() & 0o777, 0o600);
+        assert_eq!(metadata.nlink(), 1);
+    }
+}
+
+#[test]
+fn late_reprojection_rejects_unparseable_typed_message_record() {
+    const SECRET: &str = "malformed-message-secret-482915";
+    let tmp = tempdir().expect("tempdir");
+    let agent_id = "agent_unparseable_typed_message";
+    let artifact = write_subagent_transcript_artifact_for_test(
+        tmp.path(),
+        agent_id,
+        &[text_message("user", "valid first turn")],
+    )
+    .expect("write transcript artifact");
+    let malformed_record = json!({
+        "kind": "message",
+        "index": 1,
+        "message": SECRET,
+    });
+    std::fs::OpenOptions::new()
+        .append(true)
+        .open(&artifact)
+        .expect("open artifact")
+        .write_all(&json_line(&malformed_record).expect("encode malformed typed record"))
+        .expect("append malformed typed record");
+    let before = std::fs::read(&artifact).expect("read malformed artifact");
+
+    let error = reproject_subagent_transcript_artifact(
+        tmp.path(),
+        agent_id,
+        &HashSet::from([SECRET.to_string()]),
+    )
+    .expect_err("a kind=message record must deserialize before it can be republished");
+
+    assert!(
+        error
+            .to_string()
+            .contains("could not be decoded as a Message"),
+        "{error:#}"
+    );
+    assert_eq!(
+        std::fs::read(&artifact).expect("reread malformed artifact"),
+        before,
+        "failed projection must not publish a partial or raw rewritten stream"
     );
 }
 

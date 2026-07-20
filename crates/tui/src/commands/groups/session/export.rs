@@ -64,6 +64,7 @@ fn execute_export(app: &mut App, arg: Option<&str>) -> CommandResult {
         Ok(request) => request,
         Err(err) => return CommandResult::error(err),
     };
+    app.refresh_sensitive_user_input_projection();
     let label = match request.scope {
         ExportScope::Conversation => "Conversation",
         ExportScope::Turn => "Turn handoff",
@@ -222,10 +223,15 @@ fn copy_to_clipboard(app: &mut App, label: &str, markdown: &str) -> CommandResul
 }
 
 fn render_conversation(app: &App) -> String {
-    let message_count = if app.api_messages.is_empty() {
+    let sensitive_values = app.sensitive_user_input_provenance.snapshot();
+    let public_messages = crate::runtime_threads::redacted_durable_history_clone(
+        &app.api_messages,
+        &sensitive_values,
+    );
+    let message_count = if public_messages.is_empty() {
         app.history.len()
     } else {
-        app.api_messages.len()
+        public_messages.len()
     };
     let mut out = String::new();
     out.push_str("# Codewhale conversation export\n\n");
@@ -258,10 +264,10 @@ fn render_conversation(app: &App) -> String {
         "\n> Hidden instructions, internal reasoning, and reasoning signatures are omitted. Secret-like values and credential-bearing URLs are redacted as a defense in depth; review the export before sharing it.\n\n",
     );
 
-    if app.api_messages.is_empty() {
-        render_history_fallback(&mut out, &app.history);
+    if public_messages.is_empty() {
+        render_history_fallback(&mut out, &app.history, &sensitive_values);
     } else {
-        for (index, message) in app.api_messages.iter().enumerate() {
+        for (index, message) in public_messages.iter().enumerate() {
             render_message(&mut out, index + 1, message);
         }
     }
@@ -366,7 +372,11 @@ fn render_content_block(out: &mut String, index: usize, block: &ContentBlock) {
     }
 }
 
-fn render_history_fallback(out: &mut String, history: &[HistoryCell]) {
+fn render_history_fallback(
+    out: &mut String,
+    history: &[HistoryCell],
+    sensitive_values: &std::collections::HashSet<String>,
+) {
     if history.is_empty() {
         out.push_str("## Conversation\n\n[empty conversation]\n");
         return;
@@ -374,10 +384,16 @@ fn render_history_fallback(out: &mut String, history: &[HistoryCell]) {
     out.push_str(
         "> Structured API messages were unavailable; the entries below are a sanitized visible-history fallback.\n\n",
     );
+    let sanitize = |text: &str| {
+        sanitize_text(&crate::runtime_threads::redacted_sensitive_user_input_text(
+            text,
+            sensitive_values,
+        ))
+    };
     for (index, cell) in history.iter().enumerate() {
         let (role, body) = match cell {
-            HistoryCell::User { content } => ("user", sanitize_text(content)),
-            HistoryCell::Assistant { content, .. } => ("assistant", sanitize_text(content)),
+            HistoryCell::User { content } => ("user", sanitize(content)),
+            HistoryCell::Assistant { content, .. } => ("assistant", sanitize(content)),
             HistoryCell::System { .. } => ("system", "[internal context omitted]".to_string()),
             HistoryCell::Error { message, severity } => {
                 let role = match severity {
@@ -386,17 +402,16 @@ fn render_history_fallback(out: &mut String, history: &[HistoryCell]) {
                     crate::error_taxonomy::ErrorSeverity::Error => "error",
                     crate::error_taxonomy::ErrorSeverity::Critical => "critical error",
                 };
-                (role, sanitize_text(message))
+                (role, sanitize(message))
             }
             HistoryCell::Thinking { .. } => (
                 "internal reasoning",
                 "[internal reasoning omitted]".to_string(),
             ),
-            HistoryCell::Tool(tool) => ("tool", sanitize_text(&render_lines(tool.lines(120)))),
-            HistoryCell::SubAgent(subagent) => (
-                "sub-agent",
-                sanitize_text(&render_lines(subagent.lines(120))),
-            ),
+            HistoryCell::Tool(tool) => ("tool", sanitize(&render_lines(tool.lines(120)))),
+            HistoryCell::SubAgent(subagent) => {
+                ("sub-agent", sanitize(&render_lines(subagent.lines(120))))
+            }
             HistoryCell::ArchivedContext {
                 level,
                 range,
@@ -404,7 +419,7 @@ fn render_history_fallback(out: &mut String, history: &[HistoryCell]) {
                 ..
             } => (
                 "archived context",
-                sanitize_text(&format!("L{level} [{range}]: {summary}")),
+                sanitize(&format!("L{level} [{range}]: {summary}")),
             ),
         };
         let _ = writeln!(out, "## {}. {}\n", index + 1, inline_text(role));
@@ -576,13 +591,68 @@ fn url_regex() -> &'static Regex {
 }
 
 fn sanitize_turn_handoff(app: &App, markdown: &str) -> String {
-    let sanitized = sanitize_text(markdown);
+    let sensitive_values = app.sensitive_user_input_provenance.snapshot();
+    let public_markdown = markdown
+        .split('\n')
+        .enumerate()
+        .map(|(index, line)| project_turn_handoff_line(index, line, &sensitive_values))
+        .collect::<Vec<_>>()
+        .join("\n");
+    let sanitized = sanitize_text(&public_markdown);
     let workspace = app.workspace.to_string_lossy();
     if workspace.is_empty() {
         sanitized
     } else {
         sanitized.replace(workspace.as_ref(), ".")
     }
+}
+
+/// Preserve renderer-owned Markdown structure when an answer happens to be a
+/// short structural word (`Input`, `ID`, `Name`, `Result`, ...). Dynamic body
+/// text is still projected, including the value side of generated key/value
+/// bullets. This avoids applying taint replacement to one undifferentiated
+/// Markdown blob after structure has already been rendered.
+fn project_turn_handoff_line(
+    index: usize,
+    line: &str,
+    sensitive_values: &std::collections::HashSet<String>,
+) -> String {
+    const SECTION_HEADINGS: &[&str] = &[
+        "## Intent",
+        "## Strategy / To-do",
+        "## Files changed",
+        "## Turn timeline",
+        "## Tests / verifier",
+        "## Model route + tokens/cost",
+        "## Result / status",
+    ];
+    const FIXED_LINES: &[&str] = &["—"];
+
+    if (index == 0 && line.starts_with("# Turn handoff"))
+        || SECTION_HEADINGS.contains(&line)
+        || FIXED_LINES.contains(&line)
+        || (index == 1 && line.starts_with("_Status:") && line.ends_with('_'))
+        || line.is_empty()
+    {
+        return line.to_string();
+    }
+
+    if let Some(body) = line.strip_prefix("- ") {
+        if let Some(separator) = body.find(": ") {
+            let prefix_end = separator + 2;
+            let (prefix, value) = body.split_at(prefix_end);
+            return format!(
+                "- {prefix}{}",
+                crate::runtime_threads::redacted_sensitive_user_input_text(value, sensitive_values,)
+            );
+        }
+        return format!(
+            "- {}",
+            crate::runtime_threads::redacted_sensitive_user_input_text(body, sensitive_values)
+        );
+    }
+
+    crate::runtime_threads::redacted_sensitive_user_input_text(line, sensitive_values)
 }
 
 fn resolve_export_path(workspace: &Path, raw: &str) -> Result<PathBuf, String> {
@@ -878,6 +948,99 @@ mod tests {
                 .expect("Work snapshot after export"),
             work_before,
             "export must not mutate Work"
+        );
+    }
+
+    #[test]
+    fn export_projects_short_modal_values_but_preserves_tool_headings() {
+        let tmpdir = TempDir::new().expect("tempdir");
+        let mut app = test_app(&tmpdir);
+        app.sensitive_user_input_provenance.extend([
+            "input".to_string(),
+            "Input".to_string(),
+            "ID".to_string(),
+            "Name".to_string(),
+            "Tool call".to_string(),
+            "7".to_string(),
+        ]);
+        app.api_messages = vec![Message {
+            role: "assistant".to_string(),
+            content: vec![
+                ContentBlock::Text {
+                    text: "echo input, Input, ID, Name, Tool call, and 7".to_string(),
+                    cache_control: None,
+                },
+                ContentBlock::ToolUse {
+                    id: "call-input".to_string(),
+                    name: "echo".to_string(),
+                    input: serde_json::json!({"input": "7", "safe": "input"}),
+                    caller: None,
+                },
+            ],
+        }];
+
+        let markdown = render_conversation(&app);
+        assert!(markdown.contains("Tool call"));
+        assert!(markdown.contains("- ID: call-input"));
+        assert!(markdown.contains("- Name: echo"));
+        assert!(markdown.contains("Input:"));
+        assert!(!markdown.contains("echo input, Input, ID, Name, Tool call, and 7"));
+        assert!(!markdown.contains("\"input\": \"7\""));
+        assert!(!markdown.contains("\"safe\": \"input\""));
+
+        app.api_messages.clear();
+        app.history.push(HistoryCell::Assistant {
+            content: "history echoed input and 7".to_string(),
+            streaming: false,
+        });
+        let fallback = render_conversation(&app);
+        assert!(!fallback.contains("history echoed input and 7"));
+        assert!(fallback.contains("assistant"));
+    }
+
+    #[test]
+    fn turn_handoff_projects_body_collisions_without_destroying_fixed_markdown() {
+        let tmpdir = TempDir::new().expect("tempdir");
+        let app = test_app(&tmpdir);
+        app.sensitive_user_input_provenance.extend([
+            "Input".to_string(),
+            "ID".to_string(),
+            "Name".to_string(),
+            "Tool call".to_string(),
+            "Intent".to_string(),
+            "Result".to_string(),
+            "Status".to_string(),
+        ]);
+        let raw = "# Turn handoff — turn_123\n\
+_Status: completed · generated 2026-07-20 12:00:00_\n\
+\n\
+## Intent\n\
+Input ID Name Tool call\n\
+\n\
+## Result / status\n\
+- Result: Input ID Name Tool call\n\
+- Status: completed\n\
+Input:\n\
+Structured result blocks:\n";
+
+        let projected = sanitize_turn_handoff(&app, raw);
+
+        for structural in [
+            "# Turn handoff — turn_123",
+            "_Status: completed · generated 2026-07-20 12:00:00_",
+            "## Intent",
+            "## Result / status",
+            "- Result:",
+            "- Status: completed",
+        ] {
+            assert!(
+                projected.contains(structural),
+                "missing {structural}: {projected}"
+            );
+        }
+        assert!(
+            !projected.contains("Input ID Name Tool call"),
+            "{projected}"
         );
     }
 

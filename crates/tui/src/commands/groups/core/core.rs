@@ -89,6 +89,8 @@ pub(crate) fn reset_conversation_state(app: &mut App) -> bool {
     app.clear_history();
     app.mark_history_updated();
     app.api_messages.clear();
+    app.sensitive_user_input_provenance =
+        crate::runtime_threads::SensitiveUserInputProvenance::default();
     app.system_prompt = None;
     app.viewport.transcript_selection.clear();
     app.queued_messages.clear();

@@ -33,6 +33,90 @@ fn test_options(yolo: bool) -> TuiOptions {
     }
 }
 
+#[test]
+fn late_modal_taint_reprojects_visible_history_and_tool_detail_caches() {
+    let mut app = App::new(test_options(false), &Config::default());
+    let secret = "482915";
+    let structural = "running";
+    app.api_messages.push(crate::models::Message {
+        role: "assistant".to_string(),
+        content: vec![crate::models::ContentBlock::Text {
+            text: format!("provider echoed {secret} while {structural}"),
+            cache_control: None,
+        }],
+    });
+    app.history.push(HistoryCell::Assistant {
+        content: format!("visible echo {secret} while {structural}"),
+        streaming: false,
+    });
+    app.history
+        .push(HistoryCell::Tool(ToolCell::Generic(GenericToolCell {
+            name: structural.to_string(),
+            status: ToolStatus::Running,
+            input_summary: Some(format!("input {secret} {structural}")),
+            output: Some(format!("output {secret} {structural}")),
+            prompts: Some(vec![format!("child {secret} {structural}")]),
+            spillover_path: None,
+            output_summary: Some(format!("summary {secret} {structural}")),
+            is_diff: false,
+        })));
+    app.tool_details_by_cell.insert(
+        1,
+        ToolDetailRecord {
+            tool_id: structural.to_string(),
+            tool_name: structural.to_string(),
+            input: serde_json::json!({
+                structural: secret,
+                "nested": format!("{secret} {structural}")
+            }),
+            output: Some(format!("detail {secret} {structural}")),
+        },
+    );
+    app.reasoning_buffer = format!("reasoning {secret} {structural}");
+    app.tool_evidence.push(ToolEvidence {
+        tool_name: structural.to_string(),
+        summary: format!("evidence {secret} {structural}"),
+    });
+
+    app.sensitive_user_input_provenance
+        .extend([secret.to_string(), structural.to_string()]);
+    app.refresh_sensitive_user_input_projection();
+
+    let api = serde_json::to_string(&app.api_messages).expect("api messages");
+    assert!(!api.contains(secret), "{api}");
+    assert!(!api.contains(structural), "{api}");
+    let rendered = app
+        .history
+        .iter()
+        .flat_map(|cell| cell.lines(120))
+        .flat_map(|line| line.spans)
+        .map(|span| span.content.to_string())
+        .collect::<String>();
+    assert!(!rendered.contains(secret), "{rendered}");
+    let HistoryCell::Tool(ToolCell::Generic(tool)) = &app.history[1] else {
+        panic!("generic tool cell missing")
+    };
+    assert_eq!(tool.name, structural, "tool identity is structural");
+    assert_eq!(tool.status, ToolStatus::Running);
+    let detail = app.tool_details_by_cell.get(&1).expect("tool detail");
+    assert_eq!(detail.tool_id, structural);
+    assert_eq!(detail.tool_name, structural);
+    assert!(
+        !serde_json::to_string(&detail.input)
+            .unwrap()
+            .contains(secret)
+    );
+    assert!(
+        !detail
+            .output
+            .as_deref()
+            .unwrap_or_default()
+            .contains(secret)
+    );
+    assert!(!app.reasoning_buffer.contains(secret));
+    assert!(!app.tool_evidence[0].summary.contains(secret));
+}
+
 #[cfg(unix)]
 fn create_dir_symlink(target: &std::path::Path, link: &std::path::Path) -> std::io::Result<()> {
     std::os::unix::fs::symlink(target, link)

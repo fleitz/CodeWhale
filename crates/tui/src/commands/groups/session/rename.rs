@@ -67,6 +67,7 @@ pub(crate) fn rename_with_manager(
     manager: &SessionManager,
     app: &mut App,
 ) -> CommandResult {
+    app.refresh_sensitive_user_input_projection();
     let mut session = match manager.load_session(session_id) {
         Ok(s) => s,
         Err(e) => return CommandResult::error(format!("Could not load session: {e}")),
@@ -90,6 +91,7 @@ pub(crate) fn rename_with_manager(
     session.context_references = app.session_context_references.clone();
     session.artifacts = app.session_artifacts.clone();
     session.last_auto_route = app.auto_route_for_persistence();
+    session.sensitive_user_input_provenance = app.sensitive_user_input_provenance.clone();
     session.metadata.model = app.model_selection_for_persistence();
     session
         .metadata
@@ -101,14 +103,19 @@ pub(crate) fn rename_with_manager(
 
     match manager.save_session(&session) {
         Ok(_) => {
+            let public_title = crate::runtime_threads::redacted_sensitive_user_input_text(
+                new_title,
+                &app.sensitive_user_input_provenance.snapshot(),
+            );
+            session.metadata.title.clone_from(&public_title);
             app.current_session_metadata = Some(session.metadata.clone());
-            app.session_title = Some(new_title.to_string());
+            app.session_title = Some(public_title.clone());
             if let Err(err) = app.publish_pending_work_state() {
                 return CommandResult::error(format!(
                     "Session renamed, but Work views were not published: {err}"
                 ));
             }
-            CommandResult::message(format!("Session renamed to \"{new_title}\""))
+            CommandResult::message(format!("Session renamed to \"{public_title}\""))
         }
         Err(e) => CommandResult::error(format!("Could not save session: {e}")),
     }
@@ -193,6 +200,7 @@ mod tests {
 
     #[test]
     fn rename_persists_new_title() {
+        const SECRET: &str = "rename-secret-482915";
         let tmp = TempDir::new().unwrap();
         let manager = make_session_manager(&tmp);
         let mut app = make_app(&tmp);
@@ -212,6 +220,15 @@ mod tests {
         app.set_provider_identity(crate::config::ApiProvider::Custom, "lm-studio");
         app.mode = crate::tui::app::AppMode::Operate;
         app.system_prompt = None;
+        app.api_messages.push(crate::models::Message {
+            role: "assistant".to_string(),
+            content: vec![crate::models::ContentBlock::Text {
+                text: format!("provider echoed {SECRET}"),
+                cache_control: None,
+            }],
+        });
+        app.sensitive_user_input_provenance
+            .extend([SECRET.to_string()]);
         {
             let mut todos = app.todos.try_lock().expect("todos lock");
             todos.add(
@@ -226,6 +243,7 @@ mod tests {
         assert!(result.message.unwrap().contains("Brand New Title"));
 
         let reloaded = manager.load_session(&session_id).unwrap();
+        assert!(!serde_json::to_string(&reloaded).unwrap().contains(SECRET));
         assert_eq!(reloaded.metadata.title, "Brand New Title");
         assert_eq!(reloaded.work_state, expected_work_state);
         assert!(reloaded.system_prompt.is_none());

@@ -185,6 +185,30 @@ static SUBAGENT_PERSIST_WRITES: std::sync::atomic::AtomicU64 = std::sync::atomic
 static SUBAGENT_PERSIST_SKIPPED: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(0);
 
+/// Serializes every in-process mutation of the per-agent transcript artifacts.
+///
+/// The active child writer appends to the same JSONL file that a late parent
+/// provenance update reprojects in full. Without one shared boundary, the
+/// reprojector can read the old file, an active writer can append a message,
+/// and the reprojector can then replace the file with its stale snapshot.
+static SUBAGENT_TRANSCRIPT_IO_LOCK: std::sync::OnceLock<parking_lot::Mutex<()>> =
+    std::sync::OnceLock::new();
+
+#[cfg(test)]
+static SUBAGENT_TRANSCRIPT_IO_WAITERS: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
+fn lock_subagent_transcript_io() -> parking_lot::MutexGuard<'static, ()> {
+    #[cfg(test)]
+    SUBAGENT_TRANSCRIPT_IO_WAITERS.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    let guard = SUBAGENT_TRANSCRIPT_IO_LOCK
+        .get_or_init(|| parking_lot::Mutex::new(()))
+        .lock();
+    #[cfg(test)]
+    SUBAGENT_TRANSCRIPT_IO_WAITERS.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+    guard
+}
+
 fn subagent_perf_enabled() -> bool {
     static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ENABLED.get_or_init(|| {
@@ -1774,30 +1798,52 @@ pub struct SubAgentForkContext {
     /// parent runtime. This is deliberately runtime-only: forked provider
     /// requests retain the exact prefix, while durable child transcripts use
     /// the set to redact inherited answers and any later echoes recursively.
-    pub(crate) sensitive_user_input_values: HashSet<String>,
+    pub(crate) sensitive_user_input_provenance:
+        crate::runtime_threads::SensitiveUserInputProvenance,
 }
 
 impl SubAgentForkContext {
+    #[cfg(test)]
     pub(crate) fn new(messages: Vec<Message>, structured_state_block: Option<String>) -> Self {
-        let mut sensitive_user_input_values = HashSet::new();
+        Self::new_with_sensitive_user_input_provenance(
+            messages,
+            structured_state_block,
+            crate::runtime_threads::SensitiveUserInputProvenance::default(),
+        )
+    }
+
+    pub(crate) fn new_with_sensitive_user_input_provenance(
+        messages: Vec<Message>,
+        structured_state_block: Option<String>,
+        sensitive_user_input_provenance: crate::runtime_threads::SensitiveUserInputProvenance,
+    ) -> Self {
+        let mut sensitive_user_input_values = sensitive_user_input_provenance.snapshot();
         crate::runtime_threads::collect_sensitive_user_input_values(
             &messages,
             &mut sensitive_user_input_values,
         );
+        sensitive_user_input_provenance.extend(sensitive_user_input_values);
         Self {
             messages,
             structured_state_block,
-            sensitive_user_input_values,
+            sensitive_user_input_provenance,
         }
     }
 
     pub(crate) fn update_messages(&mut self, messages: &[Message]) {
+        let mut sensitive_user_input_values = self.sensitive_user_input_provenance.snapshot();
         crate::runtime_threads::collect_sensitive_user_input_values(
             messages,
-            &mut self.sensitive_user_input_values,
+            &mut sensitive_user_input_values,
         );
+        self.sensitive_user_input_provenance
+            .extend(sensitive_user_input_values);
         self.messages.clear();
         self.messages.extend_from_slice(messages);
+    }
+
+    pub(crate) fn sensitive_user_input_values(&self) -> HashSet<String> {
+        self.sensitive_user_input_provenance.snapshot()
     }
 }
 
@@ -2142,13 +2188,26 @@ impl SubAgentRuntime {
     pub(crate) fn current_sensitive_user_input_values(&self) -> HashSet<String> {
         self.live_fork_context
             .as_ref()
-            .map(|context| context.read().sensitive_user_input_values.clone())
+            .map(|context| context.read().sensitive_user_input_values())
             .or_else(|| {
                 self.fork_context
                     .as_ref()
-                    .map(|context| context.sensitive_user_input_values.clone())
+                    .map(SubAgentForkContext::sensitive_user_input_values)
             })
             .unwrap_or_default()
+    }
+
+    pub(crate) fn current_sensitive_user_input_provenance(
+        &self,
+    ) -> Option<crate::runtime_threads::SensitiveUserInputProvenance> {
+        self.live_fork_context
+            .as_ref()
+            .map(|context| context.read().sensitive_user_input_provenance.clone())
+            .or_else(|| {
+                self.fork_context
+                    .as_ref()
+                    .map(|context| context.sensitive_user_input_provenance.clone())
+            })
     }
 
     fn freeze_live_fork_context(&mut self) {
@@ -2491,7 +2550,7 @@ pub struct SubAgent {
     pub workspace: PathBuf,
     /// Process-local provenance used to project every public/durable child
     /// surface while preserving raw live provider and coordination context.
-    sensitive_user_input_values: HashSet<String>,
+    sensitive_user_input_provenance: crate::runtime_threads::SensitiveUserInputProvenance,
     /// Internal completion/cancellation arbitration bit. While set, the task
     /// has won the right to publish its terminal notifications, but the public
     /// status deliberately remains `Running` until those notifications are
@@ -2545,7 +2604,8 @@ impl SubAgent {
             allowed_tools,
             session_boot_id,
             workspace,
-            sensitive_user_input_values: HashSet::new(),
+            sensitive_user_input_provenance:
+                crate::runtime_threads::SensitiveUserInputProvenance::default(),
             completion_claimed: false,
             terminal_delivery: None,
             work_lifecycle: None,
@@ -2583,7 +2643,10 @@ impl SubAgent {
             // `snapshot_for_listing` helper (#405).
             from_prior_session: false,
         };
-        redact_subagent_result_for_persistence(&mut result, &self.sensitive_user_input_values);
+        redact_subagent_result_for_persistence(
+            &mut result,
+            &self.sensitive_user_input_provenance.snapshot(),
+        );
         result
     }
 }
@@ -2635,6 +2698,54 @@ pub struct SubAgentManager {
 }
 
 impl SubAgentManager {
+    /// Re-project every public/durable child surface attached to a provenance
+    /// source after a later parent answer is registered. Live provider state
+    /// remains in the child task; manager records and transcript artifacts are
+    /// public coordination state and are safe to rewrite in place.
+    pub(crate) fn refresh_sensitive_user_input_provenance(
+        &mut self,
+        provenance: &crate::runtime_threads::SensitiveUserInputProvenance,
+    ) -> Result<()> {
+        let sensitive_values = provenance.snapshot();
+        let agent_ids = self
+            .agents
+            .iter()
+            .filter_map(|(agent_id, agent)| {
+                agent
+                    .sensitive_user_input_provenance
+                    .shares_source_with(provenance)
+                    .then_some(agent_id.clone())
+            })
+            .collect::<Vec<_>>();
+        for agent_id in &agent_ids {
+            if let Some(agent) = self.agents.get_mut(agent_id) {
+                let projected = agent.snapshot();
+                agent.prompt = crate::runtime_threads::redacted_sensitive_user_input_text(
+                    &agent.prompt,
+                    &sensitive_values,
+                );
+                agent.assignment = projected.assignment;
+                agent.status = projected.status;
+                agent.result = projected.result;
+                agent.checkpoint = projected.checkpoint;
+                agent.needs_input = projected.needs_input;
+            }
+            if let Some(record) = self.worker_records.get_mut(agent_id) {
+                *record =
+                    crate::runtime_threads::redacted_serializable_clone(record, &sensitive_values)?;
+            }
+            reproject_subagent_transcript_artifact(&self.workspace, agent_id, &sensitive_values)?;
+        }
+        if !agent_ids.is_empty() {
+            self.persist_pending = false;
+            self.last_persist_at = Some(Instant::now());
+            self.persist_state()?
+                .join()
+                .map_err(|_| anyhow!("sub-agent privacy persist thread panicked"))?;
+        }
+        Ok(())
+    }
+
     /// Create a new manager for sub-agents.
     #[must_use]
     pub fn new(workspace: PathBuf, max_agents: usize) -> Self {
@@ -2792,9 +2903,10 @@ impl SubAgentManager {
                 updated_at_ms: now_ms,
                 session_boot_id: agent.session_boot_id.clone(),
             };
+            let sensitive_values = agent.sensitive_user_input_provenance.snapshot();
             agents.push(crate::runtime_threads::redacted_serializable_clone(
                 &persisted,
-                &agent.sensitive_user_input_values,
+                &sensitive_values,
             )?);
         }
         agents.sort_by(|a, b| a.id.cmp(&b.id));
@@ -2804,8 +2916,7 @@ impl SubAgentManager {
             let sensitive_values = self
                 .agents
                 .get(&worker.spec.worker_id)
-                .map(|agent| &agent.sensitive_user_input_values)
-                .cloned()
+                .map(|agent| agent.sensitive_user_input_provenance.snapshot())
                 .unwrap_or_default();
             *worker =
                 crate::runtime_threads::redacted_serializable_clone(worker, &sensitive_values)?;
@@ -3001,7 +3112,8 @@ impl SubAgentManager {
                 // manager treats that the same as a non-matching id —
                 // i.e. agent classified as prior-session.
                 session_boot_id: persisted.session_boot_id,
-                sensitive_user_input_values: HashSet::new(),
+                sensitive_user_input_provenance:
+                    crate::runtime_threads::SensitiveUserInputProvenance::default(),
                 completion_claimed: false,
                 terminal_delivery: None,
                 work_lifecycle: None,
@@ -3439,10 +3551,8 @@ impl SubAgentManager {
             .agents
             .get(&agent_id)
             .map(|agent| {
-                crate::runtime_threads::redacted_sensitive_user_input_text(
-                    &text,
-                    &agent.sensitive_user_input_values,
-                )
+                let sensitive_values = agent.sensitive_user_input_provenance.snapshot();
+                crate::runtime_threads::redacted_sensitive_user_input_text(&text, &sensitive_values)
             })
             .unwrap_or_default();
         let status = self
@@ -3558,7 +3668,7 @@ impl SubAgentManager {
         let sensitive_user_input_values = self
             .agents
             .get(&agent_id)
-            .map(|agent| agent.sensitive_user_input_values.clone())
+            .map(|agent| agent.sensitive_user_input_provenance.snapshot())
             .unwrap_or_default();
         if prior.status != SubAgentStatus::Running
             || self
@@ -3894,7 +4004,11 @@ impl SubAgentManager {
             // the context assigned to this spawn.
             runtime.freeze_live_fork_context();
         }
-        let sensitive_user_input_values = runtime.current_sensitive_user_input_values();
+        let sensitive_user_input_provenance = runtime
+            .current_sensitive_user_input_provenance()
+            .unwrap_or_default();
+        sensitive_user_input_provenance.extend(runtime.current_sensitive_user_input_values());
+        let sensitive_user_input_values = sensitive_user_input_provenance.snapshot();
         let durable_prompt = crate::runtime_threads::redacted_sensitive_user_input_text(
             &prompt,
             &sensitive_user_input_values,
@@ -3934,7 +4048,7 @@ impl SubAgentManager {
             runtime.context.workspace.clone(),
             self.current_session_boot_id.clone(),
         );
-        agent.sensitive_user_input_values = sensitive_user_input_values.clone();
+        agent.sensitive_user_input_provenance = sensitive_user_input_provenance.clone();
         if let Some(name) = options
             .name
             .as_deref()
@@ -4630,23 +4744,24 @@ struct SubAgentTranscriptArtifactWriter {
     path: PathBuf,
     relative_path: PathBuf,
     persisted_messages: usize,
-    sensitive_user_input_values: HashSet<String>,
+    sensitive_user_input_provenance: crate::runtime_threads::SensitiveUserInputProvenance,
+    projected_sensitive_value_count: usize,
 }
 
 impl SubAgentTranscriptArtifactWriter {
     async fn for_runtime(
         runtime: &SubAgentRuntime,
         agent_id: &str,
-        sensitive_user_input_values: HashSet<String>,
+        sensitive_user_input_provenance: crate::runtime_threads::SensitiveUserInputProvenance,
     ) -> Result<Self> {
         let workspace = runtime.manager.read().await.workspace.clone();
-        Self::create(&workspace, agent_id, sensitive_user_input_values)
+        Self::create(&workspace, agent_id, sensitive_user_input_provenance)
     }
 
     fn create(
         workspace: &Path,
         agent_id: &str,
-        sensitive_user_input_values: HashSet<String>,
+        sensitive_user_input_provenance: crate::runtime_threads::SensitiveUserInputProvenance,
     ) -> Result<Self> {
         let workspace = normalize_subagent_workspace(workspace);
         let relative_path = subagent_transcript_artifact_relative_path(agent_id);
@@ -4656,29 +4771,45 @@ impl SubAgentTranscriptArtifactWriter {
             "schema_version": SUBAGENT_TRANSCRIPT_ARTIFACT_SCHEMA_VERSION,
             "agent_id": agent_id,
         });
-        create_private_subagent_transcript(&workspace, &path, &json_line(&header)?)?;
+        let io_guard = lock_subagent_transcript_io();
+        rewrite_private_subagent_transcript_atomic(
+            &io_guard,
+            &workspace,
+            &path,
+            &json_line(&header)?,
+        )?;
         Ok(Self {
             agent_id: agent_id.to_string(),
             workspace,
             path,
             relative_path,
             persisted_messages: 0,
-            sensitive_user_input_values,
+            projected_sensitive_value_count: sensitive_user_input_provenance.snapshot().len(),
+            sensitive_user_input_provenance,
         })
     }
 
     fn redacted_messages(&mut self, messages: &[Message]) -> Vec<Message> {
+        let mut sensitive_user_input_values = self.sensitive_user_input_provenance.snapshot();
         crate::runtime_threads::collect_sensitive_user_input_values(
             messages,
-            &mut self.sensitive_user_input_values,
+            &mut sensitive_user_input_values,
         );
+        self.sensitive_user_input_provenance
+            .extend(sensitive_user_input_values);
+        let sensitive_user_input_values = self.sensitive_user_input_provenance.snapshot();
         crate::runtime_threads::redacted_durable_history_clone(
             messages,
-            &self.sensitive_user_input_values,
+            &sensitive_user_input_values,
         )
     }
 
-    fn sync_redacted_messages(&mut self, messages: &[Message], durable: bool) -> Result<()> {
+    fn sync_redacted_messages(
+        &mut self,
+        io_guard: &parking_lot::MutexGuard<'_, ()>,
+        messages: &[Message],
+        durable: bool,
+    ) -> Result<()> {
         if messages.len() < self.persisted_messages {
             return Err(anyhow!(
                 "sub-agent transcript history shrank from {} to {} messages",
@@ -4697,16 +4828,25 @@ impl SubAgentTranscriptArtifactWriter {
         }
 
         if !encoded.is_empty() || durable {
-            append_private_subagent_transcript(&self.workspace, &self.path, &encoded, durable)?;
+            append_private_subagent_transcript(
+                io_guard,
+                &self.workspace,
+                &self.path,
+                &encoded,
+                durable,
+            )?;
         }
         self.persisted_messages = messages.len();
         Ok(())
     }
 
     fn sync_messages(&mut self, messages: &[Message], durable: bool) -> Result<()> {
-        let prior_sensitive_value_count = self.sensitive_user_input_values.len();
+        // Keep provenance collection/projection and the resulting append or
+        // full rewrite indivisible with the manager's late reprojector.
+        let io_guard = lock_subagent_transcript_io();
         let redacted = self.redacted_messages(messages);
-        if self.sensitive_user_input_values.len() > prior_sensitive_value_count
+        let sensitive_value_count = self.sensitive_user_input_provenance.snapshot().len();
+        if sensitive_value_count > self.projected_sensitive_value_count
             && self.persisted_messages > 0
         {
             let header = json!({
@@ -4722,15 +4862,18 @@ impl SubAgentTranscriptArtifactWriter {
                     "message": message,
                 }))?);
             }
-            create_private_subagent_transcript(&self.workspace, &self.path, &encoded)?;
+            rewrite_private_subagent_transcript_atomic(
+                &io_guard,
+                &self.workspace,
+                &self.path,
+                &encoded,
+            )?;
             self.persisted_messages = redacted.len();
+            self.projected_sensitive_value_count = sensitive_value_count;
             return Ok(());
         }
-        self.sync_redacted_messages(&redacted, durable)
-    }
-
-    fn clear_sensitive_user_input_values(&mut self) {
-        self.sensitive_user_input_values.clear();
+        self.projected_sensitive_value_count = sensitive_value_count;
+        self.sync_redacted_messages(&io_guard, &redacted, durable)
     }
 
     fn metadata(&self, complete: bool) -> Value {
@@ -4745,16 +4888,62 @@ impl SubAgentTranscriptArtifactWriter {
     }
 }
 
-impl Drop for SubAgentTranscriptArtifactWriter {
-    fn drop(&mut self) {
-        self.clear_sensitive_user_input_values();
-    }
-}
-
 fn json_line(value: &Value) -> Result<Vec<u8>> {
     let mut encoded = serde_json::to_vec(value)?;
     encoded.push(b'\n');
     Ok(encoded)
+}
+
+fn reproject_subagent_transcript_artifact(
+    workspace: &Path,
+    agent_id: &str,
+    sensitive_values: &HashSet<String>,
+) -> Result<()> {
+    let io_guard = lock_subagent_transcript_io();
+    let workspace = normalize_subagent_workspace(workspace);
+    let path = checked_subagent_transcript_artifact_path(&workspace, agent_id)?;
+    if !path.exists() {
+        return Ok(());
+    }
+    let raw = std::fs::read_to_string(&path)?;
+    let mut encoded = Vec::with_capacity(raw.len());
+    for line in raw.lines() {
+        let Ok(mut value) = serde_json::from_str::<Value>(line) else {
+            let projected =
+                crate::runtime_threads::redacted_sensitive_user_input_text(line, sensitive_values);
+            encoded.extend_from_slice(projected.as_bytes());
+            encoded.push(b'\n');
+            continue;
+        };
+        if value.get("kind").and_then(Value::as_str) == Some("message") {
+            let message_value = value
+                .get("message")
+                .cloned()
+                .ok_or_else(|| anyhow!("sub-agent transcript record is missing its message"))?;
+            let message = serde_json::from_value::<Message>(message_value).map_err(|err| {
+                anyhow!("sub-agent transcript message could not be decoded as a Message: {err}")
+            })?;
+            let mut projected = crate::runtime_threads::redacted_durable_history_clone(
+                &[message],
+                sensitive_values,
+            );
+            if let Some(message) = projected.pop()
+                && let Some(slot) = value.get_mut("message")
+            {
+                *slot = serde_json::to_value(message)?;
+            }
+        } else if let Some(agent_id_value) = value.get_mut("agent_id")
+            && let Some(raw_agent_id) = agent_id_value.as_str()
+        {
+            *agent_id_value =
+                Value::String(crate::runtime_threads::redacted_sensitive_user_input_text(
+                    raw_agent_id,
+                    sensitive_values,
+                ));
+        }
+        encoded.extend(json_line(&value)?);
+    }
+    rewrite_private_subagent_transcript_atomic(&io_guard, &workspace, &path, &encoded)
 }
 
 fn subagent_transcript_artifact_relative_path(agent_id: &str) -> PathBuf {
@@ -4851,7 +5040,11 @@ pub(crate) fn write_subagent_transcript_artifact_for_test(
     agent_id: &str,
     messages: &[Message],
 ) -> Result<PathBuf> {
-    let mut writer = SubAgentTranscriptArtifactWriter::create(workspace, agent_id, HashSet::new())?;
+    let mut writer = SubAgentTranscriptArtifactWriter::create(
+        workspace,
+        agent_id,
+        crate::runtime_threads::SensitiveUserInputProvenance::default(),
+    )?;
     writer.sync_messages(messages, true)?;
     Ok(writer.path.clone())
 }
@@ -5005,15 +5198,51 @@ fn prepare_subagent_transcript_parent(workspace: &Path, path: &Path) -> Result<(
     Ok(())
 }
 
-fn create_private_subagent_transcript(workspace: &Path, path: &Path, bytes: &[u8]) -> Result<()> {
+/// Replace a transcript with a fully-written, synced, owner-private temporary
+/// file from the same directory. The rename publishes either the old complete
+/// stream or the new complete stream; readers never observe a truncated
+/// in-place rewrite.
+#[cfg(unix)]
+fn rewrite_private_subagent_transcript_atomic(
+    _io_guard: &parking_lot::MutexGuard<'_, ()>,
+    workspace: &Path,
+    path: &Path,
+    bytes: &[u8],
+) -> Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+
     prepare_subagent_transcript_parent(workspace, path)?;
-    let mut file = open_private_subagent_transcript(path, false)?;
-    file.write_all(bytes)?;
-    file.sync_all()?;
+    let parent = path
+        .parent()
+        .ok_or_else(|| anyhow!("sub-agent transcript artifact must have a parent directory"))?;
+    let mut temporary = tempfile::NamedTempFile::new_in(parent)?;
+    temporary
+        .as_file()
+        .set_permissions(fs::Permissions::from_mode(0o600))?;
+    temporary.write_all(bytes)?;
+    temporary.flush()?;
+    temporary.as_file().sync_all()?;
+    reject_workspace_relative_symlinks(workspace, path)?;
+    temporary.persist(path).map_err(|err| err.error)?;
+    if let Ok(directory) = fs::File::open(parent) {
+        let _ = directory.sync_all();
+    }
     Ok(())
 }
 
+#[cfg(not(unix))]
+fn rewrite_private_subagent_transcript_atomic(
+    _io_guard: &parking_lot::MutexGuard<'_, ()>,
+    workspace: &Path,
+    path: &Path,
+    bytes: &[u8],
+) -> Result<()> {
+    prepare_subagent_transcript_parent(workspace, path)?;
+    crate::utils::write_atomic(path, bytes).map_err(Into::into)
+}
+
 fn append_private_subagent_transcript(
+    _io_guard: &parking_lot::MutexGuard<'_, ()>,
     workspace: &Path,
     path: &Path,
     bytes: &[u8],
@@ -6879,7 +7108,7 @@ async fn insert_subagent_full_transcript_handle(
     let mut sensitive_user_input_values =
         sensitive_user_input_values_for_subagent(runtime, messages);
     if let Some(writer) = transcript_artifact.as_ref() {
-        sensitive_user_input_values.extend(writer.sensitive_user_input_values.iter().cloned());
+        sensitive_user_input_values.extend(writer.sensitive_user_input_provenance.snapshot());
     }
     let durable_messages = crate::runtime_threads::redacted_durable_history_clone(
         messages,
@@ -6915,11 +7144,7 @@ async fn insert_subagent_full_transcript_handle(
                 false
             }
         };
-        let metadata = writer.metadata(synced && writer.persisted_messages == messages.len());
-        if *status != SubAgentStatus::Running {
-            writer.clear_sensitive_user_input_values();
-        }
-        metadata
+        writer.metadata(synced && writer.persisted_messages == messages.len())
     });
     let (bounded_messages, omitted_messages) =
         bounded_tail_messages(&durable_messages, SUBAGENT_TRANSCRIPT_MESSAGE_BUDGET_BYTES);
@@ -7394,9 +7619,10 @@ async fn run_subagent(
     let fork_context = fork_context_enabled
         .then(|| runtime.current_fork_context())
         .flatten();
-    let inherited_sensitive_user_input_values = fork_context
+    let inherited_sensitive_user_input_provenance = fork_context
         .as_ref()
-        .map(|context| context.sensitive_user_input_values.clone())
+        .map(|context| context.sensitive_user_input_provenance.clone())
+        .or_else(|| runtime.current_sensitive_user_input_provenance())
         .unwrap_or_default();
     let request_system = subagent_request_system_prompt(&system_prompt);
     let mut messages = build_initial_subagent_messages_with_system(
@@ -7409,7 +7635,7 @@ async fn run_subagent(
     let mut transcript_artifact = match SubAgentTranscriptArtifactWriter::for_runtime(
         runtime,
         &agent_id,
-        inherited_sensitive_user_input_values.clone(),
+        inherited_sensitive_user_input_provenance.clone(),
     )
     .await
     {
@@ -7440,7 +7666,7 @@ async fn run_subagent(
         SubAgentForkContext {
             messages: messages.clone(),
             structured_state_block: None,
-            sensitive_user_input_values: inherited_sensitive_user_input_values,
+            sensitive_user_input_provenance: inherited_sensitive_user_input_provenance,
         },
     );
     let tool_registry = SubAgentToolRegistry::new_with_owner(

@@ -8046,6 +8046,153 @@ fn classified_values_redact_nested_json_object_keys_and_values() -> Result<()> {
 }
 
 #[test]
+fn typed_projection_preserves_fixed_schema_keys_and_redacts_dynamic_json_keys() -> Result<()> {
+    #[derive(Debug, Serialize, Deserialize)]
+    struct FixedEnvelope {
+        id: String,
+        session_id: Option<String>,
+        messages: Vec<String>,
+        input: Value,
+    }
+
+    let sensitive_values = HashSet::from(["input".to_string(), "7".to_string()]);
+    let envelope = FixedEnvelope {
+        id: "stable-id".to_string(),
+        session_id: Some("linked-7".to_string()),
+        messages: vec!["ordinary".to_string()],
+        input: json!({
+            "input": "7",
+            "nested": {"value": "echo input and 7"}
+        }),
+    };
+    let projected = redacted_serializable_clone(&envelope, &sensitive_values)?;
+    let serialized = serde_json::to_value(projected)?;
+
+    assert_eq!(serialized["id"], "stable-id");
+    assert!(
+        serialized["session_id"]
+            .as_str()
+            .is_some_and(|value| { value.starts_with("linked-") && !value.contains('7') })
+    );
+    assert_eq!(serialized["messages"][0], "ordinary");
+    assert!(serialized.get("input").is_some());
+    assert!(serialized["input"].get("input").is_none());
+    let dynamic = serde_json::to_string(&serialized["input"])?;
+    assert!(!dynamic.contains("\"7\""));
+    assert!(!dynamic.contains("echo input"));
+    Ok(())
+}
+
+#[test]
+fn typed_projection_preserves_short_discriminants_and_request_response_identity() -> Result<()> {
+    #[derive(Debug, Serialize, Deserialize, PartialEq, Eq)]
+    #[serde(rename_all = "snake_case")]
+    enum FixedStatus {
+        Running,
+    }
+
+    #[derive(Debug, Serialize, Deserialize)]
+    struct CollisionEnvelope {
+        id: String,
+        status: FixedStatus,
+        event: String,
+        progress: Vec<String>,
+        request: crate::tools::user_input::UserInputRequest,
+        payload: Value,
+    }
+
+    let sensitive_values = HashSet::from([
+        "running".to_string(),
+        "progress".to_string(),
+        "questions".to_string(),
+        "7".to_string(),
+    ]);
+    let envelope = CollisionEnvelope {
+        id: "questions".to_string(),
+        status: FixedStatus::Running,
+        event: "running".to_string(),
+        progress: vec!["progress running 7".to_string()],
+        request: crate::tools::user_input::UserInputRequest {
+            questions: vec![crate::tools::user_input::UserInputQuestion {
+                header: "progress".to_string(),
+                id: "questions".to_string(),
+                question: "Is running 7 okay?".to_string(),
+                options: vec![crate::tools::user_input::UserInputOption {
+                    label: "running".to_string(),
+                    description: "progress 7".to_string(),
+                }],
+                allow_free_text: true,
+                multi_select: false,
+            }],
+        },
+        payload: json!({
+            "questions": "running",
+            "safe": "progress 7"
+        }),
+    };
+
+    let projected = redacted_serializable_clone(&envelope, &sensitive_values)?;
+    assert_eq!(projected.id, "questions");
+    assert_eq!(projected.status, FixedStatus::Running);
+    assert_eq!(projected.event, "running");
+    assert!(!projected.progress[0].contains("progress"));
+    assert!(!projected.progress[0].contains("running"));
+    assert!(!projected.progress[0].contains('7'));
+    let question = &projected.request.questions[0];
+    assert_eq!(question.id, "questions");
+    assert_eq!(question.options[0].label, "running");
+    assert!(!question.header.contains("progress"));
+    assert!(!question.question.contains("running"));
+    assert!(!question.options[0].description.contains('7'));
+    assert!(projected.payload.get("questions").is_none());
+    assert!(!serde_json::to_string(&projected.payload)?.contains("running"));
+    Ok(())
+}
+
+#[test]
+fn public_tool_result_projects_dynamic_metadata_without_changing_result_schema() -> Result<()> {
+    let sensitive_values = HashSet::from(["input".to_string(), "7".to_string()]);
+    let result = Ok(
+        crate::tools::spec::ToolResult::success("echo 7").with_metadata(json!({
+            "input": "7",
+            "safe": {"input": "echo input"}
+        })),
+    );
+    let projected = redacted_tool_result_for_public(&result, &sensitive_values)?;
+    let serialized = serde_json::to_value(projected)?;
+
+    for fixed in ["content", "success", "metadata"] {
+        assert!(
+            serialized.get(fixed).is_some(),
+            "missing fixed field {fixed}"
+        );
+    }
+    assert!(serialized["metadata"].get("input").is_none());
+    assert!(!serde_json::to_string(&serialized["metadata"])?.contains("\"7\""));
+    Ok(())
+}
+
+#[test]
+fn request_user_input_public_receipt_does_not_mutate_private_provider_result() -> Result<()> {
+    const SECRET: &str = "482915";
+    let raw = Ok(crate::tools::spec::ToolResult::success(
+        json!({"answers":[{"id":"pin", "value":SECRET}]}).to_string(),
+    ));
+    let public =
+        redacted_request_user_input_result_for_public(&raw, &HashSet::from([SECRET.to_string()]))?;
+
+    assert_eq!(public.content, "User input submitted");
+    assert!(!public.content.contains(SECRET));
+    assert!(
+        raw.as_ref()
+            .expect("raw provider result")
+            .content
+            .contains(SECRET)
+    );
+    Ok(())
+}
+
+#[test]
 fn sensitive_stream_projection_never_emits_split_or_adjacent_secret_bytes() {
     const SECRET: &str = "482915";
     let sensitive_values = HashSet::from([SECRET.to_string()]);
@@ -8221,6 +8368,82 @@ async fn late_root_taint_rewrites_thread_metadata_and_event_replay() -> Result<(
         replayed.extend(batch.map_err(anyhow::Error::msg)?);
     }
     assert!(!serde_json::to_string(&replayed)?.contains(SECRET));
+    Ok(())
+}
+
+#[tokio::test]
+async fn late_root_taint_preserves_short_fixed_event_and_record_schema() -> Result<()> {
+    let data_dir = test_runtime_dir();
+    let manager = test_manager(data_dir.clone())?;
+    let thread = manager
+        .create_thread(CreateThreadRequest::default())
+        .await?;
+    manager
+        .update_thread(
+            &thread.id,
+            UpdateThreadRequest {
+                title: Some("id status event running".to_string()),
+                ..UpdateThreadRequest::default()
+            },
+        )
+        .await?;
+    manager
+        .emit_event(
+            &thread.id,
+            None,
+            None,
+            "running",
+            json!({
+                "id": "status",
+                "event": {"running": "id status event running"}
+            }),
+        )
+        .await?;
+
+    manager
+        .extend_sensitive_user_input_values(
+            &thread.id,
+            [
+                "id".to_string(),
+                "status".to_string(),
+                "event".to_string(),
+                "running".to_string(),
+            ],
+        )
+        .await?;
+
+    let durable_thread = manager.store.load_thread(&thread.id)?;
+    assert_eq!(durable_thread.id, thread.id);
+    assert!(
+        durable_thread
+            .title
+            .as_deref()
+            .is_some_and(|title| !title.contains("running"))
+    );
+    let durable_events = manager.store.events_since(&thread.id, None)?;
+    let fixed_event = durable_events
+        .iter()
+        .find(|event| event.event == "running")
+        .context("fixed event discriminant was corrupted")?;
+    assert_eq!(fixed_event.thread_id, thread.id);
+    let payload = serde_json::to_string(&fixed_event.payload)?;
+    for secret in ["id", "status", "event", "running"] {
+        assert!(
+            !payload.contains(secret),
+            "payload leaked {secret}: {payload}"
+        );
+    }
+
+    // Re-read the bytes through the typed store parsers: fixed `id`, `event`,
+    // and lifecycle-schema keys must remain valid after the late rewrite.
+    assert!(!manager.store.load_thread(&thread.id)?.id.is_empty());
+    assert!(
+        manager
+            .store
+            .events_since(&thread.id, None)?
+            .iter()
+            .all(|event| !event.event.is_empty())
+    );
     Ok(())
 }
 
@@ -8483,7 +8706,18 @@ async fn registered_taint_projects_session_and_turn_api_returns() -> Result<()> 
     manager
         .set_thread_session_id(&thread.id, &format!("session-{SECRET}"))
         .await?;
-    assert!(!serde_json::to_string(&manager.store.load_thread(&thread.id)?)?.contains(SECRET));
+    let persisted_thread = serde_json::to_value(manager.store.load_thread(&thread.id)?)?;
+    let leaking_fields = persisted_thread
+        .as_object()
+        .into_iter()
+        .flat_map(|fields| fields.iter())
+        .filter(|(_, value)| value.to_string().contains(SECRET))
+        .map(|(key, _)| key.as_str())
+        .collect::<Vec<_>>();
+    assert!(
+        leaking_fields.is_empty(),
+        "leaking fields: {leaking_fields:?}"
+    );
     assert!(
         !serde_json::to_string(&manager.store.events_since(&thread.id, None)?)?.contains(SECRET)
     );
@@ -9173,6 +9407,49 @@ async fn sensitive_answer_taint_survives_turns_recompaction_and_restart() -> Res
         }
     })
     .await??;
+    let mut approval_input = serde_json::Map::new();
+    approval_input.insert(
+        format!("echoed-{SECRET}-key"),
+        json!({"value": format!("approval {UNKNOWN_ID_SECRET}")}),
+    );
+    harness
+        .tx_event
+        .send(EngineEvent::ApprovalRequired {
+            id: "echoed-approval".to_string(),
+            tool_name: "exec_command".to_string(),
+            description: format!("approval description {SECRET}"),
+            input: Value::Object(approval_input),
+            approval_key: "echoed-approval-key".to_string(),
+            approval_grouping_key: "echoed-approval-group".to_string(),
+            intent_summary: Some(format!("approval intent {UNKNOWN_ID_SECRET}")),
+            approval_force_prompt: true,
+        })
+        .await?;
+    tokio::time::timeout(Duration::from_secs(2), async {
+        loop {
+            let detail = manager.get_thread_detail(&thread.id).await?;
+            if detail
+                .pending_approvals
+                .iter()
+                .any(|pending| pending.id == "echoed-approval")
+            {
+                let serialized = serde_json::to_string(&detail)?;
+                assert!(!serialized.contains(SECRET), "{serialized}");
+                assert!(!serialized.contains(UNKNOWN_ID_SECRET), "{serialized}");
+                break Ok::<_, anyhow::Error>(());
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await??;
+    assert!(manager.deliver_external_approval(
+        "echoed-approval",
+        ExternalApprovalDecision::Deny { remember: false },
+    ));
+    assert!(matches!(
+        harness.recv_approval_event().await,
+        Some(MockApprovalEvent::Denied { id }) if id == "echoed-approval"
+    ));
     harness
         .tx_event
         .send(EngineEvent::CompactionStarted {

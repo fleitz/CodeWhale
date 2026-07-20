@@ -294,9 +294,12 @@ impl Engine {
         dynamic_active_tools: Vec<&'static str>,
         live_fork_context: Option<&SharedSubAgentForkContext>,
     ) -> (TurnOutcomeStatus, Option<String>) {
+        let event_sensitive_user_input_provenance = live_fork_context
+            .map(|context| context.read().sensitive_user_input_provenance.clone())
+            .unwrap_or_default();
         let redact_runtime_log = |message: String| {
             let sensitive_values = live_fork_context
-                .map(|context| context.read().sensitive_user_input_values.clone())
+                .map(|context| context.read().sensitive_user_input_values())
                 .unwrap_or_default();
             crate::runtime_threads::redacted_sensitive_user_input_text(&message, &sensitive_values)
         };
@@ -728,7 +731,7 @@ impl Engine {
             // across transparent retries.
             update_live_fork_context_from_request(live_fork_context, &stream_request);
             let current_sensitive_user_input_values = live_fork_context
-                .map(|context| context.read().sensitive_user_input_values.clone())
+                .map(|context| context.read().sensitive_user_input_values())
                 .unwrap_or_default();
 
             // Stream the response. Keep the request around (cloned into the
@@ -1240,7 +1243,11 @@ impl Engine {
                                 .send(Event::ToolCallStarted {
                                     id: tool_state.id.clone(),
                                     name: tool_state.name.clone(),
-                                    input: final_tool_input(tool_state),
+                                    input:
+                                        crate::runtime_threads::redacted_sensitive_user_input_json(
+                                            &final_tool_input(tool_state),
+                                            &current_sensitive_user_input_values,
+                                        ),
                                 })
                                 .await;
                         }
@@ -1366,7 +1373,10 @@ impl Engine {
                         .send(Event::ToolCallStarted {
                             id: call.id.clone(),
                             name: call.name.clone(),
-                            input: call.args.clone(),
+                            input: crate::runtime_threads::redacted_sensitive_user_input_json(
+                                &call.args,
+                                &current_sensitive_user_input_values,
+                            ),
                         })
                         .await;
                     tool_uses.push(ToolUseState {
@@ -1849,9 +1859,14 @@ impl Engine {
                         );
                     }
 
+                    let public_tool_input =
+                        crate::runtime_threads::redacted_sensitive_user_input_json(
+                            &tool_input,
+                            &event_sensitive_user_input_provenance.snapshot(),
+                        );
                     let hook_context = crate::hooks::HookContext::new()
                         .with_tool_name(&tool_name)
-                        .with_tool_args(&tool_input)
+                        .with_tool_args(&public_tool_input)
                         .with_mode(&format!("{mode:?}"))
                         .with_workspace(self.session.workspace.clone())
                         .with_model(&self.config.model)
@@ -2259,7 +2274,10 @@ impl Engine {
                             .send(Event::ToolCallComplete {
                                 id: plan.id.clone(),
                                 name: plan.name.clone(),
-                                result: result.clone(),
+                                result: crate::runtime_threads::redacted_tool_result_for_public(
+                                    &result,
+                                    &event_sensitive_user_input_provenance.snapshot(),
+                                ),
                             })
                             .await;
                         outcomes[plan.index] = Some(ToolExecOutcome {
@@ -2297,7 +2315,10 @@ impl Engine {
                                 .send(Event::ToolCallComplete {
                                     id: plan.id.clone(),
                                     name: plan.name.clone(),
-                                    result: result.clone(),
+                                    result: crate::runtime_threads::redacted_tool_result_for_public(
+                                        &result,
+                                        &event_sensitive_user_input_provenance.snapshot(),
+                                    ),
                                 })
                                 .await;
                             outcomes[plan.index] = Some(ToolExecOutcome {
@@ -2329,8 +2350,8 @@ impl Engine {
                         let started_at = Instant::now();
                         let shell_permits = shell_permits.clone();
                         let workspace = self.session.workspace.clone();
-                        let spill_sensitive_user_input_values =
-                            spill_sensitive_user_input_values.clone();
+                        let event_sensitive_user_input_provenance =
+                            event_sensitive_user_input_provenance.clone();
 
                         tool_tasks.push(async move {
                             let _shell_permit = if plan.name == "exec_shell" {
@@ -2361,7 +2382,7 @@ impl Engine {
                                 let durable_content =
                                     crate::runtime_threads::redacted_sensitive_user_input_text(
                                         &tool_result.content,
-                                        &spill_sensitive_user_input_values,
+                                        &event_sensitive_user_input_provenance.snapshot(),
                                     );
                                 if let Some(path) =
                                     crate::tools::truncate::apply_spillover_with_artifact_projection(
@@ -2370,7 +2391,7 @@ impl Engine {
                                         &plan.name,
                                         &session_id,
                                         &durable_content,
-                                        &spill_sensitive_user_input_values,
+                                        &event_sensitive_user_input_provenance.snapshot(),
                                     )
                                 {
                                     emit_tool_audit(
@@ -2380,7 +2401,7 @@ impl Engine {
                                             "tool_name": plan.name.clone(),
                                             "path": path.display().to_string(),
                                         }),
-                                        &spill_sensitive_user_input_values,
+                                        &event_sensitive_user_input_provenance.snapshot(),
                                     );
                                 }
                             }
@@ -2389,7 +2410,10 @@ impl Engine {
                                 .send(Event::ToolCallComplete {
                                     id: plan.id.clone(),
                                     name: plan.name.clone(),
-                                    result: result.clone(),
+                                    result: crate::runtime_threads::redacted_tool_result_for_public(
+                                        &result,
+                                        &event_sensitive_user_input_provenance.snapshot(),
+                                    ),
                                 })
                                 .await;
 
@@ -2436,7 +2460,10 @@ impl Engine {
                                 .send(Event::ToolCallComplete {
                                     id: id.clone(),
                                     name: name.clone(),
-                                    result: result.clone(),
+                                    result: crate::runtime_threads::redacted_tool_result_for_public(
+                                        &result,
+                                        &event_sensitive_user_input_provenance.snapshot(),
+                                    ),
                                 })
                                 .await;
                             outcomes[index] = Some(ToolExecOutcome {
@@ -2463,7 +2490,10 @@ impl Engine {
                                 .send(Event::ToolCallComplete {
                                     id: tool_id.clone(),
                                     name: tool_name.clone(),
-                                    result: result.clone(),
+                                    result: crate::runtime_threads::redacted_tool_result_for_public(
+                                        &result,
+                                        &event_sensitive_user_input_provenance.snapshot(),
+                                    ),
                                 })
                                 .await;
                             outcomes[plan.index] = Some(ToolExecOutcome {
@@ -2484,7 +2514,10 @@ impl Engine {
                                 .send(Event::ToolCallComplete {
                                     id: tool_id.clone(),
                                     name: tool_name.clone(),
-                                    result: result.clone(),
+                                    result: crate::runtime_threads::redacted_tool_result_for_public(
+                                        &result,
+                                        &event_sensitive_user_input_provenance.snapshot(),
+                                    ),
                                 })
                                 .await;
                             outcomes[plan.index] = Some(ToolExecOutcome {
@@ -2519,7 +2552,10 @@ impl Engine {
                                 .send(Event::ToolCallComplete {
                                     id: tool_id.clone(),
                                     name: tool_name.clone(),
-                                    result: result.clone(),
+                                    result: crate::runtime_threads::redacted_tool_result_for_public(
+                                        &result,
+                                        &event_sensitive_user_input_provenance.snapshot(),
+                                    ),
                                 })
                                 .await;
 
@@ -2548,7 +2584,10 @@ impl Engine {
                                 .send(Event::ToolCallComplete {
                                     id: tool_id.clone(),
                                     name: tool_name.clone(),
-                                    result: result.clone(),
+                                    result: crate::runtime_threads::redacted_tool_result_for_public(
+                                        &result,
+                                        &event_sensitive_user_input_provenance.snapshot(),
+                                    ),
                                 })
                                 .await;
 
@@ -2590,12 +2629,24 @@ impl Engine {
                                 })))
                                 };
 
+                            // The terminal outcome below is the private copy
+                            // that is returned to the provider. Events feed UI,
+                            // hooks, evidence and persistence, so publish only
+                            // the provenance-projected copy.
+                            let sensitive_values =
+                                self.session.sensitive_user_input_provenance.snapshot();
+                            let public_result =
+                                crate::runtime_threads::redacted_request_user_input_result_for_public(
+                                    &result,
+                                    &sensitive_values,
+                                );
+
                             let _ = self
                                 .tx_event
                                 .send(Event::ToolCallComplete {
                                     id: tool_id.clone(),
                                     name: tool_name.clone(),
-                                    result: result.clone(),
+                                    result: public_result,
                                 })
                                 .await;
 
@@ -2635,19 +2686,33 @@ impl Engine {
                                     &tool_input,
                                 )
                                 .0;
+                            let approval_sensitive_values =
+                                self.session.sensitive_user_input_provenance.snapshot();
                             let _ = self
                                 .tx_event
                                 .send(Event::ApprovalRequired {
                                     id: tool_id.clone(),
                                     tool_name: tool_name.clone(),
-                                    input: tool_input.clone(),
-                                    description: plan.approval_description.clone(),
+                                    input: crate::runtime_threads::redacted_sensitive_user_input_json(
+                                        &tool_input,
+                                        &approval_sensitive_values,
+                                    ),
+                                    description:
+                                        crate::runtime_threads::redacted_sensitive_user_input_text(
+                                            &plan.approval_description,
+                                            &approval_sensitive_values,
+                                        ),
                                     approval_key,
                                     approval_grouping_key,
                                     intent_summary: if plan.read_only {
                                         None
                                     } else {
-                                        intent_summary.clone()
+                                        intent_summary.as_ref().map(|summary| {
+                                            crate::runtime_threads::redacted_sensitive_user_input_text(
+                                                summary,
+                                                &approval_sensitive_values,
+                                            )
+                                        })
                                     },
                                     approval_force_prompt: plan.approval_force_prompt,
                                 })
@@ -2773,7 +2838,7 @@ impl Engine {
                             let durable_content =
                                 crate::runtime_threads::redacted_sensitive_user_input_text(
                                     &tool_result.content,
-                                    &spill_sensitive_user_input_values,
+                                    &event_sensitive_user_input_provenance.snapshot(),
                                 );
                             if let Some(path) =
                                 crate::tools::truncate::apply_spillover_with_artifact_projection(
@@ -2782,7 +2847,7 @@ impl Engine {
                                     &tool_name,
                                     &self.session.id,
                                     &durable_content,
-                                    &spill_sensitive_user_input_values,
+                                    &event_sensitive_user_input_provenance.snapshot(),
                                 )
                             {
                                 emit_tool_audit(
@@ -2802,7 +2867,10 @@ impl Engine {
                             .send(Event::ToolCallComplete {
                                 id: tool_id.clone(),
                                 name: tool_name.clone(),
-                                result: result.clone(),
+                                result: crate::runtime_threads::redacted_tool_result_for_public(
+                                    &result,
+                                    &event_sensitive_user_input_provenance.snapshot(),
+                                ),
                             })
                             .await;
 
@@ -2867,7 +2935,10 @@ impl Engine {
                     .send(Event::ToolCallComplete {
                         id: follower.id.clone(),
                         name: follower.name.clone(),
-                        result: result.clone(),
+                        result: crate::runtime_threads::redacted_tool_result_for_public(
+                            &result,
+                            &event_sensitive_user_input_provenance.snapshot(),
+                        ),
                     })
                     .await;
                 let terminal = match result {

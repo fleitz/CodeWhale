@@ -53,6 +53,45 @@ pub(super) enum ApprovalResult {
 }
 
 impl Engine {
+    /// Once an answer is classified as private, all attached durable child
+    /// sinks must converge before the exact response can resume the provider
+    /// turn. Provenance is extended first, so concurrent/new writes already
+    /// project through it; retrying both sink families on every pass also
+    /// repairs a partial prior pass instead of treating set membership as a
+    /// completed-cleanup receipt.
+    async fn refresh_late_sensitive_projections_until_clean(&mut self) {
+        let mut attempt = 0u32;
+        loop {
+            attempt = attempt.saturating_add(1);
+            let workflow_result = crate::tools::workflow::refresh_sensitive_user_input_provenance(
+                &self.session.sensitive_user_input_provenance,
+            );
+            let child_result = self
+                .subagent_manager
+                .write()
+                .await
+                .refresh_sensitive_user_input_provenance(
+                    &self.session.sensitive_user_input_provenance,
+                );
+            if workflow_result.is_ok() && child_result.is_ok() {
+                return;
+            }
+
+            // Do not return the exact answer while any known public/durable
+            // sink is dirty. Error details can include paths or stale prose,
+            // so the operational warning intentionally reports only the pass.
+            tracing::warn!(
+                attempt,
+                workflow_clean = workflow_result.is_ok(),
+                child_clean = child_result.is_ok(),
+                "late privacy projection incomplete; retrying before provider resume"
+            );
+            let shift = attempt.saturating_sub(1).min(4);
+            let backoff_ms = 50u64.saturating_mul(1u64 << shift);
+            tokio::time::sleep(Duration::from_millis(backoff_ms)).await;
+        }
+    }
+
     /// Format a cancellation suffix when the engine knows the cause.
     /// Some internal cancellation paths still use the raw token while
     /// #1541 is open; those keep the legacy message without a guessed
@@ -111,11 +150,15 @@ impl Engine {
         tool_id: &str,
         request: UserInputRequest,
     ) -> Result<UserInputResponse, ToolError> {
+        let public_request = crate::runtime_threads::redacted_user_input_request_for_public(
+            &request,
+            &self.session.sensitive_user_input_provenance.snapshot(),
+        );
         let _ = self
             .tx_event
             .send(Event::UserInputRequired {
                 id: tool_id.to_string(),
-                request,
+                request: public_request,
             })
             .await;
 
@@ -132,6 +175,16 @@ impl Engine {
                         Ok(Some(decision)) => {
                             match decision {
                                 UserInputDecision::Submitted { id, response } if id == tool_id => {
+                                    let mut sensitive_values = std::collections::HashSet::new();
+                                    crate::runtime_threads::collect_sensitive_user_input_response_values(
+                                        &request,
+                                        &response,
+                                        &mut sensitive_values,
+                                    );
+                                    self.session
+                                        .sensitive_user_input_provenance
+                                        .extend(sensitive_values);
+                                    self.refresh_late_sensitive_projections_until_clean().await;
                                     return Ok(response);
                                 }
                                 UserInputDecision::Cancelled { id } if id == tool_id => {

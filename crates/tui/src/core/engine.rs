@@ -1322,11 +1322,7 @@ impl Engine {
         let tool_id = turn_id.clone();
         let tool_name = "exec_shell".to_string();
         let tool_input = json!({ "command": command, "source": "user" });
-        let mut sensitive_user_input_values = HashSet::new();
-        crate::runtime_threads::collect_sensitive_user_input_values(
-            &self.session.messages,
-            &mut sensitive_user_input_values,
-        );
+        let sensitive_user_input_values = self.session.sensitive_user_input_provenance.snapshot();
         let snapshot_prompt = tool_input["command"]
             .as_str()
             .unwrap_or_default()
@@ -1355,8 +1351,15 @@ impl Engine {
             let pre_seq = self.turn_counter;
             let pre_cap = self.config.snapshots_max_workspace_bytes;
             let pre_prompt = snapshot_prompt.clone();
+            let pre_sensitive_values = sensitive_user_input_values.clone();
             let _ = tokio::task::spawn_blocking(move || {
-                pre_turn_snapshot(&pre_workspace, pre_seq, pre_cap, Some(&pre_prompt))
+                pre_turn_snapshot(
+                    &pre_workspace,
+                    pre_seq,
+                    pre_cap,
+                    Some(&pre_prompt),
+                    &pre_sensitive_values,
+                )
             })
             .await;
         }
@@ -1366,7 +1369,10 @@ impl Engine {
             .send(Event::ToolCallStarted {
                 id: tool_id.clone(),
                 name: tool_name.clone(),
-                input: tool_input.clone(),
+                input: crate::runtime_threads::redacted_sensitive_user_input_json(
+                    &tool_input,
+                    &sensitive_user_input_values,
+                ),
             })
             .await;
 
@@ -1431,8 +1437,14 @@ impl Engine {
                     .send(Event::ApprovalRequired {
                         id: tool_id.clone(),
                         tool_name: tool_name.clone(),
-                        input: tool_input.clone(),
-                        description: approval_description,
+                        input: crate::runtime_threads::redacted_sensitive_user_input_json(
+                            &tool_input,
+                            &sensitive_user_input_values,
+                        ),
+                        description: crate::runtime_threads::redacted_sensitive_user_input_text(
+                            &approval_description,
+                            &sensitive_user_input_values,
+                        ),
                         approval_key,
                         approval_grouping_key,
                         intent_summary: None,
@@ -1582,13 +1594,17 @@ impl Engine {
 
         let status = user_shell_turn_outcome(&result, self.cancel_token.is_cancelled());
         let error = result.as_ref().err().map(ToString::to_string);
+        let public_result = crate::runtime_threads::redacted_tool_result_for_public(
+            &result,
+            &sensitive_user_input_values,
+        );
 
         let _ = self
             .tx_event
             .send(Event::ToolCallComplete {
                 id: tool_id,
                 name: tool_name,
-                result,
+                result: public_result,
             })
             .await;
 
@@ -1607,8 +1623,16 @@ impl Engine {
             let post_workspace = self.session.workspace.clone();
             let post_seq = self.turn_counter;
             let post_cap = self.config.snapshots_max_workspace_bytes;
+            let post_sensitive_user_input_provenance =
+                self.session.sensitive_user_input_provenance.clone();
             crate::utils::spawn_blocking_supervised("post-shell-turn-snapshot", move || {
-                post_turn_snapshot(&post_workspace, post_seq, post_cap, Some(&snapshot_prompt));
+                post_turn_snapshot(
+                    &post_workspace,
+                    post_seq,
+                    post_cap,
+                    Some(&snapshot_prompt),
+                    &post_sensitive_user_input_provenance.snapshot(),
+                );
             });
         }
     }
@@ -2273,6 +2297,16 @@ impl Engine {
                     } => {
                         let plugin_workspace_changed =
                             self.plugin_registry.workspace() != workspace.as_path();
+                        let starts_distinct_session = session_id
+                            .as_ref()
+                            .is_some_and(|next_id| next_id != &self.session.id)
+                            || (session_id.is_none()
+                                && messages.is_empty()
+                                && system_prompt.is_none());
+                        if starts_distinct_session {
+                            self.session.sensitive_user_input_provenance =
+                                crate::runtime_threads::SensitiveUserInputProvenance::default();
+                        }
                         if let Some(session_id) = session_id {
                             self.session.id = session_id;
                         } else if messages.is_empty() && system_prompt.is_none() {
@@ -2293,7 +2327,7 @@ impl Engine {
                                 ),
                             );
                         }
-                        self.session.messages = restored_messages.into();
+                        self.session.replace_messages(restored_messages);
                         self.session.system_prompt = system_prompt;
                         self.session.last_system_prompt_hash =
                             Some(system_prompt_hash(self.session.system_prompt.as_ref()));
@@ -2347,7 +2381,11 @@ impl Engine {
                         let total_tokens = self.session.total_usage.input_tokens
                             + self.session.total_usage.output_tokens;
                         let snapshot = SessionSnapshot {
-                            messages: self.session.messages.to_vec(),
+                            messages: self.session.public_messages(),
+                            sensitive_user_input_provenance: self
+                                .session
+                                .sensitive_user_input_provenance
+                                .clone(),
                             total_tokens,
                             model: self.session.model.clone(),
                             model_provider: self.api_provider.as_str().to_string(),
@@ -2490,7 +2528,7 @@ impl Engine {
             .tx_event
             .send(Event::SessionUpdated {
                 session_id: self.session.id.clone(),
-                messages: self.session.messages.clone().into(),
+                messages: self.session.public_messages(),
                 system_prompt: self.session.system_prompt.clone(),
                 model: self.session.model.clone(),
                 workspace: self.session.workspace.clone(),
@@ -3296,8 +3334,16 @@ impl Engine {
             let pre_workspace = self.session.workspace.clone();
             let pre_seq = self.turn_counter;
             let pre_cap = self.config.snapshots_max_workspace_bytes;
+            let pre_sensitive_user_input_provenance =
+                self.session.sensitive_user_input_provenance.clone();
             let _ = tokio::task::spawn_blocking(move || {
-                pre_turn_snapshot(&pre_workspace, pre_seq, pre_cap, Some(&snapshot_prompt))
+                pre_turn_snapshot(
+                    &pre_workspace,
+                    pre_seq,
+                    pre_cap,
+                    Some(&snapshot_prompt),
+                    &pre_sensitive_user_input_provenance.snapshot(),
+                )
             })
             .await;
         }
@@ -3415,8 +3461,8 @@ impl Engine {
         let subagents_available =
             self.config.subagents_enabled && self.config.features.enabled(Feature::Subagents);
 
-        let fork_context_for_runtime = if subagents_available {
-            let state = StructuredState::capture(
+        let structured_state_block = if subagents_available {
+            StructuredState::capture(
                 input_policy.mode.label(),
                 self.config.workspace.clone(),
                 std::env::current_dir().ok(),
@@ -3425,16 +3471,21 @@ impl Engine {
                 &self.config.plan_state,
                 Some(&self.subagent_manager),
             )
-            .await;
-            Some(Arc::new(parking_lot::RwLock::new(
-                SubAgentForkContext::new(
-                    self.messages_with_turn_metadata(),
-                    state.to_system_block(),
-                ),
-            )))
+            .await
+            .to_system_block()
         } else {
             None
         };
+        // Root privacy provenance is required even when the Subagents feature
+        // is disabled: turn logs and spill writers consume this same live
+        // context. Only the child-facing structured-state block is optional.
+        let fork_context_for_runtime = Some(Arc::new(parking_lot::RwLock::new(
+            SubAgentForkContext::new_with_sensitive_user_input_provenance(
+                self.messages_with_turn_metadata(),
+                structured_state_block,
+                self.session.sensitive_user_input_provenance.clone(),
+            ),
+        )));
 
         // Mailbox for structured sub-agent envelopes (#128/#130). One per
         // turn: the receiver is drained by a short-lived task that converts
@@ -3677,12 +3728,15 @@ impl Engine {
             let post_workspace = self.session.workspace.clone();
             let post_seq = self.turn_counter;
             let post_cap = self.config.snapshots_max_workspace_bytes;
+            let post_sensitive_user_input_provenance =
+                self.session.sensitive_user_input_provenance.clone();
             crate::utils::spawn_blocking_supervised("post-turn-snapshot", move || {
                 post_turn_snapshot(
                     &post_workspace,
                     post_seq,
                     post_cap,
                     Some(&snapshot_prompt_post),
+                    &post_sensitive_user_input_provenance.snapshot(),
                 );
             });
         }

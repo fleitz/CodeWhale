@@ -41,7 +41,7 @@ use crate::tui::active_cell::ActiveCell;
 use crate::tui::approval::ApprovalMode;
 use crate::tui::clipboard::{ClipboardContent, ClipboardHandler};
 use crate::tui::file_mention::ContextReference;
-use crate::tui::history::{HistoryCell, TranscriptRenderOptions};
+use crate::tui::history::{HistoryCell, ToolCell, TranscriptRenderOptions};
 use crate::tui::hotbar::HotbarActionRegistry;
 use crate::tui::paste_burst::{FlushResult, PasteBurst};
 use crate::tui::scrolling::{MouseScrollState, TranscriptLineMeta, TranscriptScroll};
@@ -1876,6 +1876,11 @@ pub struct App {
     /// Monotonic counter used to issue fresh per-cell revisions.
     pub next_history_revision: u64,
     pub api_messages: Vec<Message>,
+    /// Volatile provenance for arbitrary free-text modal answers. Public TUI
+    /// transcript surfaces project through this set; the engine separately
+    /// owns the exact provider-facing transcript.
+    pub(crate) sensitive_user_input_provenance:
+        crate::runtime_threads::SensitiveUserInputProvenance,
     pub is_loading: bool,
     /// Timestamp of the most recent Enter while the engine was busy.
     /// Used by `enter_with_double_tap()` to detect a double-tap within 500 ms.
@@ -2627,6 +2632,129 @@ pub struct ToolDetailRecord {
     pub output: Option<String>,
 }
 
+fn redact_text(text: &mut String, sensitive_values: &HashSet<String>) {
+    *text = crate::runtime_threads::redacted_sensitive_user_input_text(text, sensitive_values);
+}
+
+fn redact_optional_text(text: &mut Option<String>, sensitive_values: &HashSet<String>) {
+    if let Some(text) = text.as_mut() {
+        redact_text(text, sensitive_values);
+    }
+}
+
+fn redact_path(path: &mut PathBuf, sensitive_values: &HashSet<String>) {
+    *path = PathBuf::from(crate::runtime_threads::redacted_sensitive_user_input_text(
+        &path.to_string_lossy(),
+        sensitive_values,
+    ));
+}
+
+fn redact_optional_path(path: &mut Option<PathBuf>, sensitive_values: &HashSet<String>) {
+    if let Some(path) = path.as_mut() {
+        redact_path(path, sensitive_values);
+    }
+}
+
+fn redact_history_cell(cell: &mut HistoryCell, sensitive_values: &HashSet<String>) {
+    match cell {
+        HistoryCell::User { content }
+        | HistoryCell::Assistant { content, .. }
+        | HistoryCell::System { content }
+        | HistoryCell::Thinking { content, .. } => redact_text(content, sensitive_values),
+        HistoryCell::Error { message, .. } => redact_text(message, sensitive_values),
+        HistoryCell::ArchivedContext { summary, .. } => redact_text(summary, sensitive_values),
+        HistoryCell::Tool(tool) => redact_tool_cell(tool, sensitive_values),
+        HistoryCell::SubAgent(crate::tui::history::SubAgentCell::Delegate(card)) => {
+            card.redact_sensitive_user_input(sensitive_values);
+        }
+        HistoryCell::SubAgent(crate::tui::history::SubAgentCell::Fanout(_)) => {}
+    }
+}
+
+fn redact_tool_cell(cell: &mut ToolCell, sensitive_values: &HashSet<String>) {
+    match cell {
+        ToolCell::Exec(cell) => {
+            redact_text(&mut cell.command, sensitive_values);
+            redact_optional_text(&mut cell.output, sensitive_values);
+            redact_optional_text(&mut cell.live_output, sensitive_values);
+            redact_optional_text(&mut cell.interaction, sensitive_values);
+            redact_optional_text(&mut cell.output_summary, sensitive_values);
+        }
+        ToolCell::Exploring(cell) => {
+            for entry in &mut cell.entries {
+                redact_text(&mut entry.label, sensitive_values);
+            }
+        }
+        ToolCell::PlanUpdate(cell) => {
+            let snapshot = &mut cell.snapshot;
+            redact_optional_text(&mut snapshot.title, sensitive_values);
+            redact_optional_text(&mut snapshot.objective, sensitive_values);
+            redact_optional_text(&mut snapshot.context_summary, sensitive_values);
+            redact_optional_text(&mut snapshot.explanation, sensitive_values);
+            redact_optional_text(&mut snapshot.recommended_approach, sensitive_values);
+            redact_optional_text(&mut snapshot.verification_plan, sensitive_values);
+            redact_optional_text(&mut snapshot.risks_and_unknowns, sensitive_values);
+            redact_optional_text(&mut snapshot.handoff_packet, sensitive_values);
+            for value in snapshot
+                .sources_used
+                .iter_mut()
+                .chain(snapshot.critical_files.iter_mut())
+                .chain(snapshot.constraints.iter_mut())
+            {
+                redact_text(value, sensitive_values);
+            }
+            for item in &mut snapshot.items {
+                redact_text(&mut item.step, sensitive_values);
+            }
+        }
+        ToolCell::PatchSummary(cell) => {
+            redact_text(&mut cell.path, sensitive_values);
+            redact_text(&mut cell.summary, sensitive_values);
+            redact_optional_text(&mut cell.error, sensitive_values);
+        }
+        ToolCell::Review(cell) => {
+            redact_text(&mut cell.target, sensitive_values);
+            redact_optional_text(&mut cell.error, sensitive_values);
+            if let Some(output) = cell.output.as_mut() {
+                redact_text(&mut output.summary, sensitive_values);
+                redact_text(&mut output.overall_assessment, sensitive_values);
+                for issue in &mut output.issues {
+                    redact_text(&mut issue.title, sensitive_values);
+                    redact_text(&mut issue.description, sensitive_values);
+                    redact_optional_text(&mut issue.path, sensitive_values);
+                }
+                for suggestion in &mut output.suggestions {
+                    redact_text(&mut suggestion.suggestion, sensitive_values);
+                    redact_optional_text(&mut suggestion.path, sensitive_values);
+                }
+            }
+        }
+        ToolCell::DiffPreview(cell) => {
+            redact_text(&mut cell.title, sensitive_values);
+            redact_text(&mut cell.diff, sensitive_values);
+        }
+        ToolCell::Mcp(cell) => redact_optional_text(&mut cell.content, sensitive_values),
+        ToolCell::ViewImage(cell) => redact_path(&mut cell.path, sensitive_values),
+        ToolCell::WebSearch(cell) => {
+            redact_text(&mut cell.query, sensitive_values);
+            redact_optional_text(&mut cell.summary, sensitive_values);
+            redact_optional_text(&mut cell.source, sensitive_values);
+            redact_optional_text(&mut cell.degraded, sensitive_values);
+        }
+        ToolCell::Generic(cell) => {
+            redact_optional_text(&mut cell.input_summary, sensitive_values);
+            redact_optional_text(&mut cell.output, sensitive_values);
+            if let Some(prompts) = cell.prompts.as_mut() {
+                for prompt in prompts {
+                    redact_text(prompt, sensitive_values);
+                }
+            }
+            redact_optional_path(&mut cell.spillover_path, sensitive_values);
+            redact_optional_text(&mut cell.output_summary, sensitive_values);
+        }
+    }
+}
+
 /// Lightweight task view for sidebar rendering.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TaskPanelEntry {
@@ -2716,6 +2844,148 @@ fn default_composer_arrows_scroll_for_platform(use_mouse_capture: bool, _is_wind
 }
 
 impl App {
+    /// Re-project every public in-memory surface that can retain provider or
+    /// tool prose after a free-text `request_user_input` answer is classified
+    /// as private. The provider-facing response remains exact in the engine;
+    /// this method only mutates display/public caches.
+    pub(crate) fn refresh_sensitive_user_input_projection(&mut self) {
+        let sensitive_values = self.sensitive_user_input_provenance.snapshot();
+        if sensitive_values.is_empty() {
+            return;
+        }
+
+        self.api_messages = crate::runtime_threads::redacted_durable_history_clone(
+            &self.api_messages,
+            &sensitive_values,
+        );
+        for cell in &mut self.history {
+            redact_history_cell(cell, &sensitive_values);
+        }
+        if let Some(active) = self.active_cell.as_mut() {
+            for index in 0..active.entry_count() {
+                if let Some(cell) = active.entry_mut(index) {
+                    redact_history_cell(cell, &sensitive_values);
+                }
+            }
+        }
+
+        for detail in self
+            .tool_details_by_cell
+            .values_mut()
+            .chain(self.active_tool_details.values_mut())
+        {
+            detail.input = crate::runtime_threads::redacted_sensitive_user_input_json(
+                &detail.input,
+                &sensitive_values,
+            );
+            redact_optional_text(&mut detail.output, &sensitive_values);
+        }
+        for (_, _, input) in &mut self.pending_tool_uses {
+            *input = crate::runtime_threads::redacted_sensitive_user_input_json(
+                input,
+                &sensitive_values,
+            );
+        }
+
+        redact_text(&mut self.reasoning_buffer, &sensitive_values);
+        redact_optional_text(&mut self.reasoning_header, &sensitive_values);
+        redact_optional_text(&mut self.last_reasoning, &sensitive_values);
+        redact_optional_text(&mut self.paused_quarry, &sensitive_values);
+        redact_optional_text(&mut self.prompt_suggestion, &sensitive_values);
+        redact_optional_text(&mut self.status_message, &sensitive_values);
+        redact_optional_text(&mut self.last_status_message_seen, &sensitive_values);
+        redact_optional_text(&mut self.last_fallback_reason, &sensitive_values);
+        redact_optional_text(&mut self.pending_subagent_dispatch, &sensitive_values);
+        redact_optional_text(&mut self.project_doc, &sensitive_values);
+        redact_optional_text(&mut self.workspace_context, &sensitive_values);
+        redact_optional_text(&mut self.last_submitted_prompt, &sensitive_values);
+        redact_optional_text(&mut self.last_prefix_change_desc, &sensitive_values);
+        redact_optional_text(&mut self.session_title, &sensitive_values);
+        redact_optional_text(&mut self.receipt_text, &sensitive_values);
+        for toast in self
+            .status_toasts
+            .iter_mut()
+            .chain(self.sticky_status.iter_mut())
+        {
+            redact_text(&mut toast.text, &sensitive_values);
+        }
+        for log in &mut self.tool_log {
+            redact_text(log, &sensitive_values);
+        }
+        for progress in self.agent_progress.values_mut() {
+            redact_text(progress, &sensitive_values);
+        }
+        for rejected in &mut self.rejected_steers {
+            redact_text(rejected, &sensitive_values);
+        }
+        for evidence in &mut self.tool_evidence {
+            redact_text(&mut evidence.summary, &sensitive_values);
+        }
+        for task in &mut self.task_panel {
+            redact_text(&mut task.prompt_summary, &sensitive_values);
+        }
+        for queued in self
+            .queued_messages
+            .iter_mut()
+            .chain(self.pending_steers.iter_mut())
+            .chain(self.queued_draft.iter_mut())
+        {
+            redact_text(&mut queued.display, &sensitive_values);
+            redact_optional_text(&mut queued.skill_instruction, &sensitive_values);
+        }
+        if let Some((_, request)) = self.pending_user_input_prompt.as_mut() {
+            *request = crate::runtime_threads::redacted_user_input_request_for_public(
+                request,
+                &sensitive_values,
+            );
+        }
+        if let Some(card) = self.decision_card.as_mut() {
+            redact_text(&mut card.question, &sensitive_values);
+            for option in &mut card.options {
+                // Labels carry the typed response identity and remain exact.
+                redact_optional_text(&mut option.description, &sensitive_values);
+            }
+        }
+        if let Some(panel) = self.workflow_panel.as_mut() {
+            redact_text(&mut panel.label, &sensitive_values);
+            redact_optional_text(&mut panel.error, &sensitive_values);
+            redact_optional_text(&mut panel.result_summary, &sensitive_values);
+            redact_optional_path(&mut panel.source_path, &sensitive_values);
+            redact_optional_path(&mut panel.spillover_path, &sensitive_values);
+            for phase in &mut panel.phases {
+                redact_text(&mut phase.title, &sensitive_values);
+                for row in &mut phase.rows {
+                    redact_text(&mut row.label, &sensitive_values);
+                    redact_optional_path(&mut row.workspace, &sensitive_values);
+                    redact_optional_text(&mut row.error, &sensitive_values);
+                    redact_optional_text(&mut row.schema_error, &sensitive_values);
+                }
+            }
+            for gate in &mut panel.gates {
+                redact_optional_text(&mut gate.blocked_reason, &sensitive_values);
+            }
+        }
+
+        let subagent_cache = self
+            .subagent_cache
+            .iter()
+            .map(|entry| {
+                crate::runtime_threads::redacted_serializable_clone(entry, &sensitive_values)
+            })
+            .collect::<anyhow::Result<Vec<_>>>();
+        self.subagent_cache = subagent_cache.unwrap_or_default();
+
+        self.history_version = self.history_version.wrapping_add(1);
+        for revision in &mut self.history_revisions {
+            *revision = self.next_history_revision;
+            self.next_history_revision = self.next_history_revision.wrapping_add(1);
+        }
+        self.active_cell_revision = self.active_cell_revision.wrapping_add(1);
+        self.viewport.transcript_cache = TranscriptViewCache::new();
+        self.needs_redraw = true;
+        self.force_next_full_repaint = true;
+    }
+
     /// Advance and return the model-draft generation. Call when a draft is
     /// requested or a setup/fleet wizard opens; a spawned draft that captured
     /// an older generation is dropped on delivery.
@@ -3288,6 +3558,8 @@ impl App {
             history_revisions: Vec::new(),
             next_history_revision: 1,
             api_messages: Vec::new(),
+            sensitive_user_input_provenance:
+                crate::runtime_threads::SensitiveUserInputProvenance::default(),
             is_loading: false,
             last_enter_instant: None,
             provider_wait_incident_logged: false,

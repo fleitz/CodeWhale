@@ -549,6 +549,10 @@ pub(super) async fn save_current_session(
         session
     };
 
+    session
+        .sensitive_user_input_provenance
+        .extend(snapshot.sensitive_user_input_provenance.snapshot());
+
     // Save the session.
     manager
         .save_session(&session)
@@ -615,8 +619,16 @@ pub(super) async fn delete_session(
 }
 
 pub(super) fn session_to_detail(session: SavedSession) -> SessionDetailResponse {
-    let messages: Vec<Value> = session
-        .messages
+    let mut sensitive_values = std::collections::HashSet::new();
+    crate::runtime_threads::collect_sensitive_user_input_values(
+        &session.messages,
+        &mut sensitive_values,
+    );
+    let public_messages = crate::runtime_threads::redacted_durable_history_clone(
+        &session.messages,
+        &sensitive_values,
+    );
+    let messages: Vec<Value> = public_messages
         .iter()
         .map(|msg| {
             let content_blocks: Vec<Value> = msg
@@ -726,6 +738,7 @@ fn map_resume_thread_create_err(err: anyhow::Error) -> ApiError {
 #[cfg(test)]
 mod resume_thread_error_tests {
     use super::*;
+    use crate::models::{ContentBlock, Message};
 
     #[test]
     fn provider_config_errors_are_client_errors_but_storage_errors_stay_internal() {
@@ -738,5 +751,61 @@ mod resume_thread_error_tests {
             "Failed to save runtime thread: permission denied"
         ));
         assert_eq!(storage.status, StatusCode::INTERNAL_SERVER_ERROR);
+    }
+
+    #[test]
+    fn session_detail_projects_legacy_modal_answer_and_echo() {
+        const SECRET: &str = "482915";
+        let messages = vec![
+            Message {
+                role: "assistant".to_string(),
+                content: vec![ContentBlock::ToolUse {
+                    id: "input-call".to_string(),
+                    name: "request_user_input".to_string(),
+                    input: serde_json::json!({
+                        "questions": [{
+                            "header":"PIN", "id":"pin", "question":"PIN?", "options":[]
+                        }]
+                    }),
+                    caller: None,
+                }],
+            },
+            Message {
+                role: "user".to_string(),
+                content: vec![ContentBlock::ToolResult {
+                    tool_use_id: "input-call".to_string(),
+                    content: serde_json::json!({
+                        "answers":[{"id":"pin", "label":"Other", "value":SECRET}]
+                    })
+                    .to_string(),
+                    is_error: None,
+                    content_blocks: None,
+                }],
+            },
+            Message {
+                role: "assistant".to_string(),
+                content: vec![ContentBlock::Text {
+                    text: format!("echoed {SECRET}"),
+                    cache_control: None,
+                }],
+            },
+        ];
+        let session = crate::session_manager::create_saved_session(
+            &messages,
+            "test-model",
+            std::path::Path::new("."),
+            0,
+            None,
+        );
+        let detail = session_to_detail(session);
+        let encoded = serde_json::to_string(&detail).expect("serialize detail");
+        assert!(!encoded.contains(SECRET));
+        assert_eq!(detail.messages[0]["role"], "assistant");
+        assert_eq!(detail.messages[0]["content"][0]["type"], "tool_use");
+        assert_eq!(detail.messages[0]["content"][0]["id"], "input-call");
+        assert_eq!(
+            detail.messages[1]["content"][0]["content"],
+            "User input submitted"
+        );
     }
 }

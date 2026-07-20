@@ -795,8 +795,11 @@ async fn start_workflow(
         approval_decision
     };
     let plan_approval = summary.to_receipt(approval_decision, now_ms());
-    let sensitive_user_input_values = runtime.current_sensitive_user_input_values();
-    state.attach_sensitive_user_input_values(&run_id, sensitive_user_input_values.clone());
+    let sensitive_user_input_provenance = runtime
+        .current_sensitive_user_input_provenance()
+        .unwrap_or_default();
+    let sensitive_user_input_values = sensitive_user_input_provenance.snapshot();
+    state.attach_sensitive_user_input_provenance(&run_id, sensitive_user_input_provenance);
     let raw_workflow_title = source
         .spec
         .as_ref()
@@ -3308,7 +3311,8 @@ mod journal {
         pub runs: SharedWorkflowRuns,
         pub controllers: SharedWorkflowControllers,
         lifecycles: SharedWorkflowLifecycles,
-        sensitive_user_input_values: Mutex<HashMap<String, HashSet<String>>>,
+        sensitive_user_input_provenance:
+            Mutex<HashMap<String, crate::runtime_threads::SensitiveUserInputProvenance>>,
         journal: WorkflowRunJournal,
     }
 
@@ -3320,27 +3324,80 @@ mod journal {
                 runs,
                 controllers: Arc::new(Mutex::new(HashMap::new())),
                 lifecycles: Arc::new(Mutex::new(HashMap::new())),
-                sensitive_user_input_values: Mutex::new(HashMap::new()),
+                sensitive_user_input_provenance: Mutex::new(HashMap::new()),
                 journal,
             })
         }
 
+        #[cfg(test)]
         pub fn attach_sensitive_user_input_values(&self, run_id: &str, values: HashSet<String>) {
-            if !values.is_empty() {
-                self.sensitive_user_input_values
-                    .lock()
-                    .unwrap_or_else(|poison| poison.into_inner())
-                    .insert(run_id.to_string(), values);
-            }
+            let provenance = crate::runtime_threads::SensitiveUserInputProvenance::default();
+            provenance.extend(values);
+            self.attach_sensitive_user_input_provenance(run_id, provenance);
+        }
+
+        pub fn attach_sensitive_user_input_provenance(
+            &self,
+            run_id: &str,
+            provenance: crate::runtime_threads::SensitiveUserInputProvenance,
+        ) {
+            self.sensitive_user_input_provenance
+                .lock()
+                .unwrap_or_else(|poison| poison.into_inner())
+                .insert(run_id.to_string(), provenance);
         }
 
         fn sensitive_values_for_run(&self, run_id: &str) -> HashSet<String> {
-            self.sensitive_user_input_values
+            self.sensitive_user_input_provenance
                 .lock()
                 .unwrap_or_else(|poison| poison.into_inner())
                 .get(run_id)
-                .cloned()
+                .map(crate::runtime_threads::SensitiveUserInputProvenance::snapshot)
                 .unwrap_or_default()
+        }
+
+        fn refresh_sensitive_user_input_provenance(
+            &self,
+            provenance: &crate::runtime_threads::SensitiveUserInputProvenance,
+        ) -> Result<(), String> {
+            let run_ids = self
+                .sensitive_user_input_provenance
+                .lock()
+                .unwrap_or_else(|poison| poison.into_inner())
+                .iter()
+                .filter_map(|(run_id, attached)| {
+                    attached
+                        .shares_source_with(provenance)
+                        .then_some(run_id.clone())
+                })
+                .collect::<HashSet<_>>();
+            if run_ids.is_empty() {
+                return Ok(());
+            }
+            let sensitive_values = provenance.snapshot();
+            let mut runs = self
+                .runs
+                .lock()
+                .unwrap_or_else(|poison| poison.into_inner());
+            for run_id in &run_ids {
+                if let Some(run) = runs.get_mut(run_id) {
+                    match crate::runtime_threads::redacted_serializable_clone(
+                        run,
+                        &sensitive_values,
+                    ) {
+                        Ok(projected) => *run = projected,
+                        Err(err) => {
+                            return Err(format!(
+                                "workflow late privacy projection failed for {run_id}: {err}"
+                            ));
+                        }
+                    }
+                }
+            }
+            drop(runs);
+            self.journal
+                .reproject_runs(&run_ids, &sensitive_values)
+                .map_err(|err| format!("workflow late journal privacy projection failed: {err}"))
         }
 
         pub fn attach_lifecycle(&self, run_id: &str, lifecycle: WorkflowWorkLifecycle) {
@@ -3466,6 +3523,21 @@ mod journal {
             .clone()
     }
 
+    pub(crate) fn refresh_sensitive_user_input_provenance(
+        provenance: &crate::runtime_threads::SensitiveUserInputProvenance,
+    ) -> Result<(), String> {
+        let states = workspace_store()
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner())
+            .values()
+            .cloned()
+            .collect::<Vec<_>>();
+        for state in states {
+            state.refresh_sensitive_user_input_provenance(provenance)?;
+        }
+        Ok(())
+    }
+
     #[derive(Debug, Clone, Serialize, Deserialize)]
     #[serde(tag = "kind", rename_all = "snake_case")]
     enum WorkflowJournalRecord {
@@ -3487,6 +3559,7 @@ mod journal {
     #[derive(Debug)]
     struct WorkflowRunJournal {
         ledger_path: PathBuf,
+        io_lock: Mutex<()>,
     }
 
     impl WorkflowRunJournal {
@@ -3507,7 +3580,10 @@ mod journal {
                     ledger_path.display()
                 );
             }
-            Self { ledger_path }
+            Self {
+                ledger_path,
+                io_lock: Mutex::new(()),
+            }
         }
 
         fn hydrate_runs(&self) -> HashMap<String, WorkflowRunRecord> {
@@ -3575,6 +3651,14 @@ mod journal {
         }
 
         fn append_record(&self, record: &WorkflowJournalRecord) -> std::io::Result<()> {
+            let _io_guard = self
+                .io_lock
+                .lock()
+                .unwrap_or_else(|poison| poison.into_inner());
+            self.append_record_locked(record)
+        }
+
+        fn append_record_locked(&self, record: &WorkflowJournalRecord) -> std::io::Result<()> {
             let mut line = serde_json::to_string(record)
                 .map_err(|err| std::io::Error::other(err.to_string()))?;
             line.push('\n');
@@ -3585,6 +3669,71 @@ mod journal {
             file.write_all(line.as_bytes())?;
             file.flush()?;
             Ok(())
+        }
+
+        fn reproject_runs(
+            &self,
+            run_ids: &HashSet<String>,
+            sensitive_values: &HashSet<String>,
+        ) -> std::io::Result<()> {
+            let _io_guard = self
+                .io_lock
+                .lock()
+                .unwrap_or_else(|poison| poison.into_inner());
+            let raw = std::fs::read_to_string(&self.ledger_path).unwrap_or_default();
+            let mut projected = String::with_capacity(raw.len());
+            for line in raw.lines() {
+                let record = serde_json::from_str::<WorkflowJournalRecord>(line);
+                let line = match record {
+                    Ok(mut record) => {
+                        let matches_run = match &record {
+                            WorkflowJournalRecord::Snapshot { run } => {
+                                run_ids.contains(&run.run_id)
+                            }
+                            WorkflowJournalRecord::Progress { run_id, .. }
+                            | WorkflowJournalRecord::Event { run_id, .. } => {
+                                run_ids.contains(run_id)
+                            }
+                        };
+                        if matches_run {
+                            record = crate::runtime_threads::redacted_serializable_clone(
+                                &record,
+                                sensitive_values,
+                            )
+                            .map_err(|err| std::io::Error::other(err.to_string()))?;
+                        }
+                        serde_json::to_string(&record)
+                            .map_err(|err| std::io::Error::other(err.to_string()))?
+                    }
+                    Err(_) => crate::runtime_threads::redacted_sensitive_user_input_text(
+                        line,
+                        sensitive_values,
+                    ),
+                };
+                projected.push_str(&line);
+                projected.push('\n');
+            }
+            let file_name = self
+                .ledger_path
+                .file_name()
+                .and_then(|name| name.to_str())
+                .unwrap_or(WORKFLOW_RUNS_FILE);
+            let tmp_path = self
+                .ledger_path
+                .with_file_name(format!(".{file_name}.{}.tmp", uuid::Uuid::new_v4()));
+            let result = (|| {
+                let mut tmp = OpenOptions::new()
+                    .create_new(true)
+                    .write(true)
+                    .open(&tmp_path)?;
+                tmp.write_all(projected.as_bytes())?;
+                tmp.sync_all()?;
+                std::fs::rename(&tmp_path, &self.ledger_path)
+            })();
+            if result.is_err() {
+                let _ = std::fs::remove_file(&tmp_path);
+            }
+            result
         }
 
         fn append_snapshot(&self, record: &WorkflowRunRecord) -> std::io::Result<()> {
@@ -3831,10 +3980,65 @@ mod journal {
             assert!(!durable.contains(SECRET));
             assert!(durable.contains("[redacted user input]"));
         }
+
+        #[test]
+        fn late_parent_taint_rewrites_existing_workflow_journal_bytes() {
+            const SECRET: &str = "late-workflow-482915";
+            let tmp = tempfile::tempdir().expect("tempdir");
+            let state = WorkflowWorkspaceState::open(tmp.path());
+            let run_id = "workflow_late_private";
+            let provenance = crate::runtime_threads::SensitiveUserInputProvenance::default();
+            state.attach_sensitive_user_input_provenance(run_id, provenance.clone());
+            let mut record = sample_record(run_id, WorkflowRunStatus::Running);
+            record.workflow_goal = Some(format!("guessed {SECRET}"));
+            record.result = Some(serde_json::json!({
+                format!("key-{SECRET}"): format!("value-{SECRET}")
+            }));
+            state
+                .runs
+                .lock()
+                .expect("runs")
+                .insert(run_id.to_string(), record.clone());
+            state.record_snapshot(&record);
+            state.record_progress(run_id, &format!("progress {SECRET}"));
+            let path = tmp.path().join(".codewhale/workflow-runs.jsonl");
+            assert!(
+                std::fs::read_to_string(&path)
+                    .expect("raw journal")
+                    .contains(SECRET)
+            );
+
+            provenance.extend([SECRET.to_string()]);
+            state
+                .refresh_sensitive_user_input_provenance(&provenance)
+                .expect("late privacy rewrite");
+
+            let durable = std::fs::read_to_string(path).expect("projected journal");
+            assert!(!durable.contains(SECRET));
+            assert!(durable.contains("[redacted user input]"));
+            let in_memory = state
+                .runs
+                .lock()
+                .expect("runs")
+                .get(run_id)
+                .cloned()
+                .expect("run");
+            assert!(
+                !serde_json::to_string(&in_memory)
+                    .expect("serialize")
+                    .contains(SECRET)
+            );
+        }
     }
 }
 
 use journal::{WorkflowWorkspaceState, shared_workflow_state};
+
+pub(crate) fn refresh_sensitive_user_input_provenance(
+    provenance: &crate::runtime_threads::SensitiveUserInputProvenance,
+) -> Result<(), String> {
+    journal::refresh_sensitive_user_input_provenance(provenance)
+}
 
 /// Reconcile workflow bindings after the journal has replayed restart
 /// recovery. The journal owns lifecycle truth; the graph only receives its

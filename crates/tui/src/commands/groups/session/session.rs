@@ -18,6 +18,7 @@ use super::CommandResult;
 /// or legacy `~/.deepseek/sessions`) so repo-local `session_*.json`
 /// artifacts are no longer created by default.
 pub fn save(app: &mut App, path: Option<&str>) -> CommandResult {
+    app.refresh_sensitive_user_input_projection();
     let explicit_save_path = path.map(PathBuf::from);
 
     let messages = app.api_messages.clone();
@@ -40,6 +41,7 @@ pub fn save(app: &mut App, path: Option<&str>) -> CommandResult {
         Err(err) => return CommandResult::error(format!("Failed to snapshot Work state: {err}")),
     };
     session.last_auto_route = app.auto_route_for_persistence();
+    session.sensitive_user_input_provenance = app.sensitive_user_input_provenance.clone();
     let save_path = explicit_save_path.unwrap_or_else(|| {
         let dir = crate::session_manager::default_sessions_dir()
             .unwrap_or_else(|_| app.workspace.clone());
@@ -53,11 +55,13 @@ pub fn save(app: &mut App, path: Option<&str>) -> CommandResult {
 
     match std::fs::create_dir_all(&sessions_dir) {
         Ok(()) => {
-            let json = match serde_json::to_string_pretty(&session) {
-                Ok(j) => j,
+            let json = match crate::session_manager::SessionManager::serialize_public_session_pretty(
+                &session,
+            ) {
+                Ok(json) => json,
                 Err(e) => return CommandResult::error(format!("Failed to serialize session: {e}")),
             };
-            match crate::utils::write_atomic(&save_path, json.as_bytes()) {
+            match crate::utils::write_atomic(&save_path, &json) {
                 Ok(()) => {
                     app.current_session_id = Some(session.metadata.id.clone());
                     app.current_session_metadata = Some(session.metadata.clone());
@@ -87,6 +91,7 @@ pub fn fork(app: &mut App) -> CommandResult {
             "Cannot fork a session while runtime work is active. Wait for the current turn, maintenance, and background tasks to finish, or cancel that specific work first.",
         );
     }
+    app.refresh_sensitive_user_input_projection();
     if app.api_messages.is_empty() {
         return CommandResult::error("Nothing to fork. Send or load a message first.");
     }
@@ -136,6 +141,7 @@ pub fn fork(app: &mut App) -> CommandResult {
     };
     parent.work_state = work_state.clone();
     parent.last_auto_route = app.auto_route_for_persistence();
+    parent.sensitive_user_input_provenance = app.sensitive_user_input_provenance.clone();
 
     if let Err(err) = manager.save_session(&parent) {
         return CommandResult::error(format!("Failed to save parent session: {err}"));
@@ -158,6 +164,7 @@ pub fn fork(app: &mut App) -> CommandResult {
     forked.artifacts = app.session_artifacts.clone();
     forked.work_state = work_state;
     forked.last_auto_route = app.auto_route_for_persistence();
+    forked.sensitive_user_input_provenance = app.sensitive_user_input_provenance.clone();
 
     if let Err(err) = manager.save_session(&forked) {
         return CommandResult::error(format!("Failed to save forked session: {err}"));
@@ -435,6 +442,31 @@ mod tests {
     }
 
     #[test]
+    fn explicit_save_projects_late_modal_echoes() {
+        const SECRET: &str = "explicit-save-secret-482915";
+        let tmpdir = TempDir::new().unwrap();
+        let mut app = create_test_app_with_tmpdir(&tmpdir);
+        app.api_messages.push(crate::models::Message {
+            role: "assistant".to_string(),
+            content: vec![crate::models::ContentBlock::Text {
+                text: format!("provider echoed {SECRET}"),
+                cache_control: None,
+            }],
+        });
+        app.sensitive_user_input_provenance
+            .extend([SECRET.to_string()]);
+        let save_path = tmpdir.path().join("private-session.json");
+
+        let result = save(&mut app, save_path.to_str());
+
+        assert!(!result.is_error, "{:?}", result.message);
+        let raw = std::fs::read_to_string(save_path).expect("saved bytes");
+        assert!(!raw.contains(SECRET), "{raw}");
+        serde_json::from_str::<crate::session_manager::SavedSession>(&raw)
+            .expect("fixed SavedSession schema");
+    }
+
+    #[test]
     fn save_preserves_artifact_registry() {
         let tmpdir = TempDir::new().unwrap();
         let mut app = create_test_app_with_tmpdir(&tmpdir);
@@ -497,6 +529,7 @@ mod tests {
 
     #[test]
     fn fork_saves_parent_and_switches_to_child_session() {
+        const SECRET: &str = "fork-secret-482915";
         let tmpdir = TempDir::new().unwrap();
         let _lock = crate::test_support::lock_test_env();
         let home = tmpdir.path().join("home");
@@ -525,10 +558,12 @@ mod tests {
         app.api_messages.push(crate::models::Message {
             role: "user".to_string(),
             content: vec![crate::models::ContentBlock::Text {
-                text: "try another path".to_string(),
+                text: format!("try another path {SECRET}"),
                 cache_control: None,
             }],
         });
+        app.sensitive_user_input_provenance
+            .extend([SECRET.to_string()]);
         {
             let mut todos = app.todos.try_lock().expect("todos lock");
             todos.add(
@@ -566,6 +601,8 @@ mod tests {
             .load_session("parent-session")
             .expect("parent saved");
         let child = manager.load_session(&new_id).expect("child saved");
+        assert!(!serde_json::to_string(&parent).unwrap().contains(SECRET));
+        assert!(!serde_json::to_string(&child).unwrap().contains(SECRET));
         assert_eq!(parent.messages.len(), 1);
         assert_eq!(parent.metadata.model_provider, "custom");
         assert_eq!(

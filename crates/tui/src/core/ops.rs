@@ -21,6 +21,10 @@ pub const USER_SHELL_TOOL_ID_PREFIX: &str = "user_shell_";
 #[derive(Debug, Clone)]
 pub struct SessionSnapshot {
     pub messages: Vec<Message>,
+    /// Shared process-local provenance for values removed before persistence.
+    /// The provenance's `Debug` representation exposes only its value count.
+    pub(crate) sensitive_user_input_provenance:
+        crate::runtime_threads::SensitiveUserInputProvenance,
     pub total_tokens: u64,
     pub model: String,
     /// Generic provider kind retained for serialized compatibility.

@@ -7062,6 +7062,10 @@ fn build_session_snapshot(
     _manager: &SessionManager,
 ) -> Result<SavedSession, String> {
     let model = app.model_selection_for_persistence();
+    let public_messages = crate::runtime_threads::redacted_durable_history_clone(
+        &app.api_messages,
+        &app.sensitive_user_input_provenance.snapshot(),
+    );
     let work_state = match app.try_work_state_snapshot() {
         Ok(work_state) => work_state,
         Err(err) => app.last_known_work_state.clone().ok_or_else(|| {
@@ -7071,7 +7075,7 @@ fn build_session_snapshot(
     let mut session = if let Some(existing_id) = app.current_session_id.as_ref() {
         create_saved_session_with_id_and_mode(
             existing_id.clone(),
-            &app.api_messages,
+            &public_messages,
             &model,
             &app.workspace,
             u64::from(app.session.total_tokens),
@@ -7080,7 +7084,7 @@ fn build_session_snapshot(
         )
     } else {
         create_saved_session_with_mode(
-            &app.api_messages,
+            &public_messages,
             &model,
             &app.workspace,
             u64::from(app.session.total_tokens),
@@ -7109,6 +7113,7 @@ fn build_session_snapshot(
     session.artifacts = app.session_artifacts.clone();
     session.work_state = work_state;
     session.last_auto_route = app.auto_route_for_persistence();
+    session.sensitive_user_input_provenance = app.sensitive_user_input_provenance.clone();
     app.current_session_metadata = Some(session.metadata.clone());
     Ok(session)
 }
@@ -10539,8 +10544,11 @@ async fn apply_command_result(
                 let status = if app.api_messages.is_empty() {
                     "No session content to share.".to_string()
                 } else {
-                    let history_json = serde_json::to_string_pretty(&app.api_messages)
-                        .unwrap_or_else(|_| "[]".to_string());
+                    let history_json = crate::commands::share::serialize_public_history(
+                        &app.api_messages,
+                        &app.sensitive_user_input_provenance.snapshot(),
+                    )
+                    .unwrap_or_else(|_| "[]".to_string());
                     match crate::commands::share::perform_share(&history_json, &model, &mode).await
                     {
                         Ok(url) => format!("Session shared! URL: {url}"),
@@ -12415,11 +12423,32 @@ async fn handle_view_events(
                 }
             }
             ViewEvent::UserInputSubmitted { tool_id, response } => {
+                let privacy_request = app
+                    .pending_user_input_prompt
+                    .as_ref()
+                    .filter(|(id, _)| id == &tool_id)
+                    .map(|(_, request)| request.clone());
+                let privacy_response = response.clone();
                 match engine_handle
                     .submit_user_input(tool_id.clone(), response)
                     .await
                 {
                     Ok(()) => {
+                        if let Some(request) = privacy_request {
+                            let mut values = std::collections::HashSet::new();
+                            crate::runtime_threads::collect_sensitive_user_input_response_values(
+                                &request,
+                                &privacy_response,
+                                &mut values,
+                            );
+                            app.sensitive_user_input_provenance.extend(values);
+                            // The modal answer may already have appeared in
+                            // provider/tool output that reached visible App
+                            // caches before its privacy provenance was known.
+                            // Re-project those caches immediately on the UI
+                            // thread; the engine retains the exact response.
+                            app.refresh_sensitive_user_input_projection();
+                        }
                         app.pending_user_input_prompt = None;
                     }
                     Err(err) => {
@@ -14181,9 +14210,21 @@ fn apply_loaded_session(
         session.work_state.as_ref(),
     )?;
     *config = *restored_route.config;
+    let sensitive_user_input_provenance = session.sensitive_user_input_provenance.clone();
+    let mut sensitive_values = sensitive_user_input_provenance.snapshot();
+    crate::runtime_threads::collect_sensitive_user_input_values(
+        &session.messages,
+        &mut sensitive_values,
+    );
+    sensitive_user_input_provenance.extend(sensitive_values);
     let projected_messages =
         crate::runtime_handoff::project_messages_for_restore(&session.messages);
-    let (messages, recovered_draft) = recover_interrupted_user_tail(&projected_messages);
+    let public_messages = crate::runtime_threads::redacted_durable_history_clone(
+        &projected_messages,
+        &sensitive_user_input_provenance.snapshot(),
+    );
+    let (messages, recovered_draft) = recover_interrupted_user_tail(&public_messages);
+    app.sensitive_user_input_provenance = sensitive_user_input_provenance;
     app.api_messages = messages;
     app.clear_history();
     app.tool_cells.clear();

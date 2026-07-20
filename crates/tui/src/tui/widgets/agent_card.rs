@@ -140,6 +140,27 @@ impl DelegateCard {
         }
     }
 
+    /// Re-project already-rendered child activity after a newly submitted
+    /// `request_user_input` answer becomes sensitive. Identity and lifecycle
+    /// fields stay structural; only model/user-facing prose is rewritten.
+    pub(crate) fn redact_sensitive_user_input(
+        &mut self,
+        sensitive_values: &std::collections::HashSet<String>,
+    ) {
+        if let Some(summary) = self.summary.as_mut() {
+            *summary = crate::runtime_threads::redacted_sensitive_user_input_text(
+                summary,
+                sensitive_values,
+            );
+        }
+        for action in &mut self.actions {
+            *action = crate::runtime_threads::redacted_sensitive_user_input_text(
+                action,
+                sensitive_values,
+            );
+        }
+    }
+
     #[must_use]
     pub fn render_lines(&self, width: u16) -> Vec<Line<'static>> {
         let mut lines = Vec::with_capacity(self.actions.len() + 3);

@@ -8680,6 +8680,97 @@ async fn sync_session_restores_current_mode() {
 }
 
 #[tokio::test]
+async fn session_snapshot_carries_live_provenance_after_same_session_compaction() {
+    const SECRET: &str = "7";
+    let tmp = tempdir().expect("tempdir");
+    let config = EngineConfig {
+        workspace: tmp.path().to_path_buf(),
+        model: "deepseek-v4-pro".to_string(),
+        ..Default::default()
+    };
+    let (engine, handle) = Engine::new(config, &Config::default());
+    let source_messages = vec![
+        Message {
+            role: "assistant".to_string(),
+            content: vec![ContentBlock::ToolUse {
+                id: "input-call".to_string(),
+                name: "request_user_input".to_string(),
+                input: serde_json::json!({
+                    "questions": [{
+                        "header": "PIN",
+                        "id": "pin",
+                        "question": "Enter PIN",
+                        "options": [{"label": "Skip", "description": "Skip"}]
+                    }]
+                }),
+                caller: None,
+            }],
+        },
+        Message {
+            role: "user".to_string(),
+            content: vec![ContentBlock::ToolResult {
+                tool_use_id: "input-call".to_string(),
+                content: serde_json::json!({
+                    "answers": [{"id": "pin", "label": "Other", "value": SECRET}]
+                })
+                .to_string(),
+                is_error: None,
+                content_blocks: None,
+            }],
+        },
+    ];
+
+    let run = tokio::spawn(engine.run());
+    handle
+        .send(Op::SyncSession {
+            session_id: Some("privacy-compaction".to_string()),
+            messages: source_messages,
+            system_prompt: None,
+            system_prompt_override: false,
+            model: "deepseek-v4-pro".to_string(),
+            workspace: tmp.path().to_path_buf(),
+            mode: AppMode::Agent,
+        })
+        .await
+        .expect("sync source");
+    handle
+        .send(Op::SyncSession {
+            session_id: Some("privacy-compaction".to_string()),
+            messages: vec![Message {
+                role: "assistant".to_string(),
+                content: vec![ContentBlock::Text {
+                    text: "The submitted PIN was 7; continuing.".to_string(),
+                    cache_control: None,
+                }],
+            }],
+            system_prompt: None,
+            system_prompt_override: false,
+            model: "deepseek-v4-pro".to_string(),
+            workspace: tmp.path().to_path_buf(),
+            mode: AppMode::Agent,
+        })
+        .await
+        .expect("sync compacted history");
+
+    let snapshot = handle
+        .get_session_snapshot()
+        .await
+        .expect("session snapshot");
+    assert!(
+        snapshot
+            .sensitive_user_input_provenance
+            .snapshot()
+            .contains(SECRET)
+    );
+    assert!(
+        !format!("{:?}", snapshot.messages).contains("PIN was 7"),
+        "public snapshot leaked the compacted echo"
+    );
+
+    run.abort();
+}
+
+#[tokio::test]
 async fn sync_session_projects_persisted_subagent_handoff_for_headless_restore() {
     let tmp = tempdir().expect("tempdir");
     let config = EngineConfig {
@@ -10738,7 +10829,8 @@ fn live_child_fork_context_tracks_compaction_and_goal_request_history() {
     let shared = std::sync::Arc::new(parking_lot::RwLock::new(SubAgentForkContext {
         messages: vec![initial],
         structured_state_block: None,
-        sensitive_user_input_values: std::collections::HashSet::new(),
+        sensitive_user_input_provenance:
+            crate::runtime_threads::SensitiveUserInputProvenance::default(),
     }));
     let summary = compaction_summary_message(
         format!("## {COMPACTION_SUMMARY_MARKER}\ncompacted history"),

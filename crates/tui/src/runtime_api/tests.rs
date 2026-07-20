@@ -118,6 +118,7 @@ fn saved_session_with_blocks(blocks: Vec<crate::models::ContentBlock>) -> SavedS
         artifacts: Vec::new(),
         work_state: None,
         last_auto_route: None,
+        sensitive_user_input_provenance: Default::default(),
     }
 }
 

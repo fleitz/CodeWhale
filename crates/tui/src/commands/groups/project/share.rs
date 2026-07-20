@@ -15,6 +15,7 @@ use crate::commands::CommandResult;
 use crate::commands::traits::{CommandInfo, RegisterCommand};
 use crate::dependencies::ExternalTool;
 use crate::localization::MessageId;
+use crate::models::Message;
 use crate::tui::app::{App, AppAction};
 
 /// Share the current session as a web URL.
@@ -89,6 +90,15 @@ pub async fn perform_share(history_json: &str, model: &str, mode: &str) -> Resul
     };
 
     Ok(url)
+}
+
+pub(crate) fn serialize_public_history(
+    messages: &[Message],
+    sensitive_values: &std::collections::HashSet<String>,
+) -> Result<String, serde_json::Error> {
+    let public_messages =
+        crate::runtime_threads::redacted_durable_history_clone(messages, sensitive_values);
+    serde_json::to_string_pretty(&public_messages)
 }
 
 /// Render the session as a standalone HTML page.
@@ -247,5 +257,29 @@ mod tests {
         assert!(html.contains("test data"));
         assert!(html.contains("Exported:"));
         assert!(html.contains("https://github.com/Hmbown/CodeWhale"));
+    }
+
+    #[test]
+    fn public_history_keeps_message_schema_and_projects_dynamic_input_keys() {
+        let messages = vec![Message {
+            role: "assistant".to_string(),
+            content: vec![crate::models::ContentBlock::ToolUse {
+                id: "call-input".to_string(),
+                name: "echo".to_string(),
+                input: serde_json::json!({"input": "7", "safe": "input"}),
+                caller: None,
+            }],
+        }];
+        let values = std::collections::HashSet::from(["input".to_string(), "7".to_string()]);
+        let encoded = serialize_public_history(&messages, &values).expect("serialize");
+        let decoded: Vec<Message> = serde_json::from_str(&encoded).expect("fixed schema");
+        assert_eq!(decoded[0].role, "assistant");
+        assert!(matches!(
+            &decoded[0].content[0],
+            crate::models::ContentBlock::ToolUse { id, name, .. }
+                if id == "call-input" && name == "echo"
+        ));
+        assert!(!encoded.contains("\"input\": \"7\""));
+        assert!(!encoded.contains("\"safe\": \"input\""));
     }
 }

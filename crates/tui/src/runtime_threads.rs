@@ -20,7 +20,14 @@ use std::time::Duration;
 
 use anyhow::{Context, Result, anyhow, bail};
 use chrono::{DateTime, Utc};
-use serde::{Deserialize, Serialize, de::DeserializeOwned};
+use serde::{
+    Deserialize, Serialize,
+    de::DeserializeOwned,
+    ser::{
+        Error as _, SerializeMap, SerializeSeq, SerializeStruct, SerializeStructVariant,
+        SerializeTuple, SerializeTupleStruct, SerializeTupleVariant, Serializer,
+    },
+};
 use serde_json::{Value, json};
 use tokio::sync::{Mutex, broadcast, mpsc, oneshot, watch};
 use tokio_util::sync::CancellationToken;
@@ -68,6 +75,47 @@ const HISTORY_SNAPSHOT_SCOPE_KEY: &str = "history_snapshot_scope";
 const HISTORY_SNAPSHOT_MESSAGES_KEY: &str = "compacted_messages";
 #[cfg(test)]
 const TEST_HISTORY_SNAPSHOT_SAVE_FAILURE_ITEM_ID: &str = "item_test_history_snapshot_save_failure";
+
+/// Process-local, session-lifetime provenance for free-text answers collected
+/// by `request_user_input`.
+///
+/// The provider-facing transcript intentionally remains private and exact.
+/// Every public or durable projection takes a snapshot of this shared set so
+/// components created before a later answer (children, workflows, spill/log
+/// writers) learn the new taint instead of freezing an incomplete copy.
+#[derive(Clone, Default)]
+pub(crate) struct SensitiveUserInputProvenance {
+    values: Arc<parking_lot::RwLock<HashSet<String>>>,
+}
+
+impl std::fmt::Debug for SensitiveUserInputProvenance {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("SensitiveUserInputProvenance")
+            .field("registered_values", &self.values.read().len())
+            .finish()
+    }
+}
+
+impl SensitiveUserInputProvenance {
+    pub(crate) fn snapshot(&self) -> HashSet<String> {
+        self.values.read().clone()
+    }
+
+    pub(crate) fn extend<I>(&self, values: I) -> bool
+    where
+        I: IntoIterator<Item = String>,
+    {
+        let mut current = self.values.write();
+        let prior_len = current.len();
+        current.extend(values.into_iter().filter(|value| !value.is_empty()));
+        current.len() != prior_len
+    }
+
+    pub(crate) fn shares_source_with(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.values, &other.values)
+    }
+}
 
 async fn load_linked_session_messages_with<F>(session_id: String, load: F) -> Result<Vec<Message>>
 where
@@ -318,7 +366,7 @@ fn meaningful_user_input_free_text<'a>(
     Some(value)
 }
 
-fn collect_sensitive_user_input_response_values(
+pub(crate) fn collect_sensitive_user_input_response_values(
     request: &crate::tools::user_input::UserInputRequest,
     response: &crate::tools::user_input::UserInputResponse,
     values: &mut HashSet<String>,
@@ -355,6 +403,561 @@ fn redact_sensitive_json_string_leaves(value: &mut Value, sensitive_values: &[St
     }
 }
 
+/// Serialized fields whose contents are free-form public text rather than
+/// identity, routing, lifecycle, or enum/discriminant data. The field name
+/// itself remains structural; only string leaves below it are projected.
+fn serialized_field_contains_public_text(container: Option<&str>, field: &str) -> bool {
+    // Saved route identity is durable control-plane data, not generated
+    // prose. A short answer that happens to equal a model/provider/mode must
+    // not make a saved session unloadable or silently change its route.
+    if matches!(container, Some("SessionMetadata"))
+        && matches!(
+            field,
+            "model" | "model_provider" | "model_provider_id" | "mode" | "parent_session_id"
+        )
+        || matches!(container, Some("SavedAutoRouteReceipt"))
+            && matches!(field, "model" | "provider_identity")
+    {
+        return false;
+    }
+    matches!(
+        field,
+        "blocked_reason"
+            | "agent_id"
+            | "child_ids"
+            | "content"
+            | "context_summary"
+            | "context_mode"
+            | "constraints"
+            | "critical_files"
+            | "description"
+            | "detail"
+            | "display"
+            | "effective_billing_surface"
+            | "effective_model"
+            | "effective_provider"
+            | "effective_provider_id"
+            | "error"
+            | "explanation"
+            | "Failed"
+            | "handoff_packet"
+            | "header"
+            | "git_branch"
+            | "input_summary"
+            | "intent_summary"
+            | "Interrupted"
+            | "label"
+            | "latest_message"
+            | "last_progress"
+            | "message"
+            | "message_preview"
+            | "model"
+            | "model_provider"
+            | "model_provider_id"
+            | "name"
+            | "needs_input"
+            | "nickname"
+            | "objective"
+            | "parent_run_id"
+            | "preview"
+            | "progress"
+            | "prompt"
+            | "question"
+            | "reason"
+            | "recommended_approach"
+            | "result"
+            | "result_summary"
+            | "role"
+            | "risks_and_unknowns"
+            | "step"
+            | "storage_path"
+            | "summary"
+            | "sources_used"
+            | "source_path"
+            | "session_id"
+            | "session_name"
+            | "system_prompt"
+            | "target"
+            | "text"
+            | "title"
+            | "verification_plan"
+            | "workspace"
+            | "workflow_id"
+            | "workflow_goal"
+    )
+}
+
+/// Serde exposes the distinction that plain JSON erases: typed structs call
+/// `serialize_struct`, while `serde_json::Value::Object` and maps call
+/// `serialize_map`. Preserve that distinction while building the projected
+/// JSON value so fixed field names, enum variants, IDs, and lifecycle strings
+/// can never be rewritten merely because a short answer collides with them.
+/// Dynamic map keys/values and explicitly free-text struct fields remain
+/// recursively projected.
+#[derive(Clone, Copy)]
+struct SensitiveProjectionSerializer<'a> {
+    sensitive_values: &'a [String],
+    dynamic_json: bool,
+    public_text: bool,
+    preserve_option_label: bool,
+    container: Option<&'static str>,
+}
+
+impl<'a> SensitiveProjectionSerializer<'a> {
+    fn root(sensitive_values: &'a [String]) -> Self {
+        Self {
+            sensitive_values,
+            dynamic_json: false,
+            public_text: false,
+            preserve_option_label: false,
+            container: None,
+        }
+    }
+
+    fn dynamic(self) -> Self {
+        Self {
+            dynamic_json: true,
+            ..self
+        }
+    }
+
+    fn for_value<T: ?Sized>(self) -> Self {
+        if serialized_type_is_json_value::<T>() {
+            self.dynamic()
+        } else {
+            self
+        }
+    }
+
+    fn for_struct_field<T: ?Sized>(self, key: &str) -> Self {
+        let preserve_option_label = self.preserve_option_label || key == "options";
+        let public_text = self.public_text
+            || (serialized_field_contains_public_text(self.container, key)
+                && serialized_type_is_text_container::<T>()
+                && !(self.preserve_option_label && key == "label"));
+        Self {
+            dynamic_json: self.dynamic_json || serialized_type_is_json_value::<T>(),
+            public_text,
+            preserve_option_label,
+            ..self
+        }
+    }
+
+    fn project_text(self, value: &str) -> String {
+        let mut value = value.to_string();
+        if self.dynamic_json || self.public_text {
+            let _ = redact_sensitive_user_input_values(&mut value, self.sensitive_values);
+        }
+        value
+    }
+}
+
+fn serialized_type_is_json_value<T: ?Sized>() -> bool {
+    std::any::type_name::<T>() == "serde_json::value::Value"
+}
+
+fn serialized_type_is_text_container<T: ?Sized>() -> bool {
+    matches!(
+        std::any::type_name::<T>(),
+        "str"
+            | "alloc::string::String"
+            | "core::option::Option<alloc::string::String>"
+            | "alloc::vec::Vec<alloc::string::String>"
+            | "std::path::PathBuf"
+            | "core::option::Option<std::path::PathBuf>"
+    )
+}
+
+struct SensitiveProjectedValue<'a, T: ?Sized> {
+    value: &'a T,
+    serializer: SensitiveProjectionSerializer<'a>,
+}
+
+impl<T: Serialize + ?Sized> Serialize for SensitiveProjectedValue<'_, T> {
+    fn serialize<S>(&self, serializer: S) -> std::result::Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        let projected = self
+            .value
+            .serialize(self.serializer)
+            .map_err(S::Error::custom)?;
+        projected.serialize(serializer)
+    }
+}
+
+struct SensitiveSequence<'a, S> {
+    inner: S,
+    serializer: SensitiveProjectionSerializer<'a>,
+}
+
+impl<S> SerializeSeq for SensitiveSequence<'_, S>
+where
+    S: SerializeSeq<Ok = Value, Error = serde_json::Error>,
+{
+    type Ok = Value;
+    type Error = serde_json::Error;
+
+    fn serialize_element<T: Serialize + ?Sized>(&mut self, value: &T) -> Result<(), Self::Error> {
+        self.inner.serialize_element(&SensitiveProjectedValue {
+            value,
+            serializer: self.serializer.for_value::<T>(),
+        })
+    }
+
+    fn end(self) -> Result<Self::Ok, Self::Error> {
+        self.inner.end()
+    }
+}
+
+impl<S> SerializeTuple for SensitiveSequence<'_, S>
+where
+    S: SerializeTuple<Ok = Value, Error = serde_json::Error>,
+{
+    type Ok = Value;
+    type Error = serde_json::Error;
+
+    fn serialize_element<T: Serialize + ?Sized>(&mut self, value: &T) -> Result<(), Self::Error> {
+        self.inner.serialize_element(&SensitiveProjectedValue {
+            value,
+            serializer: self.serializer.for_value::<T>(),
+        })
+    }
+
+    fn end(self) -> Result<Self::Ok, Self::Error> {
+        self.inner.end()
+    }
+}
+
+impl<S> SerializeTupleStruct for SensitiveSequence<'_, S>
+where
+    S: SerializeTupleStruct<Ok = Value, Error = serde_json::Error>,
+{
+    type Ok = Value;
+    type Error = serde_json::Error;
+
+    fn serialize_field<T: Serialize + ?Sized>(&mut self, value: &T) -> Result<(), Self::Error> {
+        self.inner.serialize_field(&SensitiveProjectedValue {
+            value,
+            serializer: self.serializer.for_value::<T>(),
+        })
+    }
+
+    fn end(self) -> Result<Self::Ok, Self::Error> {
+        self.inner.end()
+    }
+}
+
+impl<S> SerializeTupleVariant for SensitiveSequence<'_, S>
+where
+    S: SerializeTupleVariant<Ok = Value, Error = serde_json::Error>,
+{
+    type Ok = Value;
+    type Error = serde_json::Error;
+
+    fn serialize_field<T: Serialize + ?Sized>(&mut self, value: &T) -> Result<(), Self::Error> {
+        self.inner.serialize_field(&SensitiveProjectedValue {
+            value,
+            serializer: self.serializer.for_value::<T>(),
+        })
+    }
+
+    fn end(self) -> Result<Self::Ok, Self::Error> {
+        self.inner.end()
+    }
+}
+
+struct SensitiveMap<'a, S> {
+    inner: S,
+    serializer: SensitiveProjectionSerializer<'a>,
+}
+
+impl<S> SerializeMap for SensitiveMap<'_, S>
+where
+    S: SerializeMap<Ok = Value, Error = serde_json::Error>,
+{
+    type Ok = Value;
+    type Error = serde_json::Error;
+
+    fn serialize_key<T: Serialize + ?Sized>(&mut self, key: &T) -> Result<(), Self::Error> {
+        self.inner.serialize_key(&SensitiveProjectedValue {
+            value: key,
+            serializer: self.serializer.dynamic(),
+        })
+    }
+
+    fn serialize_value<T: Serialize + ?Sized>(&mut self, value: &T) -> Result<(), Self::Error> {
+        self.inner.serialize_value(&SensitiveProjectedValue {
+            value,
+            serializer: self.serializer.dynamic(),
+        })
+    }
+
+    fn end(self) -> Result<Self::Ok, Self::Error> {
+        self.inner.end()
+    }
+}
+
+struct SensitiveStruct<'a, S> {
+    inner: S,
+    serializer: SensitiveProjectionSerializer<'a>,
+}
+
+impl<S> SerializeStruct for SensitiveStruct<'_, S>
+where
+    S: SerializeStruct<Ok = Value, Error = serde_json::Error>,
+{
+    type Ok = Value;
+    type Error = serde_json::Error;
+
+    fn serialize_field<T: Serialize + ?Sized>(
+        &mut self,
+        key: &'static str,
+        value: &T,
+    ) -> Result<(), Self::Error> {
+        self.inner.serialize_field(
+            key,
+            &SensitiveProjectedValue {
+                value,
+                serializer: self.serializer.for_struct_field::<T>(key),
+            },
+        )
+    }
+
+    fn end(self) -> Result<Self::Ok, Self::Error> {
+        self.inner.end()
+    }
+}
+
+impl<S> SerializeStructVariant for SensitiveStruct<'_, S>
+where
+    S: SerializeStructVariant<Ok = Value, Error = serde_json::Error>,
+{
+    type Ok = Value;
+    type Error = serde_json::Error;
+
+    fn serialize_field<T: Serialize + ?Sized>(
+        &mut self,
+        key: &'static str,
+        value: &T,
+    ) -> Result<(), Self::Error> {
+        self.inner.serialize_field(
+            key,
+            &SensitiveProjectedValue {
+                value,
+                serializer: self.serializer.for_struct_field::<T>(key),
+            },
+        )
+    }
+
+    fn end(self) -> Result<Self::Ok, Self::Error> {
+        self.inner.end()
+    }
+}
+
+impl<'a> Serializer for SensitiveProjectionSerializer<'a> {
+    type Ok = Value;
+    type Error = serde_json::Error;
+    type SerializeSeq =
+        SensitiveSequence<'a, <serde_json::value::Serializer as Serializer>::SerializeSeq>;
+    type SerializeTuple =
+        SensitiveSequence<'a, <serde_json::value::Serializer as Serializer>::SerializeTuple>;
+    type SerializeTupleStruct =
+        SensitiveSequence<'a, <serde_json::value::Serializer as Serializer>::SerializeTupleStruct>;
+    type SerializeTupleVariant =
+        SensitiveSequence<'a, <serde_json::value::Serializer as Serializer>::SerializeTupleVariant>;
+    type SerializeMap =
+        SensitiveMap<'a, <serde_json::value::Serializer as Serializer>::SerializeMap>;
+    type SerializeStruct =
+        SensitiveStruct<'a, <serde_json::value::Serializer as Serializer>::SerializeStruct>;
+    type SerializeStructVariant =
+        SensitiveStruct<'a, <serde_json::value::Serializer as Serializer>::SerializeStructVariant>;
+
+    fn serialize_bool(self, value: bool) -> Result<Self::Ok, Self::Error> {
+        serde_json::value::Serializer.serialize_bool(value)
+    }
+
+    fn serialize_i8(self, value: i8) -> Result<Self::Ok, Self::Error> {
+        serde_json::value::Serializer.serialize_i8(value)
+    }
+    fn serialize_i16(self, value: i16) -> Result<Self::Ok, Self::Error> {
+        serde_json::value::Serializer.serialize_i16(value)
+    }
+    fn serialize_i32(self, value: i32) -> Result<Self::Ok, Self::Error> {
+        serde_json::value::Serializer.serialize_i32(value)
+    }
+    fn serialize_i64(self, value: i64) -> Result<Self::Ok, Self::Error> {
+        serde_json::value::Serializer.serialize_i64(value)
+    }
+    fn serialize_i128(self, value: i128) -> Result<Self::Ok, Self::Error> {
+        serde_json::value::Serializer.serialize_i128(value)
+    }
+    fn serialize_u8(self, value: u8) -> Result<Self::Ok, Self::Error> {
+        serde_json::value::Serializer.serialize_u8(value)
+    }
+    fn serialize_u16(self, value: u16) -> Result<Self::Ok, Self::Error> {
+        serde_json::value::Serializer.serialize_u16(value)
+    }
+    fn serialize_u32(self, value: u32) -> Result<Self::Ok, Self::Error> {
+        serde_json::value::Serializer.serialize_u32(value)
+    }
+    fn serialize_u64(self, value: u64) -> Result<Self::Ok, Self::Error> {
+        serde_json::value::Serializer.serialize_u64(value)
+    }
+    fn serialize_u128(self, value: u128) -> Result<Self::Ok, Self::Error> {
+        serde_json::value::Serializer.serialize_u128(value)
+    }
+    fn serialize_f32(self, value: f32) -> Result<Self::Ok, Self::Error> {
+        serde_json::value::Serializer.serialize_f32(value)
+    }
+    fn serialize_f64(self, value: f64) -> Result<Self::Ok, Self::Error> {
+        serde_json::value::Serializer.serialize_f64(value)
+    }
+    fn serialize_char(self, value: char) -> Result<Self::Ok, Self::Error> {
+        self.serialize_str(value.encode_utf8(&mut [0; 4]))
+    }
+    fn serialize_str(self, value: &str) -> Result<Self::Ok, Self::Error> {
+        serde_json::value::Serializer.serialize_str(&self.project_text(value))
+    }
+    fn serialize_bytes(self, value: &[u8]) -> Result<Self::Ok, Self::Error> {
+        serde_json::value::Serializer.serialize_bytes(value)
+    }
+    fn serialize_none(self) -> Result<Self::Ok, Self::Error> {
+        serde_json::value::Serializer.serialize_none()
+    }
+    fn serialize_some<T: Serialize + ?Sized>(self, value: &T) -> Result<Self::Ok, Self::Error> {
+        value.serialize(self.for_value::<T>())
+    }
+    fn serialize_unit(self) -> Result<Self::Ok, Self::Error> {
+        serde_json::value::Serializer.serialize_unit()
+    }
+    fn serialize_unit_struct(self, name: &'static str) -> Result<Self::Ok, Self::Error> {
+        serde_json::value::Serializer.serialize_unit_struct(name)
+    }
+    fn serialize_unit_variant(
+        self,
+        name: &'static str,
+        variant_index: u32,
+        variant: &'static str,
+    ) -> Result<Self::Ok, Self::Error> {
+        serde_json::value::Serializer.serialize_unit_variant(name, variant_index, variant)
+    }
+    fn serialize_newtype_struct<T: Serialize + ?Sized>(
+        self,
+        _name: &'static str,
+        value: &T,
+    ) -> Result<Self::Ok, Self::Error> {
+        value.serialize(self.for_value::<T>())
+    }
+    fn serialize_newtype_variant<T: Serialize + ?Sized>(
+        self,
+        name: &'static str,
+        variant_index: u32,
+        variant: &'static str,
+        value: &T,
+    ) -> Result<Self::Ok, Self::Error> {
+        let public_text = self.public_text
+            || (serialized_field_contains_public_text(None, variant)
+                && serialized_type_is_text_container::<T>());
+        serde_json::value::Serializer.serialize_newtype_variant(
+            name,
+            variant_index,
+            variant,
+            &SensitiveProjectedValue {
+                value,
+                serializer: Self {
+                    public_text,
+                    ..self.for_value::<T>()
+                },
+            },
+        )
+    }
+    fn serialize_seq(self, len: Option<usize>) -> Result<Self::SerializeSeq, Self::Error> {
+        Ok(SensitiveSequence {
+            inner: serde_json::value::Serializer.serialize_seq(len)?,
+            serializer: self,
+        })
+    }
+    fn serialize_tuple(self, len: usize) -> Result<Self::SerializeTuple, Self::Error> {
+        Ok(SensitiveSequence {
+            inner: serde_json::value::Serializer.serialize_tuple(len)?,
+            serializer: self,
+        })
+    }
+    fn serialize_tuple_struct(
+        self,
+        name: &'static str,
+        len: usize,
+    ) -> Result<Self::SerializeTupleStruct, Self::Error> {
+        Ok(SensitiveSequence {
+            inner: serde_json::value::Serializer.serialize_tuple_struct(name, len)?,
+            serializer: self,
+        })
+    }
+    fn serialize_tuple_variant(
+        self,
+        name: &'static str,
+        variant_index: u32,
+        variant: &'static str,
+        len: usize,
+    ) -> Result<Self::SerializeTupleVariant, Self::Error> {
+        Ok(SensitiveSequence {
+            inner: serde_json::value::Serializer.serialize_tuple_variant(
+                name,
+                variant_index,
+                variant,
+                len,
+            )?,
+            serializer: self,
+        })
+    }
+    fn serialize_map(self, len: Option<usize>) -> Result<Self::SerializeMap, Self::Error> {
+        Ok(SensitiveMap {
+            inner: serde_json::value::Serializer.serialize_map(len)?,
+            serializer: self.dynamic(),
+        })
+    }
+    fn serialize_struct(
+        self,
+        name: &'static str,
+        len: usize,
+    ) -> Result<Self::SerializeStruct, Self::Error> {
+        Ok(SensitiveStruct {
+            inner: serde_json::value::Serializer.serialize_struct(name, len)?,
+            serializer: Self {
+                container: Some(name),
+                ..self
+            },
+        })
+    }
+    fn serialize_struct_variant(
+        self,
+        name: &'static str,
+        variant_index: u32,
+        variant: &'static str,
+        len: usize,
+    ) -> Result<Self::SerializeStructVariant, Self::Error> {
+        Ok(SensitiveStruct {
+            inner: serde_json::value::Serializer.serialize_struct_variant(
+                name,
+                variant_index,
+                variant,
+                len,
+            )?,
+            serializer: Self {
+                container: Some(name),
+                ..self
+            },
+        })
+    }
+    fn collect_str<T: ?Sized + std::fmt::Display>(
+        self,
+        value: &T,
+    ) -> Result<Self::Ok, Self::Error> {
+        self.serialize_str(&value.to_string())
+    }
+}
+
 pub(crate) fn redacted_sensitive_user_input_text(
     text: &str,
     sensitive_values: &HashSet<String>,
@@ -374,6 +977,109 @@ pub(crate) fn redacted_sensitive_user_input_json(
     let mut sorted_values = sensitive_values.iter().cloned().collect::<Vec<_>>();
     sorted_values.sort_by_key(|value| std::cmp::Reverse(value.len()));
     let _ = redact_sensitive_json_string_leaves(&mut projected, &sorted_values);
+    projected
+}
+
+pub(crate) fn redacted_tool_result_for_public(
+    result: &Result<crate::tools::spec::ToolResult, crate::tools::spec::ToolError>,
+    sensitive_values: &HashSet<String>,
+) -> Result<crate::tools::spec::ToolResult, crate::tools::spec::ToolError> {
+    match result {
+        Ok(result) => {
+            let mut projected = result.clone();
+            projected.content = match serde_json::from_str::<Value>(&result.content) {
+                Ok(value) => serde_json::to_string(&redacted_sensitive_user_input_json(
+                    &value,
+                    sensitive_values,
+                ))
+                .unwrap_or_else(|_| {
+                    redacted_sensitive_user_input_text(&result.content, sensitive_values)
+                }),
+                Err(_) => redacted_sensitive_user_input_text(&result.content, sensitive_values),
+            };
+            projected.metadata = result
+                .metadata
+                .as_ref()
+                .map(|metadata| redacted_sensitive_user_input_json(metadata, sensitive_values));
+            Ok(projected)
+        }
+        Err(error) => Err(match error {
+            crate::tools::spec::ToolError::InvalidInput { message } => {
+                crate::tools::spec::ToolError::InvalidInput {
+                    message: redacted_sensitive_user_input_text(message, sensitive_values),
+                }
+            }
+            crate::tools::spec::ToolError::MissingField { field } => {
+                crate::tools::spec::ToolError::MissingField {
+                    field: redacted_sensitive_user_input_text(field, sensitive_values),
+                }
+            }
+            crate::tools::spec::ToolError::PathEscape { path } => {
+                crate::tools::spec::ToolError::PathEscape {
+                    path: PathBuf::from(redacted_sensitive_user_input_text(
+                        &path.to_string_lossy(),
+                        sensitive_values,
+                    )),
+                }
+            }
+            crate::tools::spec::ToolError::ExecutionFailed { message } => {
+                crate::tools::spec::ToolError::ExecutionFailed {
+                    message: redacted_sensitive_user_input_text(message, sensitive_values),
+                }
+            }
+            crate::tools::spec::ToolError::Timeout { seconds } => {
+                crate::tools::spec::ToolError::Timeout { seconds: *seconds }
+            }
+            crate::tools::spec::ToolError::Cancelled { message } => {
+                crate::tools::spec::ToolError::Cancelled {
+                    message: redacted_sensitive_user_input_text(message, sensitive_values),
+                }
+            }
+            crate::tools::spec::ToolError::NotAvailable { message } => {
+                crate::tools::spec::ToolError::NotAvailable {
+                    message: redacted_sensitive_user_input_text(message, sensitive_values),
+                }
+            }
+            crate::tools::spec::ToolError::PermissionDenied { message } => {
+                crate::tools::spec::ToolError::PermissionDenied {
+                    message: redacted_sensitive_user_input_text(message, sensitive_values),
+                }
+            }
+        }),
+    }
+}
+
+pub(crate) fn redacted_request_user_input_result_for_public(
+    result: &Result<crate::tools::spec::ToolResult, crate::tools::spec::ToolError>,
+    sensitive_values: &HashSet<String>,
+) -> Result<crate::tools::spec::ToolResult, crate::tools::spec::ToolError> {
+    match result {
+        Ok(result) => Ok(crate::tools::spec::ToolResult {
+            content: REDACTED_USER_INPUT_RECEIPT.to_string(),
+            success: result.success,
+            metadata: None,
+        }),
+        Err(_) => redacted_tool_result_for_public(result, sensitive_values),
+    }
+}
+
+/// Build the display/public copy of an interactive request without changing
+/// response identity. Question ids and option labels remain exact so the UI
+/// can submit a valid typed response; explanatory copy is projected.
+pub(crate) fn redacted_user_input_request_for_public(
+    request: &crate::tools::user_input::UserInputRequest,
+    sensitive_values: &HashSet<String>,
+) -> crate::tools::user_input::UserInputRequest {
+    let mut projected = request.clone();
+    for question in &mut projected.questions {
+        question.header = redacted_sensitive_user_input_text(&question.header, sensitive_values);
+        question.question =
+            redacted_sensitive_user_input_text(&question.question, sensitive_values);
+        for option in &mut question.options {
+            option.description =
+                redacted_sensitive_user_input_text(&option.description, sensitive_values);
+        }
+    }
     projected
 }
 
@@ -426,15 +1132,16 @@ where
     if sensitive_values.is_empty() {
         return serde_json::from_value(serde_json::to_value(value)?).map_err(Into::into);
     }
-    let mut projected = serde_json::to_value(value).map_err(|error| {
-        anyhow!(
-            "Failed to serialize value for sensitive projection: {}",
-            redacted_sensitive_user_input_text(&error.to_string(), sensitive_values)
-        )
-    })?;
     let mut sorted_values = sensitive_values.iter().cloned().collect::<Vec<_>>();
     sorted_values.sort_by_key(|value| std::cmp::Reverse(value.len()));
-    let _ = redact_sensitive_json_string_leaves(&mut projected, &sorted_values);
+    let projected = value
+        .serialize(SensitiveProjectionSerializer::root(&sorted_values))
+        .map_err(|error| {
+            anyhow!(
+                "Failed to serialize value for sensitive projection: {}",
+                redacted_sensitive_user_input_text(&error.to_string(), sensitive_values)
+            )
+        })?;
     serde_json::from_value(projected).map_err(|error| {
         anyhow!(
             "Failed to restore value after sensitive projection: {}",
@@ -1582,25 +2289,21 @@ impl RuntimeThreadStore {
             self.recover_pending_sensitive_rewrite(&rewrite_path)?;
         }
 
-        // Build every replacement before mutating any root record. JSON projection
-        // intentionally works on the untyped representation so classified
-        // bytes in dynamic object keys are removed as well as string values.
-        // If a very short answer collides with a structural field name, the
-        // record becomes unreadable instead of retaining the classified bytes:
-        // late taint discovery is a privacy boundary and must fail closed.
+        // Build and deserialize every typed replacement before mutating any
+        // root record. Fixed envelope keys, ids, lifecycle discriminants, and
+        // route identity remain structural; free text plus actual Value
+        // payload/metadata fields are projected.
         let thread = self.load_thread(thread_id)?;
         let turns = self.list_turns_for_thread(thread_id)?;
         let turn_ids = turns.iter().map(|turn| turn.id.clone()).collect::<Vec<_>>();
         let items_by_turn = self.list_items_for_turns_map(&turn_ids)?;
         let events = self.events_since(thread_id, None)?;
 
+        let public_thread = redacted_serializable_clone(&thread, sensitive_values)?;
         let mut replacements = vec![SensitiveRewriteReplacement {
             target: SensitiveRewriteTarget::Thread,
             id: thread_id.to_string(),
-            contents: serde_json::to_string_pretty(&redacted_sensitive_user_input_json(
-                &serde_json::to_value(&thread)?,
-                sensitive_values,
-            ))?,
+            contents: serde_json::to_string_pretty(&public_thread)?,
         }];
         replacements.extend(
             turns
@@ -1609,12 +2312,10 @@ impl RuntimeThreadStore {
                     Ok::<_, anyhow::Error>(SensitiveRewriteReplacement {
                         target: SensitiveRewriteTarget::Turn,
                         id: turn.id.clone(),
-                        contents: serde_json::to_string_pretty(
-                            &redacted_sensitive_user_input_json(
-                                &serde_json::to_value(turn)?,
-                                sensitive_values,
-                            ),
-                        )?,
+                        contents: serde_json::to_string_pretty(&redacted_serializable_clone(
+                            turn,
+                            sensitive_values,
+                        )?)?,
                     })
                 })
                 .collect::<Result<Vec<_>>>()?,
@@ -1627,20 +2328,17 @@ impl RuntimeThreadStore {
                     Ok::<_, anyhow::Error>(SensitiveRewriteReplacement {
                         target: SensitiveRewriteTarget::Item,
                         id: item.id.clone(),
-                        contents: serde_json::to_string_pretty(
-                            &redacted_sensitive_user_input_json(
-                                &serde_json::to_value(item)?,
-                                sensitive_values,
-                            ),
-                        )?,
+                        contents: serde_json::to_string_pretty(&redacted_serializable_clone(
+                            item,
+                            sensitive_values,
+                        )?)?,
                     })
                 })
                 .collect::<Result<Vec<_>>>()?,
         );
         let mut event_projection = Vec::new();
         for event in events {
-            let event =
-                redacted_sensitive_user_input_json(&serde_json::to_value(event)?, sensitive_values);
+            let event = redacted_serializable_clone(&event, sensitive_values)?;
             serde_json::to_writer(&mut event_projection, &event)?;
             event_projection.push(b'\n');
         }
@@ -4370,9 +5068,8 @@ impl RuntimeThreadManager {
     pub async fn set_thread_session_id(&self, thread_id: &str, session_id: &str) -> Result<()> {
         let projection_lock = self.projection_lock(thread_id);
         let _projection = projection_lock.lock().await;
-        let session_id =
-            self.project_registered_sensitive_clone(thread_id, &session_id.to_string())?;
-        let thread = {
+        let requested_session_id = session_id.to_string();
+        let (thread, session_id) = {
             let _thread_mutation = self.store.thread_mutation.lock();
             let mut thread = self.project_registered_sensitive_clone(
                 thread_id,
@@ -4381,13 +5078,21 @@ impl RuntimeThreadManager {
                     .load_thread(thread_id)
                     .with_context(|| format!("Thread not found: {thread_id}"))?,
             )?;
-            if thread.session_id.as_deref() == Some(session_id.as_str()) {
+            let previous_session_id = thread.session_id.clone();
+            thread.session_id = Some(requested_session_id);
+            // A standalone session string is identity-shaped, so the
+            // schema-aware serializer intentionally leaves it alone. Project
+            // the containing typed record after assignment: within this
+            // field context, `session_id` is public free text while the rest
+            // of the thread schema remains fixed.
+            let mut thread = self.project_registered_sensitive_clone(thread_id, &thread)?;
+            let session_id = thread.session_id.clone().unwrap_or_default();
+            if previous_session_id.as_deref() == Some(session_id.as_str()) {
                 return Ok(());
             }
-            thread.session_id = Some(session_id.clone());
             thread.updated_at = Utc::now();
             self.store.save_thread(&thread)?;
-            thread
+            (thread, session_id)
         };
         self.emit_event(
             thread_id,
@@ -7552,6 +8257,13 @@ impl RuntimeThreadManager {
                     intent_summary,
                     ..
                 } => {
+                    let description = redacted_sensitive_user_input_text(
+                        &description,
+                        &sensitive_user_input_values,
+                    );
+                    let intent_summary = intent_summary.map(|summary| {
+                        redacted_sensitive_user_input_text(&summary, &sensitive_user_input_values)
+                    });
                     let Some((auto_approve, trust_mode)) =
                         self.active_turn_flags(&thread_id, &turn_id).await
                     else {
@@ -7755,6 +8467,10 @@ impl RuntimeThreadManager {
                     }
                 }
                 EngineEvent::UserInputRequired { id, request } => {
+                    let request = redacted_user_input_request_for_public(
+                        &request,
+                        &sensitive_user_input_values,
+                    );
                     let projection_lock = self.projection_lock(&thread_id);
                     let projection = projection_lock.lock().await;
                     self.register_pending_user_input(

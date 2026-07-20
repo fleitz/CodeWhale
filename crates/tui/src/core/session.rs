@@ -6,6 +6,7 @@ use crate::models::{Message, SystemPrompt, Usage};
 use crate::prefix_cache::PrefixStabilityManager;
 use crate::project_context::{ProjectContext, load_project_context_with_parents};
 use crate::prompt_zones::{AppendLog, FrozenPrefix};
+use crate::runtime_threads::SensitiveUserInputProvenance;
 use crate::tui::approval::ApprovalMode;
 use crate::working_set::WorkingSet;
 use std::path::PathBuf;
@@ -87,6 +88,11 @@ pub struct Session {
     /// [`Session::replace_messages`], and at other mutation sites in
     /// `core/engine.rs`.
     pub messages_revision: u64,
+
+    /// Shared session-lifetime provenance for free-text `request_user_input`
+    /// answers. This is intentionally never serialized with the provider
+    /// transcript; public/durable sinks use it to project later echoes.
+    pub(crate) sensitive_user_input_provenance: SensitiveUserInputProvenance,
 }
 
 /// Cumulative usage statistics for a session.
@@ -160,13 +166,28 @@ impl Session {
             prefix_stability: None,
             frozen_prefix: None,
             messages_revision: 0,
+            sensitive_user_input_provenance: SensitiveUserInputProvenance::default(),
         }
+    }
+
+    fn refresh_sensitive_user_input_provenance(&self) {
+        let mut values = self.sensitive_user_input_provenance.snapshot();
+        crate::runtime_threads::collect_sensitive_user_input_values(&self.messages, &mut values);
+        self.sensitive_user_input_provenance.extend(values);
+    }
+
+    pub(crate) fn public_messages(&self) -> Vec<Message> {
+        crate::runtime_threads::redacted_durable_history_clone(
+            &self.messages,
+            &self.sensitive_user_input_provenance.snapshot(),
+        )
     }
 
     /// Add a message to the conversation
     pub fn add_message(&mut self, message: Message) {
         self.messages.push(message);
         self.messages_revision = self.messages_revision.saturating_add(1);
+        self.refresh_sensitive_user_input_provenance();
     }
 
     /// Replace the entire message history. Used by session resume and
@@ -177,6 +198,7 @@ impl Session {
     pub fn replace_messages(&mut self, messages: Vec<Message>) {
         self.messages = messages.into();
         self.messages_revision = self.messages_revision.saturating_add(1);
+        self.refresh_sensitive_user_input_provenance();
     }
 
     /// Bump `messages_revision` without otherwise mutating the message list.
@@ -198,6 +220,8 @@ impl Session {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::models::ContentBlock;
+    use serde_json::json;
 
     #[test]
     fn session_usage_cache_starts_none() {
@@ -262,5 +286,73 @@ mod tests {
         // 0 is a valid observed value, must NOT be converted to None
         assert_eq!(usage.cache_read_input_tokens, Some(0));
         assert_eq!(usage.cache_creation_input_tokens, Some(1234));
+    }
+
+    #[test]
+    fn session_provenance_survives_compaction_that_removes_original_input_pair() {
+        let mut session = Session::new(
+            "test-model".to_string(),
+            PathBuf::from("."),
+            false,
+            false,
+            PathBuf::from("notes.md"),
+            PathBuf::from("mcp.json"),
+        );
+        session.replace_messages(vec![
+            Message {
+                role: "assistant".to_string(),
+                content: vec![ContentBlock::ToolUse {
+                    id: "input-call".to_string(),
+                    name: "request_user_input".to_string(),
+                    input: json!({
+                        "questions": [
+                            {"header":"A", "id":"a", "question":"A?", "options":[]},
+                            {"header":"B", "id":"b", "question":"B?", "options":[]}
+                        ]
+                    }),
+                    caller: None,
+                }],
+            },
+            Message {
+                role: "user".to_string(),
+                content: vec![ContentBlock::ToolResult {
+                    tool_use_id: "input-call".to_string(),
+                    content: json!({
+                        "answers": [
+                            {"id":"a", "label":"Other", "value":"input"},
+                            {"id":"b", "label":"Other", "value":"7"}
+                        ]
+                    })
+                    .to_string(),
+                    is_error: None,
+                    content_blocks: None,
+                }],
+            },
+        ]);
+        assert!(
+            session
+                .sensitive_user_input_provenance
+                .snapshot()
+                .contains("input")
+        );
+        assert!(
+            session
+                .sensitive_user_input_provenance
+                .snapshot()
+                .contains("7")
+        );
+
+        session.replace_messages(vec![crate::compaction::compaction_summary_message(
+            format!(
+                "## {}\n\nThe assistant echoed input and 7.",
+                crate::compaction::COMPACTION_SUMMARY_MARKER
+            ),
+            true,
+        )]);
+        let projected = session.public_messages();
+        let encoded = serde_json::to_string(&projected).expect("serialize");
+        assert!(!encoded.contains("echoed input"));
+        assert!(!encoded.contains("and 7"));
+        assert!(encoded.contains(crate::compaction::COMPACTION_SUMMARY_MARKER));
     }
 }

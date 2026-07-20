@@ -275,6 +275,25 @@ pub struct SavedSession {
     /// is `auto`. Optional for backward-compatible session loads.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) last_auto_route: Option<SavedAutoRouteReceipt>,
+    /// Process-local privacy provenance. It is skipped on disk so the values
+    /// being protected never become a second durable secret registry.
+    #[serde(skip)]
+    pub(crate) sensitive_user_input_provenance:
+        crate::runtime_threads::SensitiveUserInputProvenance,
+}
+
+impl SavedSession {
+    /// Rebuild the process-local privacy provenance available in this saved
+    /// history without persisting a second copy of any protected value.
+    fn refresh_sensitive_user_input_provenance(&self) {
+        let mut sensitive_values = self.sensitive_user_input_provenance.snapshot();
+        crate::runtime_threads::collect_sensitive_user_input_values(
+            &self.messages,
+            &mut sensitive_values,
+        );
+        self.sensitive_user_input_provenance
+            .extend(sensitive_values);
+    }
 }
 
 /// Manager for session persistence operations
@@ -307,6 +326,91 @@ const LEGACY_CHECKPOINT_FILE: &str = "latest.json";
 const OFFLINE_QUEUE_FILE: &str = "offline_queue.json";
 
 impl SessionManager {
+    fn reproject_owned_artifact_files(
+        session: &SavedSession,
+        sensitive_values: &std::collections::HashSet<String>,
+    ) -> std::io::Result<std::collections::HashMap<(String, PathBuf), u64>> {
+        let mut projected_sizes = std::collections::HashMap::new();
+        for artifact in &session.artifacts {
+            let owner = if artifact.session_id.is_empty() {
+                session.metadata.id.as_str()
+            } else {
+                artifact.session_id.as_str()
+            };
+            let Some(path) =
+                crate::artifacts::session_artifact_absolute_path(owner, &artifact.storage_path)
+            else {
+                // Absolute/legacy external paths are references, not files
+                // owned or published by SavedSession persistence.
+                continue;
+            };
+            if !path.exists() {
+                continue;
+            }
+            let raw = fs::read_to_string(&path).map_err(|error| {
+                std::io::Error::new(
+                    error.kind(),
+                    format!(
+                        "could not privacy-project textual session artifact {}: {error}",
+                        path.display()
+                    ),
+                )
+            })?;
+            let projected =
+                crate::runtime_threads::redacted_sensitive_user_input_text(&raw, sensitive_values);
+            if projected != raw {
+                write_atomic(&path, projected.as_bytes())?;
+            }
+            projected_sizes.insert(
+                (owner.to_string(), artifact.storage_path.clone()),
+                projected.len() as u64,
+            );
+        }
+        Ok(projected_sizes)
+    }
+
+    fn project_saved_session_for_persistence(
+        session: &SavedSession,
+    ) -> std::io::Result<SavedSession> {
+        let mut sensitive_values = session.sensitive_user_input_provenance.snapshot();
+        crate::runtime_threads::collect_sensitive_user_input_values(
+            &session.messages,
+            &mut sensitive_values,
+        );
+        let projected_artifact_sizes =
+            Self::reproject_owned_artifact_files(session, &sensitive_values)?;
+        let mut projected =
+            crate::runtime_threads::redacted_serializable_clone(session, &sensitive_values)
+                .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))?;
+        projected.messages = crate::runtime_threads::redacted_durable_history_clone(
+            &session.messages,
+            &sensitive_values,
+        );
+        for artifact in &mut projected.artifacts {
+            let owner = if artifact.session_id.is_empty() {
+                session.metadata.id.as_str()
+            } else {
+                artifact.session_id.as_str()
+            };
+            if let Some(byte_size) =
+                projected_artifact_sizes.get(&(owner.to_string(), artifact.storage_path.clone()))
+            {
+                artifact.byte_size = *byte_size;
+            }
+        }
+        Ok(projected)
+    }
+
+    /// Serialize a privacy-projected saved session for managed or explicit
+    /// persistence. Callers must attach any process-local provenance first.
+    pub(crate) fn serialize_public_session_pretty(
+        session: &SavedSession,
+    ) -> std::io::Result<Vec<u8>> {
+        let projected = Self::project_saved_session_for_persistence(session)?;
+        serde_json::to_vec_pretty(&projected)
+            .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))
+    }
+
     fn validated_session_id<'a>(&self, id: &'a str) -> std::io::Result<&'a str> {
         let trimmed = id.trim();
         if trimmed.is_empty() {
@@ -374,12 +478,10 @@ impl SessionManager {
         let path = self.validated_session_path(&session.metadata.id)?;
 
         self.archive_before_first_graph_write(session, &path)?;
-
-        let content = serde_json::to_string_pretty(&session)
-            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+        let content = Self::serialize_public_session_pretty(session)?;
 
         // Atomic write via write_atomic (NamedTempFile + fsync + persist)
-        write_atomic(&path, content.as_bytes())?;
+        write_atomic(&path, &content)?;
 
         // Clean up old sessions if we have too many
         self.cleanup_old_sessions()?;
@@ -396,9 +498,8 @@ impl SessionManager {
         let session_path = self.validated_session_path(&session.metadata.id)?;
         self.archive_before_first_graph_write(session, &session_path)?;
         fs::create_dir_all(self.checkpoints_dir())?;
-        let content = serde_json::to_string_pretty(&session)
-            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
-        write_atomic(&path, content.as_bytes())?;
+        let content = Self::serialize_public_session_pretty(session)?;
+        write_atomic(&path, &content)?;
         Ok(path)
     }
 
@@ -418,10 +519,12 @@ impl SessionManager {
             return Ok(());
         }
         let bytes = fs::read(source)?;
-        let already_graph_backed = serde_json::from_slice::<SavedSession>(&bytes)
-            .ok()
-            .and_then(|saved| saved.work_state)
-            .and_then(|state| state.graph)
+        let saved = serde_json::from_slice::<SavedSession>(&bytes)
+            .map_err(|err| io::Error::new(io::ErrorKind::InvalidData, err))?;
+        let already_graph_backed = saved
+            .work_state
+            .as_ref()
+            .and_then(|state| state.graph.as_ref())
             .is_some_and(|graph| !graph.is_empty());
         if already_graph_backed {
             return Ok(());
@@ -433,6 +536,11 @@ impl SessionManager {
                 io::Error::new(io::ErrorKind::InvalidInput, "invalid session path")
             })?);
         if !archive.exists() {
+            let saved = saved;
+            saved
+                .sensitive_user_input_provenance
+                .extend(session.sensitive_user_input_provenance.snapshot());
+            let bytes = Self::serialize_public_session_pretty(&saved)?;
             write_atomic(&archive, &bytes)?;
         }
         Ok(())
@@ -455,6 +563,7 @@ impl SessionManager {
             ));
         }
         session.system_prompt = strip_legacy_truncation_note(session.system_prompt);
+        session.refresh_sensitive_user_input_provenance();
         Ok(Some(session))
     }
 
@@ -637,6 +746,8 @@ impl SessionManager {
                 "repaired persisted tool call/result history"
             );
         }
+
+        session.refresh_sensitive_user_input_provenance();
 
         Ok(session)
     }
@@ -1074,6 +1185,12 @@ pub fn create_saved_session_with_id_and_mode(
         })
         .unwrap_or_else(|| "New Session".to_string());
 
+    let sensitive_user_input_provenance =
+        crate::runtime_threads::SensitiveUserInputProvenance::default();
+    let mut sensitive_values = std::collections::HashSet::new();
+    crate::runtime_threads::collect_sensitive_user_input_values(messages, &mut sensitive_values);
+    sensitive_user_input_provenance.extend(sensitive_values);
+
     SavedSession {
         schema_version: CURRENT_SESSION_SCHEMA_VERSION,
         metadata: SessionMetadata {
@@ -1099,6 +1216,7 @@ pub fn create_saved_session_with_id_and_mode(
         artifacts: Vec::new(),
         work_state: None,
         last_auto_route: None,
+        sensitive_user_input_provenance,
     }
 }
 
@@ -1112,6 +1230,11 @@ pub fn update_session(
     session.schema_version = CURRENT_SESSION_SCHEMA_VERSION;
     session.messages.clear();
     session.messages.extend_from_slice(messages);
+    let mut sensitive_values = session.sensitive_user_input_provenance.snapshot();
+    crate::runtime_threads::collect_sensitive_user_input_values(messages, &mut sensitive_values);
+    session
+        .sensitive_user_input_provenance
+        .extend(sensitive_values);
     session.metadata.updated_at = Utc::now();
     session.metadata.message_count = messages.len();
     session.metadata.total_tokens = total_tokens;
@@ -1416,6 +1539,7 @@ mod tests {
             artifacts: Vec::new(),
             work_state: None,
             last_auto_route: None,
+            sensitive_user_input_provenance: Default::default(),
         };
         manager.save_session(&session).expect("save");
     }
@@ -1451,6 +1575,7 @@ mod tests {
             artifacts: Vec::new(),
             work_state: None,
             last_auto_route: None,
+            sensitive_user_input_provenance: Default::default(),
         };
         manager.save_session(&session).expect("save empty");
     }
@@ -2172,6 +2297,318 @@ mod tests {
                 .expect("load checkpoint")
                 .is_none()
         );
+    }
+
+    #[test]
+    fn session_and_checkpoint_files_project_typed_modal_answers_recursively() {
+        const SECRET: &str = "482915";
+        let tmp = tempdir().expect("tempdir");
+        let manager = SessionManager::new(tmp.path().join("sessions")).expect("new");
+        let messages = vec![
+            Message {
+                role: "assistant".to_string(),
+                content: vec![ContentBlock::ToolUse {
+                    id: "input-call".to_string(),
+                    name: "request_user_input".to_string(),
+                    input: serde_json::json!({
+                        "questions": [{
+                            "header": "PIN",
+                            "id": "pin",
+                            "question": "Enter PIN",
+                            "options": [{"label": "Skip", "description": "Skip"}]
+                        }]
+                    }),
+                    caller: None,
+                }],
+            },
+            Message {
+                role: "user".to_string(),
+                content: vec![ContentBlock::ToolResult {
+                    tool_use_id: "input-call".to_string(),
+                    content: serde_json::json!({
+                        "answers": [{"id": "pin", "label": "Other", "value": SECRET}]
+                    })
+                    .to_string(),
+                    is_error: None,
+                    content_blocks: None,
+                }],
+            },
+            Message {
+                role: "assistant".to_string(),
+                content: vec![ContentBlock::ToolUse {
+                    id: "echo-call".to_string(),
+                    name: "echo".to_string(),
+                    input: serde_json::json!({
+                        format!("key-{SECRET}"): {"value": format!("echo {SECRET}")}
+                    }),
+                    caller: None,
+                }],
+            },
+        ];
+        let session = create_saved_session(&messages, "test-model", tmp.path(), 12, None);
+
+        let session_path = manager.save_session(&session).expect("save session");
+        let checkpoint_path = manager.save_checkpoint(&session).expect("save checkpoint");
+        for path in [session_path, checkpoint_path] {
+            let raw = fs::read_to_string(&path).expect("read projected file");
+            assert!(
+                !raw.contains(SECRET),
+                "secret persisted in {}",
+                path.display()
+            );
+            let decoded: SavedSession =
+                serde_json::from_str(&raw).expect("fixed SavedSession schema remains valid");
+            assert_eq!(decoded.schema_version, CURRENT_SESSION_SCHEMA_VERSION);
+            assert_eq!(decoded.messages.len(), 3);
+            assert!(matches!(
+                &decoded.messages[0].content[0],
+                ContentBlock::ToolUse { id, name, .. }
+                    if id == "input-call" && name == "request_user_input"
+            ));
+            assert!(matches!(
+                &decoded.messages[1].content[0],
+                ContentBlock::ToolResult { content, .. }
+                    if content == "User input submitted"
+            ));
+        }
+    }
+
+    #[test]
+    fn saved_session_projects_non_message_fields_and_owned_artifact_bytes() {
+        const SECRET: &str = "owned-artifact-secret-482915";
+        const SHORT: &str = "running";
+
+        struct ArtifactRootReset(Option<PathBuf>);
+        impl Drop for ArtifactRootReset {
+            fn drop(&mut self) {
+                crate::artifacts::set_test_artifact_sessions_root(self.0.take());
+            }
+        }
+
+        let _artifact_guard = crate::artifacts::TEST_ARTIFACT_SESSIONS_GUARD
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let tmp = tempdir().expect("tempdir");
+        let sessions_dir = tmp.path().join("sessions");
+        let _artifact_root = ArtifactRootReset(crate::artifacts::set_test_artifact_sessions_root(
+            Some(sessions_dir.clone()),
+        ));
+        let manager = SessionManager::new(sessions_dir.clone()).expect("new");
+        let system_prompt =
+            crate::models::SystemPrompt::Text(format!("system echoed {SECRET} {SHORT}"));
+        let mut session = create_saved_session(
+            &[make_test_message("user", "safe source message")],
+            SHORT,
+            tmp.path(),
+            12,
+            Some(&system_prompt),
+        );
+        session.metadata.title = format!("title echoed {SECRET} {SHORT}");
+        session.work_state = Some(SessionWorkState {
+            plan: crate::tools::plan::PlanSnapshot {
+                objective: Some(format!("objective {SECRET} {SHORT}")),
+                sources_used: vec![format!("source {SECRET} {SHORT}")],
+                items: vec![crate::tools::plan::PlanItemArg {
+                    step: format!("step {SECRET} {SHORT}"),
+                    status: crate::tools::plan::StepStatus::Pending,
+                }],
+                ..crate::tools::plan::PlanSnapshot::default()
+            },
+            ..SessionWorkState::default()
+        });
+        let storage_path = PathBuf::from("artifacts/art_privacy.txt");
+        let artifact_path = sessions_dir.join(&session.metadata.id).join(&storage_path);
+        fs::create_dir_all(artifact_path.parent().expect("artifact parent")).expect("artifact dir");
+        let raw_artifact = format!("tool output {SECRET} {SHORT}\n");
+        fs::write(&artifact_path, &raw_artifact).expect("raw artifact");
+        session.artifacts.push(crate::artifacts::ArtifactRecord {
+            id: "art_privacy".to_string(),
+            kind: crate::artifacts::ArtifactKind::ToolOutput,
+            session_id: session.metadata.id.clone(),
+            tool_call_id: "call-privacy".to_string(),
+            tool_name: "exec_shell".to_string(),
+            created_at: Utc::now(),
+            byte_size: raw_artifact.len() as u64,
+            preview: format!("preview {SECRET} {SHORT}"),
+            storage_path: storage_path.clone(),
+        });
+        session
+            .sensitive_user_input_provenance
+            .extend([SECRET.to_string(), SHORT.to_string()]);
+
+        let saved_path = manager
+            .save_session(&session)
+            .expect("save projected session");
+        let raw_session = fs::read_to_string(saved_path).expect("saved session bytes");
+        assert!(!raw_session.contains(SECRET), "{raw_session}");
+        let saved_artifact = fs::read_to_string(&artifact_path).expect("projected artifact");
+        assert!(!saved_artifact.contains(SECRET), "{saved_artifact}");
+        assert!(!saved_artifact.contains(SHORT), "{saved_artifact}");
+
+        let loaded = manager
+            .load_session(&session.metadata.id)
+            .expect("load projected session");
+        assert_eq!(loaded.metadata.model, SHORT, "model identity is structural");
+        assert!(!loaded.metadata.title.contains(SECRET) && !loaded.metadata.title.contains(SHORT));
+        assert!(
+            loaded
+                .system_prompt
+                .as_deref()
+                .is_some_and(|prompt| !prompt.contains(SECRET) && !prompt.contains(SHORT))
+        );
+        let plan = &loaded.work_state.as_ref().expect("Work state").plan;
+        assert!(
+            plan.sources_used
+                .iter()
+                .all(|source| !source.contains(SECRET) && !source.contains(SHORT))
+        );
+        assert!(loaded.artifacts[0].preview.find(SECRET).is_none());
+        assert_eq!(
+            loaded.artifacts[0].byte_size,
+            saved_artifact.len() as u64,
+            "metadata follows rewritten artifact bytes"
+        );
+    }
+
+    #[test]
+    fn loaded_modal_provenance_survives_source_compaction_without_serializing_registry() {
+        const SECRET: &str = "7";
+        let tmp = tempdir().expect("tempdir");
+        let manager = SessionManager::new(tmp.path().join("sessions")).expect("new");
+        let source_messages = vec![
+            Message {
+                role: "assistant".to_string(),
+                content: vec![ContentBlock::ToolUse {
+                    id: "input-call".to_string(),
+                    name: "request_user_input".to_string(),
+                    input: serde_json::json!({
+                        "questions": [{
+                            "header": "PIN",
+                            "id": "pin",
+                            "question": "Enter PIN",
+                            "options": [{"label": "Skip", "description": "Skip"}]
+                        }]
+                    }),
+                    caller: None,
+                }],
+            },
+            Message {
+                role: "user".to_string(),
+                content: vec![ContentBlock::ToolResult {
+                    tool_use_id: "input-call".to_string(),
+                    content: serde_json::json!({
+                        "answers": [{"id": "pin", "label": "Other", "value": SECRET}]
+                    })
+                    .to_string(),
+                    is_error: None,
+                    content_blocks: None,
+                }],
+            },
+        ];
+        let source = create_saved_session(&source_messages, "test-model", tmp.path(), 1, None);
+        let path = manager
+            .validated_session_path(&source.metadata.id)
+            .expect("session path");
+        fs::write(
+            &path,
+            serde_json::to_vec_pretty(&source).expect("legacy raw session"),
+        )
+        .expect("write legacy raw session");
+
+        let loaded = manager
+            .load_session(&source.metadata.id)
+            .expect("load raw legacy session");
+        assert!(
+            loaded
+                .sensitive_user_input_provenance
+                .snapshot()
+                .contains(SECRET),
+            "load must reconstruct volatile provenance while the source remains"
+        );
+
+        let compacted = [make_test_message(
+            "assistant",
+            "The submitted PIN was 7; continuing.",
+        )];
+        let compacted = update_session(loaded, &compacted, 2, None);
+        let session_path = manager.save_session(&compacted).expect("save compacted");
+        let checkpoint_path = manager
+            .save_checkpoint(&compacted)
+            .expect("checkpoint compacted");
+
+        for persisted_path in [session_path, checkpoint_path] {
+            let raw = fs::read_to_string(&persisted_path).expect("read projected persistence");
+            assert!(
+                !raw.contains("PIN was 7"),
+                "compacted echo leaked in {}",
+                persisted_path.display()
+            );
+            assert!(
+                !raw.contains("sensitive_user_input_provenance"),
+                "volatile provenance registry was serialized in {}",
+                persisted_path.display()
+            );
+            serde_json::from_str::<SavedSession>(&raw)
+                .expect("projected persistence keeps the fixed SavedSession schema");
+        }
+    }
+
+    #[test]
+    fn work_graph_archive_projects_compacted_echo_with_incoming_live_provenance() {
+        const SECRET: &str = "482915";
+        let tmp = tempdir().expect("tempdir");
+        let manager = SessionManager::new(tmp.path().join("sessions")).expect("new");
+        let mut legacy = create_saved_session(
+            &[make_test_message(
+                "assistant",
+                "Compacted history still echoed 482915.",
+            )],
+            "test-model",
+            tmp.path(),
+            0,
+            None,
+        );
+        let path = manager
+            .validated_session_path(&legacy.metadata.id)
+            .expect("session path");
+        fs::write(
+            &path,
+            serde_json::to_vec_pretty(&legacy).expect("legacy raw session"),
+        )
+        .expect("write legacy raw session");
+
+        let plan = crate::tools::plan::PlanSnapshot {
+            items: vec![crate::tools::plan::PlanItemArg {
+                step: "Import".to_string(),
+                status: crate::tools::plan::StepStatus::Pending,
+            }],
+            ..crate::tools::plan::PlanSnapshot::default()
+        };
+        let todos = crate::tools::todo::TodoListSnapshot::default();
+        let graph = crate::work_graph::import_legacy(&legacy.metadata.id, &plan, &todos)
+            .expect("import graph");
+        legacy.work_state = Some(SessionWorkState {
+            graph: Some(graph),
+            todos,
+            plan,
+        });
+        legacy
+            .sensitive_user_input_provenance
+            .extend([SECRET.to_string()]);
+
+        manager.save_session(&legacy).expect("first graph write");
+        let archive = manager
+            .sessions_dir
+            .join(WORK_GRAPH_IMPORT_ARCHIVE_DIR)
+            .join(path.file_name().expect("session filename"));
+        let raw = fs::read_to_string(&archive).expect("projected archive");
+        assert!(!raw.contains(SECRET), "archive leaked compacted echo");
+        assert!(
+            !raw.contains("sensitive_user_input_provenance"),
+            "archive serialized volatile provenance registry"
+        );
+        serde_json::from_str::<SavedSession>(&raw)
+            .expect("projected archive keeps the fixed SavedSession schema");
     }
 
     #[test]

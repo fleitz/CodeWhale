@@ -15,6 +15,7 @@
 
 use crate::models::{Message, Usage};
 use crate::snapshot::SnapshotRepo;
+use std::collections::HashSet;
 use std::path::Path;
 use std::time::{Duration, Instant};
 
@@ -142,11 +143,20 @@ const USER_PROMPT_LABEL_MAX: usize = 100;
 /// Takes the first line of the prompt (up to `USER_PROMPT_LABEL_MAX`
 /// characters) and appends it to the traditional `type:seq` label so
 /// users can identify which turn each snapshot belongs to.
-fn format_snapshot_label(prefix: &str, turn_seq: u64, user_prompt: Option<&str>) -> String {
+fn format_snapshot_label(
+    prefix: &str,
+    turn_seq: u64,
+    user_prompt: Option<&str>,
+    sensitive_values: &HashSet<String>,
+) -> String {
     let base = format!("{prefix}:{turn_seq}");
     match user_prompt {
         None | Some("") => base,
         Some(prompt) => {
+            let prompt = crate::runtime_threads::redacted_sensitive_user_input_text(
+                prompt,
+                sensitive_values,
+            );
             let first_line = prompt.lines().next().unwrap_or("");
             let truncated: String = first_line.chars().take(USER_PROMPT_LABEL_MAX).collect();
             if truncated.chars().count() < first_line.chars().count() {
@@ -174,10 +184,11 @@ pub fn pre_turn_snapshot(
     turn_seq: u64,
     cap_bytes: u64,
     user_prompt: Option<&str>,
+    sensitive_values: &HashSet<String>,
 ) -> Option<String> {
     snapshot_with_label(
         workspace,
-        &format_snapshot_label("pre-turn", turn_seq, user_prompt),
+        &format_snapshot_label("pre-turn", turn_seq, user_prompt, sensitive_values),
         cap_bytes,
     )
 }
@@ -201,10 +212,11 @@ pub fn post_turn_snapshot(
     turn_seq: u64,
     cap_bytes: u64,
     user_prompt: Option<&str>,
+    sensitive_values: &HashSet<String>,
 ) -> Option<String> {
     snapshot_with_label(
         workspace,
-        &format_snapshot_label("post-turn", turn_seq, user_prompt),
+        &format_snapshot_label("post-turn", turn_seq, user_prompt, sensitive_values),
         cap_bytes,
     )
 }
@@ -229,5 +241,44 @@ fn snapshot_with_label(workspace: &Path, label: &str, cap_bytes: u64) -> Option<
             tracing::warn!(target: "snapshot", "snapshot repo init failed: {e}");
             None
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn snapshot_label_preserves_ordinary_and_empty_behavior() {
+        let values = HashSet::new();
+        assert_eq!(
+            format_snapshot_label("pre-turn", 4, None, &values),
+            "pre-turn:4"
+        );
+        assert_eq!(
+            format_snapshot_label("post-turn", 5, Some("ordinary prompt"), &values),
+            "post-turn:5: ordinary prompt"
+        );
+    }
+
+    #[test]
+    fn snapshot_label_projects_full_prompt_before_truncation() {
+        const SECRET: &str = "cross-boundary-secret-482915";
+        let values = HashSet::from([SECRET.to_string()]);
+        let prompt = format!("{}{} tail", "a".repeat(94), SECRET);
+        let label = format_snapshot_label("pre-turn", 9, Some(&prompt), &values);
+        assert!(label.starts_with("pre-turn:9: "));
+        assert!(!label.contains(SECRET));
+        assert!(label.ends_with('…'));
+    }
+
+    #[test]
+    fn snapshot_label_never_projects_structural_prefix_or_sequence() {
+        let values = HashSet::from(["pre-turn".to_string(), "7".to_string()]);
+        let label = format_snapshot_label("pre-turn", 7, Some("pre-turn answer 7"), &values);
+        assert!(label.starts_with("pre-turn:7: "));
+        let prompt = label.split_once(": ").expect("prompt suffix").1;
+        assert!(!prompt.contains("pre-turn"));
+        assert!(!prompt.contains('7'));
     }
 }

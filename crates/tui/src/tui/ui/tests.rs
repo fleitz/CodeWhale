@@ -3676,6 +3676,7 @@ fn saved_session_with_messages(messages: Vec<Message>) -> SavedSession {
         artifacts: Vec::new(),
         work_state: None,
         last_auto_route: None,
+        sensitive_user_input_provenance: Default::default(),
     }
 }
 
@@ -12716,6 +12717,42 @@ fn auto_route_receipt_survives_session_snapshot_and_restore() {
         Some(crate::config::ZAI_GLM_5_2_MODEL)
     );
     assert_eq!(restored_app.last_auto_route_receipt, Some(receipt));
+}
+
+#[test]
+fn session_snapshot_carries_live_privacy_provenance_without_serializing_registry() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let manager =
+        crate::session_manager::SessionManager::new(tmp.path().join("sessions")).expect("manager");
+    let mut app = create_test_app();
+    app.sensitive_user_input_provenance
+        .extend(["7".to_string()]);
+    app.api_messages.push(text_message(
+        "assistant",
+        "The submitted PIN was 7; continuing.",
+    ));
+
+    let snapshot = build_session_snapshot(&mut app, &manager).expect("session snapshot");
+    assert!(
+        snapshot
+            .sensitive_user_input_provenance
+            .snapshot()
+            .contains("7"),
+        "snapshot must retain volatile provenance for persistence and archive sinks"
+    );
+    assert!(
+        !format!("{:?}", snapshot.messages).contains("PIN was 7"),
+        "snapshot messages must already be public"
+    );
+
+    let serialized = serde_json::to_string(&snapshot).expect("serialize session");
+    assert!(!serialized.contains("PIN was 7"));
+    assert!(
+        !serialized.contains("sensitive_user_input_provenance"),
+        "volatile privacy provenance must never be serialized"
+    );
+    serde_json::from_str::<SavedSession>(&serialized)
+        .expect("session schema remains backward compatible");
 }
 
 #[test]
