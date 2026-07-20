@@ -13646,8 +13646,20 @@ fn activity_detail_includes_tool_handle_and_neighbor_context() {
         body.contains("retrieve_tool_result ref=art_call-read"),
         "{body}"
     );
-    assert!(body.contains("v raw"), "{body}");
-    assert!(body.contains("details)"), "{body}");
+    let details_chord = crate::tui::shell_key_routing::display_chord(
+        crate::tui::shell_key_routing::binding(
+            crate::tui::shell_key_routing::ShellBindingId::ToolDetails,
+        )
+        .footer_chord,
+    );
+    // The pager wraps this line at a platform-dependent point ("⌥V raw /
+    // details" on macOS, "Alt+V / raw details" on Windows), so normalize
+    // whitespace before asserting the full truthful hint.
+    let flat = body.split_whitespace().collect::<Vec<_>>().join(" ");
+    assert!(
+        flat.contains(&format!("{details_chord} raw details)")),
+        "{body}"
+    );
 }
 
 #[test]
@@ -13709,10 +13721,23 @@ fn activity_detail_fallback_uses_recent_meaningful_activity_without_full_tool_du
 
     assert!(body.contains("Activity: read"));
     assert!(body.contains("Status: done"));
-    assert!(body.contains("Detail handle: v details"), "{body}");
+    let details = crate::tui::shell_key_routing::display_chord(
+        crate::tui::shell_key_routing::binding(
+            crate::tui::shell_key_routing::ShellBindingId::ToolDetails,
+        )
+        .footer_chord,
+    );
     assert!(
-        !body.contains("Detail handle: v raw details"),
+        body.contains(&format!("Detail handle: {details} details")),
+        "{body}"
+    );
+    assert!(
+        !body.contains(&format!("Detail handle: {details} raw details")),
         "fallback tool details should not be labeled raw: {body}"
+    );
+    assert!(
+        !body.contains("Detail handle: v details"),
+        "bare-v details claim must not appear: {body}"
     );
     assert!(
         !body.contains("line 10"),
@@ -13760,15 +13785,27 @@ fn turn_inspector_renders_overview_sections_for_active_turn() {
 
     let body = turn_inspector_text(&app);
 
-    // Overview framing + Ctrl+O vs. v contract.
+    // Overview framing + Ctrl+O vs. Alt+V/⌥V contract.
+    let details = crate::tui::shell_key_routing::display_chord(
+        crate::tui::shell_key_routing::binding(
+            crate::tui::shell_key_routing::ShellBindingId::ToolDetails,
+        )
+        .footer_chord,
+    );
     assert!(
         body.contains("Turn turn_abc1234 \u{00B7} completed"),
         "{body}"
     );
     assert!(!body.contains("turn_abc123456789"), "{body}");
     assert!(
-        body.contains("press v for the selected item's raw detail"),
+        body.contains(&format!(
+            "press {details} for the selected item's raw detail"
+        )),
         "{body}"
+    );
+    assert!(
+        !body.contains("press v for the selected item's raw detail"),
+        "bare-v details claim must not appear: {body}"
     );
     // Section headers for all nine sections must be present.
     for header in [
@@ -13899,20 +13936,28 @@ fn turn_inspector_timeline_numbers_semantic_entries_and_checkpoint_actions() {
         body.contains("1. user prompt: Fix timeline evidence"),
         "{body}"
     );
+    let details_chord = crate::tui::shell_key_routing::display_chord(
+        crate::tui::shell_key_routing::binding(
+            crate::tui::shell_key_routing::ShellBindingId::ToolDetails,
+        )
+        .footer_chord,
+    );
     assert!(
-        body.contains("2. read/search: read · src.rs — done · actions: v raw detail"),
+        body.contains(&format!(
+            "2. read/search: read · src.rs — done · actions: {details_chord} raw detail"
+        )),
         "{body}"
     );
     assert!(
-        body.contains(
-            "3. edit: src.rs — add timeline evidence — done · actions: v raw detail, d diff"
-        ),
+        body.contains(&format!(
+            "3. edit: src.rs — add timeline evidence — done · actions: {details_chord} diff"
+        )),
         "{body}"
     );
     assert!(
-        body.contains(
-            "4. test/verifier: cargo test timeline — done · 1.2s · actions: v raw detail"
-        ),
+        body.contains(&format!(
+            "4. test/verifier: cargo test timeline — done · 1.2s · actions: {details_chord} raw detail"
+        )),
         "{body}"
     );
     assert!(
@@ -14219,9 +14264,12 @@ fn approval_prompt_uses_event_input_after_message_complete_drain() {
         .as_any_mut()
         .downcast_mut::<ApprovalView>()
         .expect("approval view");
-    let action = approval.handle_key(KeyEvent::new(KeyCode::Char('v'), KeyModifiers::NONE));
+    // Bare `v` must not open the params pager.
+    let bare = approval.handle_key(KeyEvent::new(KeyCode::Char('v'), KeyModifiers::NONE));
+    assert!(matches!(bare, ViewAction::None));
+    let action = approval.handle_key(KeyEvent::new(KeyCode::Char('v'), KeyModifiers::ALT));
     let ViewAction::Emit(ViewEvent::OpenTextPager { content, .. }) = action else {
-        panic!("expected approval params pager");
+        panic!("expected approval params pager from Alt+V");
     };
 
     assert!(content.contains("cargo test -p codewhale-tui approval"));
