@@ -3320,7 +3320,8 @@ mod tests {
             assert!(haystack.contains("byte-identical"));
             assert!(haystack.contains("DeepSeek prefix-cache reuse"));
         }
-        assert!(AGENT_MODE.contains("Fresh sessions are the default"));
+        assert!(AGENT_MODE.contains("`fork_context` is auto-chosen"));
+        assert!(AGENT_MODE.contains("write-capable, isolated, or re-routed children start fresh"));
     }
 
     #[test]

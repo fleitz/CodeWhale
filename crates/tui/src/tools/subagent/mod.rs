@@ -1499,9 +1499,11 @@ struct SpawnRequest {
     /// locality. A global ownership table prevents two agents from holding
     /// a resident lease on the same file simultaneously.
     resident_file: Option<String>,
-    /// When true, seed the child with the parent's system prompt and message
-    /// prefix before appending the child task.
-    fork_context: bool,
+    /// `Some(true)`: seed the child with the parent's system prompt and
+    /// message prefix before appending the child task. `Some(false)`: force a
+    /// fresh isolated context. `None` (caller omitted the field): resolved by
+    /// [`auto_fork_context_default`] at spawn time.
+    fork_context: Option<bool>,
     /// Legacy recursion budget for descendants. The model-facing child tool
     /// surface is leaf-only; this remains for persisted/internal records.
     max_depth: Option<u32>,
@@ -5052,7 +5054,7 @@ impl ToolSpec for AgentTool {
                 },
                 "fork_context": {
                     "type": "boolean",
-                    "description": "false (default): fresh child context. true: include the current parent context prefix when the child needs shared context or a byte-identical parent prefix for DeepSeek prefix-cache reuse."
+                    "description": "Unset (default): auto — a read-only child (explore/plan/review/verifier or read_only write authority) running the parent's exact model route in the parent workspace forks the parent's cached context prefix; anything else starts fresh. true: force the parent prefix (cheap only on the parent's model route). false: force a fresh isolated context."
                 },
                 "max_depth": {
                     "type": "integer",
@@ -5790,6 +5792,17 @@ async fn spawn_subagent_from_input(
         workflow_child_index: None,
     };
 
+    let fork_context = spawn_request.fork_context.unwrap_or_else(|| {
+        auto_fork_context_default(
+            &spawn_request.agent_type,
+            spawn_request.write_authority,
+            spawn_request.worktree.is_some(),
+            spawn_request.cwd.is_some(),
+            &runtime,
+            child_runtime.client.api_provider(),
+            &effective_model,
+        )
+    });
     let mut manager_guard = manager.write().await;
 
     let result = manager_guard
@@ -5805,7 +5818,7 @@ async fn spawn_subagent_from_input(
                 model: Some(effective_model),
                 model_route: Some(model_route),
                 nickname: None,
-                fork_context: spawn_request.fork_context,
+                fork_context,
                 token_budget: spawn_request.token_budget,
                 max_steps: spawn_request.max_steps,
                 wall_time: spawn_request.wall_time,
@@ -7913,6 +7926,42 @@ fn parse_items_text(input: &Value, key: &str) -> Result<Option<String>, ToolErro
     Ok(Some(lines.join("\n")))
 }
 
+/// Decide `fork_context` when the caller left it unset.
+///
+/// Forking seeds the child with the byte-identical parent prefix, enabling
+/// provider prefix caching (DeepSeek prefix-cache reuse, Anthropic cache
+/// breakpoints) to serve the parent context instead of cold-prefilling. Only
+/// cheaper — and only coherent — when the child (a) is spawned directly by
+/// the engine turn (a nested spawner's snapshot is the root prefix, not its
+/// own conversation), (b) runs the exact parent provider+model route (any
+/// other route pays a full cold prefill of the entire parent context),
+/// (c) has a read-only posture (explore/plan/review/verifier, or an explicit
+/// `read_only` write authority), and (d) stays in the parent workspace with
+/// no worktree isolation. Everything else keeps the fresh-brief default.
+/// An explicit `fork_context` from the caller always wins.
+fn auto_fork_context_default(
+    agent_type: &SubAgentType,
+    write_authority: Option<SpawnWriteAuthority>,
+    has_worktree: bool,
+    has_cwd_override: bool,
+    parent_runtime: &SubAgentRuntime,
+    child_provider: crate::config::ApiProvider,
+    effective_model: &str,
+) -> bool {
+    if parent_runtime.fork_context.is_none() || parent_runtime.parent_agent_id.is_some() {
+        return false;
+    }
+    let read_only_posture = matches!(
+        agent_type,
+        SubAgentType::Explore | SubAgentType::Plan | SubAgentType::Review | SubAgentType::Verifier
+    ) || write_authority == Some(SpawnWriteAuthority::ReadOnly);
+    read_only_posture
+        && !has_worktree
+        && !has_cwd_override
+        && child_provider == parent_runtime.client.api_provider()
+        && effective_model == parent_runtime.model
+}
+
 fn parse_spawn_request(input: &Value) -> Result<SpawnRequest, ToolError> {
     let prompt = parse_text_or_items(
         input,
@@ -8027,8 +8076,7 @@ fn parse_spawn_request(input: &Value) -> Result<SpawnRequest, ToolError> {
         .map(str::to_string)
         .filter(|s| !s.trim().is_empty());
     let fork_context =
-        parse_optional_bool(input, &["fork_context", "forkContext", "inherit_context"])
-            .unwrap_or(false);
+        parse_optional_bool(input, &["fork_context", "forkContext", "inherit_context"]);
     let max_depth = input
         .get("max_depth")
         .or_else(|| input.get("maxDepth"))

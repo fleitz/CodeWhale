@@ -1253,14 +1253,19 @@ fn test_parse_spawn_request_accepts_fork_context() {
         "fork_context": true
     });
     let parsed = parse_spawn_request(&input).expect("spawn request should parse");
-    assert!(parsed.fork_context);
+    assert_eq!(parsed.fork_context, Some(true));
 
     let input = json!({
         "prompt": "continue from here",
         "inherit_context": true
     });
     let parsed = parse_spawn_request(&input).expect("spawn request should parse");
-    assert!(parsed.fork_context);
+    assert_eq!(parsed.fork_context, Some(true));
+
+    // Omitted entirely: deferred to the spawn-time auto policy.
+    let input = json!({ "prompt": "continue from here" });
+    let parsed = parse_spawn_request(&input).expect("spawn request should parse");
+    assert_eq!(parsed.fork_context, None);
 }
 
 #[test]
@@ -1399,7 +1404,7 @@ fn test_parse_spawn_request_accepts_session_name_for_agent() {
     });
     let parsed = parse_spawn_request(&input).expect("agent request should parse");
     assert_eq!(parsed.session_name.as_deref(), Some("review.parser"));
-    assert!(parsed.fork_context);
+    assert_eq!(parsed.fork_context, Some(true));
     assert_eq!(parsed.max_depth, Some(0));
 }
 
@@ -1864,14 +1869,108 @@ async fn interrupted_projection_exposes_checkpoint_metadata_and_messages() {
 fn test_delegate_defaults_to_fork_context() {
     let input = with_default_fork_context(json!({ "prompt": "review current work" }), true);
     let parsed = parse_spawn_request(&input).expect("delegate request should parse");
-    assert!(parsed.fork_context);
+    assert_eq!(parsed.fork_context, Some(true));
 
     let input = with_default_fork_context(
         json!({ "prompt": "fresh exploration", "fork_context": false }),
         true,
     );
     let parsed = parse_spawn_request(&input).expect("delegate override should parse");
-    assert!(!parsed.fork_context);
+    assert_eq!(parsed.fork_context, Some(false));
+}
+
+#[test]
+fn auto_fork_context_default_forks_only_same_route_read_only_engine_children() {
+    let mut runtime = stub_runtime();
+    let provider = runtime.client.api_provider();
+    let model = runtime.model.clone();
+
+    // No captured parent snapshot: never auto-fork.
+    assert!(!auto_fork_context_default(
+        &SubAgentType::Explore,
+        None,
+        false,
+        false,
+        &runtime,
+        provider,
+        &model
+    ));
+
+    runtime.fork_context = Some(SubAgentForkContext {
+        messages: Vec::new(),
+        structured_state_block: None,
+    });
+
+    // Read-only postures on the parent route in the parent workspace fork.
+    for agent_type in [
+        SubAgentType::Explore,
+        SubAgentType::Plan,
+        SubAgentType::Review,
+        SubAgentType::Verifier,
+    ] {
+        assert!(
+            auto_fork_context_default(&agent_type, None, false, false, &runtime, provider, &model),
+            "{agent_type:?} should auto-fork"
+        );
+    }
+    // Explicit read_only authority upgrades a General child.
+    assert!(auto_fork_context_default(
+        &SubAgentType::General,
+        Some(SpawnWriteAuthority::ReadOnly),
+        false,
+        false,
+        &runtime,
+        provider,
+        &model
+    ));
+    // Write-capable children stay fresh.
+    for agent_type in [SubAgentType::General, SubAgentType::Implementer] {
+        assert!(
+            !auto_fork_context_default(&agent_type, None, false, false, &runtime, provider, &model),
+            "{agent_type:?} must stay fresh"
+        );
+    }
+    // Worktree or cwd isolation stays fresh.
+    assert!(!auto_fork_context_default(
+        &SubAgentType::Explore,
+        None,
+        true,
+        false,
+        &runtime,
+        provider,
+        &model
+    ));
+    assert!(!auto_fork_context_default(
+        &SubAgentType::Explore,
+        None,
+        false,
+        true,
+        &runtime,
+        provider,
+        &model
+    ));
+    // A different model route pays a cold prefill of the parent context.
+    assert!(!auto_fork_context_default(
+        &SubAgentType::Explore,
+        None,
+        false,
+        false,
+        &runtime,
+        provider,
+        "some-other-model"
+    ));
+    // Nested spawners stay fresh — their snapshot is the root prefix, not
+    // their own conversation.
+    runtime.parent_agent_id = Some("agent_parent".to_string());
+    assert!(!auto_fork_context_default(
+        &SubAgentType::Explore,
+        None,
+        false,
+        false,
+        &runtime,
+        provider,
+        &model
+    ));
 }
 
 #[test]

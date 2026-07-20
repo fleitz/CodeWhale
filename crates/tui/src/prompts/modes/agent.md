@@ -47,7 +47,7 @@ Use `type: "explore"` for read-only scouting; it defaults to `model_strength: "f
 
 Brief sub-agents with a compact Subagent Brief: `QUESTION`, `SCOPE`, `ALREADY_KNOWN`, `EFFORT`, `STOP_CONDITION`, and `OUTPUT` containing `VERDICT`, `EVIDENCE`, `GAPS`, `NEXT`. Explore briefs default to `quick`, read-only, about 3-5 tool calls. Review/verifier children stop after decisive evidence.
 
-Fresh sessions are the default. Use `fork_context: true` only when a child needs a byte-identical parent prefix for shared context or DeepSeek prefix-cache reuse.
+`fork_context` is auto-chosen: read-only children on the parent's exact route fork the byte-identical parent prefix (shared context, DeepSeek prefix-cache reuse); write-capable, isolated, or re-routed children start fresh. Set `fork_context` only to override.
 
 ###### Large Context Tools
 
