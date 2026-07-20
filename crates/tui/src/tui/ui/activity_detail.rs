@@ -462,20 +462,38 @@ fn activity_detail_handle_line(app: &App, cell_index: usize, cell: &HistoryCell)
             .iter()
             .find(|artifact| artifact.tool_call_id == detail.tool_id)
         {
+            let details = crate::tui::shell_key_routing::display_chord(
+                crate::tui::shell_key_routing::binding(
+                    crate::tui::shell_key_routing::ShellBindingId::ToolDetails,
+                )
+                .footer_chord,
+            );
             return Some(format!(
-                "Detail handle: {} (retrieve_tool_result ref={}; v raw details)",
+                "Detail handle: {} (retrieve_tool_result ref={}; {details} raw details)",
                 artifact.id, artifact.id
             ));
         }
+        let details = crate::tui::shell_key_routing::display_chord(
+            crate::tui::shell_key_routing::binding(
+                crate::tui::shell_key_routing::ShellBindingId::ToolDetails,
+            )
+            .footer_chord,
+        );
         return Some(format!(
-            "Detail handle: tool:{} (v raw details)",
+            "Detail handle: tool:{} ({details} raw details)",
             detail.tool_id
         ));
     }
 
+    let details = crate::tui::shell_key_routing::display_chord(
+        crate::tui::shell_key_routing::binding(
+            crate::tui::shell_key_routing::ShellBindingId::ToolDetails,
+        )
+        .footer_chord,
+    );
     match cell {
-        HistoryCell::Tool(_) => Some("Detail handle: v details".to_string()),
-        HistoryCell::SubAgent(_) => Some("Detail handle: v details".to_string()),
+        HistoryCell::Tool(_) => Some(format!("Detail handle: {details} details")),
+        HistoryCell::SubAgent(_) => Some(format!("Detail handle: {details} details")),
         _ => None,
     }
 }
@@ -891,12 +909,17 @@ pub(super) fn turn_inspector_text(app: &App) -> String {
     } else {
         out.push("Turn: \u{2014} (no turn recorded yet)".to_string());
     }
-    // Restate the Ctrl+O (overview) vs. `v` (raw leaf detail) contract so the
-    // two surfaces never get confused.
-    out.push(
-        "Overview of the current/latest turn · press v for the selected item's raw detail"
-            .to_string(),
+    // Restate the Ctrl+O (overview) vs. Alt+V/⌥V (raw leaf detail) contract so
+    // the two surfaces never get confused. Bare `v` is never a details shortcut.
+    let details = crate::tui::shell_key_routing::display_chord(
+        crate::tui::shell_key_routing::binding(
+            crate::tui::shell_key_routing::ShellBindingId::ToolDetails,
+        )
+        .footer_chord,
     );
+    out.push(format!(
+        "Overview of the current/latest turn · press {details} for the selected item's raw detail"
+    ));
 
     push_section(&mut out, "Intent", vec![turn_intent_line(app, start)]);
 
@@ -1065,16 +1088,22 @@ fn turn_intent_line(app: &App, start: usize) -> String {
 }
 
 /// Optional selected-item context. The first view is the turn overview, but
-/// when the user has an activity cell selected we surface it plus the `v`
-/// affordance so the Ctrl+O / `v` split stays discoverable.
+/// when the user has an activity cell selected we surface it plus the Alt+V
+/// affordance so the Ctrl+O / Alt+V split stays discoverable.
 fn selected_item_context_line(app: &App) -> Option<String> {
     let idx = selected_transcript_cell_index(app)?;
     let cell = app.cell_at_virtual_index(idx)?;
     let label = truncate_line_to_width(&activity_cell_label(app, idx, cell), 48);
     let hint = if app.cell_has_detail_target(idx) {
-        " · v opens its raw detail"
+        let details = crate::tui::shell_key_routing::display_chord(
+            crate::tui::shell_key_routing::binding(
+                crate::tui::shell_key_routing::ShellBindingId::ToolDetails,
+            )
+            .footer_chord,
+        );
+        format!(" · {details} opens its raw detail")
     } else {
-        ""
+        String::new()
     };
     Some(format!("{label}{hint}"))
 }

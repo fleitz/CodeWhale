@@ -1413,7 +1413,10 @@ impl ModalView for ApprovalView {
                     self.commit_option(ApprovalOption::Deny)
                 }
             }
-            KeyCode::Char('v') | KeyCode::Char('V') => self.emit_params_pager(),
+            // Details is Alt+V / Option+V only; bare `v` is never a shortcut.
+            _ if crate::tui::shell_key_routing::is_tool_details_shortcut(&key) => {
+                self.emit_params_pager()
+            }
             KeyCode::Esc => self.emit_decision(ReviewDecision::Abort, false),
             _ => ViewAction::None,
         }
@@ -2936,15 +2939,18 @@ diff --git a/src/b.rs b/src/b.rs
 
     #[test]
     fn test_approval_view_view_params() {
+        // Bare `v` must not open details (TUI-DOG-002).
         let mut view = ApprovalView::new(benign_request());
         let action = view.handle_key(create_key_event(KeyCode::Char('v')));
-        assert!(matches!(
-            action,
-            ViewAction::Emit(ViewEvent::OpenTextPager { .. })
-        ));
+        assert!(matches!(action, ViewAction::None));
 
         let mut view = ApprovalView::new(benign_request());
         let action = view.handle_key(create_key_event(KeyCode::Char('V')));
+        assert!(matches!(action, ViewAction::None));
+
+        // Alt+V / Option+V opens the params pager.
+        let mut view = ApprovalView::new(benign_request());
+        let action = view.handle_key(KeyEvent::new(KeyCode::Char('v'), KeyModifiers::ALT));
         assert!(matches!(
             action,
             ViewAction::Emit(ViewEvent::OpenTextPager { .. })
@@ -3224,8 +3230,8 @@ diff --git a/src/b.rs b/src/b.rs
 
     #[test]
     fn approval_footer_hints_use_muted_contrast_tier() {
-        // #3380: the footer key hints ("Pg↑/↓ review · v details · Esc abort") must
-        // render one contrast tier above TEXT_HINT — TEXT_MUTED, the same
+        // #3380: the footer key hints ("Pg↑/↓ review · Alt+V/⌥V details · Esc abort")
+        // must render one contrast tier above TEXT_HINT — TEXT_MUTED, the same
         // color the app-wide ActionHint modal footers use for labels.
         use crate::palette;
         use ratatui::buffer::Buffer;

@@ -482,7 +482,17 @@ fn push_tools(out: &mut String, app: &App, locale: Locale) {
     if rendered == 0 {
         let _ = writeln!(out, "- {}", tr(locale, MessageId::CtxInspNoToolActivity));
     } else {
-        let _ = writeln!(out, "- {}", tr(locale, MessageId::CtxInspVHint));
+        let details = crate::tui::shell_key_routing::display_chord(
+            crate::tui::shell_key_routing::binding(
+                crate::tui::shell_key_routing::ShellBindingId::ToolDetails,
+            )
+            .footer_chord,
+        );
+        let _ = writeln!(
+            out,
+            "- {}",
+            tr(locale, MessageId::CtxInspVHint).replace("{details}", details.as_ref())
+        );
     }
 }
 

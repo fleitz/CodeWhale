@@ -2622,7 +2622,15 @@ fn destructive_approval_semantics(locale: Locale) -> [(&'static str, &'static st
 }
 
 fn footer_controls(locale: Locale) -> Cow<'static, str> {
-    tr(locale, MessageId::ApprovalControlsHint)
+    // Platform-aware details chord (⌥V on macOS, Alt+V elsewhere). Bare `v`
+    // is never advertised as a details shortcut (TUI-DOG-002).
+    let details = crate::tui::shell_key_routing::display_chord(
+        crate::tui::shell_key_routing::binding(
+            crate::tui::shell_key_routing::ShellBindingId::ToolDetails,
+        )
+        .footer_chord,
+    );
+    Cow::Owned(tr(locale, MessageId::ApprovalControlsHint).replace("{details}", details.as_ref()))
 }
 
 fn save_ask_rule_hint(locale: Locale) -> &'static str {
