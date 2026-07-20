@@ -294,6 +294,12 @@ impl Engine {
         dynamic_active_tools: Vec<&'static str>,
         live_fork_context: Option<&SharedSubAgentForkContext>,
     ) -> (TurnOutcomeStatus, Option<String>) {
+        let redact_runtime_log = |message: String| {
+            let sensitive_values = live_fork_context
+                .map(|context| context.read().sensitive_user_input_values.clone())
+                .unwrap_or_default();
+            crate::runtime_threads::redacted_sensitive_user_input_text(&message, &sensitive_values)
+        };
         // Only interactive TUI hosts own terminal chrome. Headless exec,
         // app-server, and stream-json stdout must remain byte-clean.
         if self.config.terminal_chrome_enabled {
@@ -721,6 +727,9 @@ impl Engine {
             // the dangling assistant ToolUse response, and stays identical
             // across transparent retries.
             update_live_fork_context_from_request(live_fork_context, &stream_request);
+            let current_sensitive_user_input_values = live_fork_context
+                .map(|context| context.read().sensitive_user_input_values.clone())
+                .unwrap_or_default();
 
             // Stream the response. Keep the request around (cloned into the
             // first call) so we can resend it on a transparent retry below
@@ -916,11 +925,11 @@ impl Engine {
                             stream_retry_attempts,
                             self.cancel_token.is_cancelled(),
                         ) {
-                            crate::logging::warn(format!(
+                            crate::logging::warn(redact_runtime_log(format!(
                                 "Stream error after suspected system sleep ({:?} monotonic vs {:?} wall since last chunk); scheduling request retry: {message}",
                                 last_progress_mono.elapsed(),
                                 wall_elapsed,
-                            ));
+                            )));
                             sleep_resume_pending = true;
                             break;
                         }
@@ -936,9 +945,9 @@ impl Engine {
                         ) {
                             transparent_stream_retries =
                                 transparent_stream_retries.saturating_add(1);
-                            crate::logging::info(format!(
+                            crate::logging::info(redact_runtime_log(format!(
                                 "Transparent stream retry {transparent_stream_retries}/{MAX_TRANSPARENT_STREAM_RETRIES} (no content received yet): {message}",
-                            ));
+                            )));
                             // Drop the failed stream before issuing the new
                             // request to release the underlying connection.
                             drop(stream);
@@ -969,9 +978,9 @@ impl Engine {
                                             )))
                                             .await;
                                     } else {
-                                        crate::logging::warn(format!(
+                                        crate::logging::warn(redact_runtime_log(format!(
                                             "Deferring transient retry-open error until the whole-stream retry budget is exhausted: {retry_msg}"
-                                        ));
+                                        )));
                                     }
                                     break;
                                 }
@@ -986,9 +995,9 @@ impl Engine {
                                 .send(Event::error(ErrorEnvelope::classify(user_message, true)))
                                 .await;
                         } else {
-                            crate::logging::warn(format!(
+                            crate::logging::warn(redact_runtime_log(format!(
                                 "Deferring transient stream error until the whole-stream retry budget is exhausted: {user_message}"
-                            ));
+                            )));
                         }
                         if stream_errors >= MAX_STREAM_ERRORS_BEFORE_FAIL {
                             break;
@@ -1047,9 +1056,9 @@ impl Engine {
                             input,
                             caller,
                         } => {
-                            crate::logging::info(format!(
+                            crate::logging::info(redact_runtime_log(format!(
                                 "Tool '{name}' block start. Initial input: {input:?}"
-                            ));
+                            )));
                             current_block_kind = Some(ContentBlockKind::ToolUse);
                             current_tool_indices.insert(index, tool_uses.len());
                             // ToolCallStarted is deferred to ContentBlockStop —
@@ -1066,9 +1075,9 @@ impl Engine {
                             });
                         }
                         ContentBlockStart::ServerToolUse { id, name, input } => {
-                            crate::logging::info(format!(
+                            crate::logging::info(redact_runtime_log(format!(
                                 "Server tool '{name}' block start. Initial input: {input:?}"
-                            ));
+                            )));
                             current_block_kind = Some(ContentBlockKind::ToolUse);
                             current_tool_indices.insert(index, tool_uses.len());
                             tool_uses.push(ToolUseState {
@@ -1133,16 +1142,16 @@ impl Engine {
                                 && let Some(tool_state) = tool_uses.get_mut(tool_idx)
                             {
                                 tool_state.input_buffer.push_str(&partial_json);
-                                crate::logging::info(format!(
+                                crate::logging::info(redact_runtime_log(format!(
                                     "Tool '{}' input delta: {} (buffer now: {})",
                                     tool_state.name, partial_json, tool_state.input_buffer
-                                ));
+                                )));
                                 if let Some(value) = parse_tool_input(&tool_state.input_buffer) {
                                     tool_state.input = value.clone();
-                                    crate::logging::info(format!(
+                                    crate::logging::info(redact_runtime_log(format!(
                                         "Tool '{}' input parsed: {:?}",
                                         tool_state.name, value
-                                    ));
+                                    )));
                                 }
                             }
                         }
@@ -1185,22 +1194,22 @@ impl Engine {
                         if let Some(tool_idx) = current_tool_indices.remove(&index)
                             && let Some(tool_state) = tool_uses.get_mut(tool_idx)
                         {
-                            crate::logging::info(format!(
+                            crate::logging::info(redact_runtime_log(format!(
                                 "Tool '{}' block stop. Buffer: '{}', Current input: {:?}",
                                 tool_state.name, tool_state.input_buffer, tool_state.input
-                            ));
+                            )));
                             if !tool_state.input_buffer.trim().is_empty() {
                                 if let Some(value) = parse_tool_input(&tool_state.input_buffer) {
                                     tool_state.input = value;
-                                    crate::logging::info(format!(
+                                    crate::logging::info(redact_runtime_log(format!(
                                         "Tool '{}' final input: {:?}",
                                         tool_state.name, tool_state.input
-                                    ));
+                                    )));
                                 } else {
-                                    crate::logging::warn(format!(
+                                    crate::logging::warn(redact_runtime_log(format!(
                                         "Tool '{}' failed to parse final input buffer: '{}'",
                                         tool_state.name, tool_state.input_buffer
-                                    ));
+                                    )));
                                     let error =
                                         malformed_tool_arguments_error(&tool_state.input_buffer);
                                     tool_state.input_parse_error = Some(error);
@@ -1215,10 +1224,10 @@ impl Engine {
                                         .await;
                                 }
                             } else {
-                                crate::logging::warn(format!(
+                                crate::logging::warn(redact_runtime_log(format!(
                                     "Tool '{}' input buffer is empty, using initial input: {:?}",
                                     tool_state.name, tool_state.input
-                                ));
+                                )));
                             }
 
                             // Now that the input is finalized, announce the
@@ -1249,7 +1258,9 @@ impl Engine {
                         // surfaces fatal errors as stream Err items; this
                         // defensive arm keeps any passed-through error
                         // visible instead of silently dropped.
-                        crate::logging::warn(format!("Provider stream error event: {error}"));
+                        crate::logging::warn(redact_runtime_log(format!(
+                            "Provider stream error event: {error}"
+                        )));
                         stream_errors += 1;
                     }
                 }
@@ -1708,9 +1719,9 @@ impl Engine {
                 let mut tool_name = tool.name.clone();
                 let mut tool_input = tool.input.clone();
                 let tool_caller = tool.caller.clone();
-                crate::logging::info(format!(
+                crate::logging::info(redact_runtime_log(format!(
                     "Planning tool '{tool_name}' with input: {tool_input:?}"
-                ));
+                )));
 
                 let requested_tool_name = tool_name.clone();
                 let tool_def =
@@ -1928,17 +1939,20 @@ impl Engine {
                         ApprovalRequirement::Suggest => "suggest",
                         ApprovalRequirement::Required => "required",
                     };
-                    emit_tool_audit(json!({
-                        "event": "tool.prepared",
-                        "tool_id": tool_id.clone(),
-                        "tool_name": tool_name.clone(),
-                        "read_only": read_only,
-                        "supports_parallel": supports_parallel,
-                        "starts_detached": detached_start,
-                        "approval": approval,
-                        "resources": &resources,
-                        "reprepared_after_hook": reprepared_after_hook,
-                    }));
+                    emit_tool_audit(
+                        json!({
+                            "event": "tool.prepared",
+                            "tool_id": tool_id.clone(),
+                            "tool_name": tool_name.clone(),
+                            "read_only": read_only,
+                            "supports_parallel": supports_parallel,
+                            "starts_detached": detached_start,
+                            "approval": approval,
+                            "resources": &resources,
+                            "reprepared_after_hook": reprepared_after_hook,
+                        }),
+                        &current_sensitive_user_input_values,
+                    );
                 }
 
                 if blocked_error.is_none()
@@ -2007,11 +2021,14 @@ impl Engine {
                         crate::config::is_workspace_trusted(&self.session.workspace),
                         false,
                     );
-                    emit_tool_audit(json!({
-                        "event": "tool.auto_review_decision",
-                        "tool_id": tool_id.clone(),
-                        "auto_review": audit_event,
-                    }));
+                    emit_tool_audit(
+                        json!({
+                            "event": "tool.auto_review_decision",
+                            "tool_id": tool_id.clone(),
+                            "auto_review": audit_event,
+                        }),
+                        &current_sensitive_user_input_values,
+                    );
                     match decision {
                         AutoReviewPlanDecision::NoChange => {}
                         AutoReviewPlanDecision::ForcePrompt(reason) => {
@@ -2042,18 +2059,21 @@ impl Engine {
                         &tool_input,
                     )
                 {
-                    emit_tool_audit(json!({
-                        "event": "tool.repo_law_decision",
-                        "tool_id": tool_id.clone(),
-                        "decision": match &decision {
-                            crate::repo_law::RepoLawPlanDecision::ForcePrompt(_) => "force_prompt",
-                            crate::repo_law::RepoLawPlanDecision::Block(_) => "block",
-                        },
-                        "reason": match &decision {
-                            crate::repo_law::RepoLawPlanDecision::ForcePrompt(reason)
-                            | crate::repo_law::RepoLawPlanDecision::Block(reason) => reason.clone(),
-                        },
-                    }));
+                    emit_tool_audit(
+                        json!({
+                            "event": "tool.repo_law_decision",
+                            "tool_id": tool_id.clone(),
+                            "decision": match &decision {
+                                crate::repo_law::RepoLawPlanDecision::ForcePrompt(_) => "force_prompt",
+                                crate::repo_law::RepoLawPlanDecision::Block(_) => "block",
+                            },
+                            "reason": match &decision {
+                                crate::repo_law::RepoLawPlanDecision::ForcePrompt(reason)
+                                | crate::repo_law::RepoLawPlanDecision::Block(reason) => reason.clone(),
+                            },
+                        }),
+                        &current_sensitive_user_input_values,
+                    );
                     match decision {
                         crate::repo_law::RepoLawPlanDecision::ForcePrompt(reason) => {
                             if self.session.auto_approve {
@@ -2087,13 +2107,16 @@ impl Engine {
                         &mut deferred_tools_hydrated_this_batch,
                     )
                 {
-                    emit_tool_audit(json!({
-                        "event": "tool.schema_hydrated",
-                        "tool_id": tool_id.clone(),
-                        "tool_name": tool_name.clone(),
-                        "auto_retry_same_turn": true,
-                        "metadata": result.metadata,
-                    }));
+                    emit_tool_audit(
+                        json!({
+                            "event": "tool.schema_hydrated",
+                            "tool_id": tool_id.clone(),
+                            "tool_name": tool_name.clone(),
+                            "auto_retry_same_turn": true,
+                            "metadata": result.metadata,
+                        }),
+                        &current_sensitive_user_input_values,
+                    );
                     if should_emit_hydration_status {
                         let status = if requested_tool_name == tool_name {
                             format!(
@@ -2207,6 +2230,7 @@ impl Engine {
 
             let mut outcomes: Vec<Option<ToolExecOutcome>> = Vec::with_capacity(plan_count);
             outcomes.resize_with(plan_count, || None);
+            let spill_sensitive_user_input_values = current_sensitive_user_input_values.clone();
 
             for batch in batches {
                 let (parallel_allowed, plans) = match batch {
@@ -2305,6 +2329,8 @@ impl Engine {
                         let started_at = Instant::now();
                         let shell_permits = shell_permits.clone();
                         let workspace = self.session.workspace.clone();
+                        let spill_sensitive_user_input_values =
+                            spill_sensitive_user_input_values.clone();
 
                         tool_tasks.push(async move {
                             let _shell_permit = if plan.name == "exec_shell" {
@@ -2331,20 +2357,32 @@ impl Engine {
                             // `tool.spillover` audit event so operators can
                             // correlate large-output episodes with disk usage.
                             if let Ok(tool_result) = result.as_mut()
-                                && let Some(path) =
-                                    crate::tools::truncate::apply_spillover_with_artifact(
+                            {
+                                let durable_content =
+                                    crate::runtime_threads::redacted_sensitive_user_input_text(
+                                        &tool_result.content,
+                                        &spill_sensitive_user_input_values,
+                                    );
+                                if let Some(path) =
+                                    crate::tools::truncate::apply_spillover_with_artifact_projection(
                                         tool_result,
                                         &plan.id,
                                         &plan.name,
                                         &session_id,
+                                        &durable_content,
+                                        &spill_sensitive_user_input_values,
                                     )
-                            {
-                                emit_tool_audit(json!({
-                                    "event": "tool.spillover",
-                                    "tool_id": plan.id.clone(),
-                                    "tool_name": plan.name.clone(),
-                                    "path": path.display().to_string(),
-                                }));
+                                {
+                                    emit_tool_audit(
+                                        json!({
+                                            "event": "tool.spillover",
+                                            "tool_id": plan.id.clone(),
+                                            "tool_name": plan.name.clone(),
+                                            "path": path.display().to_string(),
+                                        }),
+                                        &spill_sensitive_user_input_values,
+                                    );
+                                }
                             }
 
                             let _ = tx_event
@@ -2578,11 +2616,14 @@ impl Engine {
                             Option<crate::tools::ToolContext>,
                             Option<ToolApprovalStamp>,
                         ) = if plan.approval_required {
-                            emit_tool_audit(json!({
-                                "event": "tool.approval_required",
-                                "tool_id": tool_id.clone(),
-                                "tool_name": tool_name.clone(),
-                            }));
+                            emit_tool_audit(
+                                json!({
+                                    "event": "tool.approval_required",
+                                    "tool_id": tool_id.clone(),
+                                    "tool_name": tool_name.clone(),
+                                }),
+                                &spill_sensitive_user_input_values,
+                            );
                             let approval_key = crate::tools::approval_cache::build_approval_key(
                                 &tool_name,
                                 &tool_input,
@@ -2614,23 +2655,29 @@ impl Engine {
 
                             match self.await_tool_approval(&tool_id).await {
                                 Ok(ApprovalResult::Approved) => {
-                                    emit_tool_audit(json!({
-                                        "event": "tool.approval_decision",
-                                        "tool_id": tool_id.clone(),
-                                        "tool_name": tool_name.clone(),
-                                        "decision": "approved",
-                                        "caller": caller_type_for_tool_use(tool_caller.as_ref()),
-                                    }));
+                                    emit_tool_audit(
+                                        json!({
+                                            "event": "tool.approval_decision",
+                                            "tool_id": tool_id.clone(),
+                                            "tool_name": tool_name.clone(),
+                                            "decision": "approved",
+                                            "caller": caller_type_for_tool_use(tool_caller.as_ref()),
+                                        }),
+                                        &spill_sensitive_user_input_values,
+                                    );
                                     (None, None, Some(ToolApprovalStamp::ApprovedByUser))
                                 }
                                 Ok(ApprovalResult::Denied) => {
-                                    emit_tool_audit(json!({
-                                        "event": "tool.approval_decision",
-                                        "tool_id": tool_id.clone(),
-                                        "tool_name": tool_name.clone(),
-                                        "decision": "denied",
-                                        "caller": caller_type_for_tool_use(tool_caller.as_ref()),
-                                    }));
+                                    emit_tool_audit(
+                                        json!({
+                                            "event": "tool.approval_decision",
+                                            "tool_id": tool_id.clone(),
+                                            "tool_name": tool_name.clone(),
+                                            "decision": "denied",
+                                            "caller": caller_type_for_tool_use(tool_caller.as_ref()),
+                                        }),
+                                        &spill_sensitive_user_input_values,
+                                    );
                                     (
                                         Some(Err(ToolError::permission_denied(format!(
                                             "Tool '{tool_name}' denied by user"
@@ -2640,14 +2687,17 @@ impl Engine {
                                     )
                                 }
                                 Ok(ApprovalResult::RetryWithPolicy(policy)) => {
-                                    emit_tool_audit(json!({
-                                        "event": "tool.approval_decision",
-                                        "tool_id": tool_id.clone(),
-                                        "tool_name": tool_name.clone(),
-                                        "decision": "retry_with_policy",
-                                        "policy": format!("{policy:?}"),
-                                        "caller": caller_type_for_tool_use(tool_caller.as_ref()),
-                                    }));
+                                    emit_tool_audit(
+                                        json!({
+                                            "event": "tool.approval_decision",
+                                            "tool_id": tool_id.clone(),
+                                            "tool_name": tool_name.clone(),
+                                            "decision": "retry_with_policy",
+                                            "policy": format!("{policy:?}"),
+                                            "caller": caller_type_for_tool_use(tool_caller.as_ref()),
+                                        }),
+                                        &spill_sensitive_user_input_values,
+                                    );
                                     let elevated_context = tool_registry.map(|r| {
                                         r.context().clone().with_elevated_sandbox_policy(policy)
                                     });
@@ -2719,21 +2769,32 @@ impl Engine {
                         // Emit a discrete `tool.spillover` audit event so
                         // operators can correlate large-output episodes with
                         // disk-usage growth in `~/.deepseek/tool_outputs/`.
-                        if let Ok(tool_result) = result.as_mut()
-                            && let Some(path) =
-                                crate::tools::truncate::apply_spillover_with_artifact(
+                        if let Ok(tool_result) = result.as_mut() {
+                            let durable_content =
+                                crate::runtime_threads::redacted_sensitive_user_input_text(
+                                    &tool_result.content,
+                                    &spill_sensitive_user_input_values,
+                                );
+                            if let Some(path) =
+                                crate::tools::truncate::apply_spillover_with_artifact_projection(
                                     tool_result,
                                     &tool_id,
                                     &tool_name,
                                     &self.session.id,
+                                    &durable_content,
+                                    &spill_sensitive_user_input_values,
                                 )
-                        {
-                            emit_tool_audit(json!({
-                                "event": "tool.spillover",
-                                "tool_id": tool_id.clone(),
-                                "tool_name": tool_name.clone(),
-                                "path": path.display().to_string(),
-                            }));
+                            {
+                                emit_tool_audit(
+                                    json!({
+                                        "event": "tool.spillover",
+                                        "tool_id": tool_id.clone(),
+                                        "tool_name": tool_name.clone(),
+                                        "path": path.display().to_string(),
+                                    }),
+                                    &spill_sensitive_user_input_values,
+                                );
+                            }
                         }
 
                         let _ = self
@@ -2790,14 +2851,17 @@ impl Engine {
                 };
                 let result =
                     read_repeat_guard.coalesced_result(occurrence, &leader_id, &leader_result);
-                emit_tool_audit(json!({
-                    "event": "tool.read_repeat_coalesced",
-                    "tool_id": follower.id.clone(),
-                    "tool_name": follower.name.clone(),
-                    "leader_tool_id": leader_id,
-                    "count": occurrence.count,
-                    "receipt": occurrence.count >= RECEIPT_THRESHOLD,
-                }));
+                emit_tool_audit(
+                    json!({
+                        "event": "tool.read_repeat_coalesced",
+                        "tool_id": follower.id.clone(),
+                        "tool_name": follower.name.clone(),
+                        "leader_tool_id": leader_id,
+                        "count": occurrence.count,
+                        "receipt": occurrence.count >= RECEIPT_THRESHOLD,
+                    }),
+                    &spill_sensitive_user_input_values,
+                );
                 let _ = self
                     .tx_event
                     .send(Event::ToolCallComplete {
@@ -2891,13 +2955,16 @@ impl Engine {
 
                 match result {
                     Ok(output) => {
-                        emit_tool_audit(json!({
-                            "event": "tool.result",
-                            "tool_id": outcome.id.clone(),
-                            "tool_name": outcome.name.clone(),
-                            "status": terminal_status.as_str(),
-                            "success": output.success,
-                        }));
+                        emit_tool_audit(
+                            json!({
+                                "event": "tool.result",
+                                "tool_id": outcome.id.clone(),
+                                "tool_name": outcome.name.clone(),
+                                "status": terminal_status.as_str(),
+                                "success": output.success,
+                            }),
+                            &spill_sensitive_user_input_values,
+                        );
                         let output_for_context = compact_tool_result_for_route(
                             self.api_provider,
                             &self.session.model,
@@ -2951,16 +3018,24 @@ impl Engine {
                     }
                     Err(e) => {
                         let envelope: ErrorEnvelope = e.clone().into();
-                        emit_tool_audit(json!({
-                            "event": "tool.result",
-                            "tool_id": outcome.id.clone(),
-                            "tool_name": outcome.name.clone(),
-                            "status": terminal_status.as_str(),
-                            "success": false,
-                            "error": e.to_string(),
-                            "category": envelope.category.to_string(),
-                            "severity": envelope.severity.to_string(),
-                        }));
+                        let public_error =
+                            crate::runtime_threads::redacted_sensitive_user_input_text(
+                                &e.to_string(),
+                                &spill_sensitive_user_input_values,
+                            );
+                        emit_tool_audit(
+                            json!({
+                                "event": "tool.result",
+                                "tool_id": outcome.id.clone(),
+                                "tool_name": outcome.name.clone(),
+                                "status": terminal_status.as_str(),
+                                "success": false,
+                                "error": public_error,
+                                "category": envelope.category.to_string(),
+                                "severity": envelope.severity.to_string(),
+                            }),
+                            &spill_sensitive_user_input_values,
+                        );
                         step_error_count += 1;
                         step_error_categories.push(envelope.category);
                         step_error_tool_names.push(outcome.name.clone());
@@ -3017,11 +3092,14 @@ impl Engine {
                 let reason = format!(
                     "read-only repetition limit reached for '{tool_name}' at occurrence {count}; stopping turn deterministically"
                 );
-                emit_tool_audit(json!({
-                    "event": "tool.read_repeat_stopped",
-                    "tool_name": tool_name,
-                    "count": count,
-                }));
+                emit_tool_audit(
+                    json!({
+                        "event": "tool.read_repeat_stopped",
+                        "tool_name": tool_name,
+                        "count": count,
+                    }),
+                    &spill_sensitive_user_input_values,
+                );
                 let _ = self.tx_event.send(Event::status(reason.clone())).await;
                 return (TurnOutcomeStatus::Failed, Some(reason));
             }
@@ -3576,9 +3654,7 @@ fn resolve_tool_definition<'a>(
         && let Some(registry) = tool_registry
         && let Some(canonical) = registry.resolve(tool_name.as_str())
     {
-        crate::logging::info(format!(
-            "Resolved hallucinated tool name '{tool_name}' -> '{canonical}'"
-        ));
+        crate::logging::info("Resolved an unregistered model tool alias to a registered tool");
         tool_def = tool_catalog.iter().find(|d| d.name == canonical);
         if tool_def.is_some() {
             *tool_name = canonical.to_string();

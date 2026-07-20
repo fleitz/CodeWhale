@@ -45,7 +45,7 @@ use crate::tools::spec::{
 use crate::tools::todo::SharedTodoList;
 #[cfg(test)]
 use crate::tools::todo::TodoList;
-use crate::tools::truncate::{SPILLOVER_HEAD_BYTES, SPILLOVER_THRESHOLD_BYTES, maybe_spillover};
+use crate::tools::truncate::{SPILLOVER_HEAD_BYTES, SPILLOVER_THRESHOLD_BYTES};
 use crate::tui::app::AppMode;
 use crate::tui::app::ReasoningEffort;
 use crate::utils::spawn_supervised;
@@ -1823,41 +1823,52 @@ fn redact_subagent_result_for_persistence(
     result: &mut SubAgentResult,
     sensitive_user_input_values: &HashSet<String>,
 ) {
-    result.assignment =
-        redacted_subagent_assignment(&result.assignment, sensitive_user_input_values);
-    if let Some(summary) = result.result.as_mut() {
-        *summary = crate::runtime_threads::redacted_sensitive_user_input_text(
-            summary,
-            sensitive_user_input_values,
-        );
-    }
-    match &mut result.status {
-        SubAgentStatus::Interrupted(reason) | SubAgentStatus::Failed(reason) => {
-            *reason = crate::runtime_threads::redacted_sensitive_user_input_text(
-                reason,
-                sensitive_user_input_values,
-            );
+    let private_checkpoint_messages = result
+        .checkpoint
+        .as_ref()
+        .map(|checkpoint| checkpoint.messages.clone());
+    match crate::runtime_threads::redacted_serializable_clone(result, sensitive_user_input_values) {
+        Ok(mut projected) => {
+            if let (Some(checkpoint), Some(messages)) =
+                (projected.checkpoint.as_mut(), private_checkpoint_messages)
+            {
+                checkpoint.messages = crate::runtime_threads::redacted_durable_history_clone(
+                    &messages,
+                    sensitive_user_input_values,
+                );
+            }
+            *result = projected;
         }
-        SubAgentStatus::Running
-        | SubAgentStatus::Completed
-        | SubAgentStatus::Cancelled
-        | SubAgentStatus::BudgetExhausted => {}
-    }
-    if let Some(checkpoint) = result.checkpoint.as_mut() {
-        checkpoint.reason = crate::runtime_threads::redacted_sensitive_user_input_text(
-            &checkpoint.reason,
-            sensitive_user_input_values,
-        );
-        checkpoint.messages = crate::runtime_threads::redacted_durable_history_clone(
-            &checkpoint.messages,
-            sensitive_user_input_values,
-        );
-    }
-    if let Some(needs_input) = result.needs_input.as_mut() {
-        needs_input.question = crate::runtime_threads::redacted_sensitive_user_input_text(
-            &needs_input.question,
-            sensitive_user_input_values,
-        );
+        Err(err) => {
+            // Serialization is infallible for this concrete data model. Keep
+            // the fallback fail-closed in case a future custom field changes
+            // that contract rather than returning a partially raw snapshot.
+            *result = SubAgentResult {
+                name: "[private child]".to_string(),
+                agent_id: "[private]".to_string(),
+                context_mode: "redacted".to_string(),
+                fork_context: false,
+                workspace: None,
+                git_branch: None,
+                agent_type: SubAgentType::General,
+                assignment: SubAgentAssignment {
+                    objective: "Private child state omitted".to_string(),
+                    role: None,
+                },
+                model: String::new(),
+                nickname: None,
+                status: SubAgentStatus::Failed(format!("privacy projection failed: {err}")),
+                worker_status: None,
+                parent_run_id: None,
+                spawn_depth: 0,
+                result: None,
+                steps_taken: 0,
+                checkpoint: None,
+                needs_input: None,
+                duration_ms: 0,
+                from_prior_session: false,
+            };
+        }
     }
 }
 
@@ -2128,7 +2139,7 @@ impl SubAgentRuntime {
             .or_else(|| self.fork_context.clone())
     }
 
-    fn current_sensitive_user_input_values(&self) -> HashSet<String> {
+    pub(crate) fn current_sensitive_user_input_values(&self) -> HashSet<String> {
         self.live_fork_context
             .as_ref()
             .map(|context| context.read().sensitive_user_input_values.clone())
@@ -2478,6 +2489,9 @@ pub struct SubAgent {
     /// agent as in-session vs prior-session at list time.
     pub session_boot_id: String,
     pub workspace: PathBuf,
+    /// Process-local provenance used to project every public/durable child
+    /// surface while preserving raw live provider and coordination context.
+    sensitive_user_input_values: HashSet<String>,
     /// Internal completion/cancellation arbitration bit. While set, the task
     /// has won the right to publish its terminal notifications, but the public
     /// status deliberately remains `Running` until those notifications are
@@ -2531,6 +2545,7 @@ impl SubAgent {
             allowed_tools,
             session_boot_id,
             workspace,
+            sensitive_user_input_values: HashSet::new(),
             completion_claimed: false,
             terminal_delivery: None,
             work_lifecycle: None,
@@ -2542,7 +2557,7 @@ impl SubAgent {
     /// Get a snapshot of the current state.
     #[must_use]
     pub fn snapshot(&self) -> SubAgentResult {
-        SubAgentResult {
+        let mut result = SubAgentResult {
             name: self.session_name.clone(),
             agent_id: self.id.clone(),
             context_mode: if self.fork_context { "forked" } else { "fresh" }.to_string(),
@@ -2567,7 +2582,9 @@ impl SubAgent {
             // this in when it produces a snapshot via its own
             // `snapshot_for_listing` helper (#405).
             from_prior_session: false,
-        }
+        };
+        redact_subagent_result_for_persistence(&mut result, &self.sensitive_user_input_values);
+        result
     }
 }
 
@@ -2746,7 +2763,7 @@ impl SubAgentManager {
         let now_ms = epoch_millis_now();
         let mut agents = Vec::with_capacity(self.agents.len());
         for agent in self.agents.values() {
-            agents.push(PersistedSubAgent {
+            let persisted = PersistedSubAgent {
                 id: agent.id.clone(),
                 session_name: Some(agent.session_name.clone()),
                 fork_context: agent.fork_context,
@@ -2774,14 +2791,30 @@ impl SubAgentManager {
                 allowed_tools: agent.allowed_tools.clone().unwrap_or_default(),
                 updated_at_ms: now_ms,
                 session_boot_id: agent.session_boot_id.clone(),
-            });
+            };
+            agents.push(crate::runtime_threads::redacted_serializable_clone(
+                &persisted,
+                &agent.sensitive_user_input_values,
+            )?);
         }
         agents.sort_by(|a, b| a.id.cmp(&b.id));
+
+        let mut workers = self.sorted_worker_records();
+        for worker in &mut workers {
+            let sensitive_values = self
+                .agents
+                .get(&worker.spec.worker_id)
+                .map(|agent| &agent.sensitive_user_input_values)
+                .cloned()
+                .unwrap_or_default();
+            *worker =
+                crate::runtime_threads::redacted_serializable_clone(worker, &sensitive_values)?;
+        }
 
         let payload = PersistedSubAgentState {
             schema_version: SUBAGENT_STATE_SCHEMA_VERSION,
             agents,
-            workers: self.sorted_worker_records(),
+            workers,
         };
         Ok(Some((path, payload)))
     }
@@ -2968,6 +3001,7 @@ impl SubAgentManager {
                 // manager treats that the same as a non-matching id —
                 // i.e. agent classified as prior-session.
                 session_boot_id: persisted.session_boot_id,
+                sensitive_user_input_values: HashSet::new(),
                 completion_claimed: false,
                 terminal_delivery: None,
                 work_lifecycle: None,
@@ -3401,6 +3435,16 @@ impl SubAgentManager {
     pub fn followup_child(&mut self, agent_ref: &str, text: String) -> Result<ParentMailReceipt> {
         let mut receipt = self.queue_parent_message(agent_ref, text.clone(), true)?;
         let agent_id = receipt.agent_id.clone();
+        let durable_preview = self
+            .agents
+            .get(&agent_id)
+            .map(|agent| {
+                crate::runtime_threads::redacted_sensitive_user_input_text(
+                    &text,
+                    &agent.sensitive_user_input_values,
+                )
+            })
+            .unwrap_or_default();
         let status = self
             .agents
             .get(&agent_id)
@@ -3439,7 +3483,7 @@ impl SubAgentManager {
                     record.follow_up.latest_delivery = Some(AgentRunFollowUpDelivery {
                         delivered: true,
                         timestamp_ms: epoch_millis_now(),
-                        message_preview: Some(truncate_preview(&text, 120)),
+                        message_preview: Some(truncate_preview(&durable_preview, 120)),
                         reason: None,
                         interrupt: false,
                         continued_from_checkpoint: false,
@@ -3473,7 +3517,7 @@ impl SubAgentManager {
                     record.follow_up.latest_delivery = Some(AgentRunFollowUpDelivery {
                         delivered: false,
                         timestamp_ms: epoch_millis_now(),
-                        message_preview: Some(truncate_preview(&text, 120)),
+                        message_preview: Some(truncate_preview(&durable_preview, 120)),
                         reason: Some(receipt.note.clone()),
                         interrupt: false,
                         continued_from_checkpoint: false,
@@ -3511,6 +3555,11 @@ impl SubAgentManager {
         }
 
         let prior = self.get_result_by_ref(&agent_id)?;
+        let sensitive_user_input_values = self
+            .agents
+            .get(&agent_id)
+            .map(|agent| agent.sensitive_user_input_values.clone())
+            .unwrap_or_default();
         if prior.status != SubAgentStatus::Running
             || self
                 .agents
@@ -3538,6 +3587,7 @@ impl SubAgentManager {
         terminal.steps_taken = checkpoint.steps_taken;
         terminal.checkpoint = Some(checkpoint);
         terminal.needs_input = None;
+        redact_subagent_result_for_persistence(&mut terminal, &sensitive_user_input_values);
         if !self.finish_terminal_result(&agent_id, terminal, true, true) {
             return Ok((prior, self.get_result(&agent_id)?));
         }
@@ -3884,6 +3934,7 @@ impl SubAgentManager {
             runtime.context.workspace.clone(),
             self.current_session_boot_id.clone(),
         );
+        agent.sensitive_user_input_values = sensitive_user_input_values.clone();
         if let Some(name) = options
             .name
             .as_deref()
@@ -3940,7 +3991,10 @@ impl SubAgentManager {
             worker_id: agent_id.clone(),
             run_id: agent_id.clone(),
             parent_run_id: runtime.parent_agent_id.clone(),
-            session_name: Some(agent.session_name.clone()),
+            session_name: Some(crate::runtime_threads::redacted_sensitive_user_input_text(
+                &agent.session_name,
+                &sensitive_user_input_values,
+            )),
             objective: durable_assignment.objective.clone(),
             role: durable_assignment.role.clone(),
             agent_type: agent_type.clone(),
@@ -4571,6 +4625,7 @@ async fn subagent_session_projection(
 /// bounded tail; this artifact is the durable source used by the TUI's Open
 /// action when the conversation is larger than that tail.
 struct SubAgentTranscriptArtifactWriter {
+    agent_id: String,
     workspace: PathBuf,
     path: PathBuf,
     relative_path: PathBuf,
@@ -4603,6 +4658,7 @@ impl SubAgentTranscriptArtifactWriter {
         });
         create_private_subagent_transcript(&workspace, &path, &json_line(&header)?)?;
         Ok(Self {
+            agent_id: agent_id.to_string(),
             workspace,
             path,
             relative_path,
@@ -4648,7 +4704,28 @@ impl SubAgentTranscriptArtifactWriter {
     }
 
     fn sync_messages(&mut self, messages: &[Message], durable: bool) -> Result<()> {
+        let prior_sensitive_value_count = self.sensitive_user_input_values.len();
         let redacted = self.redacted_messages(messages);
+        if self.sensitive_user_input_values.len() > prior_sensitive_value_count
+            && self.persisted_messages > 0
+        {
+            let header = json!({
+                "kind": "subagent_transcript_header",
+                "schema_version": SUBAGENT_TRANSCRIPT_ARTIFACT_SCHEMA_VERSION,
+                "agent_id": self.agent_id.clone(),
+            });
+            let mut encoded = json_line(&header)?;
+            for (index, message) in redacted.iter().enumerate() {
+                encoded.extend(json_line(&json!({
+                    "kind": "message",
+                    "index": index,
+                    "message": message,
+                }))?);
+            }
+            create_private_subagent_transcript(&self.workspace, &self.path, &encoded)?;
+            self.persisted_messages = redacted.len();
+            return Ok(());
+        }
         self.sync_redacted_messages(&redacted, durable)
     }
 
@@ -6454,9 +6531,10 @@ async fn run_subagent_task(task: SubAgentTask) {
     let agent_id = task.agent_id.clone();
     let sensitive_user_input_values = task.runtime.current_sensitive_user_input_values();
     let failure_error = result.as_ref().err().map(|err| {
-        crate::logging::warn(format!(
-            "sub-agent {} model request failed: {err:#}",
-            task.agent_id
+        let log_message = format!("sub-agent {} model request failed: {err:#}", task.agent_id);
+        crate::logging::warn(crate::runtime_threads::redacted_sensitive_user_input_text(
+            &log_message,
+            &sensitive_user_input_values,
         ));
         annotate_child_model_error(
             &subagent_failure_message(err),
@@ -6825,12 +6903,7 @@ async fn insert_subagent_full_transcript_handle(
         checkpoint
     });
     let transcript_artifact = transcript_artifact.map(|writer| {
-        writer
-            .sensitive_user_input_values
-            .extend(sensitive_user_input_values.iter().cloned());
-        let synced = match writer
-            .sync_redacted_messages(&durable_messages, *status != SubAgentStatus::Running)
-        {
+        let synced = match writer.sync_messages(messages, *status != SubAgentStatus::Running) {
             Ok(()) => true,
             Err(err) => {
                 tracing::warn!(
@@ -6929,18 +7002,27 @@ fn bound_subagent_tool_result(
     agent_id: &str,
     tool_id: &str,
     content: String,
+    sensitive_user_input_values: &HashSet<String>,
 ) -> (String, Option<PathBuf>) {
     if content.len() <= SPILLOVER_THRESHOLD_BYTES {
         return (content, None);
     }
-    let spill_id = format!("sa_{agent_id}_{tool_id}");
-    match maybe_spillover(
-        &spill_id,
+    let spill_id = crate::runtime_threads::redacted_sensitive_user_input_text(
+        &format!("sa_{agent_id}_{tool_id}"),
+        sensitive_user_input_values,
+    );
+    let durable_content = crate::runtime_threads::redacted_sensitive_user_input_text(
         &content,
-        SPILLOVER_THRESHOLD_BYTES,
-        SPILLOVER_HEAD_BYTES,
-    ) {
-        Ok(Some((head, path))) => {
+        sensitive_user_input_values,
+    );
+    match crate::tools::truncate::write_spillover(&spill_id, &durable_content) {
+        Ok(path) => {
+            let head_cut = SPILLOVER_HEAD_BYTES.min(content.len());
+            let head_cut = (0..=head_cut)
+                .rev()
+                .find(|index| content.is_char_boundary(*index))
+                .unwrap_or(0);
+            let head = &content[..head_cut];
             let footer = format!(
                 "\n\n[Sub-agent tool output truncated: {head_kib} KiB of {total_kib} KiB shown. \
                  Full output saved to {path}. Use `read_file` on that path if you need the \
@@ -6951,13 +7033,11 @@ fn bound_subagent_tool_result(
             );
             (format!("{head}{footer}"), Some(path))
         }
-        Ok(None) => (content, None),
         Err(err) => {
             tracing::warn!(
                 target: "subagent",
                 ?err,
-                agent_id,
-                tool_id,
+                spill_id,
                 "sub-agent spillover write failed; passing original content through"
             );
             (content, None)
@@ -7222,7 +7302,10 @@ async fn request_subagent_model_response_with_retries(
 }
 
 fn record_agent_progress(runtime: &SubAgentRuntime, agent_id: &str, message: impl Into<String>) {
-    let message = message.into();
+    let message = crate::runtime_threads::redacted_sensitive_user_input_text(
+        &message.into(),
+        &runtime.current_sensitive_user_input_values(),
+    );
     if let Ok(mut manager) = runtime.manager.try_write() {
         manager.touch(agent_id);
         manager.record_worker_progress(agent_id, message.clone());
@@ -7987,7 +8070,13 @@ async fn run_subagent(
                 Err(_) => format!("Error: Tool {tool_name} timed out"),
             };
             let tool_ok = !result.starts_with("Error:");
-            let (result, spilled_to) = bound_subagent_tool_result(&agent_id, &tool_id, result);
+            let sensitive_user_input_values = runtime.current_sensitive_user_input_values();
+            let (result, spilled_to) = bound_subagent_tool_result(
+                &agent_id,
+                &tool_id,
+                result,
+                &sensitive_user_input_values,
+            );
             if let Some(path) = spilled_to.as_ref() {
                 record_agent_progress(
                     runtime,

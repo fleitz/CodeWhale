@@ -174,16 +174,27 @@ impl Drop for InteractiveTerminalGuard {
     }
 }
 
-pub(super) fn emit_tool_audit(event: serde_json::Value) {
+pub(super) fn emit_tool_audit(
+    event: serde_json::Value,
+    sensitive_user_input_values: &std::collections::HashSet<String>,
+) {
     let Some(path) = std::env::var_os("CODEWHALE_TOOL_AUDIT_LOG")
         .or_else(|| std::env::var_os("DEEPSEEK_TOOL_AUDIT_LOG"))
     else {
         return;
     };
-    emit_tool_audit_to_path(&PathBuf::from(path), event);
+    emit_tool_audit_to_path(&PathBuf::from(path), event, sensitive_user_input_values);
 }
 
-fn emit_tool_audit_to_path(path: &Path, event: serde_json::Value) {
+fn emit_tool_audit_to_path(
+    path: &Path,
+    event: serde_json::Value,
+    sensitive_user_input_values: &std::collections::HashSet<String>,
+) {
+    let event = crate::runtime_threads::redacted_sensitive_user_input_json(
+        &event,
+        sensitive_user_input_values,
+    );
     let line = match serde_json::to_string(&event) {
         Ok(line) => line,
         Err(e) => {
@@ -598,6 +609,7 @@ mod tests {
                 "tool_name": "exec_shell",
                 "path": "/tmp/foo.txt",
             }),
+            &std::collections::HashSet::new(),
         );
         emit_tool_audit_to_path(
             &path,
@@ -607,6 +619,7 @@ mod tests {
                 "tool_id": "call-xyz",
                 "success": true,
             }),
+            &std::collections::HashSet::new(),
         );
 
         let body = std::fs::read_to_string(&path).expect("audit log written");
@@ -643,7 +656,32 @@ mod tests {
         // Path with a parent that doesn't exist yet — the writer
         // should create it.
         let nested = tmp.path().join("nested").join("dir").join("audit.log");
-        emit_tool_audit_to_path(&nested, json!({"event": "test"}));
+        emit_tool_audit_to_path(
+            &nested,
+            json!({"event": "test"}),
+            &std::collections::HashSet::new(),
+        );
         assert!(nested.exists(), "writer should mkdir -p the parent chain");
+    }
+
+    #[test]
+    fn audit_writer_recursively_projects_sensitive_values() {
+        const SECRET: &str = "482915";
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let path = tmp.path().join("audit.log");
+        let event = json!({
+            "event": "tool.private_test",
+            "tool_id": format!("PIN{SECRET}"),
+            "nested": {"reason": format!("{SECRET}code")},
+        });
+        emit_tool_audit_to_path(
+            &path,
+            event,
+            &std::collections::HashSet::from([SECRET.to_string()]),
+        );
+
+        let body = std::fs::read_to_string(path).expect("read audit log");
+        assert!(!body.contains(SECRET));
+        assert!(body.contains("tool.private_test"));
     }
 }

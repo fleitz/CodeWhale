@@ -1665,9 +1665,56 @@ fn compact_tool_result_for_wire(
     content: &str,
     message_label: &str,
     seen_tool_results: &mut HashMap<String, SeenToolResult>,
+    sensitive_user_input_values: &std::collections::HashSet<String>,
 ) -> WireToolResult {
     let original_chars = content.chars().count();
     let sha = sha256_hex(content.as_bytes());
+    let contains_sensitive_user_input = sensitive_user_input_values
+        .iter()
+        .any(|value| !value.is_empty() && content.contains(value));
+
+    // Tainted content may stay raw in the live provider request, but it must
+    // never enter the durable SHA store. Keep small/medium results inline and
+    // bound very large results without advertising a retrieval handle whose
+    // backing file would either leak private bytes or lie about recoverability.
+    if contains_sensitive_user_input {
+        if original_chars <= TOOL_RESULT_SENT_CHAR_BUDGET {
+            return WireToolResult {
+                content: content.to_string(),
+                original_chars,
+                sent_chars: original_chars,
+                truncated: false,
+                deduplicated: false,
+            };
+        }
+
+        let head = first_chars(content, TOOL_RESULT_HEAD_CHARS);
+        let tail = last_chars(content, TOOL_RESULT_TAIL_CHARS);
+        let kept = head.chars().count() + tail.chars().count();
+        let omitted = original_chars.saturating_sub(kept);
+        let compacted = format!(
+            "[TOOL_RESULT_TRUNCATED]\n\
+             tool_name: {tool_name}\n\
+             command_or_query: {}\n\
+             exit_status: {}\n\
+             original_chars: {original_chars}\n\
+             retrieval: unavailable (private user input omitted from durable spillover)\n\
+             first_chars:\n\
+             {head}\n\n\
+             [... truncated {omitted} chars from middle ...]\n\n\
+             last_chars:\n\
+             {tail}",
+            tool_command_or_query(input),
+            tool_exit_status(content)
+        );
+        return WireToolResult {
+            sent_chars: compacted.chars().count(),
+            content: compacted,
+            original_chars,
+            truncated: true,
+            deduplicated: false,
+        };
+    }
 
     // Two independent size-and-kind predicates, deliberately decoupled:
     //
@@ -1839,6 +1886,11 @@ fn build_chat_messages_with_reasoning(
     include_tool_budget_metadata: bool,
 ) -> Vec<Value> {
     let mut out = Vec::new();
+    let mut sensitive_user_input_values = std::collections::HashSet::new();
+    crate::runtime_threads::collect_sensitive_user_input_values(
+        messages,
+        &mut sensitive_user_input_values,
+    );
     let mut pending_tool_calls: HashMap<String, PendingToolCallInfo> = HashMap::new();
     let mut seen_tool_results: HashMap<String, SeenToolResult> = HashMap::new();
     let mut last_full_turn_meta: Option<LastFullTurnMeta> = None;
@@ -2038,6 +2090,7 @@ fn build_chat_messages_with_reasoning(
                             &content,
                             &message_label,
                             &mut seen_tool_results,
+                            &sensitive_user_input_values,
                         );
                         let mut tool_msg = json!({
                             "role": "tool",
@@ -4693,6 +4746,71 @@ mod stream_decoder_tests {
             );
             assert_ne!(sent, huge_output);
         });
+    }
+
+    #[test]
+    fn request_builder_never_sha_persists_classified_user_input_echoes() {
+        const SECRET: &str = "482915";
+        let _guard = crate::tools::truncate::TEST_SPILLOVER_GUARD
+            .lock()
+            .unwrap_or_else(|err| err.into_inner());
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let spill_root = tmp.path().join(".deepseek").join("tool_outputs");
+        let prior = crate::tools::truncate::set_test_spillover_root(Some(spill_root.clone()));
+        struct Restore(Option<std::path::PathBuf>);
+        impl Drop for Restore {
+            fn drop(&mut self) {
+                crate::tools::truncate::set_test_spillover_root(self.0.take());
+            }
+        }
+        let _restore = Restore(prior);
+
+        let response = json!({
+            "answers": [{"id": "pin", "label": "Other", "value": SECRET}]
+        })
+        .to_string();
+        let echoed = format!("{}PIN{SECRET}code{}", "A".repeat(1_200), "Z".repeat(1_200));
+        let messages = vec![
+            tool_use_message(
+                "ask-pin",
+                "request_user_input",
+                json!({
+                    "questions": [{
+                        "header": "PIN",
+                        "id": "pin",
+                        "question": "Enter a PIN",
+                        "options": [
+                            {"label": "Generate", "description": "Generate one"},
+                            {"label": "Cancel", "description": "Do not continue"}
+                        ],
+                        "allow_free_text": true
+                    }]
+                }),
+            ),
+            tool_result_message("ask-pin", &response),
+            tool_use_message(
+                "echo-pin",
+                "exec_shell",
+                json!({"command": "printf output"}),
+            ),
+            tool_result_message("echo-pin", &echoed),
+        ];
+
+        let built = build_chat_messages(None, &messages, "deepseek-v4-flash");
+        let live_echo = tool_message_content(&built, 1);
+        assert_eq!(
+            live_echo, echoed,
+            "live provider context keeps the raw echo"
+        );
+        assert!(live_echo.contains(SECRET));
+        assert!(
+            !spill_root.exists()
+                || std::fs::read_dir(&spill_root)
+                    .expect("read spill root")
+                    .next()
+                    .is_none(),
+            "classified bytes must not create a durable SHA spill"
+        );
     }
 
     #[test]

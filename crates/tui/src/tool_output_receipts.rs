@@ -49,14 +49,40 @@ pub fn compact_messages_for_persistence(
     messages: &[Message],
     artifacts: &[ArtifactRecord],
 ) -> (Vec<Message>, ToolOutputReceiptStats) {
+    let mut sensitive_user_input_values = std::collections::HashSet::new();
+    crate::runtime_threads::collect_sensitive_user_input_values(
+        messages,
+        &mut sensitive_user_input_values,
+    );
+    let projected_messages = crate::runtime_threads::redacted_durable_history_clone(
+        messages,
+        &sensitive_user_input_values,
+    );
+    let projected_artifacts = artifacts
+        .iter()
+        .filter_map(|artifact| {
+            match crate::runtime_threads::redacted_serializable_clone(
+                artifact,
+                &sensitive_user_input_values,
+            ) {
+                Ok(projected) => Some(projected),
+                Err(err) => {
+                    crate::logging::warn(format!(
+                        "tool-output artifact privacy projection failed; omitting artifact receipt: {err}"
+                    ));
+                    None
+                }
+            }
+        })
+        .collect::<Vec<_>>();
     // Tool-call IDs here come from engine transcript blocks and artifact records,
     // making this save/resume bookkeeping a safe FastHashMap target.
-    let artifacts_by_call = artifacts_by_tool_call(artifacts);
+    let artifacts_by_call = artifacts_by_tool_call(&projected_artifacts);
     let mut tool_uses: FastHashMap<String, ToolUseInfo> = FastHashMap::default();
     let mut stats = ToolOutputReceiptStats::default();
     let mut compacted = Vec::with_capacity(messages.len());
 
-    for message in messages {
+    for message in &projected_messages {
         let mut next = message.clone();
         for block in &mut next.content {
             match block {
@@ -461,6 +487,65 @@ mod tests {
         assert!(content.contains(&format!("retrieve: retrieve_tool_result ref=sha:{sha}")));
         let path = crate::tools::truncate::sha_spillover_path(&sha).expect("sha path");
         assert_eq!(std::fs::read_to_string(path).expect("read sha"), raw);
+    }
+
+    #[test]
+    fn persistence_compaction_projects_classified_values_before_sha_spill() {
+        const SECRET: &str = "482915";
+        let _guard = crate::tools::truncate::TEST_SPILLOVER_GUARD
+            .lock()
+            .unwrap_or_else(|err| err.into_inner());
+        let tmp = tempdir().expect("tempdir");
+        let spill_root = tmp.path().join(".deepseek").join("tool_outputs");
+        let prior = crate::tools::truncate::set_test_spillover_root(Some(spill_root.clone()));
+        struct Restore(Option<PathBuf>);
+        impl Drop for Restore {
+            fn drop(&mut self) {
+                crate::tools::truncate::set_test_spillover_root(self.0.take());
+            }
+        }
+        let _restore = Restore(prior);
+
+        let response = json!({
+            "answers": [{"id": "pin", "label": "Other", "value": SECRET}]
+        })
+        .to_string();
+        let echoed = format!("{}PIN{SECRET}code{}", "H".repeat(7_000), "T".repeat(7_000));
+        let messages = vec![
+            tool_use_message(
+                "ask-pin",
+                "request_user_input",
+                json!({
+                    "questions": [{
+                        "header": "PIN",
+                        "id": "pin",
+                        "question": "Enter a PIN",
+                        "options": [
+                            {"label": "Generate", "description": "Generate one"},
+                            {"label": "Cancel", "description": "Do not continue"}
+                        ],
+                        "allow_free_text": true
+                    }]
+                }),
+            ),
+            tool_result_message("ask-pin", &response),
+            tool_use_message(
+                "echo-pin",
+                "exec_shell",
+                json!({"command": "printf output"}),
+            ),
+            tool_result_message("echo-pin", &echoed),
+        ];
+
+        let (compacted, stats) = compact_messages_for_persistence(&messages, &[]);
+        let encoded = serde_json::to_string(&compacted).expect("serialize compacted messages");
+        assert!(!encoded.contains(SECRET));
+        assert_eq!(stats.sha_receipts, 1);
+        for entry in std::fs::read_dir(&spill_root).expect("read spill root") {
+            let path = entry.expect("spill entry").path();
+            let durable = std::fs::read_to_string(path).expect("read durable spill");
+            assert!(!durable.contains(SECRET));
+        }
     }
 
     #[test]

@@ -7993,6 +7993,57 @@ fn typed_user_input_provenance_redacts_short_free_text_but_keeps_long_fixed_opti
 }
 
 #[test]
+fn classified_short_values_redact_inside_adjacent_identifier_text() {
+    let sensitive_values = HashSet::from(["482915".to_string()]);
+
+    assert_eq!(
+        redacted_sensitive_user_input_text("482915 PIN482915 482915code safe", &sensitive_values,),
+        "[redacted user input] PIN[redacted user input] [redacted user input]code safe"
+    );
+}
+
+#[test]
+fn redaction_marker_never_reintroduces_a_classified_value() {
+    let sensitive_values = HashSet::from([
+        "input".to_string(),
+        "redacted".to_string(),
+        "private".to_string(),
+        "hidden".to_string(),
+        "*".to_string(),
+    ]);
+    let projected = redacted_sensitive_user_input_text(
+        "input redacted private hidden * remains",
+        &sensitive_values,
+    );
+
+    for secret in &sensitive_values {
+        assert!(!projected.contains(secret));
+    }
+    assert!(projected.contains("remains"));
+}
+
+#[test]
+fn sensitive_stream_projection_never_emits_split_or_adjacent_secret_bytes() {
+    const SECRET: &str = "482915";
+    let sensitive_values = HashSet::from([SECRET.to_string()]);
+    let mut projection = SensitiveStreamProjection::default();
+    let mut public = String::new();
+
+    for delta in ["safe PIN", "482", "915 and ", "482915code tail"] {
+        let emitted = projection.push(delta, &sensitive_values);
+        assert!(!emitted.contains(SECRET));
+        public.push_str(&emitted);
+    }
+    public.push_str(&projection.finish(&sensitive_values));
+
+    assert!(!public.contains(SECRET));
+    assert_eq!(
+        public,
+        "safe PIN[redacted user input] and [redacted user input]code tail"
+    );
+}
+
+#[test]
 fn durable_history_clone_redacts_every_structured_string_leaf() -> Result<()> {
     const SECRET: &str = "structured-secret-493812";
     let mut sensitive_values = HashSet::new();
@@ -8486,10 +8537,14 @@ async fn sensitive_answer_taint_survives_turns_recompaction_and_restart() -> Res
             },
         )
         .await?;
-    assert!(matches!(
-        harness.recv_user_input_submission().await,
-        Some((id, _)) if id == "pin-input"
-    ));
+    let (submitted_id, submitted_response) = harness
+        .recv_user_input_submission()
+        .await
+        .expect("live engine receives the submitted answer");
+    assert_eq!(submitted_id, "pin-input");
+    let live_provider_payload = serde_json::to_string(&submitted_response)?;
+    assert!(live_provider_payload.contains(SECRET));
+    assert!(live_provider_payload.contains(UNKNOWN_ID_SECRET));
     harness
         .tx_event
         .send(EngineEvent::CompactionStarted {
@@ -8560,6 +8615,73 @@ async fn sensitive_answer_taint_survives_turns_recompaction_and_restart() -> Res
         .await?;
     harness
         .tx_event
+        .send(EngineEvent::MessageStarted { index: 0 })
+        .await?;
+    for delta in [
+        "standalone 482915; adjacent PIN",
+        "482915 and 482915code; unknown 739",
+        "204 remains private",
+    ] {
+        harness
+            .tx_event
+            .send(EngineEvent::MessageDelta {
+                index: 0,
+                content: delta.to_string(),
+            })
+            .await?;
+    }
+    harness
+        .tx_event
+        .send(EngineEvent::MessageComplete { index: 0 })
+        .await?;
+    harness
+        .tx_event
+        .send(EngineEvent::Status {
+            message: format!("lifecycle echoed PIN{SECRET} and {UNKNOWN_ID_SECRET}code"),
+        })
+        .await?;
+    harness
+        .tx_event
+        .send(EngineEvent::AgentProgress {
+            id: "privacy-worker".to_string(),
+            status: format!("child progress echoed {SECRET}"),
+            parent_run_id: None,
+            spawn_depth: 1,
+        })
+        .await?;
+    harness
+        .tx_event
+        .send(EngineEvent::UserInputRequired {
+            id: "echoed-followup".to_string(),
+            request: crate::tools::user_input::UserInputRequest {
+                questions: vec![crate::tools::user_input::UserInputQuestion {
+                    header: "Echo".to_string(),
+                    id: "echo".to_string(),
+                    question: format!("Should the echoed PIN{SECRET} continue?"),
+                    options: vec![],
+                    allow_free_text: true,
+                    multi_select: false,
+                }],
+            },
+        })
+        .await?;
+    tokio::time::timeout(Duration::from_secs(2), async {
+        loop {
+            let detail = manager.get_thread_detail(&thread.id).await?;
+            if detail
+                .pending_user_inputs
+                .iter()
+                .any(|pending| pending.id == "echoed-followup")
+            {
+                assert!(!serde_json::to_string(&detail)?.contains(SECRET));
+                break Ok::<_, anyhow::Error>(());
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await??;
+    harness
+        .tx_event
         .send(EngineEvent::CompactionStarted {
             id: "compact-second".to_string(),
             auto: true,
@@ -8607,6 +8729,62 @@ async fn sensitive_answer_taint_survives_turns_recompaction_and_restart() -> Res
         .await?;
     wait_for_terminal_turn(&manager, &second.id, Duration::from_secs(2)).await?;
 
+    // Replace the engine after the only durable history is the summary-only
+    // compaction checkpoint. Volatile provenance must survive that eviction;
+    // reconstructing from the projected summary alone cannot recover the raw
+    // answer without persisting the secret itself.
+    drop(harness);
+    let mut reloaded_harness = install_mock_engine(&manager, &thread.id).await;
+    let third = manager
+        .start_turn(
+            &thread.id,
+            StartTurnRequest {
+                prompt: "third turn after engine eviction".to_string(),
+                ..Default::default()
+            },
+        )
+        .await?;
+    assert!(matches!(
+        reloaded_harness.rx_op.recv().await,
+        Some(Op::SendMessage { .. })
+    ));
+    reloaded_harness
+        .tx_event
+        .send(EngineEvent::TurnStarted {
+            turn_id: third.id.clone(),
+            created_at: Utc::now(),
+            route: None,
+        })
+        .await?;
+    reloaded_harness
+        .tx_event
+        .send(EngineEvent::MessageStarted { index: 0 })
+        .await?;
+    for delta in ["evicted engine echoed PIN48", "2915 and 739", "204code"] {
+        reloaded_harness
+            .tx_event
+            .send(EngineEvent::MessageDelta {
+                index: 0,
+                content: delta.to_string(),
+            })
+            .await?;
+    }
+    reloaded_harness
+        .tx_event
+        .send(EngineEvent::MessageComplete { index: 0 })
+        .await?;
+    reloaded_harness
+        .tx_event
+        .send(EngineEvent::TurnComplete {
+            usage: Usage::default(),
+            status: TurnOutcomeStatus::Completed,
+            error: None,
+            tool_catalog: None,
+            base_url: None,
+        })
+        .await?;
+    wait_for_terminal_turn(&manager, &third.id, Duration::from_secs(2)).await?;
+
     let detail = manager.get_thread_detail(&thread.id).await?;
     let events = manager.events_since(&thread.id, None)?;
     let exported = manager.messages_for_session_export(&thread.id).await?;
@@ -8623,7 +8801,7 @@ async fn sensitive_answer_taint_survives_turns_recompaction_and_restart() -> Res
     }
 
     manager.shutdown();
-    drop(harness);
+    drop(reloaded_harness);
     drop(manager);
     let restarted = test_manager(data_dir.clone())?;
     let restarted_detail = restarted.get_thread_detail(&thread.id).await?;

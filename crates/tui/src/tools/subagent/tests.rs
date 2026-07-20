@@ -2691,6 +2691,94 @@ async fn coordination_interrupt_fans_in_once_and_preserves_checkpoint() {
     );
 }
 
+#[test]
+fn child_name_followup_interrupt_and_state_are_projected_from_runtime_taint() {
+    const SECRET: &str = "482915";
+    let tmp = tempdir().expect("tempdir");
+    let state_path = tmp.path().join("subagents.v1.json");
+    let mut manager = SubAgentManager::new(tmp.path().to_path_buf(), 2).with_state_path(state_path);
+    let agent_id = "agent_privacy_projection".to_string();
+    let (input_tx, _input_rx) = mpsc::unbounded_channel();
+    let mut agent = SubAgent::new(
+        agent_id.clone(),
+        SubAgentType::General,
+        "privacy projection".to_string(),
+        make_assignment(),
+        "deepseek-v4-flash".to_string(),
+        None,
+        None,
+        input_tx,
+        tmp.path().to_path_buf(),
+        manager.current_session_boot_id.clone(),
+    );
+    agent.session_name = format!("PIN{SECRET}");
+    agent.sensitive_user_input_values = HashSet::from([SECRET.to_string()]);
+    manager.agents.insert(agent_id.clone(), agent);
+    manager.register_worker(make_worker_spec(&agent_id, tmp.path().to_path_buf()));
+
+    manager
+        .followup_child(&agent_id, format!("follow up with {SECRET}code"))
+        .expect("follow-up delivery");
+    let worker = manager
+        .get_worker_record(&agent_id)
+        .expect("worker record after follow-up");
+    assert!(!serde_json::to_string(&worker).unwrap().contains(SECRET));
+
+    let (_, interrupted) = manager
+        .interrupt_child(
+            &agent_id,
+            Some("agent_parent"),
+            format!("interrupt because PIN{SECRET}"),
+        )
+        .expect("coordination interrupt");
+    assert!(
+        !serde_json::to_string(&interrupted)
+            .unwrap()
+            .contains(SECRET)
+    );
+    assert!(
+        !serde_json::to_string(&manager.get_result(&agent_id).unwrap())
+            .unwrap()
+            .contains(SECRET)
+    );
+
+    let (_, payload) = manager
+        .build_persist_payload()
+        .expect("build persisted projection")
+        .expect("manager has a state path");
+    assert!(!serde_json::to_string(&payload).unwrap().contains(SECRET));
+
+    let mut exhaustive = SubAgentResult {
+        name: format!("name-{SECRET}"),
+        agent_id: format!("agent-{SECRET}"),
+        context_mode: format!("context-{SECRET}"),
+        fork_context: true,
+        workspace: Some(PathBuf::from(format!("/tmp/workspace-{SECRET}"))),
+        git_branch: Some(format!("privacy/{SECRET}")),
+        agent_type: SubAgentType::General,
+        assignment: SubAgentAssignment {
+            objective: format!("objective {SECRET}"),
+            role: Some(format!("role-{SECRET}")),
+        },
+        model: format!("model-{SECRET}"),
+        nickname: Some(format!("nickname-{SECRET}")),
+        status: SubAgentStatus::Failed(format!("failure {SECRET}")),
+        worker_status: Some(AgentWorkerStatus::Failed),
+        parent_run_id: Some(format!("parent-{SECRET}")),
+        spawn_depth: 1,
+        result: Some(format!("result {SECRET}")),
+        steps_taken: 1,
+        checkpoint: None,
+        needs_input: Some(SubAgentNeedsInput {
+            question: format!("question {SECRET}"),
+        }),
+        duration_ms: 1,
+        from_prior_session: false,
+    };
+    redact_subagent_result_for_persistence(&mut exhaustive, &HashSet::from([SECRET.to_string()]));
+    assert!(!serde_json::to_string(&exhaustive).unwrap().contains(SECRET));
+}
+
 #[tokio::test]
 async fn late_completion_does_not_overwrite_cancelled_outcome() {
     let tmp = tempdir().expect("tempdir");
@@ -9179,6 +9267,78 @@ async fn forked_child_transcript_redacts_typed_secret_and_echo_but_provider_cont
 }
 
 #[test]
+fn child_local_taint_rewrites_earlier_append_only_transcript_records() {
+    const SECRET: &str = "482915";
+    let tmp = tempdir().expect("tempdir");
+    let agent_id = "agent_late_local_taint";
+    let mut writer = SubAgentTranscriptArtifactWriter::create(
+        tmp.path(),
+        agent_id,
+        std::collections::HashSet::new(),
+    )
+    .expect("create transcript writer");
+    let mut provider_messages = vec![Message {
+        role: "assistant".to_string(),
+        content: vec![
+            ContentBlock::Text {
+                text: format!("model guessed PIN{SECRET} before the answer arrived"),
+                cache_control: None,
+            },
+            ContentBlock::ToolUse {
+                id: "ask-pin".to_string(),
+                name: "request_user_input".to_string(),
+                input: json!({
+                    "questions": [{
+                        "header": "PIN",
+                        "id": "pin",
+                        "question": "Enter PIN",
+                        "options": [
+                            {"label": "Skip", "description": "Skip it"},
+                            {"label": "Cancel", "description": "Stop"}
+                        ],
+                        "allow_free_text": true
+                    }]
+                }),
+                caller: None,
+            },
+        ],
+    }];
+    writer
+        .sync_messages(&provider_messages, false)
+        .expect("persist pre-classification transcript");
+    assert!(
+        std::fs::read_to_string(&writer.path)
+            .expect("read pre-classification transcript")
+            .contains(SECRET)
+    );
+
+    provider_messages.push(Message {
+        role: "user".to_string(),
+        content: vec![ContentBlock::ToolResult {
+            tool_use_id: "ask-pin".to_string(),
+            content: json!({
+                "answers": [{"id": "pin", "label": "Other", "value": SECRET}]
+            })
+            .to_string(),
+            is_error: None,
+            content_blocks: None,
+        }],
+    });
+    writer
+        .sync_messages(&provider_messages, true)
+        .expect("rewrite transcript after local taint discovery");
+
+    let durable = std::fs::read_to_string(&writer.path).expect("read rewritten transcript");
+    assert!(!durable.contains(SECRET));
+    assert!(durable.contains("User input submitted"));
+    assert!(
+        serde_json::to_string(&provider_messages)
+            .expect("serialize live provider messages")
+            .contains(SECRET)
+    );
+}
+
+#[test]
 fn malformed_transcript_artifact_fails_closed_instead_of_showing_partial_chat() {
     let tmp = tempdir().expect("tempdir");
     let agent_id = "agent_malformed_transcript";
@@ -9280,7 +9440,7 @@ fn subagent_tool_results_spill_to_disk_and_stay_bounded_inline() {
         let raw_len = raw.len();
 
         let (inline, spilled) =
-            bound_subagent_tool_result("fleet-worker-1", "call-42", raw.clone());
+            bound_subagent_tool_result("fleet-worker-1", "call-42", raw.clone(), &HashSet::new());
 
         let path = spilled.expect("multi-MB output must spill");
         // Model-visible content is bounded to head + footer.
@@ -9293,18 +9453,53 @@ fn subagent_tool_results_spill_to_disk_and_stay_bounded_inline() {
         assert_eq!(on_disk.len(), raw_len);
 
         // Small outputs pass through untouched, no spill file.
-        let (small, spilled) =
-            bound_subagent_tool_result("fleet-worker-1", "call-43", "ok".to_string());
+        let (small, spilled) = bound_subagent_tool_result(
+            "fleet-worker-1",
+            "call-43",
+            "ok".to_string(),
+            &HashSet::new(),
+        );
         assert_eq!(small, "ok");
         assert!(spilled.is_none());
 
         // Oversized error output is bounded too: sub-agent errors are
         // routinely full build logs, unlike the root loop's short errors.
-        let (bounded_err, spilled) =
-            bound_subagent_tool_result("fleet-worker-1", "call-44", format!("Error: {raw}"));
+        let (bounded_err, spilled) = bound_subagent_tool_result(
+            "fleet-worker-1",
+            "call-44",
+            format!("Error: {raw}"),
+            &HashSet::new(),
+        );
         assert!(spilled.is_some());
         assert!(bounded_err.len() <= crate::tools::truncate::SPILLOVER_HEAD_BYTES + 1024);
         assert!(bounded_err.starts_with("Error:"));
+    });
+}
+
+#[test]
+fn subagent_spill_redacts_classified_values_only_from_durable_file() {
+    const SECRET: &str = "482915";
+    let tmp = tempdir().expect("tempdir");
+    with_spillover_root(tmp.path(), || {
+        let raw = format!(
+            "PIN{SECRET} {} {SECRET}code",
+            "large child output ".repeat(220_000)
+        );
+        let sensitive_values = HashSet::from([SECRET.to_string()]);
+        let (inline, spilled) = bound_subagent_tool_result(
+            &format!("privacy-{SECRET}-worker"),
+            &format!("privacy-{SECRET}-call"),
+            raw,
+            &sensitive_values,
+        );
+
+        let path = spilled.expect("oversized child output spills");
+        assert!(!path.display().to_string().contains(SECRET));
+        let durable = std::fs::read_to_string(path).expect("read durable child spill");
+        assert!(!durable.contains(SECRET));
+        assert!(durable.contains("PIN[redacted user input]"));
+        // The provider-facing retained head remains live-only raw context.
+        assert!(inline.contains(&format!("PIN{SECRET}")));
     });
 }
 
@@ -9322,8 +9517,12 @@ fn fanout_of_workers_with_huge_outputs_keeps_resident_state_bounded() {
             let agent_id = format!("fleet-worker-{worker}");
             let mut messages = Vec::new();
             for call in 0..3 {
-                let (inline, spilled) =
-                    bound_subagent_tool_result(&agent_id, &format!("call-{call}"), huge.clone());
+                let (inline, spilled) = bound_subagent_tool_result(
+                    &agent_id,
+                    &format!("call-{call}"),
+                    huge.clone(),
+                    &HashSet::new(),
+                );
                 let path = spilled.expect("should spill");
                 assert_eq!(
                     std::fs::read_to_string(&path).expect("readable").len(),

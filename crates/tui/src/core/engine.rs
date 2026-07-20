@@ -1322,6 +1322,11 @@ impl Engine {
         let tool_id = turn_id.clone();
         let tool_name = "exec_shell".to_string();
         let tool_input = json!({ "command": command, "source": "user" });
+        let mut sensitive_user_input_values = HashSet::new();
+        crate::runtime_threads::collect_sensitive_user_input_values(
+            &self.session.messages,
+            &mut sensitive_user_input_values,
+        );
         let snapshot_prompt = tool_input["command"]
             .as_str()
             .unwrap_or_default()
@@ -1404,12 +1409,15 @@ impl Engine {
             if let Some(ToolAskRuleDecision::Block(reason)) = ask_rule_decision {
                 Err(ToolError::permission_denied(reason))
             } else if approval_required {
-                emit_tool_audit(json!({
-                    "event": "tool.approval_required",
-                    "tool_id": tool_id.clone(),
-                    "tool_name": tool_name.clone(),
-                    "source": "composer_bang",
-                }));
+                emit_tool_audit(
+                    json!({
+                        "event": "tool.approval_required",
+                        "tool_id": tool_id.clone(),
+                        "tool_name": tool_name.clone(),
+                        "source": "composer_bang",
+                    }),
+                    &sensitive_user_input_values,
+                );
                 let approval_key =
                     crate::tools::approval_cache::build_approval_key(&tool_name, &tool_input).0;
                 let approval_grouping_key =
@@ -1434,13 +1442,16 @@ impl Engine {
 
                 match self.await_tool_approval(&tool_id).await {
                     Ok(ApprovalResult::Approved) => {
-                        emit_tool_audit(json!({
-                            "event": "tool.approval_decision",
-                            "tool_id": tool_id.clone(),
-                            "tool_name": tool_name.clone(),
-                            "decision": "approved",
-                            "source": "composer_bang",
-                        }));
+                        emit_tool_audit(
+                            json!({
+                                "event": "tool.approval_decision",
+                                "tool_id": tool_id.clone(),
+                                "tool_name": tool_name.clone(),
+                                "decision": "approved",
+                                "source": "composer_bang",
+                            }),
+                            &sensitive_user_input_values,
+                        );
                         let mut result = Self::execute_tool_with_lock(
                             self.tool_exec_lock.clone(),
                             spec.supports_parallel(),
@@ -1463,26 +1474,32 @@ impl Engine {
                         result
                     }
                     Ok(ApprovalResult::Denied) => {
-                        emit_tool_audit(json!({
-                            "event": "tool.approval_decision",
-                            "tool_id": tool_id.clone(),
-                            "tool_name": tool_name.clone(),
-                            "decision": "denied",
-                            "source": "composer_bang",
-                        }));
+                        emit_tool_audit(
+                            json!({
+                                "event": "tool.approval_decision",
+                                "tool_id": tool_id.clone(),
+                                "tool_name": tool_name.clone(),
+                                "decision": "denied",
+                                "source": "composer_bang",
+                            }),
+                            &sensitive_user_input_values,
+                        );
                         Err(ToolError::permission_denied(format!(
                             "Tool '{tool_name}' denied by user"
                         )))
                     }
                     Ok(ApprovalResult::RetryWithPolicy(policy)) => {
-                        emit_tool_audit(json!({
-                            "event": "tool.approval_decision",
-                            "tool_id": tool_id.clone(),
-                            "tool_name": tool_name.clone(),
-                            "decision": "retry_with_policy",
-                            "policy": format!("{policy:?}"),
-                            "source": "composer_bang",
-                        }));
+                        emit_tool_audit(
+                            json!({
+                                "event": "tool.approval_decision",
+                                "tool_id": tool_id.clone(),
+                                "tool_name": tool_name.clone(),
+                                "decision": "retry_with_policy",
+                                "policy": format!("{policy:?}"),
+                                "source": "composer_bang",
+                            }),
+                            &sensitive_user_input_values,
+                        );
                         let elevated_context = registry
                             .context()
                             .clone()
@@ -1532,21 +1549,35 @@ impl Engine {
         };
 
         let mut result = result;
-        if let Ok(tool_result) = result.as_mut()
-            && let Some(path) = crate::tools::truncate::apply_spillover_with_artifact(
+        if let Ok(tool_result) = result.as_mut() {
+            let mut sensitive_user_input_values = HashSet::new();
+            crate::runtime_threads::collect_sensitive_user_input_values(
+                &self.session.messages,
+                &mut sensitive_user_input_values,
+            );
+            let durable_content = crate::runtime_threads::redacted_sensitive_user_input_text(
+                &tool_result.content,
+                &sensitive_user_input_values,
+            );
+            if let Some(path) = crate::tools::truncate::apply_spillover_with_artifact_projection(
                 tool_result,
                 &tool_id,
                 &tool_name,
                 &self.session.id,
-            )
-        {
-            emit_tool_audit(json!({
-                "event": "tool.spillover",
-                "tool_id": tool_id.clone(),
-                "tool_name": tool_name.clone(),
-                "path": path.display().to_string(),
-                "source": "composer_bang",
-            }));
+                &durable_content,
+                &sensitive_user_input_values,
+            ) {
+                emit_tool_audit(
+                    json!({
+                        "event": "tool.spillover",
+                        "tool_id": tool_id.clone(),
+                        "tool_name": tool_name.clone(),
+                        "path": path.display().to_string(),
+                        "source": "composer_bang",
+                    }),
+                    &sensitive_user_input_values,
+                );
+            }
         }
 
         let status = user_shell_turn_outcome(&result, self.cancel_token.is_cancelled());

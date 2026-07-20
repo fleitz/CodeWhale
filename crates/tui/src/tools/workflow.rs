@@ -3,7 +3,7 @@
 //! The JS VM stays in `codewhale-workflow-js`; this module supplies the TUI
 //! driver that turns each `task(...)` call into a real `SubAgentManager` spawn.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
@@ -96,10 +96,15 @@ impl WorkflowWorkLifecycle {
         context: &ToolContext,
         run_id: &str,
         title: &str,
+        sensitive_user_input_values: &HashSet<String>,
     ) -> Result<Option<Self>, ToolError> {
         let Some(work) = context.runtime.work.clone() else {
             return Ok(None);
         };
+        let title = crate::runtime_threads::redacted_sensitive_user_input_text(
+            title,
+            sensitive_user_input_values,
+        );
         let lifecycle = Self {
             work,
             session_id: context.state_namespace.clone(),
@@ -111,7 +116,7 @@ impl WorkflowWorkLifecycle {
                 &lifecycle.session_id,
                 OperationIntent::new(
                     lifecycle.external.clone(),
-                    title,
+                    &title,
                     true,
                     "workflow",
                     format!("workflow:{run_id}:start"),
@@ -790,7 +795,9 @@ async fn start_workflow(
         approval_decision
     };
     let plan_approval = summary.to_receipt(approval_decision, now_ms());
-    let workflow_title = source
+    let sensitive_user_input_values = runtime.current_sensitive_user_input_values();
+    state.attach_sensitive_user_input_values(&run_id, sensitive_user_input_values.clone());
+    let raw_workflow_title = source
         .spec
         .as_ref()
         .map(|spec| spec.goal.as_str())
@@ -801,7 +808,12 @@ async fn start_workflow(
                 .and_then(|path| path.file_name()?.to_str())
         })
         .unwrap_or("Workflow run");
-    let lifecycle = WorkflowWorkLifecycle::register(context, &run_id, workflow_title)?;
+    let lifecycle = WorkflowWorkLifecycle::register(
+        context,
+        &run_id,
+        raw_workflow_title,
+        &sensitive_user_input_values,
+    )?;
 
     {
         let mut runs_guard = match lock_mutex(&state.runs) {
@@ -3281,7 +3293,7 @@ mod journal {
         WorkflowRunStatus, WorkflowUiEvent, WorkflowWorkLifecycle,
     };
     use serde::{Deserialize, Serialize};
-    use std::collections::HashMap;
+    use std::collections::{HashMap, HashSet};
     use std::fs::OpenOptions;
     use std::io::{BufRead, Write};
     use std::path::{Path, PathBuf};
@@ -3296,6 +3308,7 @@ mod journal {
         pub runs: SharedWorkflowRuns,
         pub controllers: SharedWorkflowControllers,
         lifecycles: SharedWorkflowLifecycles,
+        sensitive_user_input_values: Mutex<HashMap<String, HashSet<String>>>,
         journal: WorkflowRunJournal,
     }
 
@@ -3307,8 +3320,27 @@ mod journal {
                 runs,
                 controllers: Arc::new(Mutex::new(HashMap::new())),
                 lifecycles: Arc::new(Mutex::new(HashMap::new())),
+                sensitive_user_input_values: Mutex::new(HashMap::new()),
                 journal,
             })
+        }
+
+        pub fn attach_sensitive_user_input_values(&self, run_id: &str, values: HashSet<String>) {
+            if !values.is_empty() {
+                self.sensitive_user_input_values
+                    .lock()
+                    .unwrap_or_else(|poison| poison.into_inner())
+                    .insert(run_id.to_string(), values);
+            }
+        }
+
+        fn sensitive_values_for_run(&self, run_id: &str) -> HashSet<String> {
+            self.sensitive_user_input_values
+                .lock()
+                .unwrap_or_else(|poison| poison.into_inner())
+                .get(run_id)
+                .cloned()
+                .unwrap_or_default()
         }
 
         pub fn attach_lifecycle(&self, run_id: &str, lifecycle: WorkflowWorkLifecycle) {
@@ -3320,6 +3352,16 @@ mod journal {
         }
 
         pub fn reconcile_snapshot(&self, record: &WorkflowRunRecord) {
+            let sensitive_values = self.sensitive_values_for_run(&record.run_id);
+            let Ok(record) =
+                crate::runtime_threads::redacted_serializable_clone(record, &sensitive_values)
+            else {
+                warn!(
+                    run_id = record.run_id,
+                    "workflow Work projection failed closed"
+                );
+                return;
+            };
             let lifecycle = self
                 .lifecycles
                 .lock()
@@ -3327,7 +3369,7 @@ mod journal {
                 .get(&record.run_id)
                 .cloned();
             if let Some(lifecycle) = lifecycle
-                && let Err(err) = lifecycle.reconcile_record(record)
+                && let Err(err) = lifecycle.reconcile_record(&record)
             {
                 warn!(
                     run_id = record.run_id,
@@ -3363,8 +3405,12 @@ mod journal {
         }
 
         pub fn try_record_snapshot(&self, record: &WorkflowRunRecord) -> Result<(), String> {
+            let sensitive_values = self.sensitive_values_for_run(&record.run_id);
+            let record =
+                crate::runtime_threads::redacted_serializable_clone(record, &sensitive_values)
+                    .map_err(|err| format!("workflow privacy projection failed: {err}"))?;
             self.journal
-                .append_snapshot(record)
+                .append_snapshot(&record)
                 .map_err(|err| err.to_string())
         }
 
@@ -3375,13 +3421,27 @@ mod journal {
         }
 
         pub fn record_progress(&self, run_id: &str, message: &str) {
-            if let Err(err) = self.journal.append_progress(run_id, message) {
+            let message = crate::runtime_threads::redacted_sensitive_user_input_text(
+                message,
+                &self.sensitive_values_for_run(run_id),
+            );
+            if let Err(err) = self.journal.append_progress(run_id, &message) {
                 warn!("workflow journal progress failed: {err}");
             }
         }
 
         pub fn record_event(&self, run_id: &str, event: &WorkflowUiEvent) {
-            if let Err(err) = self.journal.append_event(run_id, event) {
+            let sensitive_values = self.sensitive_values_for_run(run_id);
+            let event =
+                match crate::runtime_threads::redacted_serializable_clone(event, &sensitive_values)
+                {
+                    Ok(event) => event,
+                    Err(err) => {
+                        warn!("workflow journal event projection failed closed: {err}");
+                        return;
+                    }
+                };
+            if let Err(err) = self.journal.append_event(run_id, &event) {
                 warn!("workflow journal event failed: {err}");
             }
         }
@@ -3733,6 +3793,44 @@ mod journal {
                 "reopening must replay the recovery snapshot without another transition"
             );
         }
+
+        #[test]
+        fn workflow_journal_recursively_projects_runtime_taint() {
+            const SECRET: &str = "482915";
+            let tmp = tempfile::tempdir().expect("tempdir");
+            let state = WorkflowWorkspaceState::open(tmp.path());
+            let run_id = "workflow_private";
+            state.attach_sensitive_user_input_values(run_id, HashSet::from([SECRET.to_string()]));
+            let mut record = sample_record(run_id, WorkflowRunStatus::Failed);
+            record.source_path = Some(PathBuf::from(format!("private/PIN{SECRET}")));
+            record.workflow_id = Some(format!("id-{SECRET}"));
+            record.workflow_goal = Some(format!("goal PIN{SECRET}"));
+            record.child_ids = vec![format!("child-{SECRET}")];
+            record.progress = vec![format!("progress {SECRET}code")];
+            record.error = Some(format!("failure PIN{SECRET}"));
+            record.result = Some(serde_json::json!({
+                "nested": {"echo": format!("{SECRET}code")}
+            }));
+            record
+                .events
+                .push(WorkflowUiEvent::new(WorkflowUiEventKind::Log {
+                    message: format!("event PIN{SECRET}"),
+                }));
+
+            state.record_snapshot(&record);
+            state.record_progress(run_id, &format!("later progress {SECRET}"));
+            state.record_event(
+                run_id,
+                &WorkflowUiEvent::new(WorkflowUiEventKind::Log {
+                    message: format!("later event {SECRET}code"),
+                }),
+            );
+
+            let path = tmp.path().join(".codewhale/workflow-runs.jsonl");
+            let durable = std::fs::read_to_string(path).expect("read workflow journal");
+            assert!(!durable.contains(SECRET));
+            assert!(durable.contains("[redacted user input]"));
+        }
     }
 }
 
@@ -3795,6 +3893,46 @@ mod tests {
     use axum::{Json, Router, routing::post};
     use codewhale_workflow::{IsolationMode, leaf_is_write_capable};
     use std::sync::atomic::{AtomicUsize, Ordering};
+
+    #[test]
+    fn workflow_work_graph_projection_never_receives_runtime_taint() {
+        const SECRET: &str = "482915";
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let work = crate::work_graph::new_shared_work_runtime(
+            crate::tools::todo::new_shared_todo_list(),
+            crate::tools::plan::new_shared_plan_state(),
+        );
+        let mut context = ToolContext::new(tmp.path().to_path_buf());
+        context.state_namespace = "workflow-private-session".to_string();
+        context.runtime.work = Some(work.clone());
+        let values = HashSet::from([SECRET.to_string()]);
+        let run_id = "workflow_private_graph";
+        let lifecycle = WorkflowWorkLifecycle::register(
+            &context,
+            run_id,
+            &format!("goal PIN{SECRET}"),
+            &values,
+        )
+        .expect("register workflow Work node")
+        .expect("work runtime attached");
+        let state = WorkflowWorkspaceState::open(tmp.path());
+        state.attach_sensitive_user_input_values(run_id, values);
+        state.attach_lifecycle(run_id, lifecycle);
+        let mut record = WorkflowRunRecord::new(run_id.to_string(), None, None, None);
+        record.workflow_goal = Some(format!("goal PIN{SECRET}"));
+        record.result = Some(json!({"nested": format!("{SECRET}code")}));
+        record.error = Some(format!("error PIN{SECRET}"));
+        state.reconcile_snapshot(&record);
+
+        let graph = work
+            .capture(Some("workflow-private-session"))
+            .expect("capture workflow graph")
+            .expect("graph")
+            .graph;
+        let encoded = serde_json::to_string(&graph).expect("serialize graph");
+        assert!(!encoded.contains(SECRET));
+        assert!(encoded.contains("[redacted user input]"));
+    }
 
     #[test]
     fn restored_workflow_binding_consumes_journal_recovery() {

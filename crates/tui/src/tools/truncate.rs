@@ -232,6 +232,7 @@ pub fn prune_older_than(max_age: Duration) -> io::Result<usize> {
 /// `head_bytes` controls how much inline content the caller wants to
 /// keep. Pass `threshold` for "preserve as much as fits inline" or
 /// a smaller value (e.g. `4 * 1024`) for "show a peek".
+#[allow(dead_code)]
 pub fn maybe_spillover(
     id: &str,
     content: &str,
@@ -290,7 +291,7 @@ fn retained_tail(content: &str, max_bytes: usize) -> &str {
 /// would just hide the error from the model's reasoning.
 #[allow(dead_code)]
 pub fn apply_spillover(result: &mut ToolResult, tool_id: &str) -> Option<PathBuf> {
-    apply_spillover_inner(result, tool_id, None)
+    apply_spillover_inner(result, tool_id, None, None)
 }
 
 /// Apply spillover and emit a session-scoped artifact reference.
@@ -300,6 +301,7 @@ pub fn apply_spillover(result: &mut ToolResult, tool_id: &str) -> Option<PathBuf
 /// transition. The canonical artifact content is also written under
 /// `~/.codewhale/sessions/<session-id>/artifacts/`, and the inline tool result
 /// becomes a fixed-format artifact reference block.
+#[allow(dead_code)]
 pub fn apply_spillover_with_artifact(
     result: &mut ToolResult,
     tool_id: &str,
@@ -313,6 +315,43 @@ pub fn apply_spillover_with_artifact(
             tool_name,
             session_id,
         }),
+        None,
+    )
+}
+
+/// Apply spillover while writing a separately projected durable body.
+///
+/// The live result keeps its raw retained head/tail for provider reasoning,
+/// while both home-level and session artifact files receive `durable_content`.
+/// Callers use this after classified request_user_input values enter taint.
+pub(crate) fn apply_spillover_with_artifact_projection(
+    result: &mut ToolResult,
+    tool_id: &str,
+    tool_name: &str,
+    session_id: &str,
+    durable_content: &str,
+    sensitive_user_input_values: &std::collections::HashSet<String>,
+) -> Option<PathBuf> {
+    let durable_tool_id = crate::runtime_threads::redacted_sensitive_user_input_text(
+        tool_id,
+        sensitive_user_input_values,
+    );
+    let durable_tool_name = crate::runtime_threads::redacted_sensitive_user_input_text(
+        tool_name,
+        sensitive_user_input_values,
+    );
+    let durable_session_id = crate::runtime_threads::redacted_sensitive_user_input_text(
+        session_id,
+        sensitive_user_input_values,
+    );
+    apply_spillover_inner(
+        result,
+        &durable_tool_id,
+        Some(ArtifactSpilloverContext {
+            tool_name: &durable_tool_name,
+            session_id: &durable_session_id,
+        }),
+        Some(durable_content),
     )
 }
 
@@ -325,6 +364,7 @@ fn apply_spillover_inner(
     result: &mut ToolResult,
     tool_id: &str,
     artifact_context: Option<ArtifactSpilloverContext<'_>>,
+    durable_content: Option<&str>,
 ) -> Option<PathBuf> {
     if !result.success {
         return None;
@@ -333,15 +373,10 @@ fn apply_spillover_inner(
         return None;
     }
     let original_content = result.content.clone();
+    let durable_content = durable_content.unwrap_or(&original_content);
     let total = original_content.len();
-    let outcome = match maybe_spillover(
-        tool_id,
-        &original_content,
-        SPILLOVER_THRESHOLD_BYTES,
-        SPILLOVER_HEAD_BYTES,
-    ) {
-        Ok(Some(pair)) => pair,
-        Ok(None) => return None,
+    let path = match write_spillover(tool_id, durable_content) {
+        Ok(path) => path,
         Err(err) => {
             tracing::warn!(
                 target: "spillover",
@@ -352,9 +387,14 @@ fn apply_spillover_inner(
             return None;
         }
     };
-    let (head, path) = outcome;
+    let head_cut = SPILLOVER_HEAD_BYTES.min(original_content.len());
+    let head_cut = (0..=head_cut)
+        .rev()
+        .find(|index| original_content.is_char_boundary(*index))
+        .unwrap_or(0);
+    let head = original_content[..head_cut].to_string();
     let tail = retained_tail(&original_content, SPILLOVER_TAIL_BYTES);
-    let digest = crate::hashing::sha256_hex(original_content.as_bytes());
+    let digest = crate::hashing::sha256_hex(durable_content.as_bytes());
     let path_str = path.display().to_string();
 
     let mut artifact_path = None;
@@ -363,7 +403,7 @@ fn apply_spillover_inner(
         match crate::artifacts::write_session_artifact(
             context.session_id,
             &artifact_id,
-            &original_content,
+            durable_content,
         ) {
             Ok((absolute_path, relative_path)) => {
                 let record = crate::artifacts::record_tool_output_artifact(
@@ -371,7 +411,7 @@ fn apply_spillover_inner(
                     tool_id,
                     context.tool_name,
                     relative_path.clone(),
-                    &original_content,
+                    durable_content,
                 );
                 let transcript_ref = crate::artifacts::TranscriptArtifactRef::from(&record);
                 let reference = crate::artifacts::render_transcript_artifact_ref(&transcript_ref);
@@ -928,6 +968,44 @@ mod tests {
             assert_eq!(metadata["original_byte_count"], big.len());
             assert_eq!(metadata["retained_head_bytes"], SPILLOVER_HEAD_BYTES);
             assert_eq!(metadata["retained_tail_bytes"], SPILLOVER_TAIL_BYTES);
+        });
+    }
+
+    #[test]
+    fn projected_spillover_keeps_raw_inline_but_redacts_every_durable_copy() {
+        let _g = setup();
+        let tmp = tempdir().unwrap();
+        with_test_home(tmp.path(), || {
+            const SECRET: &str = "482915";
+            let raw = format!(
+                "PIN{SECRET} {} {SECRET}code",
+                "large root output ".repeat(12_000)
+            );
+            let durable = raw.replace(SECRET, "[redacted user input]");
+            let mut result = ToolResult::success(raw);
+            let path = apply_spillover_with_artifact_projection(
+                &mut result,
+                &format!("privacy-{SECRET}-call"),
+                &format!("exec_{SECRET}_shell"),
+                &format!("privacy-{SECRET}-session"),
+                &durable,
+                &std::collections::HashSet::from([SECRET.to_string()]),
+            )
+            .expect("projected root output should spill");
+
+            assert!(result.content.contains(&format!("PIN{SECRET}")));
+            assert!(!path.display().to_string().contains(SECRET));
+            assert!(!fs::read_to_string(&path).unwrap().contains(SECRET));
+            for entry in fs::read_dir(tmp.path().join(".codewhale/tool_outputs")).unwrap() {
+                let entry = entry.unwrap();
+                assert!(!entry.path().display().to_string().contains(SECRET));
+                assert!(!fs::read_to_string(entry.path()).unwrap().contains(SECRET));
+            }
+            assert!(
+                !serde_json::to_string(&result.metadata)
+                    .unwrap()
+                    .contains(SECRET)
+            );
         });
     }
 
