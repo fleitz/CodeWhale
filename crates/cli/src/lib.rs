@@ -4630,7 +4630,7 @@ mod tests {
             .path()
             .join(format!("custom-tui{}", std::env::consts::EXE_SUFFIX));
         std::fs::write(&custom, b"").unwrap();
-        let custom_str = custom.to_string_lossy().into_owned();
+        let custom_str = custom.to_string_lossy();
         let bin = ScopedEnvVar::set("DEEPSEEK_TUI_BIN", &custom_str);
         (dir, bin)
     }
@@ -8336,12 +8336,8 @@ model = "qwen-2.5-7b"
             .join(format!("legacy-tui{}", std::env::consts::EXE_SUFFIX));
         std::fs::write(&canonical, b"").unwrap();
         std::fs::write(&legacy, b"").unwrap();
-        let _canonical_bin = ScopedEnvVar::set(
-            "CODEWHALE_TUI_BIN",
-            &canonical.to_string_lossy().into_owned(),
-        );
-        let _legacy_bin =
-            ScopedEnvVar::set("DEEPSEEK_TUI_BIN", &legacy.to_string_lossy().into_owned());
+        let _canonical_bin = ScopedEnvVar::set("CODEWHALE_TUI_BIN", &canonical.to_string_lossy());
+        let _legacy_bin = ScopedEnvVar::set("DEEPSEEK_TUI_BIN", &legacy.to_string_lossy());
 
         let resolved = locate_sibling_tui_binary().expect("override must resolve");
         assert_eq!(resolved, canonical);
