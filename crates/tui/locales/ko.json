@@ -846,7 +846,7 @@
     "EmptyStateNoGit": "git 없음",
     "EmptyStateMcpLabel": "mcp",
     "EmptyStateFleetLabel": "Fleet",
-    "EmptyStateFleetSetupLabel": "Fleet 설정",
+    "EmptyStateFleetSetupLabel": "Fleet 준비 완료",
     "EmptyStateHelpHint": "— 모두 보기",
     "SessionsSurfaceTitle": "세션",
     "SessionsPaneTitle": " 세션 (1-9) ",

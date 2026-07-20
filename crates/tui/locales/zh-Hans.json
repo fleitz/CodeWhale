@@ -846,7 +846,7 @@
     "EmptyStateNoGit": "无 git",
     "EmptyStateMcpLabel": "mcp",
     "EmptyStateFleetLabel": "Fleet",
-    "EmptyStateFleetSetupLabel": "Fleet 设置",
+    "EmptyStateFleetSetupLabel": "Fleet 已就绪",
     "EmptyStateHelpHint": "— 查看所有功能",
     "SessionsSurfaceTitle": "会话",
     "SessionsPaneTitle": " 会话 (1-9) ",

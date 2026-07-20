@@ -846,7 +846,7 @@
     "EmptyStateNoGit": "sin git",
     "EmptyStateMcpLabel": "mcp",
     "EmptyStateFleetLabel": "Fleet",
-    "EmptyStateFleetSetupLabel": "Configuración de Fleet",
+    "EmptyStateFleetSetupLabel": "Fleet lista",
     "EmptyStateHelpHint": "— ver todo",
     "SessionsSurfaceTitle": "sesiones",
     "SessionsPaneTitle": " sesiones (1-9) ",

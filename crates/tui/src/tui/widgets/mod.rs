@@ -5889,6 +5889,7 @@ mod tests {
     #[test]
     fn empty_state_shows_startup_context() {
         let mut app = create_test_app();
+        app.onboarding_needs_api_key = false;
         app.workspace = PathBuf::from("/tmp/codewhale-test-workspace");
         app.mcp_configured_count = 2;
 
@@ -5905,10 +5906,32 @@ mod tests {
             .join("\n");
 
         assert!(rendered.contains("codewhale · /tmp/codewhale-test-workspace · no git · mcp 2"));
-        assert!(rendered.contains("Fleet setup  /fleet setup"));
+        assert!(rendered.contains("Fleet ready  /fleet setup"));
+        assert!(
+            !rendered.contains("Fleet setup  /fleet setup"),
+            "the idle action must not imply that built-in Fleet roles still require setup"
+        );
         assert!(rendered.contains("/help or Ctrl+K"));
         assert!(!rendered.contains("Model  /model"));
         assert!(!rendered.contains("Rules  /constitution"));
+    }
+
+    #[test]
+    fn empty_state_does_not_claim_fleet_ready_without_a_provider_route() {
+        let mut app = create_test_app();
+        app.onboarding_needs_api_key = true;
+
+        for area in [Rect::new(0, 0, 40, 12), Rect::new(0, 0, 100, 20)] {
+            let rendered = build_empty_state_lines(&app, area)
+                .iter()
+                .flat_map(|line| line.spans.iter())
+                .map(|span| span.content.as_ref())
+                .collect::<String>();
+
+            assert!(rendered.contains("Fleet  /provider"), "{rendered}");
+            assert!(!rendered.contains("Fleet ready"), "{rendered}");
+            assert!(!rendered.contains("/fleet setup"), "{rendered}");
+        }
     }
 
     #[test]
@@ -5973,15 +5996,16 @@ mod tests {
     }
 
     #[test]
-    fn compact_launch_keeps_fleet_setup_without_ambient_clutter() {
-        let app = create_test_app();
+    fn compact_launch_states_that_fleet_is_ready_without_ambient_clutter() {
+        let mut app = create_test_app();
+        app.onboarding_needs_api_key = false;
         let rendered = build_empty_state_lines(&app, Rect::new(0, 0, 40, 12))
             .iter()
             .flat_map(|line| line.spans.iter())
             .map(|span| span.content.as_ref())
             .collect::<String>();
 
-        assert!(rendered.contains("/fleet setup"));
+        assert!(rendered.contains("Fleet ready  /fleet setup"));
         assert!(!rendered.contains("▗▄▄"));
     }
 
@@ -5989,6 +6013,7 @@ mod tests {
     fn launch_hierarchy_survives_responsive_gate_sizes() {
         for (width, height) in [(40, 12), (60, 16), (80, 24), (100, 32), (140, 40)] {
             let mut app = create_test_app();
+            app.onboarding_needs_api_key = false;
             app.low_motion = false;
             app.fancy_animations = true;
             let mut terminal = Terminal::new(TestBackend::new(width, height)).expect("terminal");
@@ -6003,8 +6028,8 @@ mod tests {
             let rendered = buffer_text(terminal.backend().buffer(), area);
 
             assert!(
-                rendered.contains("Fleet") && rendered.contains("/fleet setup"),
-                "Fleet must remain the launch priority at {width}x{height}:\n{rendered}"
+                rendered.contains("Fleet ready") && rendered.contains("/fleet setup"),
+                "Fleet readiness must remain explicit at {width}x{height}:\n{rendered}"
             );
             if height < 14 {
                 assert!(

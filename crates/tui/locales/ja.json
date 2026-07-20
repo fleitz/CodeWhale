@@ -846,7 +846,7 @@
     "EmptyStateNoGit": "git なし",
     "EmptyStateMcpLabel": "mcp",
     "EmptyStateFleetLabel": "Fleet",
-    "EmptyStateFleetSetupLabel": "Fleet 設定",
+    "EmptyStateFleetSetupLabel": "Fleet 準備完了",
     "EmptyStateHelpHint": "— すべてを表示",
     "SessionsSurfaceTitle": "セッション",
     "SessionsPaneTitle": " セッション (1-9) ",

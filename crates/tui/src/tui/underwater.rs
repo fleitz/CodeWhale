@@ -976,12 +976,24 @@ pub fn empty_state_lines(app: &App, area: Rect) -> Vec<Line<'static>> {
     )));
     if area.height >= 6 {
         lines.push(Line::from(""));
-        let fleet_label = if tier == ShellTier::Compact {
-            tr(app.ui_locale, MessageId::EmptyStateFleetLabel)
+        let (fleet_label, fleet_action) = if app.onboarding_needs_api_key {
+            // `--skip-onboarding` can expose the launch shell without a usable
+            // provider route. Do not claim that Fleet is ready in that state;
+            // point at the boundary that can actually make it runnable.
+            (
+                tr(app.ui_locale, MessageId::EmptyStateFleetLabel),
+                "/provider",
+            )
         } else {
-            tr(app.ui_locale, MessageId::EmptyStateFleetSetupLabel)
+            // Built-in roles are immediately usable with the active route.
+            // Keep this truth at every responsive tier so `/fleet setup`
+            // reads as optional customization instead of required setup.
+            (
+                tr(app.ui_locale, MessageId::EmptyStateFleetSetupLabel),
+                "/fleet setup",
+            )
         };
-        let fleet = format!("{fleet_label}  /fleet setup");
+        let fleet = format!("{fleet_label}  {fleet_action}");
         let inset = " ".repeat(width.saturating_sub(fleet.width()) / 2);
         lines.push(Line::from(Span::styled(
             format!("{inset}{fleet}"),

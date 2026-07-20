@@ -846,7 +846,7 @@
     "EmptyStateNoGit": "không có git",
     "EmptyStateMcpLabel": "mcp",
     "EmptyStateFleetLabel": "Fleet",
-    "EmptyStateFleetSetupLabel": "Thiết lập Fleet",
+    "EmptyStateFleetSetupLabel": "Fleet sẵn sàng",
     "EmptyStateHelpHint": "— xem mọi thứ",
     "SessionsSurfaceTitle": "phiên",
     "SessionsPaneTitle": " phiên (1-9) ",
