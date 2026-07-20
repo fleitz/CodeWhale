@@ -7936,8 +7936,10 @@ fn parse_items_text(input: &Value, key: &str) -> Result<Option<String>, ToolErro
 /// own conversation), (b) runs the exact parent provider+model route (any
 /// other route pays a full cold prefill of the entire parent context),
 /// (c) has a read-only posture (explore/plan/review/verifier, or an explicit
-/// `read_only` write authority), and (d) stays in the parent workspace with
-/// no worktree isolation. Everything else keeps the fresh-brief default.
+/// `read_only` write authority), (d) stays in the parent workspace with
+/// no worktree isolation, and (e) the parent prefix is not so large that
+/// even cached fork reads (~10% of the prefix per child step) would exceed
+/// a fresh brief. Everything else keeps the fresh-brief default.
 /// An explicit `fork_context` from the caller always wins.
 fn auto_fork_context_default(
     agent_type: &SubAgentType,
@@ -7948,7 +7950,13 @@ fn auto_fork_context_default(
     child_provider: crate::config::ApiProvider,
     effective_model: &str,
 ) -> bool {
-    if parent_runtime.fork_context.is_none() || parent_runtime.parent_agent_id.is_some() {
+    let Some(fork_snapshot) = parent_runtime.fork_context.as_ref() else {
+        return false;
+    };
+    if parent_runtime.parent_agent_id.is_some() {
+        return false;
+    }
+    if estimated_fork_prefix_tokens(fork_snapshot) > AUTO_FORK_MAX_PARENT_PREFIX_TOKENS {
         return false;
     }
     let read_only_posture = matches!(
@@ -7960,6 +7968,41 @@ fn auto_fork_context_default(
         && !has_cwd_override
         && child_provider == parent_runtime.client.api_provider()
         && effective_model == parent_runtime.model
+}
+
+/// Above this estimated parent-prefix size, auto-fork stops paying for a
+/// short read-only child: every child step re-reads the whole prefix at the
+/// provider's cached-read rate, so a very large parent context costs more
+/// than a fresh brief plus re-discovery. Explicit `fork_context: true` is
+/// not subject to this ceiling.
+const AUTO_FORK_MAX_PARENT_PREFIX_TOKENS: usize = 200_000;
+
+fn estimated_fork_prefix_tokens(snapshot: &SubAgentForkContext) -> usize {
+    let mut total = snapshot
+        .structured_state_block
+        .as_deref()
+        .map(crate::compaction::estimate_text_tokens_conservative)
+        .unwrap_or(0);
+    for message in &snapshot.messages {
+        for block in &message.content {
+            match block {
+                ContentBlock::Text { text, .. } => {
+                    total += crate::compaction::estimate_text_tokens_conservative(text);
+                }
+                ContentBlock::Thinking { thinking, .. } => {
+                    total += crate::compaction::estimate_text_tokens_conservative(thinking);
+                }
+                ContentBlock::ToolResult { content, .. } => {
+                    total += crate::compaction::estimate_text_tokens_conservative(content);
+                }
+                ContentBlock::ToolUse { input, .. } => {
+                    total += input.to_string().len() / 4;
+                }
+                _ => {}
+            }
+        }
+    }
+    total
 }
 
 fn parse_spawn_request(input: &Value) -> Result<SpawnRequest, ToolError> {

@@ -1959,6 +1959,33 @@ fn auto_fork_context_default_forks_only_same_route_read_only_engine_children() {
         provider,
         "some-other-model"
     ));
+    // A huge parent prefix stays fresh: cached fork reads on every child
+    // step would cost more than a fresh brief.
+    let huge_text = "token ".repeat(400_000);
+    runtime.fork_context = Some(SubAgentForkContext {
+        messages: vec![crate::models::Message {
+            role: "user".to_string(),
+            content: vec![crate::models::ContentBlock::Text {
+                text: huge_text,
+                cache_control: None,
+            }],
+        }],
+        structured_state_block: None,
+    });
+    assert!(!auto_fork_context_default(
+        &SubAgentType::Explore,
+        None,
+        false,
+        false,
+        &runtime,
+        provider,
+        &model
+    ));
+    runtime.fork_context = Some(SubAgentForkContext {
+        messages: Vec::new(),
+        structured_state_block: None,
+    });
+
     // Nested spawners stay fresh — their snapshot is the root prefix, not
     // their own conversation.
     runtime.parent_agent_id = Some("agent_parent".to_string());
