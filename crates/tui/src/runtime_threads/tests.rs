@@ -2319,6 +2319,7 @@ fn enforce_lru_capacity_does_not_loop_when_all_threads_are_active() {
                 exact_id: Some("deepseek".to_string()),
             },
             route_model: DEFAULT_TEXT_MODEL.to_string(),
+            sensitive_user_input_values: HashSet::new(),
             client_preflight_required: false,
         },
     );
@@ -2338,6 +2339,7 @@ fn enforce_lru_capacity_does_not_loop_when_all_threads_are_active() {
                 exact_id: Some("deepseek".to_string()),
             },
             route_model: DEFAULT_TEXT_MODEL.to_string(),
+            sensitive_user_input_values: HashSet::new(),
             client_preflight_required: false,
         },
     );
@@ -7702,6 +7704,461 @@ fn compaction_history_snapshot_redacts_request_user_input_answers() {
     assert!(!serialized.contains(short_secret));
     assert!(serialized.contains("[redacted user input]"));
     assert!(serialized.contains("ordinary durable context"));
+}
+
+#[test]
+fn typed_user_input_provenance_redacts_short_free_text_but_keeps_long_fixed_option() {
+    let short_secret = "123456";
+    let fixed_option = "All product surfaces";
+    let messages = vec![
+        Message {
+            role: "assistant".to_string(),
+            content: vec![ContentBlock::ToolUse {
+                id: "typed-input".to_string(),
+                name: REQUEST_USER_INPUT_TOOL_NAME.to_string(),
+                input: json!({
+                    "questions": [
+                        {
+                            "header": "PIN",
+                            "id": "pin",
+                            "question": "Enter the PIN",
+                            "options": [
+                                {"label": "Skip", "description": "Do not enter it"},
+                                {"label": "Cancel", "description": "Stop here"}
+                            ],
+                            "allow_free_text": true
+                        },
+                        {
+                            "header": "Scope",
+                            "id": "scope",
+                            "question": "Choose scope",
+                            "options": [
+                                {"label": fixed_option, "description": "Use every surface"},
+                                {"label": "TUI only", "description": "Use only the terminal"}
+                            ]
+                        }
+                    ]
+                }),
+                caller: None,
+            }],
+        },
+        Message {
+            role: "user".to_string(),
+            content: vec![ContentBlock::ToolResult {
+                tool_use_id: "typed-input".to_string(),
+                content: json!({
+                    "answers": [
+                        {"id": "pin", "label": "Other", "value": short_secret},
+                        {"id": "scope", "label": "Scope", "value": fixed_option}
+                    ]
+                })
+                .to_string(),
+                is_error: None,
+                content_blocks: None,
+            }],
+        },
+    ];
+
+    let mut sensitive_values = HashSet::new();
+    collect_sensitive_user_input_values(&messages, &mut sensitive_values);
+    assert!(sensitive_values.contains(short_secret));
+    assert!(!sensitive_values.contains(fixed_option));
+}
+
+#[test]
+fn durable_history_clone_redacts_every_structured_string_leaf() -> Result<()> {
+    const SECRET: &str = "structured-secret-493812";
+    let mut sensitive_values = HashSet::new();
+    sensitive_values.insert(SECRET.to_string());
+    let messages = vec![
+        crate::compaction::compaction_summary_message(
+            format!(
+                "## {}\n\nSummary echoed {SECRET}",
+                crate::compaction::COMPACTION_SUMMARY_MARKER
+            ),
+            true,
+        ),
+        Message {
+            role: "assistant".to_string(),
+            content: vec![
+                ContentBlock::Text {
+                    text: format!("text {SECRET}"),
+                    cache_control: None,
+                },
+                ContentBlock::ImageUrl {
+                    image_url: crate::models::ImageUrlContent {
+                        url: format!("https://example.invalid/{SECRET}"),
+                    },
+                },
+                ContentBlock::Thinking {
+                    thinking: format!("signed {SECRET}"),
+                    signature: Some("provider-signature".to_string()),
+                },
+                ContentBlock::ToolUse {
+                    id: "tool-structural-id".to_string(),
+                    name: "exec_shell".to_string(),
+                    input: json!({"nested": [{"command": format!("echo {SECRET}")}]}),
+                    caller: None,
+                },
+                ContentBlock::ServerToolUse {
+                    id: "server-structural-id".to_string(),
+                    name: "web_search".to_string(),
+                    input: json!({"query": SECRET}),
+                },
+                ContentBlock::ToolSearchToolResult {
+                    tool_use_id: "search-result-id".to_string(),
+                    content: json!({"matches": [SECRET]}),
+                },
+                ContentBlock::CodeExecutionToolResult {
+                    tool_use_id: "code-result-id".to_string(),
+                    content: json!({"stdout": SECRET}),
+                },
+            ],
+        },
+        Message {
+            role: "user".to_string(),
+            content: vec![ContentBlock::ToolResult {
+                tool_use_id: "ordinary-result-id".to_string(),
+                content: format!("result {SECRET}"),
+                is_error: None,
+                content_blocks: Some(vec![json!({"deep": {"value": SECRET}})]),
+            }],
+        },
+    ];
+
+    let redacted = redacted_durable_history_clone(&messages, &sensitive_values);
+    let serialized = serde_json::to_string(&redacted)?;
+    assert!(!serialized.contains(SECRET));
+    assert!(serialized.contains("tool-structural-id"));
+    assert!(serialized.contains("exec_shell"));
+    assert!(serialized.contains(crate::compaction::COMPACTION_SUMMARY_MARKER));
+    assert!(matches!(
+        &redacted[1].content[2],
+        ContentBlock::Thinking { thinking, signature }
+            if thinking == "[redacted user input]" && signature.is_none()
+    ));
+    Ok(())
+}
+
+#[tokio::test]
+async fn seeded_runtime_history_redacts_private_and_public_resume_projections() -> Result<()> {
+    const SECRET: &str = "resume-private-answer-481516";
+    let data_dir = test_runtime_dir();
+    let manager = test_manager(data_dir.clone())?;
+    let thread = manager
+        .create_thread(CreateThreadRequest::default())
+        .await?;
+    let messages = vec![
+        crate::compaction::compaction_summary_message(
+            format!(
+                "## {}\n\nEarlier answer was {SECRET}",
+                crate::compaction::COMPACTION_SUMMARY_MARKER
+            ),
+            true,
+        ),
+        Message {
+            role: "assistant".to_string(),
+            content: vec![ContentBlock::ToolUse {
+                id: "resume-input".to_string(),
+                name: REQUEST_USER_INPUT_TOOL_NAME.to_string(),
+                input: json!({
+                    "questions": [{
+                        "header": "Secret",
+                        "id": "secret",
+                        "question": "Enter it",
+                        "options": [
+                            {"label": "Skip", "description": "Skip"},
+                            {"label": "Cancel", "description": "Cancel"}
+                        ],
+                        "allow_free_text": true
+                    }]
+                }),
+                caller: None,
+            }],
+        },
+        Message {
+            role: "user".to_string(),
+            content: vec![ContentBlock::ToolResult {
+                tool_use_id: "resume-input".to_string(),
+                content: serde_json::to_string(&json!({
+                    "answers": [{"id": "secret", "label": "Other", "value": SECRET}]
+                }))?,
+                is_error: None,
+                content_blocks: None,
+            }],
+        },
+        Message {
+            role: "assistant".to_string(),
+            content: vec![ContentBlock::ToolUse {
+                id: "echo-tool".to_string(),
+                name: "exec_shell".to_string(),
+                input: json!({"command": format!("echo {SECRET}")}),
+                caller: None,
+            }],
+        },
+    ];
+
+    manager
+        .seed_thread_from_messages(&thread.id, &messages)
+        .await?;
+    let detail = manager.get_thread_detail(&thread.id).await?;
+    let events = manager.events_since(&thread.id, None)?;
+    let exported = manager.messages_for_session_export(&thread.id).await?;
+    assert!(!serde_json::to_string(&detail)?.contains(SECRET));
+    assert!(!serde_json::to_string(&events)?.contains(SECRET));
+    assert!(!serde_json::to_string(&exported)?.contains(SECRET));
+
+    for directory in ["threads", "turns", "items", "events"] {
+        let path = data_dir.join(directory);
+        if !path.exists() {
+            continue;
+        }
+        for entry in std::fs::read_dir(path)? {
+            let entry = entry?;
+            if entry.file_type()?.is_file() {
+                assert!(
+                    !std::fs::read_to_string(entry.path())?.contains(SECRET),
+                    "raw answer persisted in {}",
+                    entry.path().display()
+                );
+            }
+        }
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn sensitive_answer_taint_survives_turns_recompaction_and_restart() -> Result<()> {
+    const SECRET: &str = "482915";
+    let data_dir = test_runtime_dir();
+    let manager = test_manager(data_dir.clone())?;
+    let thread = manager
+        .create_thread(CreateThreadRequest::default())
+        .await?;
+    let mut harness = install_mock_engine(&manager, &thread.id).await;
+    let request = crate::tools::user_input::UserInputRequest {
+        questions: vec![crate::tools::user_input::UserInputQuestion {
+            header: "PIN".to_string(),
+            id: "pin".to_string(),
+            question: "Enter the six-digit PIN".to_string(),
+            options: vec![
+                crate::tools::user_input::UserInputOption {
+                    label: "Skip".to_string(),
+                    description: "Continue without it".to_string(),
+                },
+                crate::tools::user_input::UserInputOption {
+                    label: "Cancel".to_string(),
+                    description: "Stop the operation".to_string(),
+                },
+            ],
+            allow_free_text: true,
+            multi_select: false,
+        }],
+    };
+
+    let first = manager
+        .start_turn(
+            &thread.id,
+            StartTurnRequest {
+                prompt: "first turn".to_string(),
+                ..Default::default()
+            },
+        )
+        .await?;
+    assert!(matches!(
+        harness.rx_op.recv().await,
+        Some(Op::SendMessage { .. })
+    ));
+    harness
+        .tx_event
+        .send(EngineEvent::TurnStarted {
+            turn_id: first.id.clone(),
+            created_at: Utc::now(),
+            route: None,
+        })
+        .await?;
+    harness
+        .tx_event
+        .send(EngineEvent::UserInputRequired {
+            id: "pin-input".to_string(),
+            request: request.clone(),
+        })
+        .await?;
+    tokio::time::timeout(Duration::from_secs(2), async {
+        loop {
+            if manager
+                .get_thread_detail(&thread.id)
+                .await
+                .is_ok_and(|detail| !detail.pending_user_inputs.is_empty())
+            {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await?;
+    manager
+        .submit_user_input(
+            &thread.id,
+            "pin-input",
+            crate::tools::user_input::UserInputResponse {
+                answers: vec![crate::tools::user_input::UserInputAnswer {
+                    id: "pin".to_string(),
+                    label: "Other".to_string(),
+                    value: SECRET.to_string(),
+                }],
+            },
+        )
+        .await?;
+    assert!(matches!(
+        harness.recv_user_input_submission().await,
+        Some((id, _)) if id == "pin-input"
+    ));
+    harness
+        .tx_event
+        .send(EngineEvent::CompactionStarted {
+            id: "compact-first".to_string(),
+            auto: true,
+            message: "first compaction".to_string(),
+        })
+        .await?;
+    harness
+        .tx_event
+        .send(EngineEvent::SessionUpdated {
+            session_id: "taint-session".to_string(),
+            messages: vec![crate::compaction::compaction_summary_message(
+                format!(
+                    "## {}\n\nThe first summary retained PIN {SECRET}",
+                    crate::compaction::COMPACTION_SUMMARY_MARKER
+                ),
+                true,
+            )],
+            system_prompt: None,
+            model: DEFAULT_TEXT_MODEL.to_string(),
+            workspace: PathBuf::from("."),
+        })
+        .await?;
+    harness
+        .tx_event
+        .send(EngineEvent::CompactionCompleted {
+            id: "compact-first".to_string(),
+            auto: true,
+            message: "first compaction complete".to_string(),
+            messages_before: Some(3),
+            messages_after: Some(1),
+            summary_prompt: Some("summarize".to_string()),
+        })
+        .await?;
+    harness
+        .tx_event
+        .send(EngineEvent::TurnComplete {
+            usage: Usage::default(),
+            status: TurnOutcomeStatus::Completed,
+            error: None,
+            tool_catalog: None,
+            base_url: None,
+        })
+        .await?;
+    wait_for_terminal_turn(&manager, &first.id, Duration::from_secs(2)).await?;
+
+    let second = manager
+        .start_turn(
+            &thread.id,
+            StartTurnRequest {
+                prompt: "second turn".to_string(),
+                ..Default::default()
+            },
+        )
+        .await?;
+    assert!(matches!(
+        harness.rx_op.recv().await,
+        Some(Op::SendMessage { .. })
+    ));
+    harness
+        .tx_event
+        .send(EngineEvent::TurnStarted {
+            turn_id: second.id.clone(),
+            created_at: Utc::now(),
+            route: None,
+        })
+        .await?;
+    harness
+        .tx_event
+        .send(EngineEvent::CompactionStarted {
+            id: "compact-second".to_string(),
+            auto: true,
+            message: "second compaction".to_string(),
+        })
+        .await?;
+    // The raw request/result pair is already gone. Only the active engine's
+    // session-lifetime taint can redact this later compaction.
+    harness
+        .tx_event
+        .send(EngineEvent::SessionUpdated {
+            session_id: "taint-session".to_string(),
+            messages: vec![crate::compaction::compaction_summary_message(
+                format!(
+                    "## {}\n\nA later summary still remembered {SECRET}",
+                    crate::compaction::COMPACTION_SUMMARY_MARKER
+                ),
+                true,
+            )],
+            system_prompt: None,
+            model: DEFAULT_TEXT_MODEL.to_string(),
+            workspace: PathBuf::from("."),
+        })
+        .await?;
+    harness
+        .tx_event
+        .send(EngineEvent::CompactionCompleted {
+            id: "compact-second".to_string(),
+            auto: true,
+            message: "second compaction complete".to_string(),
+            messages_before: Some(2),
+            messages_after: Some(1),
+            summary_prompt: Some("summarize".to_string()),
+        })
+        .await?;
+    harness
+        .tx_event
+        .send(EngineEvent::TurnComplete {
+            usage: Usage::default(),
+            status: TurnOutcomeStatus::Completed,
+            error: None,
+            tool_catalog: None,
+            base_url: None,
+        })
+        .await?;
+    wait_for_terminal_turn(&manager, &second.id, Duration::from_secs(2)).await?;
+
+    let detail = manager.get_thread_detail(&thread.id).await?;
+    let events = manager.events_since(&thread.id, None)?;
+    let exported = manager.messages_for_session_export(&thread.id).await?;
+    assert!(!serde_json::to_string(&detail)?.contains(SECRET));
+    assert!(!serde_json::to_string(&events)?.contains(SECRET));
+    assert!(!serde_json::to_string(&exported)?.contains(SECRET));
+    for item in &detail.items {
+        let private = manager.store.load_item(&item.id)?;
+        assert!(!serde_json::to_string(&private)?.contains(SECRET));
+    }
+
+    manager.shutdown();
+    drop(harness);
+    drop(manager);
+    let restarted = test_manager(data_dir.clone())?;
+    let restarted_detail = restarted.get_thread_detail(&thread.id).await?;
+    let restarted_export = restarted.messages_for_session_export(&thread.id).await?;
+    assert!(!serde_json::to_string(&restarted_detail)?.contains(SECRET));
+    assert!(!serde_json::to_string(&restarted_export)?.contains(SECRET));
+    for directory in ["threads", "turns", "items", "events"] {
+        for entry in std::fs::read_dir(data_dir.join(directory))? {
+            let entry = entry?;
+            if entry.file_type()?.is_file() {
+                assert!(!std::fs::read_to_string(entry.path())?.contains(SECRET));
+            }
+        }
+    }
+    Ok(())
 }
 
 #[test]

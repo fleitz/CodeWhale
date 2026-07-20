@@ -70,16 +70,20 @@ const HISTORY_SNAPSHOT_MESSAGES_KEY: &str = "compacted_messages";
 const TEST_HISTORY_SNAPSHOT_SAVE_FAILURE_ITEM_ID: &str = "item_test_history_snapshot_save_failure";
 
 fn collect_sensitive_user_input_values(messages: &[Message], values: &mut HashSet<String>) {
-    let sensitive_tool_ids = messages
+    let sensitive_tools = messages
         .iter()
         .flat_map(|message| message.content.iter())
         .filter_map(|block| match block {
-            ContentBlock::ToolUse { id, name, .. } if name == REQUEST_USER_INPUT_TOOL_NAME => {
-                Some(id.clone())
-            }
+            ContentBlock::ToolUse {
+                id, name, input, ..
+            } if name == REQUEST_USER_INPUT_TOOL_NAME => Some((
+                id.clone(),
+                serde_json::from_value::<crate::tools::user_input::UserInputRequest>(input.clone())
+                    .ok(),
+            )),
             _ => None,
         })
-        .collect::<HashSet<_>>();
+        .collect::<HashMap<_, _>>();
     for block in messages.iter().flat_map(|message| message.content.iter()) {
         if let ContentBlock::ToolResult {
             tool_use_id,
@@ -87,21 +91,21 @@ fn collect_sensitive_user_input_values(messages: &[Message], values: &mut HashSe
             content_blocks,
             ..
         } = block
-            && sensitive_tool_ids.contains(tool_use_id)
+            && let Some(request) = sensitive_tools.get(tool_use_id)
         {
             if let Ok(value) = serde_json::from_str::<Value>(content) {
-                collect_typed_user_input_free_text_values(&value, values);
+                collect_typed_user_input_free_text_values(&value, request.as_ref(), values);
             }
             if let Some(content_blocks) = content_blocks {
                 for value in content_blocks {
-                    collect_typed_user_input_free_text_values(value, values);
+                    collect_typed_user_input_free_text_values(value, request.as_ref(), values);
                 }
             }
         }
     }
 }
 
-fn project_messages_for_durable_history_snapshot(
+fn redacted_durable_history_clone(
     messages: &[Message],
     prior_sensitive_values: &HashSet<String>,
 ) -> Vec<Message> {
@@ -140,6 +144,10 @@ fn project_messages_for_durable_history_snapshot(
                 ContentBlock::Text { text, .. } if summary.is_none() => {
                     let _ = redact_sensitive_user_input_values(text, &sensitive_values);
                 }
+                ContentBlock::ImageUrl { image_url } => {
+                    let _ =
+                        redact_sensitive_user_input_values(&mut image_url.url, &sensitive_values);
+                }
                 ContentBlock::Thinking {
                     thinking,
                     signature,
@@ -149,6 +157,25 @@ fn project_messages_for_durable_history_snapshot(
                         *thinking = "[redacted user input]".to_string();
                         *signature = None;
                     }
+                }
+                ContentBlock::ToolUse { input, .. } | ContentBlock::ServerToolUse { input, .. } => {
+                    let _ = redact_sensitive_json_string_leaves(input, &sensitive_values);
+                }
+                ContentBlock::ToolResult {
+                    content,
+                    content_blocks,
+                    ..
+                } => {
+                    let _ = redact_sensitive_user_input_values(content, &sensitive_values);
+                    if let Some(content_blocks) = content_blocks {
+                        for value in content_blocks {
+                            let _ = redact_sensitive_json_string_leaves(value, &sensitive_values);
+                        }
+                    }
+                }
+                ContentBlock::ToolSearchToolResult { content, .. }
+                | ContentBlock::CodeExecutionToolResult { content, .. } => {
+                    let _ = redact_sensitive_json_string_leaves(content, &sensitive_values);
                 }
                 _ => {}
             }
@@ -173,12 +200,23 @@ fn project_messages_for_durable_history_snapshot(
     projected
 }
 
-fn collect_typed_user_input_free_text_values(value: &Value, values: &mut HashSet<String>) {
+fn project_messages_for_durable_history_snapshot(
+    messages: &[Message],
+    prior_sensitive_values: &HashSet<String>,
+) -> Vec<Message> {
+    redacted_durable_history_clone(messages, prior_sensitive_values)
+}
+
+fn collect_typed_user_input_free_text_values(
+    value: &Value,
+    request: Option<&crate::tools::user_input::UserInputRequest>,
+    values: &mut HashSet<String>,
+) {
     if let Ok(response) =
         serde_json::from_value::<crate::tools::user_input::UserInputResponse>(value.clone())
     {
         for answer in response.answers {
-            if let Some(value) = meaningful_user_input_free_text(&answer) {
+            if let Some(value) = meaningful_user_input_free_text(request, &answer) {
                 values.insert(value.to_string());
             }
         }
@@ -187,24 +225,47 @@ fn collect_typed_user_input_free_text_values(value: &Value, values: &mut HashSet
     match value {
         Value::Array(items) => {
             for item in items {
-                collect_typed_user_input_free_text_values(item, values);
+                collect_typed_user_input_free_text_values(item, request, values);
             }
         }
         Value::Object(object) => {
             for value in object.values() {
-                collect_typed_user_input_free_text_values(value, values);
+                collect_typed_user_input_free_text_values(value, request, values);
             }
         }
         _ => {}
     }
 }
 
-fn meaningful_user_input_free_text(
-    answer: &crate::tools::user_input::UserInputAnswer,
-) -> Option<&str> {
+fn meaningful_user_input_free_text<'a>(
+    request: Option<&crate::tools::user_input::UserInputRequest>,
+    answer: &'a crate::tools::user_input::UserInputAnswer,
+) -> Option<&'a str> {
     let value = answer.value.trim();
     let label = answer.label.trim();
-    if value.is_empty() || value.eq_ignore_ascii_case(label) {
+    if value.is_empty() {
+        return None;
+    }
+    if let Some(question) = request.and_then(|request| {
+        request
+            .questions
+            .iter()
+            .find(|question| question.id == answer.id)
+    }) {
+        // Fixed selections are public control-plane values. Anything else is
+        // user-authored free text, including malformed clients that submit a
+        // custom value when allow_free_text is false. Fail closed here: the
+        // request itself gives us stronger provenance than value length.
+        if question
+            .options
+            .iter()
+            .any(|option| value.eq_ignore_ascii_case(option.label.trim()))
+        {
+            return None;
+        }
+        return Some(value);
+    }
+    if value.eq_ignore_ascii_case(label) {
         return None;
     }
     let normalized = value.to_ascii_lowercase();
@@ -226,10 +287,33 @@ fn meaningful_user_input_free_text(
     ) {
         return None;
     }
-    if label.eq_ignore_ascii_case("other") || value.chars().count() >= 8 {
-        Some(value)
-    } else {
-        None
+    // Legacy/malformed history lacks the matching typed request. Treat every
+    // non-control custom value as sensitive regardless of length.
+    Some(value)
+}
+
+fn collect_sensitive_user_input_response_values(
+    request: &crate::tools::user_input::UserInputRequest,
+    response: &crate::tools::user_input::UserInputResponse,
+    values: &mut HashSet<String>,
+) {
+    for answer in &response.answers {
+        if let Some(value) = meaningful_user_input_free_text(Some(request), answer) {
+            values.insert(value.to_string());
+        }
+    }
+}
+
+fn redact_sensitive_json_string_leaves(value: &mut Value, sensitive_values: &[String]) -> bool {
+    match value {
+        Value::String(text) => redact_sensitive_user_input_values(text, sensitive_values),
+        Value::Array(values) => values.iter_mut().fold(false, |changed, value| {
+            redact_sensitive_json_string_leaves(value, sensitive_values) || changed
+        }),
+        Value::Object(values) => values.values_mut().fold(false, |changed, value| {
+            redact_sensitive_json_string_leaves(value, sensitive_values) || changed
+        }),
+        Value::Null | Value::Bool(_) | Value::Number(_) => false,
     }
 }
 
@@ -1648,6 +1732,10 @@ struct ActiveThreadState {
     active_turn: Option<ActiveTurnState>,
     route_identity: ProviderIdentity,
     route_model: String,
+    /// Raw free-text answers exist only for the lifetime of the live engine.
+    /// Durable history is already redacted, so this set is deliberately not
+    /// serialized or reconstructed after eviction/restart.
+    sensitive_user_input_values: HashSet<String>,
     /// Real engines client-preflight before an in-progress record is written.
     /// Explicitly injected test engines own their client seam.
     client_preflight_required: bool,
@@ -2116,6 +2204,27 @@ impl RuntimeThreadManager {
         );
     }
 
+    async fn sensitive_user_input_values_for_thread(&self, thread_id: &str) -> HashSet<String> {
+        self.active
+            .lock()
+            .await
+            .engines
+            .get(thread_id)
+            .map(|state| state.sensitive_user_input_values.clone())
+            .unwrap_or_default()
+    }
+
+    async fn extend_sensitive_user_input_values(
+        &self,
+        thread_id: &str,
+        values: impl IntoIterator<Item = String>,
+    ) {
+        let mut active = self.active.lock().await;
+        if let Some(state) = active.engines.get_mut(thread_id) {
+            state.sensitive_user_input_values.extend(values);
+        }
+    }
+
     fn claim_pending_user_input(&self, thread_id: &str, input_id: &str) -> PendingUserInputClaim {
         let mut pending = self.pending_user_inputs.lock();
         let Some(entry) = pending.get_mut(&(thread_id.to_string(), input_id.to_string())) else {
@@ -2548,6 +2657,19 @@ impl RuntimeThreadManager {
         request: PendingUserInputRequest,
         outcome: UserInputTerminalOutcome,
     ) -> Result<bool> {
+        if let UserInputTerminalOutcome::Answered(response) = &outcome {
+            let mut sensitive_values = HashSet::new();
+            collect_sensitive_user_input_response_values(
+                &request.request,
+                response,
+                &mut sensitive_values,
+            );
+            // Record provenance before any public settlement projection or
+            // engine delivery. A failed receipt may over-redact for this live
+            // engine lifetime, which is the safe failure direction.
+            self.extend_sensitive_user_input_values(thread_id, sensitive_values)
+                .await;
+        }
         let projection_lock = self.projection_lock(thread_id);
         let _projection = projection_lock.lock().await;
         let (event, payload) = match &outcome {
@@ -3876,10 +3998,16 @@ impl RuntimeThreadManager {
             .load_thread(thread_id)
             .with_context(|| format!("Thread not found: {thread_id}"))?;
         let now = Utc::now();
+        let mut seeded_sensitive_values = HashSet::new();
+        collect_sensitive_user_input_values(messages, &mut seeded_sensitive_values);
+        // Public seed items and the private checkpoint must be projections of
+        // the same redacted clone. Never flatten the raw imported transcript
+        // before discovering request/response provenance.
+        let redacted_messages = redacted_durable_history_clone(messages, &seeded_sensitive_values);
         let runtime_history_snapshot = messages
             .iter()
             .any(|message| message.role == crate::compaction::RUNTIME_HISTORY_ROLE)
-            .then(|| messages.to_vec());
+            .then(|| redacted_messages.clone());
 
         // Group messages into turns. A turn starts with a user message and
         // includes all subsequent assistant messages (which may contain
@@ -3887,7 +4015,7 @@ impl RuntimeThreadManager {
         let mut turns: Vec<TurnSeed> = Vec::new();
         let mut current_turn: Option<TurnSeed> = None;
 
-        for msg in messages {
+        for msg in &redacted_messages {
             match msg.role.as_str() {
                 "user" => {
                     let mut user_text = String::new();
@@ -4214,11 +4342,6 @@ impl RuntimeThreadManager {
                 started_at: Some(now),
                 ended_at: Some(now),
             };
-            let mut seeded_sensitive_values = HashSet::new();
-            collect_sensitive_user_input_values(
-                &runtime_history_snapshot,
-                &mut seeded_sensitive_values,
-            );
             // Attach a metadata-free lifecycle item first. If publishing the
             // new private checkpoint fails, any prior checkpoint remains
             // referenced and recoverable.
@@ -5451,6 +5574,7 @@ impl RuntimeThreadManager {
                     active_turn: None,
                     route_identity,
                     route_model,
+                    sensitive_user_input_values: HashSet::new(),
                     client_preflight_required: true,
                 },
             );
@@ -5753,7 +5877,9 @@ impl RuntimeThreadManager {
         let mut compaction_items: HashMap<String, String> = HashMap::new();
         let mut history_snapshot_item_ids: Vec<String> = Vec::new();
         let mut latest_session_messages: Option<Vec<Message>> = None;
-        let mut sensitive_user_input_values: HashSet<String> = HashSet::new();
+        let mut sensitive_user_input_values = self
+            .sensitive_user_input_values_for_thread(&thread_id)
+            .await;
         let mut turn_usage: Option<Usage> = None;
         let mut turn_base_url: Option<String> = None;
         let mut turn_status: Option<RuntimeTurnStatus> = None;
@@ -6114,6 +6240,10 @@ impl RuntimeThreadManager {
                         item.summary = summarize_text(&message, SUMMARY_LIMIT);
                         item.detail = Some(message);
                         if let Some(messages) = latest_session_messages.as_ref() {
+                            sensitive_user_input_values.extend(
+                                self.sensitive_user_input_values_for_thread(&thread_id)
+                                    .await,
+                            );
                             self.set_latest_compaction_history_snapshot(
                                 &thread_id,
                                 &mut item,
@@ -6152,6 +6282,10 @@ impl RuntimeThreadManager {
                         item.summary = summarize_text(&message, SUMMARY_LIMIT);
                         item.detail = Some(message);
                         if let Some(messages) = latest_session_messages.as_ref() {
+                            sensitive_user_input_values.extend(
+                                self.sensitive_user_input_values_for_thread(&thread_id)
+                                    .await,
+                            );
                             // Emergency recovery can rewrite and locally trim
                             // history yet still miss its target budget. The
                             // failed status is truthful, but the durable
@@ -6549,6 +6683,11 @@ impl RuntimeThreadManager {
                         &messages,
                         &mut sensitive_user_input_values,
                     );
+                    self.extend_sensitive_user_input_values(
+                        &thread_id,
+                        sensitive_user_input_values.iter().cloned(),
+                    )
+                    .await;
                     latest_session_messages = Some(messages);
                 }
                 EngineEvent::Status { message } => {
@@ -6615,6 +6754,10 @@ impl RuntimeThreadManager {
                         history_snapshot_item_ids.last(),
                         latest_session_messages.as_ref(),
                     ) {
+                        sensitive_user_input_values.extend(
+                            self.sensitive_user_input_values_for_thread(&thread_id)
+                                .await,
+                        );
                         // Capture the exact terminal engine history on the
                         // final compaction boundary. This includes synthetic
                         // goal continuations and runtime-owned messages added
@@ -7024,6 +7167,7 @@ impl RuntimeThreadManager {
                 active_turn: None,
                 route_identity: route.identity,
                 route_model: route.model,
+                sensitive_user_input_values: HashSet::new(),
                 client_preflight_required: false,
             },
         );
