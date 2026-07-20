@@ -4769,35 +4769,48 @@ impl EnvRuntimeOverrides {
             verbosity: std::env::var("CODEWHALE_VERBOSITY")
                 .or_else(|_| std::env::var("DEEPSEEK_VERBOSITY"))
                 .ok(),
-            output_mode: std::env::var("DEEPSEEK_OUTPUT_MODE").ok(),
-            auth_mode: std::env::var("DEEPSEEK_AUTH_MODE").ok(),
-            log_level: std::env::var("DEEPSEEK_LOG_LEVEL").ok(),
-            telemetry: std::env::var("DEEPSEEK_TELEMETRY")
+            output_mode: std::env::var("CODEWHALE_OUTPUT_MODE")
+                .or_else(|_| std::env::var("DEEPSEEK_OUTPUT_MODE"))
+                .ok(),
+            auth_mode: std::env::var("CODEWHALE_AUTH_MODE")
+                .or_else(|_| std::env::var("DEEPSEEK_AUTH_MODE"))
+                .ok(),
+            log_level: std::env::var("CODEWHALE_LOG_LEVEL")
+                .or_else(|_| std::env::var("DEEPSEEK_LOG_LEVEL"))
+                .ok(),
+            telemetry: std::env::var("CODEWHALE_TELEMETRY")
+                .or_else(|_| std::env::var("DEEPSEEK_TELEMETRY"))
                 .ok()
                 .and_then(|v| match parse_bool(&v) {
                     Ok(b) => Some(b),
                     Err(_) => {
-                        tracing::warn!("Invalid DEEPSEEK_TELEMETRY value '{v}', expected true/false");
+                        tracing::warn!("Invalid CODEWHALE_TELEMETRY/DEEPSEEK_TELEMETRY value '{v}', expected true/false");
                         None
                     }
                 }),
-            approval_policy: std::env::var("DEEPSEEK_APPROVAL_POLICY").ok(),
-            sandbox_mode: std::env::var("DEEPSEEK_SANDBOX_MODE").ok(),
-            yolo: std::env::var("DEEPSEEK_YOLO")
+            approval_policy: std::env::var("CODEWHALE_APPROVAL_POLICY")
+                .or_else(|_| std::env::var("DEEPSEEK_APPROVAL_POLICY"))
+                .ok(),
+            sandbox_mode: std::env::var("CODEWHALE_SANDBOX_MODE")
+                .or_else(|_| std::env::var("DEEPSEEK_SANDBOX_MODE"))
+                .ok(),
+            yolo: std::env::var("CODEWHALE_YOLO")
+                .or_else(|_| std::env::var("DEEPSEEK_YOLO"))
                 .ok()
                 .and_then(|v| match parse_bool(&v) {
                     Ok(b) => Some(b),
                     Err(_) => {
-                        tracing::warn!("Invalid DEEPSEEK_YOLO value '{v}', expected true/false");
+                        tracing::warn!("Invalid CODEWHALE_YOLO/DEEPSEEK_YOLO value '{v}', expected true/false");
                         None
                     }
                 }),
-            http_headers: std::env::var("DEEPSEEK_HTTP_HEADERS")
+            http_headers: std::env::var("CODEWHALE_HTTP_HEADERS")
+                .or_else(|_| std::env::var("DEEPSEEK_HTTP_HEADERS"))
                 .ok()
                 .and_then(|value| match parse_http_headers(&value) {
                     Ok(h) => Some(h),
                     Err(_) => {
-                        tracing::warn!("Invalid DEEPSEEK_HTTP_HEADERS value, expected format: header1=val1,header2=val2");
+                        tracing::warn!("Invalid CODEWHALE_HTTP_HEADERS/DEEPSEEK_HTTP_HEADERS value, expected format: header1=val1,header2=val2");
                         None
                     }
                 })
