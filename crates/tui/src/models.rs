@@ -296,8 +296,13 @@ fn known_context_window_for_model(model_lower: &str) -> Option<u32> {
         | "qwen/qwen3.6-35b-a3b"
         | "qwen/qwen3.6-max-preview"
         | "qwen/qwen3.6-27b"
-        | "tencent/hy3-preview"
-        | "moonshotai/kimi-k2.7-code"
+        | "tencent/hy3-preview" => Some(262_144),
+        // Official Kimi K3 platform pricing (2026-07-20):
+        // https://platform.kimi.ai/docs/pricing/chat-k3 — 1,048,576 context.
+        // Bare `k3` is the Kimi Code membership route id for the same K3
+        // contract; do not fall through to the 128K legacy default.
+        "moonshotai/kimi-k3" | "kimi-k3" | "k3" | "opencode-go/kimi-k3" => Some(1_048_576),
+        "moonshotai/kimi-k2.7-code"
         | "moonshotai/kimi-k2.6"
         | "moonshotai/kimi-k2.6:free"
         | "kimi-k2.7-code"
@@ -365,6 +370,9 @@ pub fn max_output_tokens_for_model(model: &str) -> Option<u32> {
         }
         "claude-haiku-4-5" => Some(64_000),
         "arcee-ai/trinity-large-thinking" | "trinity-large-thinking" => Some(262_144),
+        // Kimi K3 max generation is 131K; context is 1M. Keep them separate so
+        // UI/budget code never treats max output as the context window.
+        "moonshotai/kimi-k3" | "kimi-k3" | "k3" | "opencode-go/kimi-k3" => Some(131_072),
         // Kimi K2.7 Code has a 256K context window but its documented default
         // maximum generation is 32K. Keeping those separate prevents the
         // input budget from collapsing to the 1K emergency floor (#4368).
@@ -978,6 +986,29 @@ mod tests {
             Some(131_072)
         );
         assert_eq!(max_output_tokens_for_model("glm-5-turbo"), Some(131_072));
+    }
+
+    #[test]
+    fn bare_k3_membership_id_uses_1m_context_not_legacy_128k() {
+        assert_eq!(context_window_for_model("k3"), Some(1_048_576));
+        assert_eq!(context_window_for_model("kimi-k3"), Some(1_048_576));
+        assert_eq!(
+            context_window_for_model("opencode-go/kimi-k3"),
+            Some(1_048_576)
+        );
+        assert_eq!(
+            max_output_tokens_for_model("k3"),
+            Some(crate::config::KIMI_K3_MAX_OUTPUT_TOKENS)
+        );
+        assert_eq!(
+            max_output_tokens_for_model("kimi-k3"),
+            Some(crate::config::KIMI_K3_MAX_OUTPUT_TOKENS)
+        );
+        // Never project max output as the context window.
+        assert_ne!(
+            context_window_for_model("k3"),
+            max_output_tokens_for_model("k3")
+        );
     }
 
     #[test]
