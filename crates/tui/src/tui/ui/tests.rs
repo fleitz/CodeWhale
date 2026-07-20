@@ -13516,6 +13516,148 @@ fn apply_loaded_session_rebuilds_exact_adaptive_tool_detail() {
     assert!(copied.contains(raw), "{copied}");
 }
 
+#[tokio::test(flavor = "current_thread")]
+#[allow(clippy::await_holding_lock)] // Serializes the process-global artifact-root override.
+async fn turn_complete_then_late_artifact_survives_shutdown_reload_with_exact_details() {
+    let _root_guard = crate::artifacts::TEST_ARTIFACT_SESSIONS_GUARD
+        .lock()
+        .unwrap_or_else(|error| error.into_inner());
+    let dir = tempfile::tempdir().expect("tempdir");
+    let sessions_dir = dir.path().join("sessions");
+    let prior = crate::artifacts::set_test_artifact_sessions_root(Some(sessions_dir.clone()));
+    struct ArtifactRootReset(Option<PathBuf>);
+    impl Drop for ArtifactRootReset {
+        fn drop(&mut self) {
+            crate::artifacts::set_test_artifact_sessions_root(self.0.take());
+        }
+    }
+    let _reset = ArtifactRootReset(prior);
+
+    let session_id = "late-detached-artifact-session";
+    let tool_call_id = "call-late-detached";
+    let raw = "first line\n    two  spaces\n\texact-tab\nCW_LATE_RELOAD_SENTINEL\n";
+    let sha = crate::hashing::sha256_hex(raw.as_bytes());
+    let artifact_id = format!("art_output_{sha}_0123456789ab");
+    let (absolute_path, relative_path) =
+        crate::artifacts::write_session_artifact(session_id, &artifact_id, raw)
+            .expect("write canonical artifact");
+    let envelope = serde_json::json!({
+        "schema": crate::tools::large_output_router::EVIDENCE_SCHEMA,
+        "status": "success",
+        "tool": "run_tests",
+        "payload_kind": "text",
+        "bytes": raw.len(),
+        "estimated_tokens": 24,
+        "handle": format!("output_{sha}_0123456789ab"),
+        "sha256": sha,
+        "facts": [],
+        "preview": {"head": "first line", "tail": "CW_LATE_RELOAD_SENTINEL"},
+        "inspect": {
+            "tool": "handle_read",
+            "operations": ["count", "slice", "range", "search", "introspect"]
+        },
+        "evidence_available": true
+    })
+    .to_string();
+    let mut app = create_test_app();
+    app.current_session_id = Some(session_id.to_string());
+    app.api_messages = vec![
+        Message {
+            role: "assistant".to_string(),
+            content: vec![ContentBlock::ToolUse {
+                id: tool_call_id.to_string(),
+                name: "run_tests".to_string(),
+                input: serde_json::json!({"package": "codewhale-tui"}),
+                caller: None,
+            }],
+        },
+        Message {
+            role: "user".to_string(),
+            content: vec![ContentBlock::ToolResult {
+                tool_use_id: tool_call_id.to_string(),
+                content: envelope.clone(),
+                is_error: Some(false),
+                content_blocks: None,
+            }],
+        },
+    ];
+    let manager =
+        crate::session_manager::SessionManager::new(sessions_dir.clone()).expect("manager");
+    let verification_manager =
+        crate::session_manager::SessionManager::new(sessions_dir).expect("verification manager");
+    let (handle, task) = persistence_actor::spawn_persistence_actor(manager);
+
+    // Exact production ordering under regression: the root TurnComplete
+    // queues its sole snapshot before the detached artifact event arrives.
+    let completed_snapshot = build_session_snapshot(
+        &mut app,
+        &crate::session_manager::SessionManager::new(dir.path().join("snapshot-helper"))
+            .expect("snapshot helper"),
+    )
+    .expect("TurnComplete snapshot");
+    assert!(completed_snapshot.artifacts.is_empty());
+    handle.try_send(PersistRequest::SessionSnapshot(completed_snapshot));
+
+    let late_result = crate::tools::spec::ToolResult::success(envelope.clone()).with_metadata(
+        serde_json::json!({
+            "spillover_path": absolute_path.display().to_string(),
+            "artifact_session_id": session_id,
+            "artifact_relative_path": crate::artifacts::format_artifact_relative_path(&relative_path),
+            "artifact_byte_size": raw.len() as u64,
+            "artifact_preview": "first line ... CW_LATE_RELOAD_SENTINEL",
+            "artifact_id": artifact_id,
+            "adaptive_evidence": {
+                "artifact_session_id": session_id,
+                "artifact_relative_path": crate::artifacts::format_artifact_relative_path(&relative_path),
+                "artifact_path": absolute_path.display().to_string(),
+                "sha256": sha,
+                "bytes": raw.len() as u64,
+                "details_available": true
+            }
+        }),
+    );
+    let artifact = crate::tui::tool_routing::handle_tool_artifact_stored(
+        &mut app,
+        tool_call_id,
+        "run_tests",
+        &serde_json::json!({"package": "codewhale-tui"}),
+        &late_result,
+        None,
+        Some("detached-agent"),
+    )
+    .expect("late artifact record");
+    app.is_loading = false;
+    app.runtime_turn_status = Some("completed".to_string());
+    let late_request = late_artifact_persist_request(&app, Some(artifact))
+        .expect("completed turn must persist its late artifact");
+    handle.try_send(late_request);
+
+    // Graceful shutdown is the durability boundary used by the real TUI.
+    handle.try_send(PersistRequest::Shutdown);
+    task.await.expect("persistence actor shutdown");
+
+    let loaded = verification_manager
+        .load_session(session_id)
+        .expect("reload completed session");
+    assert_eq!(loaded.artifacts.len(), 1);
+    let mut restored = create_test_app();
+    apply_loaded_session(&mut restored, &mut Config::default(), &loaded).expect("restore session");
+    let (&cell_index, details) = restored
+        .tool_details_by_cell
+        .iter()
+        .next()
+        .expect("restored Alt/Option+V detail");
+    assert_eq!(details[0].tool_id, tool_call_id);
+    assert!(open_details_pager_for_cell(&mut restored, cell_index));
+    let body = pop_pager_body(&mut restored);
+    assert!(
+        body.as_bytes()
+            .windows(raw.len())
+            .any(|window| window == raw.as_bytes()),
+        "Alt/Option+V lost exact artifact bytes: {body:?}"
+    );
+}
+
 #[test]
 fn apply_loaded_session_keeps_unmatched_failed_artifact_truthful() {
     let _root_guard = crate::artifacts::TEST_ARTIFACT_SESSIONS_GUARD

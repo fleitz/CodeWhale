@@ -30,10 +30,12 @@
 //!   `SavedSession` values in the channel (< 1 MB) is negligible pressure.
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::path::PathBuf;
 use std::sync::OnceLock;
 
 use tokio::sync::{mpsc, oneshot};
 
+use crate::artifacts::ArtifactRecord;
 use crate::session_manager::{OfflineQueueState, SavedSession, SessionManager};
 use crate::utils::spawn_supervised;
 
@@ -49,6 +51,13 @@ pub enum PersistRequest {
     SaveCheckpoint { session: SavedSession },
     /// Write a full session snapshot (completed turn, durable save).
     SessionSnapshot(SavedSession),
+    /// Merge one late-arriving exact-output artifact into an already queued
+    /// or durable session. Artifact records are monotonic for the actor's
+    /// lifetime so a subsequently queued stale snapshot cannot erase them.
+    SessionArtifactStored {
+        session_id: String,
+        artifact: ArtifactRecord,
+    },
     /// Write queued/draft offline input for crash recovery.
     OfflineQueue {
         state: OfflineQueueState,
@@ -241,6 +250,13 @@ struct PendingState {
     /// drop session A when an immediate `/new` queues session B before
     /// the actor drains.
     sessions: BTreeMap<String, SavedSession>,
+    /// Monotonic artifact overlays accepted by this actor, keyed by owning
+    /// session and stable artifact id. These deliberately survive write
+    /// cycles so a later stale `SessionSnapshot` cannot erase an artifact.
+    artifact_overlays: BTreeMap<String, BTreeMap<(String, PathBuf), ArtifactRecord>>,
+    /// Sessions whose overlays contain a newly accepted artifact that has not
+    /// yet been merged into the durable session file.
+    dirty_artifact_sessions: BTreeSet<String>,
     offline_queue: Option<PendingOfflineQueue>,
 }
 
@@ -265,6 +281,19 @@ impl PendingState {
             }
             PersistRequest::SessionSnapshot(session) => {
                 self.sessions.insert(session.metadata.id.clone(), session);
+            }
+            PersistRequest::SessionArtifactStored {
+                session_id,
+                artifact,
+            } => {
+                self.artifact_overlays
+                    .entry(session_id.clone())
+                    .or_default()
+                    .insert(
+                        (artifact.tool_call_id.clone(), artifact.storage_path.clone()),
+                        artifact,
+                    );
+                self.dirty_artifact_sessions.insert(session_id);
             }
             PersistRequest::OfflineQueue { state, session_id } => {
                 self.offline_queue = Some(PendingOfflineQueue::Save {
@@ -304,17 +333,34 @@ fn flush_inner(manager: &SessionManager, pending: &mut PendingState) -> FlushRep
             manager.clear_session_checkpoint(&session_id),
         );
     }
-    for (session_id, session) in std::mem::take(&mut pending.checkpoints) {
+    for (session_id, mut session) in std::mem::take(&mut pending.checkpoints) {
+        let overlay = pending.artifact_overlays.get(&session_id);
+        match validate_artifact_overlay(&session_id, overlay) {
+            Ok(()) => merge_artifact_overlay(&mut session, overlay),
+            Err(error) => record(format!("checkpoint-artifact:{session_id}"), Err(error)),
+        }
         record(
             format!("checkpoint:{session_id}"),
             manager.save_checkpoint(&session).map(|_| ()),
         );
     }
-    for (session_id, session) in std::mem::take(&mut pending.sessions) {
-        record(
-            format!("session:{session_id}"),
-            manager.save_session(&session).map(|_| ()),
+    for (session_id, mut session) in std::mem::take(&mut pending.sessions) {
+        let overlay = pending.artifact_overlays.get(&session_id);
+        match validate_artifact_overlay(&session_id, overlay) {
+            Ok(()) => merge_artifact_overlay(&mut session, overlay),
+            Err(error) => record(format!("session-artifact:{session_id}"), Err(error)),
+        }
+        let result = manager.save_session(&session).map(|_| ());
+        pending.dirty_artifact_sessions.remove(&session_id);
+        record(format!("session:{session_id}"), result);
+    }
+    for session_id in std::mem::take(&mut pending.dirty_artifact_sessions) {
+        let result = merge_artifacts_into_durable_session(
+            manager,
+            &session_id,
+            pending.artifact_overlays.get(&session_id),
         );
+        record(format!("session-artifact:{session_id}"), result);
     }
     if let Some(request) = pending.offline_queue.take() {
         match request {
@@ -331,6 +377,56 @@ fn flush_inner(manager: &SessionManager, pending: &mut PendingState) -> FlushRep
         }
     }
     report
+}
+
+fn merge_artifact_overlay(
+    session: &mut SavedSession,
+    overlay: Option<&BTreeMap<(String, PathBuf), ArtifactRecord>>,
+) {
+    let Some(overlay) = overlay else { return };
+    for artifact in overlay.values() {
+        if let Some(existing) = session.artifacts.iter_mut().find(|existing| {
+            existing.tool_call_id == artifact.tool_call_id
+                && existing.storage_path == artifact.storage_path
+        }) {
+            *existing = artifact.clone();
+        } else {
+            session.artifacts.push(artifact.clone());
+        }
+    }
+}
+
+fn merge_artifacts_into_durable_session(
+    manager: &SessionManager,
+    session_id: &str,
+    overlay: Option<&BTreeMap<(String, PathBuf), ArtifactRecord>>,
+) -> std::io::Result<()> {
+    validate_artifact_overlay(session_id, overlay)?;
+    let mut session = manager.load_session(session_id)?;
+    merge_artifact_overlay(&mut session, overlay);
+    manager.save_session(&session).map(|_| ())
+}
+
+fn validate_artifact_overlay(
+    session_id: &str,
+    overlay: Option<&BTreeMap<(String, PathBuf), ArtifactRecord>>,
+) -> std::io::Result<()> {
+    let Some(overlay) = overlay else {
+        return Ok(());
+    };
+    for artifact in overlay.values() {
+        if artifact.session_id != session_id
+            || artifact.storage_path.is_absolute()
+            || crate::artifacts::open_session_artifact_for_read(session_id, &artifact.storage_path)
+                .is_err()
+        {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                "late artifact is not confined to its owning session",
+            ));
+        }
+    }
+    Ok(())
 }
 
 /// Surface flush failures in the log for write cycles that have no caller
@@ -476,6 +572,70 @@ mod tests {
                 .title,
             "Session B"
         );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    #[allow(clippy::await_holding_lock)] // Serializes the process-global artifact-root override.
+    async fn late_artifact_overlay_survives_a_newer_stale_session_snapshot() {
+        let _root_guard = crate::artifacts::TEST_ARTIFACT_SESSIONS_GUARD
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let sessions_dir = tmp.path().join("sessions");
+        let prior = crate::artifacts::set_test_artifact_sessions_root(Some(sessions_dir.clone()));
+        struct ArtifactRootReset(Option<PathBuf>);
+        impl Drop for ArtifactRootReset {
+            fn drop(&mut self) {
+                crate::artifacts::set_test_artifact_sessions_root(self.0.take());
+            }
+        }
+        let _reset = ArtifactRootReset(prior);
+
+        let manager = SessionManager::new(sessions_dir.clone()).expect("manager");
+        let verification_manager = SessionManager::new(sessions_dir).expect("verification manager");
+        let mut stale = crate::session_manager::create_saved_session_with_mode(
+            &[],
+            "deepseek-v4-pro",
+            tmp.path(),
+            0,
+            None,
+            Some("agent"),
+        );
+        stale.metadata.id = "late-artifact-stale-snapshot".to_string();
+        let raw = "CW_LATE_STALE_SENTINEL\n    exact spacing\n";
+        let artifact_id = "art_late_stale";
+        let (_, relative_path) =
+            crate::artifacts::write_session_artifact(&stale.metadata.id, artifact_id, raw)
+                .expect("write artifact");
+        let artifact = ArtifactRecord {
+            id: artifact_id.to_string(),
+            kind: crate::artifacts::ArtifactKind::ToolOutput,
+            session_id: stale.metadata.id.clone(),
+            tool_call_id: "call-late-stale".to_string(),
+            tool_name: "run_tests".to_string(),
+            success: Some(true),
+            created_at: chrono::Utc::now(),
+            byte_size: raw.len() as u64,
+            preview: "CW_LATE_STALE_SENTINEL".to_string(),
+            storage_path: relative_path,
+        };
+        let (handle, task) = spawn_persistence_actor(manager);
+
+        handle.try_send(PersistRequest::SessionSnapshot(stale.clone()));
+        handle.try_send(PersistRequest::SessionArtifactStored {
+            session_id: stale.metadata.id.clone(),
+            artifact: artifact.clone(),
+        });
+        // A full snapshot built before the late event must not win merely
+        // because it was enqueued afterward by another persistence path.
+        handle.try_send(PersistRequest::SessionSnapshot(stale.clone()));
+        handle.try_send(PersistRequest::Shutdown);
+        task.await.expect("persistence actor join");
+
+        let loaded = verification_manager
+            .load_session(&stale.metadata.id)
+            .expect("load durable session");
+        assert_eq!(loaded.artifacts, vec![artifact]);
     }
 
     #[tokio::test]

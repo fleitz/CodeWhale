@@ -2823,7 +2823,7 @@ async fn run_event_loop(
                         parent_tool_id,
                         owner_agent_id,
                     } => {
-                        crate::tui::tool_routing::handle_tool_artifact_stored(
+                        let late_artifact = crate::tui::tool_routing::handle_tool_artifact_stored(
                             app,
                             &id,
                             &name,
@@ -2832,6 +2832,20 @@ async fn run_event_loop(
                             parent_tool_id.as_deref(),
                             owner_agent_id.as_deref(),
                         );
+                        // Root TurnComplete may precede detached/background
+                        // child evidence. The completed-turn snapshot is
+                        // already queued at that point, and idle recovery
+                        // snapshots intentionally stop. Merge the late record
+                        // through the same serialized actor so shutdown waits
+                        // for it and no direct-write race can overwrite it.
+                        if let Some(request) = late_artifact_persist_request(app, late_artifact)
+                            && !persistence_actor::try_persist(request)
+                        {
+                            tracing::warn!(
+                                tool_call_id = %id,
+                                "late tool artifact could not be queued for session persistence"
+                            );
+                        }
                     }
                     EngineEvent::TurnStarted { turn_id, .. } => {
                         app.ocean_completion_started_at = None;
@@ -7130,6 +7144,23 @@ fn build_session_snapshot(
     session.last_auto_route = app.auto_route_for_persistence();
     app.current_session_metadata = Some(session.metadata.clone());
     Ok(session)
+}
+
+fn late_artifact_persist_request(
+    app: &App,
+    artifact: Option<crate::artifacts::ArtifactRecord>,
+) -> Option<PersistRequest> {
+    let artifact = artifact?;
+    let turn_is_complete =
+        !app.is_loading && !matches!(app.runtime_turn_status.as_deref(), Some("in_progress"));
+    if !turn_is_complete || app.current_session_id.as_deref() != Some(artifact.session_id.as_str())
+    {
+        return None;
+    }
+    Some(PersistRequest::SessionArtifactStored {
+        session_id: artifact.session_id.clone(),
+        artifact,
+    })
 }
 
 fn is_work_graph_mutation_tool(name: &str) -> bool {

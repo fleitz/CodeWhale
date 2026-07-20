@@ -495,8 +495,8 @@ fn record_spillover_artifact_if_any(
     id: &str,
     name: &str,
     result: &Result<ToolResult, ToolError>,
-) {
-    let Ok(tool_result) = result else { return };
+) -> Option<crate::artifacts::ArtifactRecord> {
+    let Ok(tool_result) = result else { return None };
     // Read-repeat followers reuse the leader's already-indexed artifact. They
     // carry its metadata so their live detail view remains useful, but must
     // not create a second persisted ArtifactRecord for the same canonical
@@ -508,17 +508,14 @@ fn record_spillover_artifact_if_any(
         .and_then(serde_json::Value::as_bool)
         .is_some_and(|executed| !executed)
     {
-        return;
+        return None;
     }
-    let Some(path) = tool_result
+    let path = tool_result
         .metadata
         .as_ref()
         .and_then(|metadata| metadata.get("spillover_path"))
         .and_then(serde_json::Value::as_str)
-        .map(PathBuf::from)
-    else {
-        return;
-    };
+        .map(PathBuf::from)?;
     let metadata = tool_result.metadata.as_ref();
     let session_id = metadata
         .and_then(|metadata| metadata.get("artifact_session_id"))
@@ -547,7 +544,7 @@ fn record_spillover_artifact_if_any(
         .iter()
         .any(|artifact| artifact.tool_call_id == id && artifact.storage_path == storage_path)
     {
-        return;
+        return None;
     }
     let mut record = crate::artifacts::record_tool_output_artifact_with_size(
         session_id,
@@ -564,7 +561,8 @@ fn record_spillover_artifact_if_any(
     {
         record.id = artifact_id.to_string();
     }
-    app.session_artifacts.push(record);
+    app.session_artifacts.push(record.clone());
+    Some(record)
 }
 
 /// Index exact evidence produced by a nested tool without rendering another
@@ -578,8 +576,8 @@ pub(crate) fn handle_tool_artifact_stored(
     result: &ToolResult,
     parent_tool_id: Option<&str>,
     owner_agent_id: Option<&str>,
-) {
-    record_spillover_artifact_if_any(app, id, name, &Ok(result.clone()));
+) -> Option<crate::artifacts::ArtifactRecord> {
+    let stored_artifact = record_spillover_artifact_if_any(app, id, name, &Ok(result.clone()));
 
     let owner_cell = parent_tool_id
         .and_then(|parent_id| app.tool_cells.get(parent_id).copied())
@@ -587,7 +585,7 @@ pub(crate) fn handle_tool_artifact_stored(
             owner_agent_id.and_then(|agent_id| app.subagent_card_index.get(agent_id).copied())
         });
     let Some(cell_index) = owner_cell else {
-        return;
+        return stored_artifact;
     };
     let detail = ToolDetailRecord {
         tool_id: id.to_string(),
@@ -607,6 +605,7 @@ pub(crate) fn handle_tool_artifact_stored(
             .entry(id.to_string())
             .or_insert(detail);
     }
+    stored_artifact
 }
 
 /// #3031: shell/tasks tools embed the literal `"(no output)"` into successful
