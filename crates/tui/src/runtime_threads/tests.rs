@@ -7887,6 +7887,7 @@ fn compaction_history_snapshot_redacts_request_user_input_answers() {
 #[test]
 fn typed_user_input_provenance_redacts_short_free_text_but_keeps_long_fixed_option() {
     let short_secret = "123456";
+    let unknown_id_secret = "654321";
     let fixed_option = "All product surfaces";
     let messages = vec![
         Message {
@@ -7927,7 +7928,8 @@ fn typed_user_input_provenance_redacts_short_free_text_but_keeps_long_fixed_opti
                 content: json!({
                     "answers": [
                         {"id": "pin", "label": "Other", "value": short_secret},
-                        {"id": "scope", "label": "Scope", "value": fixed_option}
+                        {"id": "scope", "label": "Scope", "value": fixed_option},
+                        {"id": "unknown", "label": unknown_id_secret, "value": unknown_id_secret}
                     ]
                 })
                 .to_string(),
@@ -7940,6 +7942,7 @@ fn typed_user_input_provenance_redacts_short_free_text_but_keeps_long_fixed_opti
     let mut sensitive_values = HashSet::new();
     collect_sensitive_user_input_values(&messages, &mut sensitive_values);
     assert!(sensitive_values.contains(short_secret));
+    assert!(sensitive_values.contains(unknown_id_secret));
     assert!(!sensitive_values.contains(fixed_option));
 }
 
@@ -8105,9 +8108,251 @@ async fn seeded_runtime_history_redacts_private_and_public_resume_projections() 
     Ok(())
 }
 
+#[tokio::test(flavor = "current_thread")]
+async fn ordinary_sensitive_session_resume_uses_redacted_checkpoint_through_recompaction()
+-> Result<()> {
+    const SECRET: &str = "ordinary-resume-secret-317905";
+    let _env_lock = lock_test_env();
+    let owned_home = test_runtime_dir();
+    let _home = EnvVarGuard::set("CODEWHALE_HOME", &owned_home);
+    let runtime_dir = owned_home.join("runtime");
+    let provider_name = "ordinary-sensitive-resume";
+    let config = Config {
+        provider: Some(provider_name.to_string()),
+        providers: Some(crate::config::ProvidersConfig {
+            custom: std::collections::HashMap::from([(
+                provider_name.to_string(),
+                crate::config::ProviderConfig {
+                    kind: Some("openai-compatible".to_string()),
+                    base_url: Some("http://127.0.0.1:18193/v1".to_string()),
+                    model: Some("ordinary-resume-model".to_string()),
+                    api_key: Some("local-test-key".to_string()),
+                    ..Default::default()
+                },
+            )]),
+            ..Default::default()
+        }),
+        ..Default::default()
+    };
+    let manager = RuntimeThreadManager::open(
+        config.clone(),
+        PathBuf::from("."),
+        test_manager_config(runtime_dir.clone()),
+    )?;
+    let raw_messages = vec![
+        Message {
+            role: "assistant".to_string(),
+            content: vec![ContentBlock::ToolUse {
+                id: "ordinary-resume-input".to_string(),
+                name: REQUEST_USER_INPUT_TOOL_NAME.to_string(),
+                input: json!({
+                    "questions": [{
+                        "header": "Credential",
+                        "id": "credential",
+                        "question": "Enter the credential",
+                        "options": [
+                            {"label": "Skip", "description": "Skip it"},
+                            {"label": "Cancel", "description": "Cancel"}
+                        ],
+                        "allow_free_text": true
+                    }]
+                }),
+                caller: None,
+            }],
+        },
+        Message {
+            role: "user".to_string(),
+            content: vec![ContentBlock::ToolResult {
+                tool_use_id: "ordinary-resume-input".to_string(),
+                content: json!({
+                    "answers": [{
+                        "id": "credential",
+                        "label": "Other",
+                        "value": SECRET
+                    }]
+                })
+                .to_string(),
+                is_error: None,
+                content_blocks: None,
+            }],
+        },
+        Message {
+            role: "assistant".to_string(),
+            content: vec![ContentBlock::ToolUse {
+                id: "ordinary-echo".to_string(),
+                name: "exec_shell".to_string(),
+                input: json!({"command": format!("echo {SECRET}")}),
+                caller: None,
+            }],
+        },
+    ];
+    let session_id = "ordinary_sensitive_session";
+    let sessions = crate::session_manager::SessionManager::new(
+        crate::session_manager::default_sessions_dir()?,
+    )?;
+    let raw_session = crate::session_manager::create_saved_session_with_id_and_mode(
+        session_id.to_string(),
+        &raw_messages,
+        "ordinary-resume-model",
+        Path::new("."),
+        0,
+        None,
+        Some("agent"),
+    );
+    sessions.save_session(&raw_session)?;
+
+    let thread = manager
+        .create_thread(CreateThreadRequest {
+            model: Some("ordinary-resume-model".to_string()),
+            model_provider: Some("custom".to_string()),
+            model_provider_id: Some(provider_name.to_string()),
+            ..Default::default()
+        })
+        .await?;
+    manager
+        .seed_thread_from_messages(&thread.id, &raw_messages)
+        .await?;
+    manager
+        .set_thread_session_id(&thread.id, session_id)
+        .await?;
+
+    let seeded_detail = manager.get_thread_detail(&thread.id).await?;
+    assert!(!serde_json::to_string(&seeded_detail)?.contains(SECRET));
+    assert!(seeded_detail.items.iter().any(|item| {
+        item.kind == TurnItemKind::ContextCompaction
+            && item.summary == RESTORED_RUNTIME_HISTORY_RECEIPT
+    }));
+    let private_items = manager.store.list_items_for_turns_map(
+        &seeded_detail
+            .turns
+            .iter()
+            .map(|turn| turn.id.clone())
+            .collect::<Vec<_>>(),
+    )?;
+    assert!(
+        private_items
+            .values()
+            .flatten()
+            .any(item_has_compaction_history_snapshot)
+    );
+    assert!(!serde_json::to_string(&private_items)?.contains(SECRET));
+
+    // The linked session intentionally remains raw. Engine loading must still
+    // choose the authoritative private checkpoint and never sync those bytes.
+    let engine = manager.get_engine(&thread.id).await?;
+    let restored = engine.get_session_snapshot().await?;
+    assert!(!serde_json::to_string(&restored.messages)?.contains(SECRET));
+    assert!(serde_json::to_string(&restored.messages)?.contains("[redacted user input]"));
+    let removed = {
+        let mut active = manager.active.lock().await;
+        active.lru.retain(|id| id != &thread.id);
+        active.engines.remove(&thread.id)
+    }
+    .context("loaded engine was not active")?;
+    removed.engine.send(Op::Shutdown).await?;
+
+    let mut harness = install_mock_engine(&manager, &thread.id).await;
+    let turn = manager
+        .start_turn(
+            &thread.id,
+            StartTurnRequest {
+                prompt: "recompact the restored history".to_string(),
+                ..Default::default()
+            },
+        )
+        .await?;
+    assert!(matches!(
+        harness.rx_op.recv().await,
+        Some(Op::SendMessage { .. })
+    ));
+    harness
+        .tx_event
+        .send(EngineEvent::TurnStarted {
+            turn_id: turn.id.clone(),
+            created_at: Utc::now(),
+            route: None,
+        })
+        .await?;
+    harness
+        .tx_event
+        .send(EngineEvent::CompactionStarted {
+            id: "ordinary-recompaction".to_string(),
+            auto: true,
+            message: "ordinary recompaction".to_string(),
+        })
+        .await?;
+    harness
+        .tx_event
+        .send(EngineEvent::SessionUpdated {
+            session_id: session_id.to_string(),
+            messages: restored.messages,
+            system_prompt: None,
+            model: "ordinary-resume-model".to_string(),
+            workspace: PathBuf::from("."),
+        })
+        .await?;
+    harness
+        .tx_event
+        .send(EngineEvent::CompactionCompleted {
+            id: "ordinary-recompaction".to_string(),
+            auto: true,
+            message: "ordinary recompaction complete".to_string(),
+            messages_before: Some(3),
+            messages_after: Some(1),
+            summary_prompt: Some("summarize".to_string()),
+        })
+        .await?;
+    harness
+        .tx_event
+        .send(EngineEvent::TurnComplete {
+            usage: Usage::default(),
+            status: TurnOutcomeStatus::Completed,
+            error: None,
+            tool_catalog: None,
+            base_url: None,
+        })
+        .await?;
+    wait_for_terminal_turn(&manager, &turn.id, Duration::from_secs(2)).await?;
+
+    assert!(
+        !serde_json::to_string(&manager.get_thread_detail(&thread.id).await?)?.contains(SECRET)
+    );
+    assert!(!serde_json::to_string(&manager.events_since(&thread.id, None)?)?.contains(SECRET));
+    assert!(
+        !serde_json::to_string(&manager.messages_for_session_export(&thread.id).await?)?
+            .contains(SECRET)
+    );
+    manager.shutdown();
+    drop(harness);
+    drop(manager);
+
+    let restarted = RuntimeThreadManager::open(
+        config,
+        PathBuf::from("."),
+        test_manager_config(runtime_dir.clone()),
+    )?;
+    assert!(
+        !serde_json::to_string(&restarted.get_thread_detail(&thread.id).await?)?.contains(SECRET)
+    );
+    assert!(
+        !serde_json::to_string(&restarted.messages_for_session_export(&thread.id).await?)?
+            .contains(SECRET)
+    );
+    for directory in ["threads", "turns", "items", "events"] {
+        for entry in std::fs::read_dir(runtime_dir.join(directory))? {
+            let entry = entry?;
+            if entry.file_type()?.is_file() {
+                assert!(!std::fs::read_to_string(entry.path())?.contains(SECRET));
+            }
+        }
+    }
+    Ok(())
+}
+
 #[tokio::test]
 async fn sensitive_answer_taint_survives_turns_recompaction_and_restart() -> Result<()> {
     const SECRET: &str = "482915";
+    const UNKNOWN_ID_SECRET: &str = "739204";
     let data_dir = test_runtime_dir();
     let manager = test_manager(data_dir.clone())?;
     let thread = manager
@@ -8180,11 +8425,18 @@ async fn sensitive_answer_taint_survives_turns_recompaction_and_restart() -> Res
             &thread.id,
             "pin-input",
             crate::tools::user_input::UserInputResponse {
-                answers: vec![crate::tools::user_input::UserInputAnswer {
-                    id: "pin".to_string(),
-                    label: "Other".to_string(),
-                    value: SECRET.to_string(),
-                }],
+                answers: vec![
+                    crate::tools::user_input::UserInputAnswer {
+                        id: "pin".to_string(),
+                        label: "Other".to_string(),
+                        value: SECRET.to_string(),
+                    },
+                    crate::tools::user_input::UserInputAnswer {
+                        id: "unknown-pin".to_string(),
+                        label: UNKNOWN_ID_SECRET.to_string(),
+                        value: UNKNOWN_ID_SECRET.to_string(),
+                    },
+                ],
             },
         )
         .await?;
@@ -8206,7 +8458,7 @@ async fn sensitive_answer_taint_survives_turns_recompaction_and_restart() -> Res
             session_id: "taint-session".to_string(),
             messages: vec![crate::compaction::compaction_summary_message(
                 format!(
-                    "## {}\n\nThe first summary retained PIN {SECRET}",
+                    "## {}\n\nThe first summary retained PINs {SECRET} and {UNKNOWN_ID_SECRET}",
                     crate::compaction::COMPACTION_SUMMARY_MARKER
                 ),
                 true,
@@ -8276,7 +8528,7 @@ async fn sensitive_answer_taint_survives_turns_recompaction_and_restart() -> Res
             session_id: "taint-session".to_string(),
             messages: vec![crate::compaction::compaction_summary_message(
                 format!(
-                    "## {}\n\nA later summary still remembered {SECRET}",
+                    "## {}\n\nA later summary still remembered {SECRET} and {UNKNOWN_ID_SECRET}",
                     crate::compaction::COMPACTION_SUMMARY_MARKER
                 ),
                 true,
@@ -8313,11 +8565,15 @@ async fn sensitive_answer_taint_survives_turns_recompaction_and_restart() -> Res
     let events = manager.events_since(&thread.id, None)?;
     let exported = manager.messages_for_session_export(&thread.id).await?;
     assert!(!serde_json::to_string(&detail)?.contains(SECRET));
+    assert!(!serde_json::to_string(&detail)?.contains(UNKNOWN_ID_SECRET));
     assert!(!serde_json::to_string(&events)?.contains(SECRET));
+    assert!(!serde_json::to_string(&events)?.contains(UNKNOWN_ID_SECRET));
     assert!(!serde_json::to_string(&exported)?.contains(SECRET));
+    assert!(!serde_json::to_string(&exported)?.contains(UNKNOWN_ID_SECRET));
     for item in &detail.items {
         let private = manager.store.load_item(&item.id)?;
         assert!(!serde_json::to_string(&private)?.contains(SECRET));
+        assert!(!serde_json::to_string(&private)?.contains(UNKNOWN_ID_SECRET));
     }
 
     manager.shutdown();
@@ -8327,12 +8583,15 @@ async fn sensitive_answer_taint_survives_turns_recompaction_and_restart() -> Res
     let restarted_detail = restarted.get_thread_detail(&thread.id).await?;
     let restarted_export = restarted.messages_for_session_export(&thread.id).await?;
     assert!(!serde_json::to_string(&restarted_detail)?.contains(SECRET));
+    assert!(!serde_json::to_string(&restarted_detail)?.contains(UNKNOWN_ID_SECRET));
     assert!(!serde_json::to_string(&restarted_export)?.contains(SECRET));
+    assert!(!serde_json::to_string(&restarted_export)?.contains(UNKNOWN_ID_SECRET));
     for directory in ["threads", "turns", "items", "events"] {
         for entry in std::fs::read_dir(data_dir.join(directory))? {
             let entry = entry?;
             if entry.file_type()?.is_file() {
                 assert!(!std::fs::read_to_string(entry.path())?.contains(SECRET));
+                assert!(!std::fs::read_to_string(entry.path())?.contains(UNKNOWN_ID_SECRET));
             }
         }
     }

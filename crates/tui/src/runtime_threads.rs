@@ -246,23 +246,26 @@ fn meaningful_user_input_free_text<'a>(
     if value.is_empty() {
         return None;
     }
-    if let Some(question) = request.and_then(|request| {
-        request
+    if let Some(request) = request {
+        if let Some(question) = request
             .questions
             .iter()
             .find(|question| question.id == answer.id)
-    }) {
-        // Fixed selections are public control-plane values. Anything else is
-        // user-authored free text, including malformed clients that submit a
-        // custom value when allow_free_text is false. Fail closed here: the
-        // request itself gives us stronger provenance than value length.
-        if question
-            .options
-            .iter()
-            .any(|option| value.eq_ignore_ascii_case(option.label.trim()))
         {
-            return None;
+            // Fixed selections are public control-plane values. Anything else
+            // is user-authored free text, including malformed clients that
+            // submit a custom value when allow_free_text is false.
+            if question
+                .options
+                .iter()
+                .any(|option| value.eq_ignore_ascii_case(option.label.trim()))
+            {
+                return None;
+            }
         }
+        // A typed request exists, but an unknown answer id has no option
+        // provenance. Never fall back to the legacy label/value heuristic:
+        // fail closed for every nonempty value.
         return Some(value);
     }
     if value.eq_ignore_ascii_case(label) {
@@ -4085,10 +4088,11 @@ impl RuntimeThreadManager {
         // the same redacted clone. Never flatten the raw imported transcript
         // before discovering request/response provenance.
         let redacted_messages = redacted_durable_history_clone(messages, &seeded_sensitive_values);
-        let runtime_history_snapshot = messages
+        let runtime_history_snapshot = (messages
             .iter()
             .any(|message| message.role == crate::compaction::RUNTIME_HISTORY_ROLE)
-            .then(|| redacted_messages.clone());
+            || !seeded_sensitive_values.is_empty())
+        .then(|| redacted_messages.clone());
 
         // Group messages into turns. A turn starts with a user message and
         // includes all subsequent assistant messages (which may contain
