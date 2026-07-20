@@ -1007,6 +1007,9 @@ mod tests {
         pager.search_input = "two  spaces".to_string();
         pager.update_search_matches();
         assert_eq!(pager.search_matches.len(), 1);
+        let committed = pager.handle_key(key(KeyCode::Enter));
+        assert!(matches!(committed, ViewAction::None));
+        assert!(!pager.search_mode);
 
         let action = pager.handle_key(key(KeyCode::Char('c')));
         match action {

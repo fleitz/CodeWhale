@@ -563,12 +563,15 @@ pub(super) fn open_tool_details_pager(app: &mut App) -> bool {
 pub(super) fn spillover_pager_section(app: &App, cell_index: usize) -> Option<String> {
     use crate::tui::history::{GenericToolCell, HistoryCell, ToolCell};
 
-    let detail = app.tool_detail_record_for_cell(cell_index)?;
-    if let Some(section) = exact_evidence_pager_section(app, detail) {
+    if let Some(detail) = app.tool_detail_record_for_cell(cell_index)
+        && let Some(section) = exact_evidence_pager_section(app, detail)
+    {
         return Some(section);
     }
 
-    // Explicit classic mode keeps its existing generic-cell spillover path.
+    // Generic cells from classic spillover (including restored pre-adaptive
+    // sessions) do not necessarily have a ToolDetailRecord. Keep that
+    // compatibility path independent from the adaptive detail index.
     let cell = app.cell_at_virtual_index(cell_index)?;
     let HistoryCell::Tool(ToolCell::Generic(GenericToolCell {
         spillover_path: Some(path),

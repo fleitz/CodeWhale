@@ -39,6 +39,21 @@ use crate::artifacts::ArtifactRecord;
 use crate::session_manager::{OfflineQueueState, SavedSession, SessionManager};
 use crate::utils::spawn_supervised;
 
+type ArtifactKey = (String, PathBuf);
+
+/// Late artifacts normally live in memory for less than one write cycle. Keep
+/// hard bounds anyway: if the session store is unavailable for a long time,
+/// exact-output previews and paths must not accumulate without limit.
+const MAX_PENDING_ARTIFACT_SESSIONS: usize = 32;
+const MAX_PENDING_ARTIFACTS_PER_SESSION: usize = 1_024;
+const MAX_TRACKED_ARTIFACT_HIGH_WATERS: usize = 64;
+
+#[derive(Debug)]
+struct VersionedArtifact {
+    generation: u64,
+    record: ArtifactRecord,
+}
+
 // ---------------------------------------------------------------------------
 // Request type
 // ---------------------------------------------------------------------------
@@ -250,13 +265,22 @@ struct PendingState {
     /// drop session A when an immediate `/new` queues session B before
     /// the actor drains.
     sessions: BTreeMap<String, SavedSession>,
-    /// Monotonic artifact overlays accepted by this actor, keyed by owning
-    /// session and stable artifact id. These deliberately survive write
-    /// cycles so a later stale `SessionSnapshot` cannot erase an artifact.
-    artifact_overlays: BTreeMap<String, BTreeMap<(String, PathBuf), ArtifactRecord>>,
-    /// Sessions whose overlays contain a newly accepted artifact that has not
-    /// yet been merged into the durable session file.
-    dirty_artifact_sessions: BTreeSet<String>,
+    /// Validated artifact records not yet covered by a successful durable
+    /// session write. Records are versioned so a flush only evicts the exact
+    /// generation it made durable; a later arrival can never be cleared by an
+    /// older write result.
+    artifact_overlays: BTreeMap<String, BTreeMap<ArtifactKey, VersionedArtifact>>,
+    /// Actor-local generation assigned to accepted artifacts. This is only a
+    /// high-water marker; it contains no artifact content or path.
+    next_artifact_generation: u64,
+    /// Bounded, non-content receipt of the latest generation made durable for
+    /// recently active sessions. Correctness does not depend on retaining an
+    /// entry: an evicted session recovers its high water from the durable
+    /// session file before any later snapshot is saved.
+    durable_artifact_high_waters: BTreeMap<String, u64>,
+    /// Rejected late records are quarantined as bounded, non-secret failure
+    /// receipts. The rejected record itself is never retained.
+    artifact_rejections: Vec<(String, std::io::ErrorKind)>,
     offline_queue: Option<PendingOfflineQueue>,
 }
 
@@ -286,14 +310,7 @@ impl PendingState {
                 session_id,
                 artifact,
             } => {
-                self.artifact_overlays
-                    .entry(session_id.clone())
-                    .or_default()
-                    .insert(
-                        (artifact.tool_call_id.clone(), artifact.storage_path.clone()),
-                        artifact,
-                    );
-                self.dirty_artifact_sessions.insert(session_id);
+                self.absorb_artifact(session_id, artifact);
             }
             PersistRequest::OfflineQueue { state, session_id } => {
                 self.offline_queue = Some(PendingOfflineQueue::Save {
@@ -315,6 +332,90 @@ impl PendingState {
         }
         Control::Continue
     }
+
+    fn absorb_artifact(&mut self, session_id: String, artifact: ArtifactRecord) {
+        if let Err(error) = validate_late_artifact(&session_id, &artifact) {
+            self.reject_artifact(&session_id, error.kind());
+            return;
+        }
+
+        let key = (artifact.tool_call_id.clone(), artifact.storage_path.clone());
+        let starts_new_session = !self.artifact_overlays.contains_key(&session_id);
+        if starts_new_session && self.artifact_overlays.len() >= MAX_PENDING_ARTIFACT_SESSIONS {
+            self.reject_artifact(&session_id, std::io::ErrorKind::Other);
+            return;
+        }
+        if self
+            .artifact_overlays
+            .get(&session_id)
+            .is_some_and(|overlay| {
+                overlay.len() >= MAX_PENDING_ARTIFACTS_PER_SESSION && !overlay.contains_key(&key)
+            })
+        {
+            self.reject_artifact(&session_id, std::io::ErrorKind::Other);
+            return;
+        }
+        let Some(generation) = self.next_artifact_generation.checked_add(1) else {
+            self.reject_artifact(&session_id, std::io::ErrorKind::Other);
+            return;
+        };
+        self.next_artifact_generation = generation;
+        self.artifact_overlays
+            .entry(session_id)
+            .or_default()
+            .insert(
+                key,
+                VersionedArtifact {
+                    generation,
+                    record: artifact,
+                },
+            );
+    }
+
+    fn reject_artifact(&mut self, session_id: &str, kind: std::io::ErrorKind) {
+        self.artifact_rejections
+            .push((format!("session-artifact-rejected:{session_id}"), kind));
+        if self.artifact_rejections.len() > FlushReport::MAX_ACCUMULATED_FAILURES {
+            let excess = self.artifact_rejections.len() - FlushReport::MAX_ACCUMULATED_FAILURES;
+            self.artifact_rejections.drain(..excess);
+        }
+    }
+
+    fn overlay_high_water(&self, session_id: &str) -> Option<u64> {
+        self.artifact_overlays
+            .get(session_id)
+            .and_then(|overlay| overlay.values().map(|artifact| artifact.generation).max())
+    }
+
+    fn mark_artifact_generation_durable(&mut self, session_id: &str, high_water: u64) {
+        let remove_session = self
+            .artifact_overlays
+            .get_mut(session_id)
+            .is_some_and(|overlay| {
+                overlay.retain(|_, artifact| artifact.generation > high_water);
+                overlay.is_empty()
+            });
+        if remove_session {
+            // Evict previews, tool names, and paths immediately after the
+            // durable file becomes the monotonic source of truth.
+            self.artifact_overlays.remove(session_id);
+        }
+        self.durable_artifact_high_waters
+            .entry(session_id.to_string())
+            .and_modify(|durable| *durable = (*durable).max(high_water))
+            .or_insert(high_water);
+        while self.durable_artifact_high_waters.len() > MAX_TRACKED_ARTIFACT_HIGH_WATERS {
+            let Some(oldest_session) = self
+                .durable_artifact_high_waters
+                .iter()
+                .min_by_key(|(_, generation)| **generation)
+                .map(|(session_id, _)| session_id.clone())
+            else {
+                break;
+            };
+            self.durable_artifact_high_waters.remove(&oldest_session);
+        }
+    }
 }
 
 /// Write all pending work to disk, draining `pending`. Every write and
@@ -322,6 +423,7 @@ impl PendingState {
 /// are reported, never silently discarded.
 fn flush_inner(manager: &SessionManager, pending: &mut PendingState) -> FlushReport {
     let mut report = FlushReport::default();
+    report.failures.append(&mut pending.artifact_rejections);
     let mut record = |what: String, result: std::io::Result<()>| match result {
         Ok(()) => report.completed += 1,
         Err(err) => report.failures.push((what, err.kind())),
@@ -335,32 +437,52 @@ fn flush_inner(manager: &SessionManager, pending: &mut PendingState) -> FlushRep
     }
     for (session_id, mut session) in std::mem::take(&mut pending.checkpoints) {
         let overlay = pending.artifact_overlays.get(&session_id);
-        match validate_artifact_overlay(&session_id, overlay) {
-            Ok(()) => merge_artifact_overlay(&mut session, overlay),
-            Err(error) => record(format!("checkpoint-artifact:{session_id}"), Err(error)),
-        }
-        record(
-            format!("checkpoint:{session_id}"),
-            manager.save_checkpoint(&session).map(|_| ()),
-        );
+        let result = merge_durable_artifact_high_water(manager, &session_id, &mut session)
+            .and_then(|()| {
+                merge_artifact_overlay(&mut session, overlay);
+                manager.save_checkpoint(&session).map(|_| ())
+            });
+        record(format!("checkpoint:{session_id}"), result);
     }
+    let mut attempted_artifact_sessions = BTreeSet::new();
     for (session_id, mut session) in std::mem::take(&mut pending.sessions) {
+        attempted_artifact_sessions.insert(session_id.clone());
+        let overlay_high_water = pending.overlay_high_water(&session_id);
         let overlay = pending.artifact_overlays.get(&session_id);
-        match validate_artifact_overlay(&session_id, overlay) {
-            Ok(()) => merge_artifact_overlay(&mut session, overlay),
-            Err(error) => record(format!("session-artifact:{session_id}"), Err(error)),
+        let result =
+            save_session_with_artifact_high_water(manager, &session_id, &mut session, overlay);
+        match result {
+            Ok(()) => {
+                if let Some(high_water) = overlay_high_water {
+                    pending.mark_artifact_generation_durable(&session_id, high_water);
+                }
+                record(format!("session:{session_id}"), Ok(()));
+            }
+            Err(error) => record(format!("session:{session_id}"), Err(error)),
         }
-        let result = manager.save_session(&session).map(|_| ());
-        pending.dirty_artifact_sessions.remove(&session_id);
-        record(format!("session:{session_id}"), result);
     }
-    for session_id in std::mem::take(&mut pending.dirty_artifact_sessions) {
+    let dirty_artifact_sessions = pending
+        .artifact_overlays
+        .keys()
+        .filter(|session_id| !attempted_artifact_sessions.contains(*session_id))
+        .cloned()
+        .collect::<Vec<_>>();
+    for session_id in dirty_artifact_sessions {
+        let Some(overlay_high_water) = pending.overlay_high_water(&session_id) else {
+            continue;
+        };
         let result = merge_artifacts_into_durable_session(
             manager,
             &session_id,
             pending.artifact_overlays.get(&session_id),
         );
-        record(format!("session-artifact:{session_id}"), result);
+        match result {
+            Ok(()) => {
+                pending.mark_artifact_generation_durable(&session_id, overlay_high_water);
+                record(format!("session-artifact:{session_id}"), Ok(()));
+            }
+            Err(error) => record(format!("session-artifact:{session_id}"), Err(error)),
+        }
     }
     if let Some(request) = pending.offline_queue.take() {
         match request {
@@ -381,10 +503,11 @@ fn flush_inner(manager: &SessionManager, pending: &mut PendingState) -> FlushRep
 
 fn merge_artifact_overlay(
     session: &mut SavedSession,
-    overlay: Option<&BTreeMap<(String, PathBuf), ArtifactRecord>>,
+    overlay: Option<&BTreeMap<ArtifactKey, VersionedArtifact>>,
 ) {
     let Some(overlay) = overlay else { return };
-    for artifact in overlay.values() {
+    for versioned in overlay.values() {
+        let artifact = &versioned.record;
         if let Some(existing) = session.artifacts.iter_mut().find(|existing| {
             existing.tool_call_id == artifact.tool_call_id
                 && existing.storage_path == artifact.storage_path
@@ -399,33 +522,81 @@ fn merge_artifact_overlay(
 fn merge_artifacts_into_durable_session(
     manager: &SessionManager,
     session_id: &str,
-    overlay: Option<&BTreeMap<(String, PathBuf), ArtifactRecord>>,
+    overlay: Option<&BTreeMap<ArtifactKey, VersionedArtifact>>,
 ) -> std::io::Result<()> {
-    validate_artifact_overlay(session_id, overlay)?;
     let mut session = manager.load_session(session_id)?;
+    if session.metadata.id != session_id {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "durable session id does not match its persistence key",
+        ));
+    }
     merge_artifact_overlay(&mut session, overlay);
     manager.save_session(&session).map(|_| ())
 }
 
-fn validate_artifact_overlay(
+fn save_session_with_artifact_high_water(
+    manager: &SessionManager,
     session_id: &str,
-    overlay: Option<&BTreeMap<(String, PathBuf), ArtifactRecord>>,
+    session: &mut SavedSession,
+    overlay: Option<&BTreeMap<ArtifactKey, VersionedArtifact>>,
 ) -> std::io::Result<()> {
-    let Some(overlay) = overlay else {
-        return Ok(());
-    };
-    for artifact in overlay.values() {
-        if artifact.session_id != session_id
-            || artifact.storage_path.is_absolute()
-            || crate::artifacts::open_session_artifact_for_read(session_id, &artifact.storage_path)
-                .is_err()
-        {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::PermissionDenied,
-                "late artifact is not confined to its owning session",
-            ));
+    merge_durable_artifact_high_water(manager, session_id, session)?;
+    merge_artifact_overlay(session, overlay);
+    manager.save_session(session).map(|_| ())
+}
+
+fn merge_durable_artifact_high_water(
+    manager: &SessionManager,
+    session_id: &str,
+    session: &mut SavedSession,
+) -> std::io::Result<()> {
+    match manager.load_session(session_id) {
+        Ok(durable) => {
+            if durable.metadata.id != session_id {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "durable session id does not match its persistence key",
+                ));
+            }
+            // The durable session is the monotonic high water after an
+            // in-memory overlay is evicted. Merge it after the incoming
+            // snapshot so a late stale snapshot can never erase artifacts,
+            // including records whose output file has since become
+            // unavailable.
+            merge_artifact_records(session, &durable.artifacts);
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error),
+    }
+    Ok(())
+}
+
+fn merge_artifact_records(session: &mut SavedSession, artifacts: &[ArtifactRecord]) {
+    for artifact in artifacts {
+        if let Some(existing) = session.artifacts.iter_mut().find(|existing| {
+            existing.tool_call_id == artifact.tool_call_id
+                && existing.storage_path == artifact.storage_path
+        }) {
+            *existing = artifact.clone();
+        } else {
+            session.artifacts.push(artifact.clone());
         }
     }
+}
+
+fn validate_late_artifact(session_id: &str, artifact: &ArtifactRecord) -> std::io::Result<()> {
+    if artifact.session_id != session_id || artifact.storage_path.is_absolute() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            "late artifact is not confined to its owning session",
+        ));
+    }
+    // Validate and open once while accepting ownership. Later flushes retain
+    // only the already-validated descriptor; loss of the underlying output
+    // must not turn a stale snapshot into permission to erase durable
+    // metadata.
+    crate::artifacts::open_session_artifact_for_read(session_id, &artifact.storage_path)?;
     Ok(())
 }
 
@@ -460,6 +631,27 @@ mod tests {
                 "timed out waiting for persistence actor"
             );
             tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    }
+
+    fn artifact_record(
+        session_id: &str,
+        artifact_id: &str,
+        tool_call_id: &str,
+        storage_path: PathBuf,
+        raw: &str,
+    ) -> ArtifactRecord {
+        ArtifactRecord {
+            id: artifact_id.to_string(),
+            kind: crate::artifacts::ArtifactKind::ToolOutput,
+            session_id: session_id.to_string(),
+            tool_call_id: tool_call_id.to_string(),
+            tool_name: "run_tests".to_string(),
+            success: Some(true),
+            created_at: chrono::Utc::now(),
+            byte_size: raw.len() as u64,
+            preview: raw.lines().next().unwrap_or_default().to_string(),
+            storage_path,
         }
     }
 
@@ -636,6 +828,226 @@ mod tests {
             .load_session(&stale.metadata.id)
             .expect("load durable session");
         assert_eq!(loaded.artifacts, vec![artifact]);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    #[allow(clippy::await_holding_lock)] // Serializes the process-global artifact-root override.
+    async fn rejected_artifacts_do_not_poison_a_later_valid_artifact() {
+        let _root_guard = crate::artifacts::TEST_ARTIFACT_SESSIONS_GUARD
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let sessions_dir = tmp.path().join("sessions");
+        let prior = crate::artifacts::set_test_artifact_sessions_root(Some(sessions_dir.clone()));
+        struct ArtifactRootReset(Option<PathBuf>);
+        impl Drop for ArtifactRootReset {
+            fn drop(&mut self) {
+                crate::artifacts::set_test_artifact_sessions_root(self.0.take());
+            }
+        }
+        let _reset = ArtifactRootReset(prior);
+
+        let manager = SessionManager::new(sessions_dir.clone()).expect("manager");
+        let verification_manager = SessionManager::new(sessions_dir).expect("verification manager");
+        let mut stale = crate::session_manager::create_saved_session_with_mode(
+            &[],
+            "deepseek-v4-pro",
+            tmp.path(),
+            0,
+            None,
+            Some("agent"),
+        );
+        stale.metadata.id = "late-artifact-quarantine".to_string();
+        let missing = artifact_record(
+            &stale.metadata.id,
+            "art_missing",
+            "call-missing",
+            crate::artifacts::session_artifact_relative_path("art_missing"),
+            "missing",
+        );
+        let wrong_owner = ArtifactRecord {
+            session_id: "different-session".to_string(),
+            ..missing.clone()
+        };
+        let valid_raw = "CW_VALID_AFTER_REJECTED_ARTIFACT\n";
+        let (_, valid_path) = crate::artifacts::write_session_artifact(
+            &stale.metadata.id,
+            "art_valid_after_rejected",
+            valid_raw,
+        )
+        .expect("write valid artifact");
+        let valid = artifact_record(
+            &stale.metadata.id,
+            "art_valid_after_rejected",
+            "call-valid-after-rejected",
+            valid_path,
+            valid_raw,
+        );
+        let (handle, task) = spawn_persistence_actor(manager);
+
+        handle.try_send(PersistRequest::SessionSnapshot(stale.clone()));
+        handle.try_send(PersistRequest::SessionArtifactStored {
+            session_id: stale.metadata.id.clone(),
+            artifact: missing,
+        });
+        handle.try_send(PersistRequest::SessionArtifactStored {
+            session_id: stale.metadata.id.clone(),
+            artifact: wrong_owner,
+        });
+        handle.try_send(PersistRequest::SessionArtifactStored {
+            session_id: stale.metadata.id.clone(),
+            artifact: valid.clone(),
+        });
+        // Even another pre-artifact snapshot cannot let either rejected
+        // record block or erase the independently valid record.
+        handle.try_send(PersistRequest::SessionSnapshot(stale));
+        let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
+        handle.try_send(PersistRequest::FlushAndReport { reply: reply_tx });
+        let report = reply_rx.await.expect("flush report");
+        assert_eq!(
+            report
+                .failures
+                .iter()
+                .filter(|(what, _)| what.starts_with("session-artifact-rejected:"))
+                .count(),
+            2,
+            "each bad record must be quarantined independently: {:?}",
+            report.failures
+        );
+
+        let loaded = verification_manager
+            .load_session("late-artifact-quarantine")
+            .expect("valid artifact session persisted");
+        assert_eq!(loaded.artifacts, vec![valid]);
+        handle.try_send(PersistRequest::Shutdown);
+        task.await.expect("persistence actor join");
+    }
+
+    #[test]
+    fn durable_high_water_survives_unavailable_output_and_evicts_sensitive_overlay() {
+        let _root_guard = crate::artifacts::TEST_ARTIFACT_SESSIONS_GUARD
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let sessions_dir = tmp.path().join("sessions");
+        let prior = crate::artifacts::set_test_artifact_sessions_root(Some(sessions_dir.clone()));
+        struct ArtifactRootReset(Option<PathBuf>);
+        impl Drop for ArtifactRootReset {
+            fn drop(&mut self) {
+                crate::artifacts::set_test_artifact_sessions_root(self.0.take());
+            }
+        }
+        let _reset = ArtifactRootReset(prior);
+
+        let manager = SessionManager::new(sessions_dir).expect("manager");
+        let mut stale = crate::session_manager::create_saved_session_with_mode(
+            &[],
+            "deepseek-v4-pro",
+            tmp.path(),
+            0,
+            None,
+            Some("agent"),
+        );
+        stale.metadata.id = "durable-artifact-high-water".to_string();
+        let raw = "CW_DURABLE_HIGH_WATER\n";
+        let (absolute_path, relative_path) = crate::artifacts::write_session_artifact(
+            &stale.metadata.id,
+            "art_durable_high_water",
+            raw,
+        )
+        .expect("write artifact");
+        let artifact = artifact_record(
+            &stale.metadata.id,
+            "art_durable_high_water",
+            "call-durable-high-water",
+            relative_path,
+            raw,
+        );
+        let mut pending = PendingState::default();
+        pending.absorb(PersistRequest::SessionSnapshot(stale.clone()));
+        pending.absorb(PersistRequest::SessionArtifactStored {
+            session_id: stale.metadata.id.clone(),
+            artifact: artifact.clone(),
+        });
+
+        let first = flush_inner(&manager, &mut pending);
+        assert!(first.failures.is_empty(), "first flush: {first:?}");
+        assert!(
+            pending.artifact_overlays.is_empty(),
+            "successful durable high water must evict preview/path metadata"
+        );
+        assert!(
+            pending
+                .durable_artifact_high_waters
+                .contains_key(&stale.metadata.id),
+            "non-content high-water receipt should remain"
+        );
+
+        std::fs::remove_file(&absolute_path).expect("make prior output unavailable");
+        pending.absorb(PersistRequest::SessionSnapshot(stale));
+        let second = flush_inner(&manager, &mut pending);
+        assert!(second.failures.is_empty(), "stale flush: {second:?}");
+        let loaded = manager
+            .load_session("durable-artifact-high-water")
+            .expect("load monotonic durable session");
+        assert_eq!(
+            loaded.artifacts,
+            vec![artifact],
+            "an unavailable output cannot let a stale snapshot roll metadata back"
+        );
+    }
+
+    #[test]
+    fn artifact_generation_eviction_keeps_a_newer_arrival_and_bounds_session_receipts() {
+        let mut pending = PendingState::default();
+        pending.artifact_overlays.insert(
+            "active-session".to_string(),
+            BTreeMap::from([
+                (
+                    ("call-old".to_string(), PathBuf::from("artifacts/old.txt")),
+                    VersionedArtifact {
+                        generation: 10,
+                        record: artifact_record(
+                            "active-session",
+                            "art_old",
+                            "call-old",
+                            PathBuf::from("artifacts/old.txt"),
+                            "old",
+                        ),
+                    },
+                ),
+                (
+                    ("call-new".to_string(), PathBuf::from("artifacts/new.txt")),
+                    VersionedArtifact {
+                        generation: 11,
+                        record: artifact_record(
+                            "active-session",
+                            "art_new",
+                            "call-new",
+                            PathBuf::from("artifacts/new.txt"),
+                            "new",
+                        ),
+                    },
+                ),
+            ]),
+        );
+        pending.mark_artifact_generation_durable("active-session", 10);
+        let survivor = pending
+            .artifact_overlays
+            .get("active-session")
+            .expect("newer generation remains");
+        assert_eq!(survivor.len(), 1);
+        assert_eq!(survivor.values().next().unwrap().generation, 11);
+
+        for generation in 12..(12 + MAX_TRACKED_ARTIFACT_HIGH_WATERS as u64 + 3) {
+            pending
+                .mark_artifact_generation_durable(&format!("transition-{generation}"), generation);
+        }
+        assert_eq!(
+            pending.durable_artifact_high_waters.len(),
+            MAX_TRACKED_ARTIFACT_HIGH_WATERS,
+            "session transitions must bound retained non-content receipts"
+        );
     }
 
     #[tokio::test]
