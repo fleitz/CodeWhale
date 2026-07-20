@@ -66,8 +66,12 @@ pub(super) fn build_relevance(app: &App) -> FilePickerRelevance {
     for detail in app.active_tool_details.values() {
         mark_tool_detail_paths(detail, &app.workspace, &mut seen_tool_paths, &mut relevance);
     }
-    let mut rows: Vec<_> = app.tool_details_by_cell.iter().collect();
-    rows.sort_by_key(|(idx, _)| std::cmp::Reverse(**idx));
+    let mut rows = app
+        .tool_details_by_cell
+        .iter()
+        .flat_map(|(idx, details)| details.iter().map(move |detail| (*idx, detail)))
+        .collect::<Vec<_>>();
+    rows.sort_by_key(|(idx, detail)| (std::cmp::Reverse(*idx), detail.tool_id.as_str()));
     for (_, detail) in rows.into_iter().take(48) {
         mark_tool_detail_paths(detail, &app.workspace, &mut seen_tool_paths, &mut relevance);
     }

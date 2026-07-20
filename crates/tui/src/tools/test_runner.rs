@@ -17,8 +17,6 @@ use super::spec::{
 
 use crate::dependencies::ExternalTool;
 
-const MAX_OUTPUT_CHARS: usize = 40_000;
-
 /// Tool for running `cargo test` in the workspace root.
 pub struct RunTestsTool;
 
@@ -89,34 +87,36 @@ impl ToolSpec for RunTestsTool {
         let output = run_cargo(&context.workspace, &args)?;
 
         let exit_code = output.status.code().unwrap_or(-1);
-        let stdout_raw = String::from_utf8_lossy(&output.stdout);
-        let stderr_raw = String::from_utf8_lossy(&output.stderr);
-        let stdout = truncate_with_note(&stdout_raw, MAX_OUTPUT_CHARS);
-        let stderr = truncate_with_note(&stderr_raw, MAX_OUTPUT_CHARS);
-
         let result = RunTestsOutput {
             success: output.status.success(),
             exit_code,
-            stdout,
-            stderr,
+            stdout: String::from_utf8_lossy(&output.stdout).into_owned(),
+            stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
             command: command_str,
         };
-
-        let mut tool_result =
-            ToolResult::json(&result).map_err(|e| ToolError::execution_failed(e.to_string()))?;
-        if let Some(summary) = summarize_cargo_failure(
-            &result.command,
-            &result.stdout,
-            &result.stderr,
-            Some(result.exit_code),
-        ) {
-            tool_result = tool_result.with_metadata(json!({
-                "summary": summary.summary,
-                "cargo_failure_summary": summary.to_metadata_value(),
-            }));
-        }
-        Ok(tool_result)
+        tool_result_from_output(&result)
     }
+}
+
+fn tool_result_from_output(result: &RunTestsOutput) -> Result<ToolResult, ToolError> {
+    // Preserve the complete streams until the engine-owned adaptive broker.
+    // The broker decides whether the JSON stays inline or becomes an exact
+    // artifact; this tool must not destroy bytes before that boundary.
+    let mut tool_result =
+        ToolResult::json(result).map_err(|e| ToolError::execution_failed(e.to_string()))?;
+    tool_result.success = result.success;
+    let mut metadata = json!({"exit_code": result.exit_code});
+    if let Some(summary) = summarize_cargo_failure(
+        &result.command,
+        &result.stdout,
+        &result.stderr,
+        Some(result.exit_code),
+    ) {
+        metadata["summary"] = json!(summary.summary);
+        metadata["cargo_failure_summary"] = summary.to_metadata_value();
+    }
+    tool_result = tool_result.with_metadata(metadata);
+    Ok(tool_result)
 }
 
 // === Helpers ===
@@ -146,34 +146,6 @@ fn format_command(workspace: &Path, args: &[String]) -> String {
             .collect::<Vec<_>>()
             .join(" ")
     )
-}
-
-fn truncate_with_note(text: &str, max_chars: usize) -> String {
-    if text.chars().count() <= max_chars {
-        return text.to_string();
-    }
-    let end = char_boundary_index(text, max_chars);
-    let truncated = &text[..end];
-    let omitted_chars = text
-        .chars()
-        .count()
-        .saturating_sub(truncated.chars().count());
-    let note = format!(
-        "\n\n[output truncated to {max_chars} characters; {omitted_chars} characters omitted]"
-    );
-    format!("{truncated}{note}")
-}
-
-fn char_boundary_index(text: &str, max_chars: usize) -> usize {
-    if max_chars == 0 {
-        return 0;
-    }
-    for (count, (idx, _)) in text.char_indices().enumerate() {
-        if count == max_chars {
-            return idx;
-        }
-    }
-    text.len()
 }
 
 #[cfg(test)]
@@ -278,7 +250,7 @@ mod tests {
         let ctx = ToolContext::new(&project_dir);
         let tool = RunTestsTool;
         let result = tool.execute(json!({}), &ctx).await.expect("execute");
-        assert!(result.success);
+        assert!(!result.success);
 
         let parsed: RunTestsOutput =
             serde_json::from_str(&result.content).expect("tool result should be json");
@@ -302,9 +274,104 @@ mod tests {
     }
 
     #[test]
-    fn truncation_adds_note() {
-        let long = "x".repeat(MAX_OUTPUT_CHARS + 128);
-        let truncated = truncate_with_note(&long, MAX_OUTPUT_CHARS);
-        assert!(truncated.contains("output truncated"));
+    fn failing_output_preserves_sentinel_beyond_old_truncation_boundary() {
+        let sentinel = "CW_RUN_TESTS_EXACT_SENTINEL";
+        let stdout = format!("{}{sentinel}", "x".repeat(50_000));
+        let output = RunTestsOutput {
+            success: false,
+            exit_code: 101,
+            stdout: stdout.clone(),
+            stderr: "test result: FAILED. 0 passed; 1 failed".to_string(),
+            command: "cargo test --workspace".to_string(),
+        };
+
+        let result = tool_result_from_output(&output).expect("tool result");
+        assert!(!result.success, "transport status must match cargo status");
+        assert!(result.content.contains(sentinel));
+        let parsed: RunTestsOutput = serde_json::from_str(&result.content).expect("exact JSON");
+        assert_eq!(parsed.stdout, stdout);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    #[allow(clippy::await_holding_lock)] // Serializes the process-global artifact-root override.
+    async fn brokered_failure_keeps_exact_run_tests_output_and_compact_exit_facts() {
+        use crate::context_budget::PressureLevel;
+        use crate::tools::handle::new_shared_handle_store;
+        use crate::tools::large_output_router::{
+            LargeOutputBroker, ProjectionOutcome, WorkshopConfig,
+        };
+
+        let _root_guard = crate::artifacts::TEST_ARTIFACT_SESSIONS_GUARD
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let temp = tempdir().expect("tempdir");
+        let prior =
+            crate::artifacts::set_test_artifact_sessions_root(Some(temp.path().join("sessions")));
+        struct RestoreRoot(Option<std::path::PathBuf>);
+        impl Drop for RestoreRoot {
+            fn drop(&mut self) {
+                crate::artifacts::set_test_artifact_sessions_root(self.0.take());
+            }
+        }
+        let _restore = RestoreRoot(prior);
+
+        let sentinel = "CW_BROKERED_RUN_TESTS_LATE_SENTINEL";
+        let output = RunTestsOutput {
+            success: false,
+            exit_code: 101,
+            stdout: format!(
+                "running 1 test\ntest tests::fails ... FAILED\n{}\n{sentinel}\n",
+                "repetitive compiler diagnostics\n".repeat(4_000)
+            ),
+            stderr: "test result: FAILED. 0 passed; 1 failed; 0 ignored\nerror: test failed"
+                .to_string(),
+            command: "cargo test --workspace".to_string(),
+        };
+        let mut result = tool_result_from_output(&output).expect("raw tool result");
+        let exact_json = result.content.clone();
+        let broker = LargeOutputBroker::new(
+            WorkshopConfig {
+                large_output_threshold_tokens: Some(100),
+                ..WorkshopConfig::default()
+            },
+            "run-tests-broker-session",
+            temp.path(),
+            new_shared_handle_store(),
+            PressureLevel::Low,
+            Some(128_000),
+        );
+
+        let outcome = broker
+            .project(
+                "call-run-tests-large-failure",
+                "run_tests",
+                &json!({"args": "--workspace"}),
+                &mut result,
+            )
+            .await;
+        let ProjectionOutcome::Stored { path, .. } = outcome else {
+            panic!("large failed RunTests result must be brokered")
+        };
+        assert!(!result.success);
+        assert!(!result.content.contains(sentinel));
+        let envelope: Value = serde_json::from_str(&result.content).expect("evidence envelope");
+        assert_eq!(envelope["status"], json!("failed"));
+        let facts = envelope["facts"].as_array().expect("facts");
+        assert!(
+            facts.iter().any(|fact| fact == "exit code: 101"),
+            "exit code must remain model-visible: {facts:?}"
+        );
+        assert!(
+            facts.iter().any(|fact| {
+                fact.as_str()
+                    .is_some_and(|text| text.contains("error: test failed"))
+            }),
+            "failure diagnosis must remain model-visible: {facts:?}"
+        );
+        assert!(facts.iter().any(|fact| fact == "tests::fails"));
+        assert_eq!(std::fs::read_to_string(path).unwrap(), exact_json);
+        let parsed: RunTestsOutput = serde_json::from_str(&exact_json).unwrap();
+        assert!(parsed.stdout.contains(sentinel));
+        assert_eq!(parsed.exit_code, 101);
     }
 }

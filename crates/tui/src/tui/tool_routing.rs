@@ -4,12 +4,13 @@ use std::path::PathBuf;
 use std::time::Instant;
 
 use crate::hooks::HookEvent;
+use crate::localization::MessageId;
 use crate::tools::ReviewOutput;
 use crate::tools::apply_patch::{NormalizedApplyPatchInput, normalize_apply_patch_input};
 use crate::tools::plan::PlanSnapshot;
 use crate::tools::spec::{ToolError, ToolResult};
 use crate::tui::active_cell::ActiveCell;
-use crate::tui::app::{App, ToolDetailRecord, ToolEvidence};
+use crate::tui::app::{App, ToolDetailArtifact, ToolDetailRecord, ToolEvidence};
 use crate::tui::history::{
     DiffPreviewCell, ExecCell, ExecSource, ExploringEntry, GenericToolCell, HistoryCell,
     McpToolCell, PatchSummaryCell, PlanUpdateCell, ReviewCell, ToolCell, ToolStatus, ViewImageCell,
@@ -55,6 +56,7 @@ pub(super) fn handle_tool_call_started(
                 ExploringEntry {
                     label,
                     status: ToolStatus::Running,
+                    output_summary: None,
                 },
             )
             .map_or(0, |(_, inner)| inner);
@@ -196,6 +198,7 @@ pub(super) fn handle_tool_call_started(
                 status: ToolStatus::Running,
                 output: None,
                 error: None,
+                adaptive_summary: None,
             })),
         );
         return;
@@ -212,6 +215,7 @@ pub(super) fn handle_tool_call_started(
                 status: ToolStatus::Running,
                 content: None,
                 is_image: false,
+                adaptive_summary: None,
             })),
         );
         return;
@@ -249,6 +253,7 @@ pub(super) fn handle_tool_call_started(
                 source: None,
                 degraded: None,
                 ref_count: 0,
+                adaptive_summary: None,
             })),
         );
         return;
@@ -329,9 +334,13 @@ fn register_tool_cell(
         tool_name: tool_name.to_string(),
         input: input.clone(),
         output: None,
+        artifact: None,
     };
     if cell_index < app.history.len() {
-        app.tool_details_by_cell.insert(cell_index, record);
+        app.tool_details_by_cell
+            .entry(cell_index)
+            .or_default()
+            .push(record);
     } else {
         // Active-cell entry: keep the detail record in `active_tool_details`
         // until the active cell flushes. `flush_active_cell` migrates these
@@ -351,17 +360,67 @@ fn store_tool_detail_output(
         Ok(tool_result) => tool_result.content.clone(),
         Err(err) => err.to_string(),
     });
+    let artifact = result
+        .as_ref()
+        .ok()
+        .and_then(tool_detail_artifact_from_result);
     if cell_index < app.history.len()
-        && let Some(detail) = app.tool_details_by_cell.get_mut(&cell_index)
+        && let Some(detail) = app
+            .tool_details_by_cell
+            .get_mut(&cell_index)
+            .and_then(|details| details.iter_mut().find(|detail| detail.tool_id == tool_id))
     {
         detail.output = payload.clone();
+        detail.artifact = artifact.clone();
     }
     // Also write to the active table while the entry might still live there;
     // some callsites pre-rewrite cell_index but the active_tool_details map is
     // the canonical source for in-flight outputs.
     if let Some(detail) = app.active_tool_details.get_mut(tool_id) {
         detail.output = payload;
+        detail.artifact = artifact;
     }
+}
+
+fn tool_detail_artifact_from_result(result: &ToolResult) -> Option<ToolDetailArtifact> {
+    let metadata = result.metadata.as_ref()?;
+    let evidence = metadata.get("adaptive_evidence");
+    let string = |key: &str| {
+        evidence
+            .and_then(|value| value.get(key))
+            .or_else(|| metadata.get(key))
+            .and_then(serde_json::Value::as_str)
+    };
+    let available = evidence
+        .and_then(|value| value.get("details_available"))
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or_else(|| metadata.get("spillover_path").is_some());
+    let relative_path = string("artifact_relative_path").map(PathBuf::from);
+    let absolute_path = string("artifact_path")
+        .or_else(|| string("spillover_path"))
+        .map(PathBuf::from);
+    if relative_path.is_none() && absolute_path.is_none() && !evidence.is_some() {
+        return None;
+    }
+    Some(ToolDetailArtifact {
+        session_id: string("artifact_session_id")
+            .unwrap_or_default()
+            .to_string(),
+        relative_path,
+        absolute_path,
+        sha256: string("sha256")
+            .or_else(|| string("artifact_sha256"))
+            .map(str::to_string),
+        byte_size: evidence
+            .and_then(|value| value.get("bytes"))
+            .or_else(|| metadata.get("artifact_byte_size"))
+            .and_then(serde_json::Value::as_u64)
+            .unwrap_or(0),
+        duration_ms: metadata
+            .get("duration_ms")
+            .and_then(serde_json::Value::as_u64),
+        available,
+    })
 }
 
 #[allow(clippy::too_many_lines)]
@@ -438,7 +497,17 @@ fn record_spillover_artifact_if_any(
     result: &Result<ToolResult, ToolError>,
 ) {
     let Ok(tool_result) = result else { return };
-    if !tool_result.success {
+    // Read-repeat followers reuse the leader's already-indexed artifact. They
+    // carry its metadata so their live detail view remains useful, but must
+    // not create a second persisted ArtifactRecord for the same canonical
+    // file under a different tool-call id.
+    if tool_result
+        .metadata
+        .as_ref()
+        .and_then(|metadata| metadata.get("executed"))
+        .and_then(serde_json::Value::as_bool)
+        .is_some_and(|executed| !executed)
+    {
         return;
     }
     let Some(path) = tool_result
@@ -480,15 +549,64 @@ fn record_spillover_artifact_if_any(
     {
         return;
     }
-    app.session_artifacts
-        .push(crate::artifacts::record_tool_output_artifact_with_size(
-            session_id,
-            id,
-            name,
-            storage_path,
-            byte_size,
-            content_for_preview,
-        ));
+    let mut record = crate::artifacts::record_tool_output_artifact_with_size(
+        session_id,
+        id,
+        name,
+        storage_path,
+        byte_size,
+        content_for_preview,
+    );
+    record.success = Some(tool_result.success);
+    if let Some(artifact_id) = metadata
+        .and_then(|metadata| metadata.get("artifact_id"))
+        .and_then(serde_json::Value::as_str)
+    {
+        record.id = artifact_id.to_string();
+    }
+    app.session_artifacts.push(record);
+}
+
+/// Index exact evidence produced by a nested tool without rendering another
+/// completion card. When its visible owner is known, add an independent raw
+/// detail entry so Alt+V can inspect every parallel/sub-agent result live.
+pub(crate) fn handle_tool_artifact_stored(
+    app: &mut App,
+    id: &str,
+    name: &str,
+    input: &serde_json::Value,
+    result: &ToolResult,
+    parent_tool_id: Option<&str>,
+    owner_agent_id: Option<&str>,
+) {
+    record_spillover_artifact_if_any(app, id, name, &Ok(result.clone()));
+
+    let owner_cell = parent_tool_id
+        .and_then(|parent_id| app.tool_cells.get(parent_id).copied())
+        .or_else(|| {
+            owner_agent_id.and_then(|agent_id| app.subagent_card_index.get(agent_id).copied())
+        });
+    let Some(cell_index) = owner_cell else {
+        return;
+    };
+    let detail = ToolDetailRecord {
+        tool_id: id.to_string(),
+        tool_name: name.to_string(),
+        input: input.clone(),
+        output: Some(result.content.clone()),
+        artifact: tool_detail_artifact_from_result(result),
+    };
+    if cell_index < app.history.len() {
+        let details = app.tool_details_by_cell.entry(cell_index).or_default();
+        if !details.iter().any(|existing| existing.tool_id == id) {
+            details.push(detail);
+        }
+    } else {
+        app.tool_cells.insert(id.to_string(), cell_index);
+        app.active_tool_details
+            .entry(id.to_string())
+            .or_insert(detail);
+    }
 }
 
 /// #3031: shell/tasks tools embed the literal `"(no output)"` into successful
@@ -504,12 +622,64 @@ fn visible_tool_output(content: &str) -> Option<String> {
     }
 }
 
+fn adaptive_evidence_summary(app: &App, result: &ToolResult) -> Option<String> {
+    let evidence = result.metadata.as_ref()?.get("adaptive_evidence")?;
+    let bytes = evidence
+        .get("bytes")
+        .and_then(serde_json::Value::as_u64)
+        .unwrap_or(0);
+    let size = crate::artifacts::format_byte_size(bytes);
+    let available = evidence
+        .get("details_available")
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(false);
+    let failures = evidence
+        .get("failure_count")
+        .and_then(serde_json::Value::as_u64);
+    let mut summary = if !available {
+        app.tr(MessageId::EvidenceDetailsUnavailable)
+            .replace("{size}", &size)
+    } else if failures == Some(1) {
+        app.tr(MessageId::EvidenceFailureOutputKept)
+            .replace("{size}", &size)
+    } else if let Some(count) = failures {
+        app.tr(MessageId::EvidenceFailuresOutputKept)
+            .replace("{size}", &size)
+            .replace("{count}", &count.to_string())
+    } else {
+        app.tr(MessageId::EvidenceOutputKept)
+            .replace("{size}", &size)
+    };
+    if let Some(primary) = evidence
+        .get("display_primary")
+        .and_then(serde_json::Value::as_str)
+        .filter(|primary| !primary.trim().is_empty())
+    {
+        summary.push_str(" · ");
+        summary.push_str(primary);
+    }
+    if available {
+        let hint = app.tr(MessageId::EvidenceOpenDetails).replace(
+            "{shortcut}",
+            crate::tui::shell_key_routing::tool_details_chord().as_ref(),
+        );
+        summary.push_str(" · ");
+        summary.push_str(&hint);
+    }
+    Some(summary)
+}
+
 pub(super) fn handle_tool_call_complete(
     app: &mut App,
     id: &str,
     name: &str,
     result: &Result<ToolResult, ToolError>,
 ) {
+    // An ignored/duplicate visible completion can still be the sole durable
+    // receipt for a newly executed result. Index exact evidence before
+    // suppressing transcript mutation; read-repeat followers are filtered by
+    // their `executed: false` metadata in the helper itself.
+    record_spillover_artifact_if_any(app, id, name, result);
     if app.ignored_tool_calls.remove(id) {
         return;
     }
@@ -518,18 +688,21 @@ pub(super) fn handle_tool_call_complete(
     // spawn their own LLM calls (RLM, summarizers, retrieval helpers)
     // get accrued without needing a per-tool hook (#524).
     accrue_child_token_cost_if_any(app, result);
-    record_spillover_artifact_if_any(app, id, name, result);
+    let adaptive_summary = result
+        .as_ref()
+        .ok()
+        .and_then(|tool_result| adaptive_evidence_summary(app, tool_result));
 
     // Exploring entries land in the per-tool map regardless of whether they
     // live in the active cell or in finalized history; the path is the same.
     if let Some((cell_index, entry_index)) = app.exploring_entries.remove(id) {
-        app.tool_cells.remove(id);
         store_tool_detail_output(app, id, cell_index, result);
         if let Some(HistoryCell::Tool(ToolCell::Exploring(cell))) =
             app.cell_at_virtual_index_mut(cell_index)
             && let Some(entry) = cell.entries.get_mut(entry_index)
         {
             entry.status = tool_status_from_result(result);
+            entry.output_summary = adaptive_summary;
             app.mark_history_updated();
             // Mutating the in-flight exploring cell needs an active-cell
             // revision bump so the transcript cache invalidates the synthetic
@@ -541,6 +714,9 @@ pub(super) fn handle_tool_call_complete(
                 }
             }
         }
+        if cell_index < app.history.len() {
+            app.tool_cells.remove(id);
+        }
         refresh_active_tool_completion_timestamp(app, cell_index);
         return;
     }
@@ -550,7 +726,7 @@ pub(super) fn handle_tool_call_complete(
     // a tool result arrived after the active cell was already flushed). Build
     // a finalized standalone cell from the result so the user can still see
     // the output, but DO NOT touch the active cell.
-    let Some(cell_index) = app.tool_cells.remove(id) else {
+    let Some(cell_index) = app.tool_cells.get(id).copied() else {
         push_orphan_tool_completion(app, id, name, result);
         return;
     };
@@ -560,7 +736,6 @@ pub(super) fn handle_tool_call_complete(
 
     let status = tool_status_from_result(result);
     let mut workflow_panel_output: Option<String> = None;
-
     if let Some(cell) = app.cell_at_virtual_index_mut(cell_index) {
         match cell {
             HistoryCell::Tool(ToolCell::Exec(exec)) => {
@@ -620,10 +795,11 @@ pub(super) fn handle_tool_call_complete(
                         .and_then(serde_json::Value::as_u64);
                     if status != ToolStatus::Running && exec.interaction.is_none() {
                         exec.output = visible_tool_output(&tool_result.content);
-                        exec.output_summary = exec
-                            .output
-                            .as_deref()
-                            .map(super::history::summarize_tool_output);
+                        exec.output_summary = adaptive_summary.clone().or_else(|| {
+                            exec.output
+                                .as_deref()
+                                .map(super::history::summarize_tool_output)
+                        });
                         exec.live_output = None;
                     } else if status == ToolStatus::Running
                         && exec.interaction.is_none()
@@ -663,7 +839,12 @@ pub(super) fn handle_tool_call_complete(
             }
             HistoryCell::Tool(ToolCell::Review(review)) => {
                 review.status = status;
+                review.adaptive_summary = adaptive_summary.clone();
                 match result.as_ref() {
+                    Ok(_) if adaptive_summary.is_some() => {
+                        review.output = None;
+                        review.error = None;
+                    }
                     Ok(tool_result) => {
                         if tool_result.success {
                             review.output = Some(ReviewOutput::from_str(&tool_result.content));
@@ -678,7 +859,13 @@ pub(super) fn handle_tool_call_complete(
                 app.mark_history_updated();
             }
             HistoryCell::Tool(ToolCell::Mcp(mcp)) => {
+                mcp.adaptive_summary = adaptive_summary.clone();
                 match result.as_ref() {
+                    Ok(_) if adaptive_summary.is_some() => {
+                        mcp.status = status;
+                        mcp.is_image = false;
+                        mcp.content = None;
+                    }
                     Ok(tool_result) => {
                         let summary = summarize_mcp_output(&tool_result.content);
                         if status == ToolStatus::Hydrated {
@@ -700,7 +887,14 @@ pub(super) fn handle_tool_call_complete(
             }
             HistoryCell::Tool(ToolCell::WebSearch(search)) => {
                 search.status = status;
+                search.adaptive_summary = adaptive_summary.clone();
                 match result.as_ref() {
+                    Ok(_) if adaptive_summary.is_some() => {
+                        search.summary = None;
+                        search.source = None;
+                        search.degraded = None;
+                        search.ref_count = 0;
+                    }
                     Ok(tool_result) => {
                         search.summary = Some(summarize_tool_output(&tool_result.content));
                         let presentation = web_search_presentation(&tool_result.content);
@@ -719,8 +913,11 @@ pub(super) fn handle_tool_call_complete(
                 match result.as_ref() {
                     Ok(tool_result) => {
                         generic.output = visible_tool_output(&tool_result.content);
-                        generic.output_summary =
-                            generic.output.as_deref().map(summarize_tool_output);
+                        generic.output_summary = adaptive_summary
+                            .clone()
+                            .or_else(|| generic.output.as_deref().map(summarize_tool_output));
+                        generic.spillover_path = tool_detail_artifact_from_result(tool_result)
+                            .and_then(|artifact| artifact.absolute_path);
                         generic.is_diff = output_looks_like_diff(&tool_result.content);
                     }
                     Err(err) => {
@@ -755,6 +952,8 @@ pub(super) fn handle_tool_call_complete(
             active.bump_revision();
         }
         refresh_active_tool_completion_timestamp(app, cell_index);
+    } else {
+        app.tool_cells.remove(id);
     }
 
     if refreshes_workspace_context_on_completion(name) && status != ToolStatus::Running {
@@ -1198,7 +1397,12 @@ fn push_orphan_tool_completion(
     result: &Result<ToolResult, ToolError>,
 ) {
     let status = tool_status_from_result(result);
+    let adaptive_summary = result
+        .as_ref()
+        .ok()
+        .and_then(|tool_result| adaptive_evidence_summary(app, tool_result));
     let output = match result.as_ref() {
+        Ok(tool_result) if adaptive_summary.is_some() => Some(tool_result.content.clone()),
         Ok(tool_result) => Some(summarize_tool_output(&tool_result.content)),
         Err(err) => Some(err.to_string()),
     };
@@ -1211,7 +1415,7 @@ fn push_orphan_tool_completion(
         .and_then(|m| m.get("spillover_path"))
         .and_then(serde_json::Value::as_str)
         .map(std::path::PathBuf::from);
-    let output_summary = output.as_deref().map(summarize_tool_output);
+    let output_summary = adaptive_summary.or_else(|| output.as_deref().map(summarize_tool_output));
     let is_diff = output.as_deref().is_some_and(output_looks_like_diff);
     app.add_message(HistoryCell::Tool(ToolCell::Generic(GenericToolCell {
         name: name.to_string(),
@@ -1226,7 +1430,7 @@ fn push_orphan_tool_completion(
     let cell_index = app.history.len().saturating_sub(1);
     app.tool_details_by_cell.insert(
         cell_index,
-        ToolDetailRecord {
+        vec![ToolDetailRecord {
             tool_id: tool_id.to_string(),
             tool_name: name.to_string(),
             input: serde_json::Value::Null,
@@ -1234,7 +1438,11 @@ fn push_orphan_tool_completion(
                 Ok(tool_result) => Some(tool_result.content.clone()),
                 Err(err) => Some(err.to_string()),
             },
-        },
+            artifact: result
+                .as_ref()
+                .ok()
+                .and_then(tool_detail_artifact_from_result),
+        }],
     );
 
     // Shift active-cell virtual indices forward by 1 to absorb the new
@@ -1655,6 +1863,160 @@ mod tests {
     use super::*;
     use crate::tools::plan::StepStatus;
     use serde_json::json;
+
+    #[test]
+    fn nonexecuted_repeat_receipt_is_not_an_independent_artifact() {
+        let app_options = crate::tui::app::TuiOptions {
+            model: "deepseek-v4-pro".to_string(),
+            workspace: std::path::PathBuf::from("."),
+            config_path: None,
+            config_profile: None,
+            allow_shell: false,
+            use_alt_screen: false,
+            use_mouse_capture: false,
+            use_bracketed_paste: false,
+            max_subagents: 1,
+            skills_dir: std::path::PathBuf::from("."),
+            memory_path: std::path::PathBuf::from("memory.md"),
+            notes_path: std::path::PathBuf::from("notes.txt"),
+            mcp_config_path: std::path::PathBuf::from("mcp.json"),
+            use_memory: false,
+            start_in_agent_mode: true,
+            skip_onboarding: true,
+            yolo: false,
+            resume_session_id: None,
+            initial_input: None,
+        };
+        let mut app = App::new(app_options, &crate::config::Config::default());
+        app.current_session_id = Some("repeat-session".to_string());
+        let reused = ToolResult {
+            content: "bounded leader envelope".to_string(),
+            success: true,
+            metadata: Some(json!({
+                "executed": false,
+                "spillover_path": "/tmp/leader-artifact.txt",
+                "artifact_relative_path": "artifacts/art_output_leader.txt",
+                "artifact_session_id": "repeat-session",
+                "artifact_id": "art_output_leader"
+            })),
+        };
+
+        record_spillover_artifact_if_any(&mut app, "follower-call", "read_file", &Ok(reused));
+
+        assert!(app.session_artifacts.is_empty());
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    #[allow(clippy::await_holding_lock)] // Serializes the process-global artifact-root override.
+    async fn nested_and_ignored_artifact_receipts_remain_indexed() {
+        let _artifact_lock = crate::artifacts::TEST_ARTIFACT_SESSIONS_GUARD
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let temp = tempfile::tempdir().expect("tempdir");
+        let prior =
+            crate::artifacts::set_test_artifact_sessions_root(Some(temp.path().join("sessions")));
+        struct RestoreRoot(Option<PathBuf>);
+        impl Drop for RestoreRoot {
+            fn drop(&mut self) {
+                crate::artifacts::set_test_artifact_sessions_root(self.0.take());
+            }
+        }
+        let _restore = RestoreRoot(prior);
+        let app_options = crate::tui::app::TuiOptions {
+            model: "deepseek-v4-pro".to_string(),
+            workspace: temp.path().to_path_buf(),
+            config_path: None,
+            config_profile: None,
+            allow_shell: false,
+            use_alt_screen: false,
+            use_mouse_capture: false,
+            use_bracketed_paste: false,
+            max_subagents: 1,
+            skills_dir: temp.path().to_path_buf(),
+            memory_path: temp.path().join("memory.md"),
+            notes_path: temp.path().join("notes.txt"),
+            mcp_config_path: temp.path().join("mcp.json"),
+            use_memory: false,
+            start_in_agent_mode: true,
+            skip_onboarding: true,
+            yolo: false,
+            resume_session_id: None,
+            initial_input: None,
+        };
+        let mut app = App::new(app_options, &crate::config::Config::default());
+        let session_id = "nested-receipt-session";
+        app.current_session_id = Some(session_id.to_string());
+        handle_tool_call_started(
+            &mut app,
+            "parallel-parent",
+            "multi_tool_use.parallel",
+            &json!({}),
+        );
+        let broker = crate::tools::large_output_router::LargeOutputBroker::new(
+            crate::tools::large_output_router::WorkshopConfig {
+                large_output_threshold_tokens: Some(100),
+                ..Default::default()
+            },
+            session_id,
+            temp.path(),
+            crate::tools::handle::new_shared_handle_store(),
+            crate::context_budget::PressureLevel::Low,
+            Some(128_000),
+        );
+        let mut nested = ToolResult::error(
+            "CW_NESTED_RECEIPT_SENTINEL\n".to_string() + &"parallel failure\n".repeat(20_000),
+        );
+        let outcome = broker
+            .project(
+                "parallel-parent.0",
+                "run_tests",
+                &json!({"package": "nested"}),
+                &mut nested,
+            )
+            .await;
+        assert!(matches!(
+            outcome,
+            crate::tools::large_output_router::ProjectionOutcome::Stored { .. }
+        ));
+        handle_tool_artifact_stored(
+            &mut app,
+            "parallel-parent.0",
+            "run_tests",
+            &json!({"package": "nested"}),
+            &nested,
+            Some("parallel-parent"),
+            None,
+        );
+
+        assert_eq!(app.session_artifacts.len(), 1);
+        assert_eq!(app.session_artifacts[0].tool_call_id, "parallel-parent.0");
+        let parent_cell = app.tool_cells["parallel-parent"];
+        assert_eq!(app.tool_cells["parallel-parent.0"], parent_cell);
+        let nested_detail = app
+            .active_tool_details
+            .get("parallel-parent.0")
+            .expect("nested Alt+V detail");
+        assert!(nested_detail.artifact.as_ref().is_some_and(|a| a.available));
+
+        let mut ignored = ToolResult::success(
+            "CW_IGNORED_RECEIPT_SENTINEL\n".to_string() + &"background output\n".repeat(20_000),
+        );
+        let outcome = broker
+            .project("ignored-call", "exec_shell_wait", &json!({}), &mut ignored)
+            .await;
+        assert!(matches!(
+            outcome,
+            crate::tools::large_output_router::ProjectionOutcome::Stored { .. }
+        ));
+        app.ignored_tool_calls.insert("ignored-call".to_string());
+        handle_tool_call_complete(&mut app, "ignored-call", "exec_shell_wait", &Ok(ignored));
+        assert_eq!(app.session_artifacts.len(), 2);
+        assert!(
+            app.session_artifacts
+                .iter()
+                .any(|artifact| artifact.tool_call_id == "ignored-call")
+        );
+    }
 
     #[test]
     fn web_search_presentation_reads_source_degradation_and_citation_count() {

@@ -132,6 +132,22 @@ impl PagerView {
         Self::new(title, lines)
     }
 
+    /// Build a pager whose display/search rows retain source whitespace.
+    ///
+    /// Ordinary prose pagers intentionally use word wrapping. Raw tool
+    /// evidence is different: indentation, repeated spaces, and tabs can be
+    /// semantically meaningful, so its wrapping must never pass through
+    /// `split_whitespace`.
+    pub fn from_preformatted_text(title: impl Into<String>, text: &str, width: u16) -> Self {
+        let mut lines = Vec::new();
+        for raw in text.split('\n') {
+            for wrapped in wrap_preformatted_text(raw, width.max(1) as usize) {
+                lines.push(Line::from(Span::raw(wrapped)));
+            }
+        }
+        Self::new(title, lines)
+    }
+
     fn scroll_up(&mut self, amount: usize) {
         self.scroll = self.scroll.saturating_sub(amount);
     }
@@ -630,6 +646,40 @@ fn wrap_text(text: &str, width: usize) -> Vec<String> {
     lines
 }
 
+fn wrap_preformatted_text(text: &str, width: usize) -> Vec<String> {
+    if width == 0 {
+        return vec![text.to_string()];
+    }
+
+    let mut lines = Vec::new();
+    let mut current = String::new();
+    let mut current_width = 0usize;
+
+    for character in text.chars() {
+        // Keep the literal tab in the searchable/display row while accounting
+        // for the next four-column tab stop for wrapping purposes.
+        let character_width = if character == '\t' {
+            4 - (current_width % 4)
+        } else {
+            UnicodeWidthChar::width(character).unwrap_or(0)
+        };
+
+        if !current.is_empty() && current_width + character_width > width {
+            lines.push(std::mem::take(&mut current));
+            current_width = 0;
+        }
+        current.push(character);
+        current_width += character_width;
+    }
+
+    if current.is_empty() {
+        lines.push(String::new());
+    } else {
+        lines.push(current);
+    }
+    lines
+}
+
 fn push_word_breaking_chars(
     word: &str,
     width: usize,
@@ -937,6 +987,26 @@ mod tests {
     fn copy_override_preserves_indentation_tabs_and_blank_lines() {
         let source = "Result:\n    indented\n\twith-tab\n\nnext";
         let mut pager = PagerView::from_text("T", source, 12).with_copy_text(source);
+
+        let action = pager.handle_key(key(KeyCode::Char('c')));
+        match action {
+            ViewAction::Emit(ViewEvent::CopyToClipboard { text, .. }) => {
+                assert_eq!(text, source);
+            }
+            other => panic!("expected CopyToClipboard emit, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn preformatted_text_preserves_display_and_search_whitespace() {
+        let source = "Result:\n    two  spaces\n\twith-tab\n\nnext";
+        let mut pager = PagerView::from_preformatted_text("T", source, 80).with_copy_text(source);
+
+        assert_eq!(pager.body_text(), source);
+        pager.start_search();
+        pager.search_input = "two  spaces".to_string();
+        pager.update_search_matches();
+        assert_eq!(pager.search_matches.len(), 1);
 
         let action = pager.handle_key(key(KeyCode::Char('c')));
         match action {

@@ -15,9 +15,6 @@ use super::web::extract::{DocumentKind, ExtractedDocument, extract_document};
 use super::web::fetch::{
     DEFAULT_MAX_BYTES, DEFAULT_TIMEOUT, FetchOptions, HARD_MAX_BYTES, HARD_MAX_TIMEOUT, fetch,
 };
-use super::web::overflow::bound_text as bound_web_text;
-#[cfg(test)]
-use super::web::overflow::inline_char_budget;
 use async_trait::async_trait;
 use serde::Serialize;
 use serde_json::{Value, json};
@@ -331,24 +328,14 @@ fn render_extracted(
 }
 
 fn bound_text(
-    url: &str,
+    _url: &str,
     content: String,
-    context: &ToolContext,
+    _context: &ToolContext,
 ) -> Result<(String, Option<ArtifactWrite>), ToolError> {
-    let bounded = bound_web_text(
-        content,
-        context,
-        |body| fetch_artifact_id(url, body.as_bytes()),
-        "page",
-    )?;
-    let artifact = bounded.artifact.map(|artifact| ArtifactWrite {
-        session_id: artifact.session_id,
-        absolute_path: artifact.absolute_path,
-        relative_path: artifact.relative_path,
-        byte_size: artifact.byte_size,
-        preview: artifact.preview,
-    });
-    Ok((bounded.content, artifact))
+    // Text remains raw until the ordinary engine result boundary, where the
+    // adaptive broker creates the one canonical artifact. Pre-spilling here
+    // would make that broker preserve only this tool's truncated receipt.
+    Ok((content, None))
 }
 
 fn write_binary_artifact(
@@ -450,14 +437,6 @@ mod tests {
     use crate::tools::spec::ToolContext;
     use std::path::PathBuf;
 
-    struct ArtifactRootRestore(Option<PathBuf>);
-
-    impl Drop for ArtifactRootRestore {
-        fn drop(&mut self) {
-            crate::artifacts::set_test_artifact_sessions_root(self.0.take());
-        }
-    }
-
     fn ctx() -> ToolContext {
         ToolContext::new(PathBuf::from("."))
     }
@@ -473,14 +452,7 @@ mod tests {
     }
 
     #[test]
-    fn route_budget_overflow_round_trips_through_session_artifact() {
-        let _lock = crate::artifacts::TEST_ARTIFACT_SESSIONS_GUARD
-            .lock()
-            .unwrap_or_else(|error| error.into_inner());
-        let tmp = tempfile::tempdir().unwrap();
-        let prior =
-            crate::artifacts::set_test_artifact_sessions_root(Some(tmp.path().join("sessions")));
-        let _restore = ArtifactRootRestore(prior);
+    fn text_fetch_defers_canonical_storage_to_engine_boundary() {
         let context = ToolContext::new(".")
             .with_state_namespace("fetch-overflow")
             .with_route_context_window(10_000);
@@ -488,14 +460,9 @@ mod tests {
 
         let (inline, artifact) =
             bound_text("https://example.com/large", full.clone(), &context).unwrap();
-        let artifact = artifact.expect("overflow artifact");
 
-        assert!(inline.contains("retrieve_tool_result"));
-        assert!(inline.chars().count() <= inline_char_budget(&context));
-        assert_eq!(
-            std::fs::read_to_string(artifact.absolute_path).unwrap(),
-            full
-        );
+        assert_eq!(inline, full);
+        assert!(artifact.is_none());
     }
 
     #[test]

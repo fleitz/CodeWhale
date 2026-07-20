@@ -763,6 +763,7 @@ mod tests {
                 session_id: "existing-session".to_string(),
                 tool_call_id: "call-big".to_string(),
                 tool_name: "exec_shell".to_string(),
+                success: Some(true),
                 created_at: chrono::Utc::now(),
                 byte_size: 128,
                 preview: "tool output".to_string(),

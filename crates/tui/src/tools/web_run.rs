@@ -13,9 +13,6 @@ use super::web::fetch::fetch_with_initial_pin;
 use super::web::fetch::{FetchOptions, HARD_MAX_BYTES, fetch};
 #[cfg(test)]
 use super::web::guard::DnsPin;
-use super::web::overflow::bound_text as bound_web_text;
-#[cfg(test)]
-use super::web::overflow::inline_char_budget;
 use async_trait::async_trait;
 use regex::Regex;
 use serde::{Deserialize, Serialize};
@@ -1144,34 +1141,14 @@ fn page_from_fetched(
 
 fn bounded_web_run_result(
     output: &WebRunOutput,
-    context: &ToolContext,
+    _context: &ToolContext,
 ) -> Result<ToolResult, ToolError> {
     let full = serde_json::to_string_pretty(output)
         .map_err(|error| ToolError::execution_failed(error.to_string()))?;
-    let bounded = bound_web_text(
-        full,
-        context,
-        |body| {
-            let digest = crate::hashing::sha256_hex(body.as_bytes());
-            format!("web_run_{}", &digest[..16])
-        },
-        "web.run result",
-    )?;
-    let metadata = bounded.artifact.map(|artifact| {
-        json!({
-            "spillover_path": artifact.absolute_path.display().to_string(),
-            "artifact_session_id": artifact.session_id,
-            "artifact_relative_path": crate::artifacts::format_artifact_relative_path(&artifact.relative_path),
-            "artifact_byte_size": artifact.byte_size,
-            "artifact_preview": artifact.preview,
-        })
-    });
-
-    Ok(ToolResult {
-        content: bounded.content,
-        success: true,
-        metadata,
-    })
+    // Keep the exact structured result intact until the ordinary engine tool
+    // boundary. The adaptive broker owns the single canonical text artifact;
+    // pre-spilling here would cause it to store a truncated receipt instead.
+    Ok(ToolResult::success(full))
 }
 
 fn render_view(
@@ -1505,14 +1482,6 @@ mod tests {
 
     static WEB_RUN_TEST_LOCK: Mutex<()> = Mutex::const_new(());
 
-    struct ArtifactRootRestore(Option<PathBuf>);
-
-    impl Drop for ArtifactRootRestore {
-        fn drop(&mut self) {
-            crate::artifacts::set_test_artifact_sessions_root(self.0.take());
-        }
-    }
-
     fn lock_web_run_test_state() -> MutexGuard<'static, ()> {
         WEB_RUN_TEST_LOCK.blocking_lock()
     }
@@ -1566,14 +1535,7 @@ mod tests {
     }
 
     #[test]
-    fn oversized_web_run_output_round_trips_through_session_artifact() {
-        let _lock = crate::artifacts::TEST_ARTIFACT_SESSIONS_GUARD
-            .lock()
-            .unwrap_or_else(|error| error.into_inner());
-        let tmp = tempfile::tempdir().unwrap();
-        let prior =
-            crate::artifacts::set_test_artifact_sessions_root(Some(tmp.path().join("sessions")));
-        let _restore = ArtifactRootRestore(prior);
+    fn oversized_web_run_output_defers_storage_to_engine_boundary() {
         let context = ToolContext::new(".")
             .with_state_namespace("web-run-overflow")
             .with_route_context_window(10_000);
@@ -1583,16 +1545,11 @@ mod tests {
         };
 
         let result = bounded_web_run_result(&output, &context).unwrap();
-        let metadata = result.metadata.expect("artifact metadata");
-        let path = metadata["spillover_path"].as_str().unwrap();
-        let full = std::fs::read_to_string(path).unwrap();
-
-        assert!(result.content.contains("retrieve_tool_result"));
-        assert!(result.content.chars().count() <= inline_char_budget(&context));
         assert_eq!(
-            serde_json::from_str::<Value>(&full).unwrap()["warnings"][0],
+            serde_json::from_str::<Value>(&result.content).unwrap()["warnings"][0],
             output.warnings[0]
         );
+        assert!(result.metadata.is_none());
     }
 
     #[test]

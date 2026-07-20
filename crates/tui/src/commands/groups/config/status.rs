@@ -344,6 +344,7 @@ mod tests {
                 session_id: "session-123".to_string(),
                 tool_call_id: "call-big".to_string(),
                 tool_name: "exec_shell".to_string(),
+                success: Some(true),
                 created_at: chrono::Utc::now(),
                 byte_size: 24_000,
                 preview: "large output".to_string(),

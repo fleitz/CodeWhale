@@ -22,6 +22,7 @@ fn web_search_cell_renders_receipt_source_degradation_and_citations() {
         source: Some("provider-native/xai/grok-4.5".to_string()),
         degraded: Some("provider_native -> duckduckgo".to_string()),
         ref_count: 2,
+        adaptive_summary: None,
     };
     let rendered = cell
         .lines_with_motion(120, true)
@@ -1714,6 +1715,7 @@ fn exploring_card_search_reads_as_find_not_read() {
         entries: vec![super::ExploringEntry {
             label: "Searching for `TranscriptScroll`".to_string(),
             status: ToolStatus::Success,
+            output_summary: None,
         }],
     };
     let header: String = cell.lines_with_motion(80, true)[0]
@@ -1742,6 +1744,7 @@ fn exploring_card_read_keeps_read_verb() {
         entries: vec![super::ExploringEntry {
             label: "Reading src/foo.rs".to_string(),
             status: ToolStatus::Success,
+            output_summary: None,
         }],
     };
     let header: String = cell.lines_with_motion(80, true)[0]
@@ -3179,6 +3182,69 @@ fn agent_spawn_suppresses_generic_card_in_favor_of_delegate_card() {
         assert!(
             lines.is_empty(),
             "spawn generic tool card must yield to DelegateCard (#4133): {mode:?} {lines:?}"
+        );
+    }
+}
+
+#[test]
+fn adaptive_failure_receipt_stays_compact_at_release_viewports() {
+    let envelope = serde_json::json!({
+        "schema": crate::tools::large_output_router::EVIDENCE_SCHEMA,
+        "status": "failed",
+        "tool": "exec_shell",
+        "payload_kind": "command_output",
+        "bytes": 2_100_000,
+        "estimated_tokens": 700_000,
+        "handle": format!("output_{}_0123456789ab", "a".repeat(64)),
+        "sha256": "a".repeat(64),
+        "facts": ["error[E0382]: borrow of moved value"],
+        "preview": {"head": "checking", "tail": "could not compile"},
+        "inspect": {"tool": "handle_read", "operations": ["search"]},
+        "evidence_available": true
+    })
+    .to_string();
+    let chord = crate::tui::shell_key_routing::tool_details_chord();
+    let cell = ExecCell {
+        command: "cargo test --workspace".to_string(),
+        status: ToolStatus::Failed,
+        output: Some(envelope),
+        live_output: None,
+        shell_task_id: None,
+        owner_agent_id: None,
+        owner_agent_name: None,
+        started_at: None,
+        duration_ms: Some(1_234),
+        source: ExecSource::Assistant,
+        interaction: None,
+        output_summary: Some(format!(
+            "1 failure · 3 MB output kept · error[E0382]: borrow of moved value · {chord} details"
+        )),
+    };
+
+    for (width, height) in [(80, 24), (100, 32), (140, 40)] {
+        let lines = cell.lines_with_motion(width, true);
+        let rendered = lines
+            .iter()
+            .map(line_to_plain)
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(lines.len() <= 4, "{width}x{height}: {rendered}");
+        assert!(
+            rendered.contains("1 failure"),
+            "{width}x{height}: {rendered}"
+        );
+        assert!(rendered.contains("E0382"), "{width}x{height}: {rendered}");
+        assert!(
+            rendered.contains(chord.as_ref()),
+            "{width}x{height}: {rendered}"
+        );
+        assert!(
+            !rendered.contains("codewhale.tool_evidence"),
+            "{width}x{height}: {rendered}"
+        );
+        assert!(
+            !rendered.contains("output_aaaa"),
+            "{width}x{height}: {rendered}"
         );
     }
 }

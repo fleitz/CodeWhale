@@ -7,6 +7,7 @@
 //! every subsequent request.
 
 use std::fs;
+use std::io::{self, Read};
 use std::path::PathBuf;
 
 use async_trait::async_trait;
@@ -25,9 +26,44 @@ const DEFAULT_MAX_MATCHES: usize = 20;
 const HARD_MAX_MATCHES: usize = 100;
 const DEFAULT_CONTEXT_LINES: usize = 1;
 const HARD_CONTEXT_LINES: usize = 5;
+/// Compatibility retrieval may still build a line index. Keep that legacy
+/// path explicitly bounded; larger canonical artifacts are read through the
+/// streaming `handle_read` surface advertised by adaptive evidence.
+const HARD_SOURCE_BYTES: u64 = 32 * 1024 * 1024;
 
 /// Retrieve summaries or slices of a prior spilled tool result.
 pub struct RetrieveToolResultTool;
+
+#[derive(Clone)]
+struct ResolvedSpilloverReference {
+    display_path: PathBuf,
+    session: Option<SessionArtifactReference>,
+}
+
+#[derive(Clone)]
+struct SessionArtifactReference {
+    session_id: String,
+    relative_path: PathBuf,
+}
+
+impl ResolvedSpilloverReference {
+    fn legacy(path: PathBuf) -> Self {
+        Self {
+            display_path: path,
+            session: None,
+        }
+    }
+
+    fn session(session_id: &str, relative_path: PathBuf, display_path: PathBuf) -> Self {
+        Self {
+            display_path,
+            session: Some(SessionArtifactReference {
+                session_id: session_id.to_string(),
+                relative_path,
+            }),
+        }
+    }
+}
 
 #[async_trait]
 impl ToolSpec for RetrieveToolResultTool {
@@ -112,20 +148,38 @@ impl ToolSpec for RetrieveToolResultTool {
             1,
             HARD_MAX_BYTES,
         );
-        let path = resolve_spillover_reference(reference, &context.state_namespace)?;
-        let content = fs::read_to_string(&path).map_err(|err| {
-            ToolError::execution_failed(format!("failed to read {}: {err}", path.display()))
-        })?;
+        let resolved = resolve_spillover_reference(reference, &context.state_namespace)?;
+        let display_path = resolved.display_path.clone();
+        let content = tokio::task::spawn_blocking(move || read_verified_result(&resolved))
+            .await
+            .map_err(|err| {
+                ToolError::execution_failed(format!("tool-result reader task failed: {err}"))
+            })?
+            .map_err(|err| {
+                ToolError::execution_failed(format!(
+                    "failed to read {}: {err}",
+                    display_path.display()
+                ))
+            })?;
 
         let lines: Vec<&str> = content.lines().collect();
         let payload = match mode.as_str() {
-            "summary" => {
-                build_summary_payload(reference, &path, &content, &lines, &input, max_bytes)
+            "summary" => build_summary_payload(
+                reference,
+                &display_path,
+                &content,
+                &lines,
+                &input,
+                max_bytes,
+            ),
+            "head" => {
+                build_head_tail_payload(reference, &display_path, "head", &lines, &input, max_bytes)
             }
-            "head" => build_head_tail_payload(reference, &path, "head", &lines, &input, max_bytes),
-            "tail" => build_head_tail_payload(reference, &path, "tail", &lines, &input, max_bytes),
-            "lines" => build_lines_payload(reference, &path, &lines, &input, max_bytes)?,
-            "query" => build_query_payload(reference, &path, &lines, &input, max_bytes)?,
+            "tail" => {
+                build_head_tail_payload(reference, &display_path, "tail", &lines, &input, max_bytes)
+            }
+            "lines" => build_lines_payload(reference, &display_path, &lines, &input, max_bytes)?,
+            "query" => build_query_payload(reference, &display_path, &lines, &input, max_bytes)?,
             other => {
                 return Err(ToolError::invalid_input(format!(
                     "unsupported mode `{other}` (expected summary, head, tail, lines, or query)"
@@ -137,6 +191,83 @@ impl ToolSpec for RetrieveToolResultTool {
             ToolError::execution_failed(format!("failed to serialize result: {err}"))
         })
     }
+}
+
+fn read_verified_result(reference: &ResolvedSpilloverReference) -> io::Result<String> {
+    let mut file = if let Some(session) = reference.session.as_ref() {
+        crate::artifacts::open_session_artifact_for_read(
+            &session.session_id,
+            &session.relative_path,
+        )?
+    } else {
+        open_legacy_result_no_follow(&reference.display_path)?
+    };
+    let source_bytes = file.metadata()?.len();
+    if source_bytes > HARD_SOURCE_BYTES {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "stored tool result is {source_bytes} bytes; compatibility retrieval refuses sources over {HARD_SOURCE_BYTES} bytes (use handle_read)"
+            ),
+        ));
+    }
+    let mut content = String::with_capacity(source_bytes as usize);
+    file.read_to_string(&mut content)?;
+    if let Some(expected) = digest_encoded_in_filename(&reference.display_path) {
+        let actual = crate::hashing::sha256_hex(content.as_bytes());
+        if actual != expected {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "stored tool-result digest does not match its content-addressed reference",
+            ));
+        }
+    }
+    Ok(content)
+}
+
+fn open_legacy_result_no_follow(path: &std::path::Path) -> io::Result<fs::File> {
+    #[cfg(unix)]
+    let file = {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC | libc::O_NONBLOCK)
+            .open(path)?
+    };
+    #[cfg(not(unix))]
+    let file = {
+        if fs::symlink_metadata(path)?.file_type().is_symlink() {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "tool-result symlink refused",
+            ));
+        }
+        fs::File::open(path)?
+    };
+    if !file.metadata()?.is_file() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "tool result is not a regular file",
+        ));
+    }
+    Ok(file)
+}
+
+fn digest_encoded_in_filename(path: &std::path::Path) -> Option<String> {
+    let file_name = path.file_name()?.to_str()?.strip_suffix(".txt")?;
+    if let Some(digests) = file_name.strip_prefix("art_output_") {
+        let (content_digest, occurrence) = digests.split_once('_')?;
+        if content_digest.len() == 64
+            && occurrence.len() == 12
+            && content_digest.chars().all(|ch| ch.is_ascii_hexdigit())
+            && occurrence.chars().all(|ch| ch.is_ascii_hexdigit())
+        {
+            return Some(content_digest.to_ascii_lowercase());
+        }
+    }
+    let digest = file_name.strip_prefix("sha_")?;
+    crate::tools::truncate::is_valid_sha256(&digest.to_ascii_lowercase())
+        .then(|| digest.to_ascii_lowercase())
 }
 
 /// Resolve a tool-result ref to a concrete file path.
@@ -153,7 +284,10 @@ impl ToolSpec for RetrieveToolResultTool {
 ///
 /// The error message on a miss enumerates which forms were tried so the
 /// model can correct course without a second blind guess.
-fn resolve_spillover_reference(reference: &str, session_id: &str) -> Result<PathBuf, ToolError> {
+fn resolve_spillover_reference(
+    reference: &str,
+    session_id: &str,
+) -> Result<ResolvedSpilloverReference, ToolError> {
     let root = crate::tools::truncate::spillover_root().ok_or_else(|| {
         ToolError::execution_failed("could not resolve ~/.codewhale/tool_outputs")
     })?;
@@ -179,10 +313,6 @@ fn resolve_spillover_reference(reference: &str, session_id: &str) -> Result<Path
     } else {
         None
     };
-    let session_artifacts_root_canonical = session_artifacts_root
-        .as_ref()
-        .and_then(|p| p.canonicalize().ok());
-
     let trimmed = reference.trim();
     let stripped = trimmed
         .strip_prefix("tool_result:")
@@ -190,49 +320,61 @@ fn resolve_spillover_reference(reference: &str, session_id: &str) -> Result<Path
         .trim();
 
     let mut tried: Vec<PathBuf> = Vec::new();
-    let try_path = |candidate: PathBuf, tried: &mut Vec<PathBuf>| -> Option<PathBuf> {
-        // Always record what we tried so the `not_found` diagnostic
-        // can enumerate every candidate, even ones whose
-        // `canonicalize` returns ENOENT. Models otherwise saw the
-        // useless "(no valid candidates derived from ref)" line.
-        tried.push(candidate.clone());
+    let try_legacy_path =
+        |candidate: PathBuf, tried: &mut Vec<PathBuf>| -> Option<ResolvedSpilloverReference> {
+            // Always record what we tried so the `not_found` diagnostic
+            // can enumerate every candidate, even ones whose
+            // `canonicalize` returns ENOENT. Models otherwise saw the
+            // useless "(no valid candidates derived from ref)" line.
+            tried.push(candidate.clone());
 
-        // Reject symlinks at the leaf BEFORE canonicalizing so an
-        // attacker who can write under `<sid>/artifacts/` cannot
-        // plant a symlink to `/etc/passwd` and read it back through
-        // `retrieve_tool_result`. canonicalize() would happily
-        // follow such a link and then pass the `starts_with(root)`
-        // check because of the resolved-then-compare order. The
-        // home-level `~/.codewhale/tool_outputs/` dir is engine-only and
-        // never carried this concern; session artifact dirs hold
-        // arbitrary tool output and need the guard.
-        if let Ok(meta) = std::fs::symlink_metadata(&candidate)
-            && meta.file_type().is_symlink()
-        {
-            return None;
-        }
+            // Do not follow a leaf symlink even in the compatibility store.
+            // Session artifacts take the stricter resolver below, which also
+            // refuses symlinks in every parent component.
+            if let Ok(meta) = std::fs::symlink_metadata(&candidate)
+                && meta.file_type().is_symlink()
+            {
+                return None;
+            }
 
-        let canonical = candidate.canonicalize().ok()?;
-        if !canonical.is_file() {
-            return None;
-        }
-        let inside_legacy = root_canonical
-            .as_ref()
-            .is_some_and(|root| canonical.starts_with(root));
-        let inside_session = session_artifacts_root_canonical
-            .as_ref()
-            .is_some_and(|root| canonical.starts_with(root));
-        if inside_legacy || inside_session {
-            Some(canonical)
-        } else {
-            None
-        }
-    };
+            let canonical = candidate.canonicalize().ok()?;
+            if !canonical.is_file() {
+                return None;
+            }
+            if root_canonical
+                .as_ref()
+                .is_some_and(|root| canonical.starts_with(root))
+            {
+                Some(ResolvedSpilloverReference::legacy(canonical))
+            } else {
+                None
+            }
+        };
+    let try_session_relative =
+        |relative: PathBuf, tried: &mut Vec<PathBuf>| -> Option<ResolvedSpilloverReference> {
+            let display = session_artifacts_root
+                .as_ref()
+                .map_or_else(|| relative.clone(), |root| root.join(&relative));
+            tried.push(display);
+            let relative = PathBuf::from(crate::artifacts::ARTIFACTS_DIR_NAME).join(relative);
+            let resolved =
+                crate::artifacts::resolve_session_artifact_for_read(session_id, &relative).ok()?;
+            Some(ResolvedSpilloverReference::session(
+                session_id, relative, resolved,
+            ))
+        };
 
     // Form 1/3: absolute path. Validate it lives under one of the allowed roots.
     let raw_path = PathBuf::from(stripped);
     if raw_path.is_absolute() {
-        if let Some(found) = try_path(raw_path.clone(), &mut tried) {
+        if let Some(found) = try_legacy_path(raw_path.clone(), &mut tried) {
+            return Ok(found);
+        }
+        if let Some(relative) = session_artifacts_root
+            .as_ref()
+            .and_then(|root| raw_path.strip_prefix(root).ok())
+            && let Some(found) = try_session_relative(relative.to_path_buf(), &mut tried)
+        {
             return Ok(found);
         }
         return Err(not_found(
@@ -251,7 +393,7 @@ fn resolve_spillover_reference(reference: &str, session_id: &str) -> Result<Path
         .trim();
     if crate::tools::truncate::is_valid_sha256(&sha_candidate.to_ascii_lowercase())
         && let Some(p) = crate::tools::truncate::sha_spillover_path(sha_candidate)
-        && let Some(found) = try_path(p, &mut tried)
+        && let Some(found) = try_legacy_path(p, &mut tried)
     {
         return Ok(found);
     }
@@ -262,15 +404,15 @@ fn resolve_spillover_reference(reference: &str, session_id: &str) -> Result<Path
         || (std::path::MAIN_SEPARATOR != '/' && stripped.contains(std::path::MAIN_SEPARATOR));
     if looks_like_path {
         // Try legacy spillover root.
-        if let Some(found) = try_path(root.join(stripped), &mut tried) {
+        if let Some(found) = try_legacy_path(root.join(stripped), &mut tried) {
             return Ok(found);
         }
         // Session artifact roots point directly at `<sid>/artifacts/`.
         // Strip an optional leading `artifacts/` segment from transcript
         // paths before joining.
-        if let Some(sa_root) = session_artifacts_root.as_ref() {
+        if session_artifacts_root.is_some() {
             let rel = stripped.strip_prefix("artifacts/").unwrap_or(stripped);
-            if let Some(found) = try_path(sa_root.join(rel), &mut tried) {
+            if let Some(found) = try_session_relative(PathBuf::from(rel), &mut tried) {
                 return Ok(found);
             }
         }
@@ -284,7 +426,7 @@ fn resolve_spillover_reference(reference: &str, session_id: &str) -> Result<Path
 
     // Form 1: bare id → legacy `tool_outputs/<id>.txt`.
     if let Some(p) = crate::tools::truncate::spillover_path(stripped)
-        && let Some(found) = try_path(p, &mut tried)
+        && let Some(found) = try_legacy_path(p, &mut tried)
     {
         return Ok(found);
     }
@@ -292,23 +434,33 @@ fn resolve_spillover_reference(reference: &str, session_id: &str) -> Result<Path
     //   a) session artifacts dir at `artifacts/art_<id>.txt`
     //   b) legacy spillover at `<id>.txt`
     if let Some(stripped_art) = stripped.strip_prefix("art_") {
-        if let Some(sa_root) = session_artifacts_root.as_ref() {
-            let session_file = sa_root.join(format!("art_{stripped_art}.txt"));
-            if let Some(found) = try_path(session_file, &mut tried) {
-                return Ok(found);
-            }
+        if session_artifacts_root.is_some()
+            && let Some(found) =
+                try_session_relative(PathBuf::from(format!("art_{stripped_art}.txt")), &mut tried)
+        {
+            return Ok(found);
         }
         if let Some(p) = crate::tools::truncate::spillover_path(stripped_art)
-            && let Some(found) = try_path(p, &mut tried)
+            && let Some(found) = try_legacy_path(p, &mut tried)
+        {
+            return Ok(found);
+        }
+        if session_artifacts_root.is_some()
+            && let Some(found) =
+                resolve_adaptive_call_artifact(session_id, stripped_art, &mut tried)
         {
             return Ok(found);
         }
     }
     // Form 2b: maybe the model passed the bare id but the artifact lives
     // under the session artifacts dir. Try `artifacts/art_<id>.txt`.
-    if let Some(sa_root) = session_artifacts_root.as_ref() {
-        let session_file = sa_root.join(format!("art_{stripped}.txt"));
-        if let Some(found) = try_path(session_file, &mut tried) {
+    if session_artifacts_root.is_some() {
+        if let Some(found) =
+            try_session_relative(PathBuf::from(format!("art_{stripped}.txt")), &mut tried)
+        {
+            return Ok(found);
+        }
+        if let Some(found) = resolve_adaptive_call_artifact(session_id, stripped, &mut tried) {
             return Ok(found);
         }
     }
@@ -319,6 +471,42 @@ fn resolve_spillover_reference(reference: &str, session_id: &str) -> Result<Path
         &root,
         session_artifacts_root.as_deref(),
     ))
+}
+
+/// Adaptive artifacts keep the content digest in their filename and a short
+/// hash of the original call id as the occurrence suffix. This lets legacy
+/// `ref=<call-id>` requests find the same canonical session file without a
+/// second home-level raw copy.
+fn resolve_adaptive_call_artifact(
+    session_id: &str,
+    tool_call_id: &str,
+    tried: &mut Vec<PathBuf>,
+) -> Option<ResolvedSpilloverReference> {
+    let session_artifacts_root =
+        crate::artifacts::resolve_session_artifacts_dir_for_read(session_id).ok()?;
+    let digest = crate::hashing::sha256_hex(tool_call_id.as_bytes());
+    let suffix = format!("_{}.txt", &digest[..12]);
+    let mut entries = std::fs::read_dir(session_artifacts_root)
+        .ok()?
+        .filter_map(Result::ok)
+        .filter_map(|entry| {
+            let name = entry.file_name().into_string().ok()?;
+            (name.starts_with("art_output_") && name.ends_with(&suffix)).then_some(name)
+        })
+        .collect::<Vec<_>>();
+    entries.sort();
+    entries.into_iter().find_map(|file_name| {
+        let relative = PathBuf::from(crate::artifacts::ARTIFACTS_DIR_NAME).join(&file_name);
+        tried.push(
+            crate::artifacts::session_artifact_absolute_path(session_id, &relative)
+                .unwrap_or_else(|| relative.clone()),
+        );
+        let resolved =
+            crate::artifacts::resolve_session_artifact_for_read(session_id, &relative).ok()?;
+        Some(ResolvedSpilloverReference::session(
+            session_id, relative, resolved,
+        ))
+    })
 }
 
 /// Format a "ref didn't resolve" error with enough detail for the
@@ -866,6 +1054,9 @@ mod tests {
     #[test]
     fn resolves_art_prefix_via_session_artifacts() {
         let _lock = test_lock();
+        let _artifact_lock = crate::artifacts::TEST_ARTIFACT_SESSIONS_GUARD
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
         let tmp = tempdir().unwrap();
         let _spill_guard = set_spillover_root(tmp.path().join("tool_outputs"));
         let _art_guard = {
@@ -897,10 +1088,82 @@ mod tests {
         );
     }
 
+    #[test]
+    fn call_id_compatibility_reads_the_single_adaptive_session_artifact() {
+        let _lock = test_lock();
+        let _artifact_lock = crate::artifacts::TEST_ARTIFACT_SESSIONS_GUARD
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let tmp = tempdir().unwrap();
+        let legacy_root = tmp.path().join("tool_outputs");
+        let _spill_guard = set_spillover_root(legacy_root.clone());
+        let _art_guard = {
+            let prior = crate::artifacts::set_test_artifact_sessions_root(Some(
+                tmp.path().join("sessions"),
+            ));
+            scopeguard_for_test(prior)
+        };
+        let session_id = "adaptive-session";
+        let call_id = "call-provider-uuid-compatible";
+        let body = "one canonical adaptive evidence file\nerror[E0382]: moved value\n";
+        let content_sha = crate::hashing::sha256_hex(body.as_bytes());
+        let call_sha = crate::hashing::sha256_hex(call_id.as_bytes());
+        let artifact_id = format!("art_output_{content_sha}_{}", &call_sha[..12]);
+        let (artifact_path, _) =
+            crate::artifacts::write_session_artifact(session_id, &artifact_id, body).unwrap();
+        assert!(
+            !legacy_root.join(format!("{call_id}.txt")).exists(),
+            "compatibility must not require a second legacy raw copy"
+        );
+
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let workspace_tmp = tempdir().unwrap();
+        let ctx = ToolContext::new(workspace_tmp.path()).with_state_namespace(session_id);
+        for reference in [call_id.to_string(), format!("art_{call_id}"), artifact_id] {
+            let result = runtime
+                .block_on(RetrieveToolResultTool.execute(
+                    json!({"ref": reference, "mode": "query", "query": "E0382"}),
+                    &ctx,
+                ))
+                .expect("compatibility ref resolves canonical artifact");
+            assert!(result.content.contains("E0382"));
+        }
+
+        let tampered = body.replace("one", "ONE");
+        assert_eq!(tampered.len(), body.len());
+        std::fs::write(&artifact_path, tampered).expect("tamper canonical artifact");
+        let error = runtime
+            .block_on(
+                RetrieveToolResultTool.execute(json!({"ref": call_id, "mode": "summary"}), &ctx),
+            )
+            .expect_err("compatibility retrieval must verify adaptive content digest");
+        assert!(error.to_string().contains("content-addressed reference"));
+    }
+
+    #[test]
+    fn compatibility_reader_refuses_unbounded_sources_before_materializing() {
+        let tmp = tempdir().unwrap();
+        let path = tmp.path().join("legacy-large.txt");
+        let file = fs::File::create(&path).expect("create sparse source");
+        file.set_len(HARD_SOURCE_BYTES + 1)
+            .expect("size sparse source");
+
+        let error = read_verified_result(&ResolvedSpilloverReference::legacy(path))
+            .expect_err("oversized source must fail closed");
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert!(error.to_string().contains("use handle_read"));
+    }
+
     #[cfg(unix)]
     #[test]
     fn rejects_symlink_inside_session_artifacts() {
         let _lock = test_lock();
+        let _artifact_lock = crate::artifacts::TEST_ARTIFACT_SESSIONS_GUARD
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
         let tmp = tempdir().unwrap();
         let _spill_guard = set_spillover_root(tmp.path().join("tool_outputs"));
         let _art_guard = {
@@ -936,6 +1199,97 @@ mod tests {
             err.to_string().contains("not found"),
             "expected `not found`, got: {err}"
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn compatibility_reader_refuses_cross_session_artifacts_parent_symlink() {
+        let _lock = test_lock();
+        let _artifact_lock = crate::artifacts::TEST_ARTIFACT_SESSIONS_GUARD
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let tmp = tempdir().unwrap();
+        let _spill_guard = set_spillover_root(tmp.path().join("tool_outputs"));
+        let sessions = tmp.path().join("sessions");
+        let _art_guard = {
+            let prior = crate::artifacts::set_test_artifact_sessions_root(Some(sessions.clone()));
+            scopeguard_for_test(prior)
+        };
+        let owner_artifacts = sessions.join("owner/artifacts");
+        fs::create_dir_all(&owner_artifacts).unwrap();
+        let call_id = "call-cross-session-secret";
+        let body = "owner-only canonical evidence";
+        let content_sha = crate::hashing::sha256_hex(body.as_bytes());
+        let call_sha = crate::hashing::sha256_hex(call_id.as_bytes());
+        let file_name = format!("art_output_{content_sha}_{}.txt", &call_sha[..12]);
+        fs::write(owner_artifacts.join(&file_name), body).unwrap();
+        fs::create_dir_all(sessions.join("attacker")).unwrap();
+        std::os::unix::fs::symlink(&owner_artifacts, sessions.join("attacker/artifacts")).unwrap();
+
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let workspace_tmp = tempdir().unwrap();
+        let ctx = ToolContext::new(workspace_tmp.path()).with_state_namespace("attacker");
+        for reference in [call_id.to_string(), format!("art_{call_id}"), file_name] {
+            let error = runtime
+                .block_on(
+                    RetrieveToolResultTool
+                        .execute(json!({"ref": reference, "mode": "summary"}), &ctx),
+                )
+                .expect_err("cross-session parent symlink must not resolve");
+            assert!(error.to_string().contains("not found"), "{error}");
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn compatibility_reader_keeps_open_anchored_when_parent_is_swapped() {
+        let _lock = test_lock();
+        let _artifact_lock = crate::artifacts::TEST_ARTIFACT_SESSIONS_GUARD
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let tmp = tempdir().unwrap();
+        let _spill_guard = set_spillover_root(tmp.path().join("tool_outputs"));
+        let sessions = tmp.path().join("sessions");
+        let _art_guard = {
+            let prior = crate::artifacts::set_test_artifact_sessions_root(Some(sessions.clone()));
+            scopeguard_for_test(prior)
+        };
+        let attacker_artifacts = sessions.join("attacker/artifacts");
+        let owner_artifacts = sessions.join("owner/artifacts");
+        fs::create_dir_all(&attacker_artifacts).unwrap();
+        fs::create_dir_all(&owner_artifacts).unwrap();
+        fs::write(
+            attacker_artifacts.join("art_race.txt"),
+            "attacker-owned evidence",
+        )
+        .unwrap();
+        fs::write(owner_artifacts.join("art_race.txt"), "owner secret").unwrap();
+
+        let attacker_artifacts_for_swap = attacker_artifacts.clone();
+        let owner_artifacts_for_swap = owner_artifacts.clone();
+        crate::artifacts::set_before_session_artifact_leaf_open_hook(move || {
+            let original = attacker_artifacts_for_swap.with_file_name("artifacts-original");
+            fs::rename(&attacker_artifacts_for_swap, &original).unwrap();
+            std::os::unix::fs::symlink(&owner_artifacts_for_swap, &attacker_artifacts_for_swap)
+                .unwrap();
+        });
+
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let workspace_tmp = tempdir().unwrap();
+        let ctx = ToolContext::new(workspace_tmp.path()).with_state_namespace("attacker");
+        let result = runtime
+            .block_on(
+                RetrieveToolResultTool.execute(json!({"ref": "art_race", "mode": "summary"}), &ctx),
+            )
+            .expect("descriptor-relative open stays on the checked session tree");
+        assert!(result.content.contains("attacker-owned evidence"));
+        assert!(!result.content.contains("owner secret"));
     }
 
     struct ArtifactRootGuard {

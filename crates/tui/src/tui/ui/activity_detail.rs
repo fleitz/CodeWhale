@@ -6,6 +6,8 @@
 //! spillover folding), the copy-cell actions, and the footer detail labels.
 //! No logic changes were made during the extraction.
 
+use std::io::Read as _;
+
 use crate::snapshot::SnapshotRepo;
 use crate::tui::app::App;
 use crate::tui::footer_ui::one_line_summary;
@@ -555,15 +557,18 @@ pub(super) fn open_tool_details_pager(app: &mut App) -> bool {
     open_details_pager_for_cell(app, cell_index)
 }
 
-/// Build the trailing "Spillover" section for the tool-details pager
-/// (#500). Returns `None` when the cell at `cell_index` is not a
-/// `GenericToolCell` with a recorded spillover path, or when the
-/// spillover file is missing or unreadable. Failures fall back to a
-/// short notice in the section so the user understands why the full
-/// content can't be loaded — better than silent truncation.
+/// Build the exact-evidence section for any tool cell. Adaptive evidence is
+/// resolved from the detail record rather than a renderer-specific field, so
+/// shell failures and specialized cells have the same Option/Alt+V behavior.
 pub(super) fn spillover_pager_section(app: &App, cell_index: usize) -> Option<String> {
     use crate::tui::history::{GenericToolCell, HistoryCell, ToolCell};
 
+    let detail = app.tool_detail_record_for_cell(cell_index)?;
+    if let Some(section) = exact_evidence_pager_section(app, detail) {
+        return Some(section);
+    }
+
+    // Explicit classic mode keeps its existing generic-cell spillover path.
     let cell = app.cell_at_virtual_index(cell_index)?;
     let HistoryCell::Tool(ToolCell::Generic(GenericToolCell {
         spillover_path: Some(path),
@@ -582,36 +587,201 @@ pub(super) fn spillover_pager_section(app: &App, cell_index: usize) -> Option<St
     ))
 }
 
-pub(crate) fn open_details_pager_for_cell(app: &mut App, cell_index: usize) -> bool {
-    if let Some(detail) = app.tool_detail_record_for_cell(cell_index) {
-        let input = serde_json::to_string_pretty(&detail.input)
-            .unwrap_or_else(|_| detail.input.to_string());
-        let output = detail.output.as_deref().map_or(
-            "(not available)".to_string(),
-            std::string::ToString::to_string,
-        );
-
-        // #500: when the tool result was spilled to disk, fold the full
-        // file content into the pager body so the user can see what was
-        // elided (the model only ever saw the head). The truncated head
-        // stays above as `Output:` so the user can compare what the
-        // model received against the full payload.
-        let spillover_section = spillover_pager_section(app, cell_index);
-
-        // Frame the body as leaf-level raw detail for the selected item. The
-        // Tool ID / Input / Output / spillover content below is unchanged — only
-        // the leading intro line is new, so existing raw-output visibility is
-        // preserved (#4105).
-        let content = if let Some(section) = spillover_section {
-            format!(
-                "{RAW_DETAIL_PAGER_INTRO}\n\nTool ID: {}\nTool: {}\n\nInput:\n{}\n\nOutput:\n{}\n\n{}",
-                detail.tool_id, detail.tool_name, input, output, section
-            )
+fn exact_evidence_pager_section(
+    app: &App,
+    detail: &crate::tui::app::ToolDetailRecord,
+) -> Option<String> {
+    if let Some(artifact) = detail.artifact.as_ref() {
+        let raw_status = detail
+            .output
+            .as_deref()
+            .and_then(|output| serde_json::from_str::<serde_json::Value>(output).ok())
+            .and_then(|value| {
+                value
+                    .get("status")
+                    .and_then(serde_json::Value::as_str)
+                    .map(str::to_string)
+            })
+            .unwrap_or_default();
+        let status = match raw_status.as_str() {
+            "succeeded" | "success" | "done" => app.tr(crate::localization::MessageId::PhaseDone),
+            "failed" | "error" | "cancelled" => app.tr(crate::localization::MessageId::PhaseFailed),
+            _ => app.tr(crate::localization::MessageId::EvidenceUnknown),
+        };
+        let runtime = if detail.tool_name.contains("shell") || detail.tool_name == "run_tests" {
+            app.tr(crate::localization::MessageId::EvidenceRuntimeShell)
+        } else if detail.tool_name.starts_with("mcp_") {
+            app.tr(crate::localization::MessageId::EvidenceRuntimeMcp)
         } else {
-            format!(
-                "{RAW_DETAIL_PAGER_INTRO}\n\nTool ID: {}\nTool: {}\n\nInput:\n{}\n\nOutput:\n{}",
-                detail.tool_id, detail.tool_name, input, output
-            )
+            app.tr(crate::localization::MessageId::EvidenceRuntimeTool)
+        };
+        let duration = artifact
+            .duration_ms
+            .map(|milliseconds| format!(" · {milliseconds} ms"))
+            .unwrap_or_default();
+        let provenance = artifact
+            .relative_path
+            .as_ref()
+            .map(|path| crate::artifacts::format_artifact_relative_path(path))
+            .or_else(|| {
+                artifact
+                    .absolute_path
+                    .as_ref()
+                    .map(|path| path.display().to_string())
+            })
+            .unwrap_or_else(|| {
+                app.tr(crate::localization::MessageId::EvidenceProvenanceMissing)
+                    .into_owned()
+            });
+        let header = app
+            .tr(crate::localization::MessageId::EvidenceExactOutputHeader)
+            .replace("{status}", &status)
+            .replace("{runtime}", &runtime)
+            .replace("{duration}", &duration)
+            .replace("{provenance}", &provenance)
+            .replace(
+                "{size}",
+                &crate::artifacts::format_byte_size(artifact.byte_size),
+            );
+        if !artifact.available {
+            return Some(format!(
+                "{header}\n\n{}",
+                app.tr(crate::localization::MessageId::EvidenceStoreRejected)
+            ));
+        }
+        // Session-scoped evidence must fail closed: if its validated relative
+        // path cannot be opened, never fall back to an unvalidated absolute
+        // path from persisted metadata. Absolute paths remain only for the
+        // explicit classic spill compatibility record, which has no relative
+        // session path.
+        let opened = match artifact.relative_path.as_ref() {
+            Some(relative) => {
+                crate::artifacts::open_session_artifact_for_read(&artifact.session_id, relative)
+            }
+            None => artifact.absolute_path.as_ref().map_or_else(
+                || {
+                    Err(std::io::Error::new(
+                        std::io::ErrorKind::PermissionDenied,
+                        "artifact path is missing or unsafe",
+                    ))
+                },
+                |path| {
+                    if artifact.session_id.trim().is_empty() {
+                        // Empty owner exists only for a live classic-spill
+                        // compatibility detail. Restored records always bind
+                        // the SavedSession id before reaching this surface.
+                        std::fs::File::open(path)
+                    } else {
+                        crate::artifacts::open_retained_absolute_artifact_for_read(
+                            &artifact.session_id,
+                            path,
+                        )
+                    }
+                },
+            ),
+        };
+        let mut file = match opened {
+            Ok(file) => file,
+            Err(_) if artifact.relative_path.is_some() => {
+                return Some(format!(
+                    "{header}\n\n{}",
+                    app.tr(crate::localization::MessageId::EvidencePathUnsafe)
+                ));
+            }
+            Err(error) => {
+                let message = app
+                    .tr(crate::localization::MessageId::EvidenceReadFailed)
+                    .replace("{error}", &error.to_string());
+                return Some(format!("{header}\n\n{message}"));
+            }
+        };
+        // Read and verify the same already-validated descriptor. In
+        // particular, do not resolve a session path and reopen it by name: a
+        // concurrent rename/symlink swap between those operations could make
+        // Alt+V display evidence from another namespace.
+        let mut text = String::with_capacity(
+            usize::try_from(artifact.byte_size)
+                .unwrap_or(0)
+                .min(16 * 1024 * 1024),
+        );
+        let body = match file.read_to_string(&mut text) {
+            Ok(_) => {
+                if artifact.sha256.as_ref().is_some_and(|expected| {
+                    crate::hashing::sha256_hex(text.as_bytes()) != *expected
+                }) {
+                    app.tr(crate::localization::MessageId::EvidenceIntegrityFailed)
+                        .into_owned()
+                } else {
+                    format!(
+                        "{}:\n{text}",
+                        app.tr(crate::localization::MessageId::EvidenceRawOutput)
+                    )
+                }
+            }
+            Err(error) => app
+                .tr(crate::localization::MessageId::EvidenceReadFailed)
+                .replace("{error}", &error.to_string()),
+        };
+        return Some(format!("{header}\n\n{body}"));
+    }
+    None
+}
+
+pub(crate) fn open_details_pager_for_cell(app: &mut App, cell_index: usize) -> bool {
+    let details = app.tool_detail_records_for_cell(cell_index);
+    if !details.is_empty() {
+        let total = details.len();
+        let mut blocks = Vec::with_capacity(total);
+        for (index, detail) in details.iter().enumerate() {
+            let input = serde_json::to_string_pretty(&detail.input)
+                .unwrap_or_else(|_| detail.input.to_string());
+            let output = detail.output.as_deref().map_or(
+                "(not available)".to_string(),
+                std::string::ToString::to_string,
+            );
+            let exact_section = exact_evidence_pager_section(app, detail).or_else(|| {
+                (total == 1)
+                    .then(|| spillover_pager_section(app, cell_index))
+                    .flatten()
+            });
+            let output_label = if detail.artifact.is_some() {
+                app.tr(crate::localization::MessageId::EvidenceModelObservation)
+                    .into_owned()
+            } else {
+                "Output".to_string()
+            };
+            let ordinal = (total > 1).then(|| {
+                format!(
+                    "{}\n",
+                    app.tr(crate::localization::MessageId::EvidenceResultOrdinal)
+                        .replace("{index}", &(index + 1).to_string())
+                        .replace("{total}", &total.to_string())
+                )
+            });
+            let mut block = format!(
+                "{}Tool ID: {}\nTool: {}\n\nInput:\n{}",
+                ordinal.unwrap_or_default(),
+                detail.tool_id,
+                detail.tool_name,
+                input,
+            );
+            // Put the exact-evidence receipt (especially failed status) above
+            // the bounded model observation. Even a valid envelope can wrap
+            // across many terminal rows at 80 columns; leading with it made
+            // the authoritative status invisible in the initial 80x24 pager.
+            if let Some(section) = exact_section {
+                block.push_str("\n\n");
+                block.push_str(&section);
+            }
+            block.push_str(&format!("\n\n{output_label}:\n{output}"));
+            blocks.push(block);
+        }
+        let content = format!("{RAW_DETAIL_PAGER_INTRO}\n\n{}", blocks.join("\n\n"));
+        let title = if total == 1 {
+            format!("Raw detail — {}", details[0].tool_name)
+        } else {
+            app.tr(crate::localization::MessageId::EvidencePagerMultipleTitle)
+                .replace("{count}", &total.to_string())
         };
 
         let width = app
@@ -619,11 +789,10 @@ pub(crate) fn open_details_pager_for_cell(app: &mut App, cell_index: usize) -> b
             .last_transcript_area
             .map(|area| area.width)
             .unwrap_or(80);
-        app.view_stack.push(PagerView::from_text(
-            format!("Raw detail — {}", detail.tool_name),
-            &content,
-            width.saturating_sub(2),
-        ));
+        app.view_stack.push(
+            PagerView::from_preformatted_text(title, &content, width.saturating_sub(2))
+                .with_copy_text(content),
+        );
         return true;
     }
 

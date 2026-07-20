@@ -213,6 +213,20 @@ fn emit_tool_audit_to_path(path: &Path, event: serde_json::Value) {
 }
 
 impl Engine {
+    fn mcp_payload_to_tool_result(result: serde_json::Value) -> ToolResult {
+        let is_error = result
+            .get("isError")
+            .and_then(serde_json::Value::as_bool)
+            .or_else(|| result.get("is_error").and_then(serde_json::Value::as_bool))
+            .unwrap_or(false);
+        let content = serde_json::to_string(&result).unwrap_or_else(|_| result.to_string());
+        if is_error {
+            ToolResult::error(content)
+        } else {
+            ToolResult::success(content)
+        }
+    }
+
     pub(super) async fn execute_mcp_tool_with_pool(
         pool: Arc<AsyncMutex<McpPool>>,
         name: &str,
@@ -223,15 +237,16 @@ impl Engine {
             .call_tool(name, input)
             .await
             .map_err(|e| ToolError::execution_failed(format!("MCP tool failed: {e}")))?;
-        let content = serde_json::to_string(&result).unwrap_or_else(|_| result.to_string());
-        Ok(ToolResult::success(content))
+        Ok(Self::mcp_payload_to_tool_result(result))
     }
 
     pub(super) async fn execute_parallel_tool(
         &mut self,
+        parent_tool_id: &str,
         input: serde_json::Value,
         tool_registry: Option<&crate::tools::ToolRegistry>,
         tool_exec_lock: Arc<RwLock<()>>,
+        large_output_broker: crate::tools::large_output_router::LargeOutputBroker,
     ) -> Result<ToolResult, ToolError> {
         let calls = parse_parallel_tool_calls(&input)?;
         let mcp_pool = if calls.iter().any(|(tool, _)| McpPool::is_mcp_tool(tool)) {
@@ -291,13 +306,18 @@ impl Engine {
             let mcp_pool = mcp_pool.clone();
             let shell_permits = shell_permits.clone();
             let workspace = self.session.workspace.clone();
+            let evidence_broker = large_output_broker.clone();
+            let evidence_tool_id = format!("{parent_tool_id}.{index}");
+            let evidence_parent_tool_id = parent_tool_id.to_string();
             tasks.push(async move {
+                let evidence_input = tool_input.clone();
+                let artifact_event_tx = tx_event.clone();
                 let _shell_permit = if tool_name == "exec_shell" {
                     shell_permits.acquire_owned().await.ok()
                 } else {
                     None
                 };
-                let result = Engine::execute_tool_with_lock(
+                let mut result = Engine::execute_tool_with_lock(
                     lock,
                     true,
                     false,
@@ -310,6 +330,38 @@ impl Engine {
                     None,
                 )
                 .await;
+                let projection = evidence_broker
+                    .project_terminal_result(
+                        &evidence_tool_id,
+                        &tool_name,
+                        &evidence_input,
+                        &mut result,
+                    )
+                    .await;
+                if let Some(audit) = projection.audit_payload(
+                    &evidence_tool_id,
+                    &tool_name,
+                    Some("multi_tool_use.parallel"),
+                ) {
+                    emit_tool_audit(audit);
+                }
+                if matches!(
+                    projection,
+                    crate::tools::large_output_router::ProjectionOutcome::ClassicSpill { .. }
+                        | crate::tools::large_output_router::ProjectionOutcome::Stored { .. }
+                ) && let Ok(output) = &result
+                {
+                    let _ = artifact_event_tx
+                        .send(Event::ToolArtifactStored {
+                            id: evidence_tool_id.clone(),
+                            name: tool_name.clone(),
+                            input: evidence_input,
+                            result: output.clone(),
+                            parent_tool_id: Some(evidence_parent_tool_id),
+                            owner_agent_id: None,
+                        })
+                        .await;
+                }
                 (index, tool_name, result)
             });
         }
@@ -342,10 +394,19 @@ impl Engine {
             };
             results[index] = Some(entry);
         }
-        let results = results.into_iter().flatten().collect();
-
-        ToolResult::json(&ParallelToolResult { results })
-            .map_err(|e| ToolError::execution_failed(e.to_string()))
+        let results: Vec<ParallelToolResultEntry> = results.into_iter().flatten().collect();
+        let failure_count = results
+            .iter()
+            .filter(|entry: &&ParallelToolResultEntry| !entry.success)
+            .count();
+        let mut aggregate = ToolResult::json(&ParallelToolResult { results })
+            .map_err(|e| ToolError::execution_failed(e.to_string()))?;
+        aggregate.success = failure_count == 0;
+        aggregate = aggregate.with_metadata(json!({
+            "failure_count": failure_count,
+            "parallel_result_count": result_count,
+        }));
+        Ok(aggregate)
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -471,6 +532,284 @@ mod tests {
     use std::time::Duration;
 
     const TEST_HEARTBEAT_INTERVAL: Duration = Duration::from_millis(10);
+
+    struct LargeParallelErrorTool;
+
+    #[async_trait::async_trait]
+    impl crate::tools::spec::ToolSpec for LargeParallelErrorTool {
+        fn name(&self) -> &'static str {
+            "large_parallel_error"
+        }
+
+        fn description(&self) -> &'static str {
+            "Return a deterministic large typed error for engine-boundary tests"
+        }
+
+        fn input_schema(&self) -> serde_json::Value {
+            json!({
+                "type": "object",
+                "required": ["marker"],
+                "properties": {"marker": {"type": "string"}}
+            })
+        }
+
+        fn capabilities(&self) -> Vec<crate::tools::spec::ToolCapability> {
+            vec![crate::tools::spec::ToolCapability::ReadOnly]
+        }
+
+        fn supports_parallel(&self) -> bool {
+            true
+        }
+
+        async fn execute(
+            &self,
+            input: serde_json::Value,
+            _context: &crate::tools::spec::ToolContext,
+        ) -> Result<ToolResult, ToolError> {
+            let marker = input
+                .get("marker")
+                .and_then(serde_json::Value::as_str)
+                .ok_or_else(|| ToolError::missing_field("marker"))?;
+            Err(ToolError::execution_failed(format!(
+                "{}\n{marker}\n{}",
+                "parallel child stderr\n".repeat(10_000),
+                "parallel child stderr\n".repeat(10_000)
+            )))
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    #[allow(clippy::await_holding_lock)] // Serializes the process-global artifact-root override.
+    async fn large_mcp_error_payload_stays_failed_after_adaptive_projection() {
+        let _artifact_lock = crate::artifacts::TEST_ARTIFACT_SESSIONS_GUARD
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let temp = tempfile::tempdir().expect("tempdir");
+        let prior =
+            crate::artifacts::set_test_artifact_sessions_root(Some(temp.path().join("sessions")));
+        struct RestoreRoot(Option<PathBuf>);
+        impl Drop for RestoreRoot {
+            fn drop(&mut self) {
+                crate::artifacts::set_test_artifact_sessions_root(self.0.take());
+            }
+        }
+        let _restore = RestoreRoot(prior);
+
+        let marker = "CW_LARGE_MCP_ERROR_SENTINEL";
+        let payload = json!({
+            "isError": true,
+            "content": [{
+                "type": "text",
+                "text": format!("{marker}\n{}", "provider validation failure\n".repeat(20_000)),
+            }],
+        });
+        let exact_bytes = serde_json::to_string(&payload)
+            .expect("serialize MCP fixture")
+            .len();
+        let mut result = Engine::mcp_payload_to_tool_result(payload);
+        assert!(
+            !result.success,
+            "MCP payload error status must be preserved"
+        );
+
+        let broker = crate::tools::large_output_router::LargeOutputBroker::new(
+            crate::tools::large_output_router::WorkshopConfig {
+                large_output_threshold_tokens: Some(100),
+                ..Default::default()
+            },
+            "mcp-error-session",
+            temp.path(),
+            crate::tools::handle::new_shared_handle_store(),
+            crate::context_budget::PressureLevel::Low,
+            Some(128_000),
+        );
+        let outcome = broker
+            .project(
+                "mcp-error-call",
+                "mcp_test_validate",
+                &json!({}),
+                &mut result,
+            )
+            .await;
+
+        assert!(matches!(
+            outcome,
+            crate::tools::large_output_router::ProjectionOutcome::Stored { .. }
+        ));
+        assert!(!result.success);
+        let envelope: serde_json::Value =
+            serde_json::from_str(&result.content).expect("adaptive MCP envelope");
+        assert_eq!(envelope["status"], "failed");
+        assert!(result.content.len() < exact_bytes / 10);
+        assert_eq!(
+            result.metadata.as_ref().unwrap()["adaptive_evidence"]["status"],
+            "failed"
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    #[allow(clippy::await_holding_lock)] // Serializes the process-global artifact-root override.
+    async fn parallel_large_typed_errors_keep_independent_handles() {
+        use crate::tools::spec::{RuntimeToolServices, ToolContext, ToolSpec};
+
+        let _artifact_lock = crate::artifacts::TEST_ARTIFACT_SESSIONS_GUARD
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let temp = tempfile::tempdir().expect("tempdir");
+        let sessions_root = temp.path().join("sessions");
+        let prior = crate::artifacts::set_test_artifact_sessions_root(Some(sessions_root.clone()));
+        struct RestoreRoot(Option<PathBuf>);
+        impl Drop for RestoreRoot {
+            fn drop(&mut self) {
+                crate::artifacts::set_test_artifact_sessions_root(self.0.take());
+            }
+        }
+        let _restore = RestoreRoot(prior);
+
+        let session_id = "parallel-evidence-session";
+        let handle_store = crate::tools::handle::new_shared_handle_store();
+        let broker = crate::tools::large_output_router::LargeOutputBroker::new(
+            crate::tools::large_output_router::WorkshopConfig {
+                large_output_threshold_tokens: Some(100),
+                ..Default::default()
+            },
+            session_id,
+            temp.path(),
+            handle_store.clone(),
+            crate::context_budget::PressureLevel::Low,
+            Some(128_000),
+        );
+        let outer_broker = broker.clone();
+        let (mut engine, handle) = Engine::new(
+            EngineConfig {
+                workspace: temp.path().to_path_buf(),
+                snapshots_enabled: false,
+                subagents_enabled: false,
+                ..EngineConfig::default()
+            },
+            &Config::default(),
+        );
+        let context = ToolContext::new(temp.path()).with_state_namespace(session_id);
+        let mut registry = crate::tools::ToolRegistry::new(context);
+        registry.register(std::sync::Arc::new(LargeParallelErrorTool));
+        let markers = ["CW_PARALLEL_CHILD_ALPHA", "CW_PARALLEL_CHILD_BETA"];
+        let input = json!({
+            "tool_uses": markers.iter().map(|marker| json!({
+                "recipient_name": "large_parallel_error",
+                "parameters": {"marker": marker},
+            })).collect::<Vec<_>>()
+        });
+
+        let mut result = engine
+            .execute_parallel_tool(
+                "parallel-parent",
+                input,
+                Some(&registry),
+                std::sync::Arc::new(tokio::sync::RwLock::new(())),
+                broker,
+            )
+            .await
+            .expect("parallel aggregate");
+        assert!(!result.success, "failed children must fail the aggregate");
+        assert_eq!(result.metadata.as_ref().unwrap()["failure_count"], 2);
+        let aggregate: serde_json::Value =
+            serde_json::from_str(&result.content).expect("parallel result JSON");
+        let entries = aggregate["results"].as_array().expect("result entries");
+        assert_eq!(entries.len(), 2);
+
+        let mut handles = Vec::new();
+        for (entry, marker) in entries.iter().zip(markers) {
+            assert_eq!(entry["success"], false);
+            let content = entry["content"].as_str().expect("child envelope");
+            assert!(crate::core::engine::is_adaptive_evidence_envelope(content));
+            assert!(
+                !content.contains(marker),
+                "exact child evidence must stay out of the parent aggregate"
+            );
+            let envelope: serde_json::Value =
+                serde_json::from_str(content).expect("adaptive child envelope");
+            assert_eq!(envelope["status"], "failed");
+            handles.push(
+                envelope["handle"]
+                    .as_str()
+                    .expect("opaque child handle")
+                    .to_string(),
+            );
+        }
+        assert_ne!(handles[0], handles[1], "each child result owns one handle");
+
+        let mut artifact_receipts = Vec::new();
+        let mut rx = handle.rx_event.write().await;
+        while let Ok(event) = rx.try_recv() {
+            if let Event::ToolArtifactStored {
+                id,
+                name,
+                result,
+                parent_tool_id,
+                owner_agent_id,
+                ..
+            } = event
+            {
+                artifact_receipts.push((id, name, result, parent_tool_id, owner_agent_id));
+            }
+        }
+        drop(rx);
+        artifact_receipts.sort_by(|left, right| left.0.cmp(&right.0));
+        assert_eq!(artifact_receipts.len(), 2);
+        for (index, (id, name, receipt, parent, owner)) in artifact_receipts.iter().enumerate() {
+            assert_eq!(id, &format!("parallel-parent.{index}"));
+            assert_eq!(name, "large_parallel_error");
+            assert!(!receipt.success);
+            assert_eq!(parent.as_deref(), Some("parallel-parent"));
+            assert!(owner.is_none());
+        }
+
+        let outer_outcome = outer_broker
+            .project(
+                "parallel-parent",
+                "multi_tool_use.parallel",
+                &json!({}),
+                &mut result,
+            )
+            .await;
+        assert!(matches!(
+            outer_outcome,
+            crate::tools::large_output_router::ProjectionOutcome::Stored { .. }
+        ));
+        let outer_envelope: serde_json::Value =
+            serde_json::from_str(&result.content).expect("outer evidence envelope");
+        assert_eq!(outer_envelope["status"], "failed");
+        assert_eq!(
+            result.metadata.as_ref().unwrap()["adaptive_evidence"]["failure_count"],
+            2
+        );
+
+        let runtime = RuntimeToolServices {
+            handle_store,
+            ..RuntimeToolServices::default()
+        };
+        let read_context = ToolContext::new(temp.path())
+            .with_state_namespace(session_id)
+            .with_runtime_services(runtime);
+        for (handle, marker) in handles.iter().zip(markers) {
+            let projection = crate::tools::handle::HandleReadTool
+                .execute(
+                    json!({"handle": handle, "search": {"query": marker}}),
+                    &read_context,
+                )
+                .await
+                .expect("independent child handle remains retrievable");
+            assert!(projection.content.contains(marker));
+        }
+
+        let artifact_count = std::fs::read_dir(sessions_root.join(session_id).join("artifacts"))
+            .expect("session artifacts")
+            .count();
+        assert_eq!(
+            artifact_count, 3,
+            "one canonical artifact per child plus the parent aggregate"
+        );
+    }
 
     #[tokio::test]
     async fn tool_heartbeat_emits_for_slow_tool() {

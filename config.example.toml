@@ -867,22 +867,26 @@ l3_threshold = 576000
 seam_model = "deepseek-v4-flash"
 
 # ─────────────────────────────────────────────────────────────────────────────────
-# Workshop / Large-Output Routing (#548)
+# Adaptive Evidence / Large-Output Routing
 # ─────────────────────────────────────────────────────────────────────────────────
-# Tool outputs exceeding `large_output_threshold_tokens` are routed through a
-# V4-Flash synthesis sub-agent.  Only the synthesis reaches the parent context;
-# the raw text is stored in the workshop variable `last_tool_result` so the
-# parent can call `promote_to_context` later if it needs the full content.
+# Large tool outputs are routed automatically at the ordinary engine tool
+# boundary. Exact bytes are kept as a session artifact; the model receives a
+# bounded evidence envelope and can inspect narrow slices with `handle_read`.
+# No Workflow-JS/RLM activation or synthesis model is required.
 #
 # Per-tool overrides let high-volume tools (e.g. exec_shell) use tighter
 # thresholds without changing the global default.
 #
-# Add `raw = true` to any tool call to bypass routing for that invocation.
+# `mode = "classic"` is the explicit compatibility fallback to the legacy
+# fixed-size spill/truncation path. The default when `[workshop]` is omitted is
+# `adaptive`.
 #
 # [workshop]
+# mode = "adaptive"
 # large_output_threshold_tokens = 4096
+# handle_only_threshold_tokens = 262144
 # [workshop.per_tool_thresholds]
-# exec_shell  = 2048   # shell output synthesised aggressively
+# exec_shell  = 2048   # shell output is artifact-backed aggressively
 # grep_files  = 2048
 # web_search  = 8192   # web results can be large; give them more room
 

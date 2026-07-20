@@ -2332,8 +2332,10 @@ pub struct App {
     /// While a tool call is in flight inside `active_cell`, it is tracked by
     /// `active_tool_entries` instead and migrated here at flush time.
     pub tool_cells: HashMap<String, usize>,
-    /// Full tool input/output keyed by history cell index.
-    pub tool_details_by_cell: HashMap<usize, ToolDetailRecord>,
+    /// Full tool input/output records keyed by history cell index. Exploring
+    /// cells aggregate several visible operations, so one cell may own more
+    /// than one independently inspectable detail record.
+    pub tool_details_by_cell: HashMap<usize, Vec<ToolDetailRecord>>,
     /// Linked context references keyed by the visible user history cell that
     /// introduced them.
     pub context_references_by_cell: HashMap<usize, Vec<SessionContextReference>>,
@@ -2625,6 +2627,18 @@ pub struct ToolDetailRecord {
     pub tool_name: String,
     pub input: Value,
     pub output: Option<String>,
+    pub artifact: Option<ToolDetailArtifact>,
+}
+
+#[derive(Debug, Clone)]
+pub struct ToolDetailArtifact {
+    pub session_id: String,
+    pub relative_path: Option<PathBuf>,
+    pub absolute_path: Option<PathBuf>,
+    pub sha256: Option<String>,
+    pub byte_size: u64,
+    pub duration_ms: Option<u64>,
+    pub available: bool,
 }
 
 /// Lightweight task view for sidebar rendering.
@@ -4684,12 +4698,30 @@ impl App {
     /// transcript cell.
     #[must_use]
     pub fn tool_detail_record_for_cell(&self, index: usize) -> Option<&ToolDetailRecord> {
-        if let Some(detail) = self.tool_details_by_cell.get(&index) {
-            return Some(detail);
+        if let Some(details) = self.tool_details_by_cell.get(&index) {
+            return details.first();
         }
         self.active_tool_details
             .values()
-            .find(|detail| self.tool_cells.get(&detail.tool_id).copied() == Some(index))
+            .filter(|detail| self.tool_cells.get(&detail.tool_id).copied() == Some(index))
+            .min_by(|left, right| left.tool_id.cmp(&right.tool_id))
+    }
+
+    /// Resolve every independent detail record represented by one visible
+    /// cell. The returned order is stable so an Exploring aggregate never
+    /// selects an arbitrary HashMap entry.
+    #[must_use]
+    pub fn tool_detail_records_for_cell(&self, index: usize) -> Vec<&ToolDetailRecord> {
+        if let Some(details) = self.tool_details_by_cell.get(&index) {
+            return details.iter().collect();
+        }
+        let mut details = self
+            .active_tool_details
+            .values()
+            .filter(|detail| self.tool_cells.get(&detail.tool_id).copied() == Some(index))
+            .collect::<Vec<_>>();
+        details.sort_by(|left, right| left.tool_id.cmp(&right.tool_id));
+        details
     }
 
     /// Whether a virtual transcript cell can open a meaningful `v` detail
@@ -4853,9 +4885,14 @@ impl App {
         let mut details = std::mem::take(&mut self.active_tool_details);
         self.active_tool_entry_completed_at.clear();
         for (tool_id, detail) in details.drain() {
+            let cell_index = self.tool_cells.remove(&tool_id).unwrap_or(base_index);
             self.tool_details_by_cell
-                .entry(self.tool_cells.get(&tool_id).copied().unwrap_or(base_index))
-                .or_insert(detail);
+                .entry(cell_index)
+                .or_default()
+                .push(detail);
+        }
+        for records in self.tool_details_by_cell.values_mut() {
+            records.sort_by(|left, right| left.tool_id.cmp(&right.tool_id));
         }
 
         self.exploring_cell = None;

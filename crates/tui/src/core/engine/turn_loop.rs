@@ -2146,6 +2146,7 @@ impl Engine {
 
             let mut outcomes: Vec<Option<ToolExecOutcome>> = Vec::with_capacity(plan_count);
             outcomes.resize_with(plan_count, || None);
+            let large_output_broker = self.large_output_broker();
 
             for batch in batches {
                 let (parallel_allowed, plans) = match batch {
@@ -2240,7 +2241,7 @@ impl Engine {
                         let lock = tool_exec_lock.clone();
                         let mcp_pool = mcp_pool.clone();
                         let tx_event = self.tx_event.clone();
-                        let session_id = self.session.id.clone();
+                        let evidence_broker = large_output_broker.clone();
                         let started_at = Instant::now();
                         let shell_permits = shell_permits.clone();
                         let workspace = self.session.workspace.clone();
@@ -2265,25 +2266,18 @@ impl Engine {
                             )
                             .await;
 
-                            // #500: spill outsized output before fanout (mirror
-                            // of the sequential path below). Emit a
-                            // `tool.spillover` audit event so operators can
-                            // correlate large-output episodes with disk usage.
-                            if let Ok(tool_result) = result.as_mut()
-                                && let Some(path) =
-                                    crate::tools::truncate::apply_spillover_with_artifact(
-                                        tool_result,
-                                        &plan.id,
-                                        &plan.name,
-                                        &session_id,
-                                    )
+                            let projection = evidence_broker
+                                .project_terminal_result(
+                                    &plan.id,
+                                    &plan.name,
+                                    &plan.input,
+                                    &mut result,
+                                )
+                                .await;
+                            if let Some(audit) =
+                                projection.audit_payload(&plan.id, &plan.name, None)
                             {
-                                emit_tool_audit(json!({
-                                    "event": "tool.spillover",
-                                    "tool_id": plan.id.clone(),
-                                    "tool_name": plan.name.clone(),
-                                    "path": path.display().to_string(),
-                                }));
+                                emit_tool_audit(audit);
                             }
 
                             let _ = tx_event
@@ -2402,18 +2396,34 @@ impl Engine {
                         if tool_name == MULTI_TOOL_PARALLEL_NAME {
                             let started_at = Instant::now();
                             let cancel_token = self.cancel_token.clone();
-                            let terminal = tokio::select! {
+                            let (mut result, cancelled_before_completion) = tokio::select! {
                                 biased;
                                 () = cancel_token.cancelled() => {
-                                    ToolExecutionOutcome::cancelled(interrupted_tool_result())
+                                    (Ok(interrupted_tool_result()), true)
                                 },
                                 result = self.execute_parallel_tool(
+                                    &tool_id,
                                     tool_input.clone(),
                                     tool_registry,
                                     tool_exec_lock.clone(),
-                                ) => ToolExecutionOutcome::from_legacy(result),
+                                    large_output_broker.clone(),
+                                ) => (result, false),
                             };
-                            let result = terminal.legacy_result();
+                            let projection = large_output_broker
+                                .project_terminal_result(
+                                    &tool_id,
+                                    &tool_name,
+                                    &tool_input,
+                                    &mut result,
+                                )
+                                .await;
+                            if let Some(audit) = projection.audit_payload(
+                                &tool_id,
+                                &tool_name,
+                                Some("multi_tool_use.parallel"),
+                            ) {
+                                emit_tool_audit(audit);
+                            }
 
                             let _ = self
                                 .tx_event
@@ -2424,6 +2434,15 @@ impl Engine {
                                 })
                                 .await;
 
+                            let terminal = if cancelled_before_completion {
+                                ToolExecutionOutcome::cancelled(
+                                    result
+                                        .clone()
+                                        .expect("cancelled parallel result is model-visible"),
+                                )
+                            } else {
+                                ToolExecutionOutcome::from_legacy(result.clone())
+                            };
                             outcomes[plan.index] = Some(ToolExecOutcome {
                                 index: plan.index,
                                 id: tool_id,
@@ -2437,12 +2456,25 @@ impl Engine {
 
                         if is_tool_search_tool(&tool_name) {
                             let started_at = Instant::now();
-                            let result = execute_tool_search(
+                            let mut result = execute_tool_search(
                                 &tool_name,
                                 &tool_input,
                                 &tool_catalog,
                                 &mut active_tool_names,
                             );
+                            let projection = large_output_broker
+                                .project_terminal_result(
+                                    &tool_id,
+                                    &tool_name,
+                                    &tool_input,
+                                    &mut result,
+                                )
+                                .await;
+                            if let Some(audit) =
+                                projection.audit_payload(&tool_id, &tool_name, Some("tool_search"))
+                            {
+                                emit_tool_audit(audit);
+                            }
 
                             let _ = self
                                 .tx_event
@@ -2466,7 +2498,7 @@ impl Engine {
 
                         if tool_name == REQUEST_USER_INPUT_NAME {
                             let started_at = Instant::now();
-                            let result =
+                            let mut result =
                                 if crate::core::authority::permission_posture_allows_questions(
                                     self.session.approval_mode,
                                 ) {
@@ -2490,6 +2522,21 @@ impl Engine {
                                     "permission_posture": "auto-review",
                                 })))
                                 };
+                            let projection = large_output_broker
+                                .project_terminal_result(
+                                    &tool_id,
+                                    &tool_name,
+                                    &tool_input,
+                                    &mut result,
+                                )
+                                .await;
+                            if let Some(audit) = projection.audit_payload(
+                                &tool_id,
+                                &tool_name,
+                                Some("request_user_input"),
+                            ) {
+                                emit_tool_audit(audit);
+                            }
 
                             let _ = self
                                 .tx_event
@@ -2651,28 +2698,11 @@ impl Engine {
                             stamp_tool_result_approval(tool_result, approval_stamp);
                         }
 
-                        // #500: spill outsized tool outputs to disk before the
-                        // result fans out to the model context and the UI cell.
-                        // Both consumers see the same artifact reference block +
-                        // metadata pointing at the session-owned full file.
-                        // Emit a discrete `tool.spillover` audit event so
-                        // operators can correlate large-output episodes with
-                        // disk-usage growth in `~/.deepseek/tool_outputs/`.
-                        if let Ok(tool_result) = result.as_mut()
-                            && let Some(path) =
-                                crate::tools::truncate::apply_spillover_with_artifact(
-                                    tool_result,
-                                    &tool_id,
-                                    &tool_name,
-                                    &self.session.id,
-                                )
-                        {
-                            emit_tool_audit(json!({
-                                "event": "tool.spillover",
-                                "tool_id": tool_id.clone(),
-                                "tool_name": tool_name.clone(),
-                                "path": path.display().to_string(),
-                            }));
+                        let projection = large_output_broker
+                            .project_terminal_result(&tool_id, &tool_name, &tool_input, &mut result)
+                            .await;
+                        if let Some(audit) = projection.audit_payload(&tool_id, &tool_name, None) {
+                            emit_tool_audit(audit);
                         }
 
                         let _ = self
@@ -2830,6 +2860,18 @@ impl Engine {
 
                 match result {
                     Ok(output) => {
+                        if output
+                            .metadata
+                            .as_ref()
+                            .and_then(|metadata| metadata.get("normalized_tool_error"))
+                            .and_then(serde_json::Value::as_bool)
+                            == Some(true)
+                        {
+                            step_error_count += 1;
+                            step_error_categories.push(ErrorCategory::Tool);
+                            step_error_tool_names.push(outcome.name.clone());
+                            step_error_tool_inputs.push(tool_input.clone());
+                        }
                         emit_tool_audit(json!({
                             "event": "tool.result",
                             "tool_id": outcome.id.clone(),

@@ -139,14 +139,15 @@ use super::key_actions;
 use super::app::{
     ActiveTurnMetadata, App, AppAction, AppMode, HuntVerdict, OnboardingState,
     PendingProviderSwitch, QueuedMessage, ReasoningEffort, SidebarFocus, StatusToastLevel,
-    SubmitDisposition, TaskPanelEntry, TaskPanelEntryKind, TuiOptions,
-    looks_like_slash_command_input, shell_command_from_bang_input,
+    SubmitDisposition, TaskPanelEntry, TaskPanelEntryKind, ToolDetailArtifact, ToolDetailRecord,
+    TuiOptions, looks_like_slash_command_input, shell_command_from_bang_input,
 };
 use super::approval::{
     ApprovalMode, ApprovalRequest, ApprovalView, ElevationRequest, ElevationView, ReviewDecision,
 };
 use super::history::{
-    HistoryCell, ToolCell, ToolStatus, history_cells_from_message, summarize_tool_output,
+    GenericToolCell, HistoryCell, ToolCell, ToolStatus, history_cells_from_message,
+    summarize_tool_output,
 };
 use super::slash_menu::{
     apply_slash_menu_selection, partial_inline_skill_mention_at_cursor,
@@ -2813,6 +2814,24 @@ async fn run_event_loop(
                         if matches!(name.as_str(), "agent") {
                             subagent_list_refresh_requested = true;
                         }
+                    }
+                    EngineEvent::ToolArtifactStored {
+                        id,
+                        name,
+                        input,
+                        result,
+                        parent_tool_id,
+                        owner_agent_id,
+                    } => {
+                        crate::tui::tool_routing::handle_tool_artifact_stored(
+                            app,
+                            &id,
+                            &name,
+                            &input,
+                            &result,
+                            parent_tool_id.as_deref(),
+                            owner_agent_id.as_deref(),
+                        );
                     }
                     EngineEvent::TurnStarted { turn_id, .. } => {
                         app.ocean_completion_started_at = None;
@@ -14147,6 +14166,131 @@ async fn run_xai_device_login_from_tui(
     Ok(())
 }
 
+fn restored_tool_detail_artifact(
+    session_id: &str,
+    artifact: &crate::artifacts::ArtifactRecord,
+) -> ToolDetailArtifact {
+    let session_matches =
+        artifact.session_id.trim().is_empty() || artifact.session_id == session_id;
+    // Empty is accepted only as the legacy migration shape; the SavedSession
+    // being loaded remains authoritative. Never let artifact metadata select a
+    // different session namespace.
+    let owning_session = session_id.to_string();
+    let (relative_path, absolute_path) = if artifact.storage_path.is_relative() {
+        (Some(artifact.storage_path.clone()), None)
+    } else if session_matches
+        && crate::artifacts::open_retained_absolute_artifact_for_read(
+            &owning_session,
+            &artifact.storage_path,
+        )
+        .is_ok()
+    {
+        (None, Some(artifact.storage_path.clone()))
+    } else {
+        (None, None)
+    };
+    let available = session_matches
+        && relative_path.as_ref().map_or_else(
+            || {
+                absolute_path.as_ref().is_some_and(|path| {
+                    crate::artifacts::open_retained_absolute_artifact_for_read(
+                        &owning_session,
+                        path,
+                    )
+                    .is_ok()
+                })
+            },
+            |relative| {
+                crate::artifacts::resolve_session_artifact_for_read(&owning_session, relative)
+                    .is_ok()
+            },
+        );
+    ToolDetailArtifact {
+        session_id: owning_session,
+        relative_path,
+        absolute_path,
+        sha256: crate::artifacts::adaptive_sha_from_artifact_id(&artifact.id),
+        byte_size: artifact.byte_size,
+        duration_ms: None,
+        available,
+    }
+}
+
+fn restored_artifact_summary(
+    app: &App,
+    artifact: &crate::artifacts::ArtifactRecord,
+    failed: Option<bool>,
+    available: bool,
+) -> String {
+    let size = crate::artifacts::format_byte_size(artifact.byte_size);
+    let mut summary = if !available {
+        app.tr(MessageId::EvidenceDetailsUnavailable)
+            .replace("{size}", &size)
+    } else {
+        match failed {
+            Some(true) => app
+                .tr(MessageId::EvidenceFailureOutputKept)
+                .replace("{size}", &size),
+            Some(false) => app
+                .tr(MessageId::EvidenceOutputKept)
+                .replace("{size}", &size),
+            None => format!(
+                "{} · {}",
+                app.tr(MessageId::EvidenceUnknown),
+                app.tr(MessageId::EvidenceOutputKept)
+                    .replace("{size}", &size)
+            ),
+        }
+    };
+    if available {
+        summary.push_str(" · ");
+        summary.push_str(&app.tr(MessageId::EvidenceOpenDetails).replace(
+            "{shortcut}",
+            crate::tui::shell_key_routing::tool_details_chord().as_ref(),
+        ));
+    }
+    summary
+}
+
+fn restored_artifact_cell_and_detail(
+    app: &App,
+    session_id: &str,
+    artifact: &crate::artifacts::ArtifactRecord,
+    input: serde_json::Value,
+    model_observation: Option<String>,
+    failed: Option<bool>,
+) -> (HistoryCell, ToolDetailRecord) {
+    let detail_artifact = restored_tool_detail_artifact(session_id, artifact);
+    let summary = restored_artifact_summary(app, artifact, failed, detail_artifact.available);
+    let tool_name = if artifact.tool_name.trim().is_empty() {
+        "tool".to_string()
+    } else {
+        artifact.tool_name.clone()
+    };
+    let cell = HistoryCell::Tool(ToolCell::Generic(GenericToolCell {
+        name: tool_name.clone(),
+        status: match failed {
+            Some(true) => ToolStatus::Failed,
+            Some(false) => ToolStatus::Success,
+            None => ToolStatus::Hydrated,
+        },
+        input_summary: crate::tui::history::summarize_tool_args(&input),
+        output: model_observation.clone(),
+        prompts: None,
+        spillover_path: None,
+        output_summary: Some(summary),
+        is_diff: false,
+    }));
+    let detail = ToolDetailRecord {
+        tool_id: artifact.tool_call_id.clone(),
+        tool_name,
+        input,
+        output: model_observation,
+        artifact: Some(detail_artifact),
+    };
+    (cell, detail)
+}
+
 fn apply_loaded_session(
     app: &mut App,
     config: &mut Config,
@@ -14199,8 +14343,66 @@ fn apply_loaded_session(
     app.last_exec_wait_command = None;
     let messages = app.api_messages.clone();
     let mut message_to_cell = std::collections::HashMap::new();
+    let artifacts_by_call = session
+        .artifacts
+        .iter()
+        .filter(|artifact| artifact.kind == crate::artifacts::ArtifactKind::ToolOutput)
+        .map(|artifact| (artifact.tool_call_id.as_str(), artifact))
+        .collect::<std::collections::HashMap<_, _>>();
+    let mut restored_tool_uses =
+        std::collections::HashMap::<String, (String, serde_json::Value)>::new();
+    let mut restored_artifact_calls = std::collections::HashSet::new();
     for (message_index, msg) in messages.iter().enumerate() {
         let mut cells = history_cells_from_message(msg);
+        let mut restored_details = Vec::new();
+        for block in &msg.content {
+            match block {
+                ContentBlock::ToolUse {
+                    id, name, input, ..
+                } => {
+                    restored_tool_uses.insert(id.clone(), (name.clone(), input.clone()));
+                }
+                ContentBlock::ToolResult {
+                    tool_use_id,
+                    content,
+                    is_error,
+                    ..
+                } => {
+                    let Some(artifact) = artifacts_by_call.get(tool_use_id.as_str()) else {
+                        continue;
+                    };
+                    if !restored_artifact_calls.insert(tool_use_id.clone()) {
+                        continue;
+                    }
+                    let input = restored_tool_uses
+                        .get(tool_use_id)
+                        .map(|(_, input)| input.clone())
+                        .unwrap_or_else(|| serde_json::json!({}));
+                    let failed = is_error.unwrap_or(false)
+                        || serde_json::from_str::<serde_json::Value>(content)
+                            .ok()
+                            .and_then(|value| {
+                                value
+                                    .get("status")
+                                    .and_then(serde_json::Value::as_str)
+                                    .map(|status| matches!(status, "error" | "failed"))
+                            })
+                            .unwrap_or(false);
+                    let (cell, detail) = restored_artifact_cell_and_detail(
+                        app,
+                        &session.metadata.id,
+                        artifact,
+                        input,
+                        Some(content.clone()),
+                        Some(failed),
+                    );
+                    let offset = cells.len();
+                    cells.push(cell);
+                    restored_details.push((offset, detail));
+                }
+                _ => {}
+            }
+        }
         if msg.role == "user"
             && session
                 .context_references
@@ -14222,6 +14424,43 @@ fn apply_loaded_session(
             message_to_cell.insert(message_index, base + offset);
         }
         app.extend_history(cells);
+        for (offset, detail) in restored_details {
+            let cell_index = base + offset;
+            app.tool_cells.insert(detail.tool_id.clone(), cell_index);
+            app.tool_details_by_cell
+                .entry(cell_index)
+                .or_default()
+                .push(detail);
+        }
+    }
+    // Older or partially repaired sessions can retain an artifact record even
+    // when the corresponding result block is missing. Keep it inspectable via
+    // a compact terminal receipt instead of silently orphaning exact evidence.
+    for artifact in &session.artifacts {
+        if artifact.kind != crate::artifacts::ArtifactKind::ToolOutput
+            || restored_artifact_calls.contains(&artifact.tool_call_id)
+        {
+            continue;
+        }
+        let input = restored_tool_uses
+            .get(&artifact.tool_call_id)
+            .map(|(_, input)| input.clone())
+            .unwrap_or_else(|| serde_json::json!({}));
+        let (cell, detail) = restored_artifact_cell_and_detail(
+            app,
+            &session.metadata.id,
+            artifact,
+            input,
+            None,
+            artifact.success.map(|success| !success),
+        );
+        let cell_index = app.history.len();
+        app.extend_history([cell]);
+        app.tool_cells.insert(detail.tool_id.clone(), cell_index);
+        app.tool_details_by_cell
+            .entry(cell_index)
+            .or_default()
+            .push(detail);
     }
     app.sync_context_references_from_session(&session.context_references, &message_to_cell);
     app.mark_history_updated();

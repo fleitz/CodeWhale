@@ -4891,6 +4891,7 @@ fn non_yolo_mode_retains_default_defer_policy() {
     assert!(!should_default_defer_tool("run_tests", &always_load));
     assert!(!should_default_defer_tool("agent", &always_load));
     assert!(!should_default_defer_tool("read_file", &always_load));
+    assert!(!should_default_defer_tool("handle_read", &always_load));
     assert!(!should_default_defer_tool("remember", &always_load));
     assert!(!should_default_defer_tool(
         "wait_for_dev_server",
@@ -9039,6 +9040,95 @@ fn v4_keeps_large_file_reads_but_compacts_noisy_shell_output() {
         compact_tool_result_for_context("deepseek-v3.2-128k", "read_file", &output);
     assert!(legacy_context.contains("output compacted to protect context"));
     assert!(legacy_context.len() < v4_context.len());
+}
+
+#[test]
+fn validated_adaptive_evidence_envelope_survives_route_compaction_unchanged() {
+    let sha256 = "a".repeat(64);
+    let envelope = json!({
+        "schema": crate::tools::large_output_router::EVIDENCE_SCHEMA,
+        "status": "failed",
+        "tool": "exec_shell",
+        "payload_kind": "command_output",
+        "bytes": 2_100_019,
+        "estimated_tokens": 700_007,
+        "handle": format!("output_{sha256}_{}", "b".repeat(12)),
+        "sha256": sha256,
+        "facts": ["error[E0382]: borrow of moved value"],
+        "preview": {"head": "bounded head", "tail": "bounded tail"},
+        "inspect": {
+            "tool": "handle_read",
+            "operations": ["count", "slice", "range", "search", "introspect"]
+        },
+        "evidence_available": true
+    })
+    .to_string();
+    let output = ToolResult::error(envelope.clone());
+
+    assert!(is_adaptive_evidence_envelope(&envelope));
+    assert_eq!(
+        compact_tool_result_for_route(
+            ApiProvider::Deepseek,
+            "deepseek-v3.2-128k",
+            None,
+            "exec_shell",
+            &output,
+        ),
+        envelope
+    );
+}
+
+#[test]
+fn spoofed_or_oversized_adaptive_envelopes_do_not_bypass_route_compaction() {
+    let spoofed = json!({
+        "schema": crate::tools::large_output_router::EVIDENCE_SCHEMA,
+        "status": "succeeded",
+        "tool": "exec_shell",
+        "payload_kind": "command_output",
+        "bytes": 12_000,
+        "estimated_tokens": 4_000,
+        "facts": [],
+        "preview": {"head": "small"},
+        "evidence_available": true,
+        "padding": "x".repeat(3_000)
+    })
+    .to_string();
+    assert!(!is_adaptive_evidence_envelope(&spoofed));
+    let compacted = compact_tool_result_for_route(
+        ApiProvider::Deepseek,
+        "deepseek-v3.2-128k",
+        None,
+        "exec_shell",
+        &ToolResult::success(spoofed),
+    );
+    assert!(compacted.contains("output compacted to protect context"));
+
+    let sha256 = "c".repeat(64);
+    let oversized = json!({
+        "schema": crate::tools::large_output_router::EVIDENCE_SCHEMA,
+        "status": "succeeded",
+        "tool": "exec_shell",
+        "payload_kind": "command_output",
+        "bytes": 50_000,
+        "estimated_tokens": 16_667,
+        "handle": format!("output_{sha256}_{}", "d".repeat(12)),
+        "sha256": sha256,
+        "facts": ["ok"],
+        "preview": {"head": "x".repeat(11_900)},
+        "inspect": {"tool": "handle_read", "operations": ["count"]},
+        "evidence_available": true
+    })
+    .to_string();
+    assert!(oversized.chars().count() > 12_000);
+    assert!(!is_adaptive_evidence_envelope(&oversized));
+    let compacted = compact_tool_result_for_route(
+        ApiProvider::Deepseek,
+        "deepseek-v3.2-128k",
+        None,
+        "exec_shell",
+        &ToolResult::success(oversized),
+    );
+    assert!(compacted.contains("output compacted to protect context"));
 }
 
 #[test]

@@ -103,6 +103,23 @@ pub enum Event {
         result: Result<ToolResult, ToolError>,
     },
 
+    /// A nested tool result produced durable exact evidence without owning a
+    /// top-level transcript completion. The TUI indexes this receipt so
+    /// parallel/sub-agent artifacts survive save, resume, and fork. It must
+    /// not create another visible completion card or model-visible message.
+    ToolArtifactStored {
+        id: String,
+        name: String,
+        input: Value,
+        result: ToolResult,
+        /// Top-level tool whose detail pager should include this nested
+        /// result, when the nested call came from a parallel tool fanout.
+        parent_tool_id: Option<String>,
+        /// Sub-agent card whose detail pager should include this nested
+        /// result, when the nested call ran inside a worker.
+        owner_agent_id: Option<String>,
+    },
+
     // === Turn Lifecycle ===
     /// A new turn has started (user sent a message)
     TurnStarted {

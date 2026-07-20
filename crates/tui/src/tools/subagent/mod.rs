@@ -45,7 +45,6 @@ use crate::tools::spec::{
 use crate::tools::todo::SharedTodoList;
 #[cfg(test)]
 use crate::tools::todo::TodoList;
-use crate::tools::truncate::{SPILLOVER_HEAD_BYTES, SPILLOVER_THRESHOLD_BYTES, maybe_spillover};
 use crate::tui::app::AppMode;
 use crate::tui::app::ReasoningEffort;
 use crate::utils::spawn_supervised;
@@ -6634,58 +6633,71 @@ async fn publish_live_subagent_transcript(
     .await;
 }
 
-/// Bound a sub-agent tool result before it enters `messages` (#3882).
-///
-/// The root engine applies spillover in `turn_loop.rs`; the sub-agent loop
-/// bypassed it, so one multi-MB build log became many resident copies across
-/// child messages, checkpoints, transcript handles, and persistence — the
-/// Fleet fanout memory blow-up. Over-threshold content (successes AND
-/// errors: sub-agent error output is routinely a full build log, so the root
-/// loop's pass-errors-through rationale does not hold here) is written to the
-/// shared spillover directory and replaced inline by a bounded head plus a
-/// footer naming the on-disk path.
-///
-/// Returns the (possibly bounded) content and the spillover path when one was
-/// written. Spillover write failures degrade to passing the original content
-/// through, mirroring `apply_spillover`.
-fn bound_subagent_tool_result(
+/// Apply the same engine-native evidence projection before a tool result enters
+/// child messages. The child shares the owning session's artifact/handle store;
+/// no Workflow-JS activation or legacy home-level spill copy is involved.
+async fn bound_subagent_tool_result(
+    runtime: &SubAgentRuntime,
     agent_id: &str,
     tool_id: &str,
-    content: String,
-) -> (String, Option<PathBuf>) {
-    if content.len() <= SPILLOVER_THRESHOLD_BYTES {
-        return (content, None);
-    }
-    let spill_id = format!("sa_{agent_id}_{tool_id}");
-    match maybe_spillover(
-        &spill_id,
-        &content,
-        SPILLOVER_THRESHOLD_BYTES,
-        SPILLOVER_HEAD_BYTES,
-    ) {
-        Ok(Some((head, path))) => {
-            let footer = format!(
-                "\n\n[Sub-agent tool output truncated: {head_kib} KiB of {total_kib} KiB shown. \
-                 Full output saved to {path}. Use `read_file` on that path if you need the \
-                 elided output.]",
-                head_kib = head.len() / 1024,
-                total_kib = content.len() / 1024,
-                path = path.display(),
+    tool_name: &str,
+    input: &Value,
+    mut result: ToolResult,
+) -> (ToolResult, Option<PathBuf>) {
+    let config = runtime
+        .api_config
+        .as_ref()
+        .and_then(|config| config.workshop.clone())
+        .unwrap_or_default();
+    let broker = crate::tools::large_output_router::LargeOutputBroker::new(
+        config,
+        runtime.context.state_namespace.clone(),
+        runtime.context.workspace.clone(),
+        runtime.context.runtime.handle_store.clone(),
+        crate::context_budget::PressureLevel::Low,
+        runtime.context.route_context_window,
+    );
+    match result.metadata.as_mut() {
+        Some(Value::Object(metadata)) => {
+            metadata.insert(
+                "owner_agent_id".to_string(),
+                Value::String(agent_id.to_string()),
             );
-            (format!("{head}{footer}"), Some(path))
         }
-        Ok(None) => (content, None),
-        Err(err) => {
-            tracing::warn!(
-                target: "subagent",
-                ?err,
-                agent_id,
-                tool_id,
-                "sub-agent spillover write failed; passing original content through"
-            );
-            (content, None)
+        Some(existing) => {
+            let provider_metadata = std::mem::take(existing);
+            *existing = json!({
+                "owner_agent_id": agent_id,
+                "provider_metadata": provider_metadata,
+            });
         }
+        None => result.metadata = Some(json!({"owner_agent_id": agent_id})),
     }
+    let evidence_tool_id = format!("subagent-{agent_id}-{tool_id}");
+    let outcome = broker
+        .project(&evidence_tool_id, tool_name, input, &mut result)
+        .await;
+    let path = match outcome {
+        crate::tools::large_output_router::ProjectionOutcome::ClassicSpill { path }
+        | crate::tools::large_output_router::ProjectionOutcome::Stored { path, .. } => Some(path),
+        crate::tools::large_output_router::ProjectionOutcome::Inline
+        | crate::tools::large_output_router::ProjectionOutcome::Unavailable { .. } => None,
+    };
+    if path.is_some()
+        && let Some(event_tx) = runtime.event_tx.as_ref()
+    {
+        let _ = event_tx
+            .send(Event::ToolArtifactStored {
+                id: evidence_tool_id,
+                name: tool_name.to_string(),
+                input: input.clone(),
+                result: result.clone(),
+                parent_tool_id: None,
+                owner_agent_id: Some(agent_id.to_string()),
+            })
+            .await;
+    }
+    (result, path)
 }
 
 /// Rough serialized size of one message, used for checkpoint/transcript byte
@@ -7639,6 +7651,7 @@ async fn run_subagent(
         );
         let mut tool_results: Vec<ContentBlock> = Vec::new();
         for (tool_id, tool_name, tool_input) in tool_uses {
+            let evidence_input = tool_input.clone();
             let tool_display_name = subagent_progress_tool_display_name(&tool_name);
             record_agent_progress(
                 runtime,
@@ -7655,27 +7668,35 @@ async fn run_subagent(
                     step: steps,
                 });
             }
-            let result = match tokio::time::timeout(runtime.tool_timeout, async {
+            let output = match tokio::time::timeout(runtime.tool_timeout, async {
                 tool_registry
-                    .execute(&agent_id, &tool_name, tool_input)
+                    .execute_with_status(&agent_id, &tool_name, tool_input)
                     .await
             })
             .await
             {
                 Ok(Ok(output)) => output,
-                Ok(Err(e)) => format!("Error: {e}"),
-                Err(_) => format!("Error: Tool {tool_name} timed out"),
+                Ok(Err(e)) => ToolResult::error(format!("Error: {e}")),
+                Err(_) => ToolResult::error(format!("Error: Tool {tool_name} timed out")),
             };
-            let tool_ok = !result.starts_with("Error:");
-            let (result, spilled_to) = bound_subagent_tool_result(&agent_id, &tool_id, result);
-            if let Some(path) = spilled_to.as_ref() {
+            let (output, stored_evidence) = bound_subagent_tool_result(
+                runtime,
+                &agent_id,
+                &tool_id,
+                &tool_name,
+                &evidence_input,
+                output,
+            )
+            .await;
+            let tool_ok = output.success;
+            let result = output.content;
+            if stored_evidence.is_some() {
                 record_agent_progress(
                     runtime,
                     &agent_id,
                     format!(
-                        "{}: tool '{tool_display_name}' output spilled to {}",
-                        format_step_counter(steps, max_steps),
-                        path.display()
+                        "{}: tool '{tool_display_name}' output kept for bounded inspection",
+                        format_step_counter(steps, max_steps)
                     ),
                 );
             }
@@ -9794,7 +9815,12 @@ impl SubAgentToolRegistry {
         }
     }
 
-    async fn execute(&self, _agent_id: &str, name: &str, input: Value) -> Result<String> {
+    async fn execute_with_status(
+        &self,
+        _agent_id: &str,
+        name: &str,
+        input: Value,
+    ) -> Result<ToolResult> {
         if !self.is_tool_allowed(name) {
             return Err(anyhow!("Tool {name} not allowed for this sub-agent"));
         }
@@ -9849,8 +9875,14 @@ impl SubAgentToolRegistry {
         self.registry
             .execute_full_with_context(name, input, Some(&context))
             .await
-            .map(|result| result.content)
             .map_err(|e| anyhow!(e))
+    }
+
+    #[cfg(test)]
+    async fn execute(&self, agent_id: &str, name: &str, input: Value) -> Result<String> {
+        self.execute_with_status(agent_id, name, input)
+            .await
+            .map(|result| result.content)
     }
 }
 

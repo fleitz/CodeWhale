@@ -5,7 +5,7 @@ use std::path::PathBuf;
 use crate::session_manager::{
     create_saved_session_with_id_and_mode, create_saved_session_with_mode,
 };
-use crate::tui::app::{App, AppAction};
+use crate::tui::app::{App, AppAction, ToolDetailRecord};
 use crate::tui::session_picker::SessionPickerView;
 
 use super::CommandResult;
@@ -155,7 +155,18 @@ pub fn fork(app: &mut App) -> CommandResult {
     forked.metadata.copy_cost_from(&parent.metadata);
     forked.metadata.mark_forked_from(&parent.metadata);
     forked.context_references = app.session_context_references.clone();
-    forked.artifacts = app.session_artifacts.clone();
+    forked.artifacts = match crate::artifacts::clone_artifact_records_for_session(
+        &app.session_artifacts,
+        &parent.metadata.id,
+        &forked.metadata.id,
+    ) {
+        Ok(artifacts) => artifacts,
+        Err(err) => {
+            return CommandResult::error(format!(
+                "Failed to retain exact evidence in forked session: {err}"
+            ));
+        }
+    };
     forked.work_state = work_state;
     forked.last_auto_route = app.auto_route_for_persistence();
 
@@ -171,6 +182,13 @@ pub fn fork(app: &mut App) -> CommandResult {
     app.current_session_id = Some(forked.metadata.id.clone());
     app.current_session_metadata = Some(forked.metadata.clone());
     app.session_title = Some(forked.metadata.title.clone());
+    app.session_artifacts = forked.artifacts.clone();
+    rebind_forked_tool_details(
+        app,
+        &parent.metadata.id,
+        &forked.metadata.id,
+        &forked.artifacts,
+    );
     let fork_id = forked.metadata.id.clone();
     let parent_label = crate::session_manager::truncate_id(&parent.metadata.id).to_string();
     let fork_label = crate::session_manager::truncate_id(&fork_id).to_string();
@@ -186,6 +204,76 @@ pub fn fork(app: &mut App) -> CommandResult {
             mode: app.mode,
         },
     )
+}
+
+/// Point the live detail index at the fork's copied artifact namespace.
+///
+/// The transcript itself is intentionally retained in place during `/fork`,
+/// so rebuilding details from serialized messages would be disruptive. Rebind
+/// every known detail by its stable tool-call id instead. Any unmatched or
+/// cross-session detail fails closed rather than retaining a hidden dependency
+/// on the parent session.
+fn rebind_forked_tool_details(
+    app: &mut App,
+    source_session_id: &str,
+    target_session_id: &str,
+    cloned_artifacts: &[crate::artifacts::ArtifactRecord],
+) {
+    fn rebind_one(
+        detail: &mut ToolDetailRecord,
+        source_session_id: &str,
+        target_session_id: &str,
+        cloned_artifacts: &[crate::artifacts::ArtifactRecord],
+    ) {
+        let Some(detail_artifact) = detail.artifact.as_mut() else {
+            return;
+        };
+        let source_matches = detail_artifact.session_id.trim().is_empty()
+            || detail_artifact.session_id == source_session_id;
+        let cloned = source_matches
+            .then(|| {
+                cloned_artifacts
+                    .iter()
+                    .find(|artifact| artifact.tool_call_id == detail.tool_id)
+            })
+            .flatten();
+
+        detail_artifact.session_id = target_session_id.to_string();
+        detail_artifact.absolute_path = None;
+        let Some(cloned) = cloned else {
+            detail_artifact.relative_path = None;
+            detail_artifact.available = false;
+            return;
+        };
+        detail_artifact.relative_path = Some(cloned.storage_path.clone());
+        detail_artifact.sha256 = crate::artifacts::adaptive_sha_from_artifact_id(&cloned.id)
+            .or_else(|| detail_artifact.sha256.clone());
+        detail_artifact.byte_size = cloned.byte_size;
+        detail_artifact.available = crate::artifacts::open_session_artifact_for_read(
+            target_session_id,
+            &cloned.storage_path,
+        )
+        .is_ok();
+    }
+
+    for details in app.tool_details_by_cell.values_mut() {
+        for detail in details {
+            rebind_one(
+                detail,
+                source_session_id,
+                target_session_id,
+                cloned_artifacts,
+            );
+        }
+    }
+    for detail in app.active_tool_details.values_mut() {
+        rebind_one(
+            detail,
+            source_session_id,
+            target_session_id,
+            cloned_artifacts,
+        );
+    }
 }
 
 /// Start a fresh saved session from the current TUI state.
@@ -389,8 +477,11 @@ mod tests {
     use super::*;
     use crate::config::Config;
     use crate::test_support::EnvVarGuard;
-    use crate::tui::app::{App, AppMode, ReasoningEffort, TuiOptions, TurnCacheRecord};
-    use crate::tui::history::HistoryCell;
+    use crate::tui::app::{
+        App, AppMode, ReasoningEffort, ToolDetailArtifact, TuiOptions, TurnCacheRecord,
+    };
+    use crate::tui::history::{GenericToolCell, HistoryCell, ToolCell, ToolStatus};
+    use crate::tui::pager::PagerView;
     use std::time::Instant;
     use tempfile::TempDir;
 
@@ -446,6 +537,7 @@ mod tests {
                 session_id: "artifact-session".to_string(),
                 tool_call_id: "call-big".to_string(),
                 tool_name: "exec_shell".to_string(),
+                success: Some(true),
                 created_at: chrono::Utc::now(),
                 byte_size: 512_000,
                 preview: "cargo test output".to_string(),
@@ -497,6 +589,11 @@ mod tests {
 
     #[test]
     fn fork_saves_parent_and_switches_to_child_session() {
+        use std::io::Read as _;
+
+        let _artifact_lock = crate::artifacts::TEST_ARTIFACT_SESSIONS_GUARD
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
         let tmpdir = TempDir::new().unwrap();
         let _lock = crate::test_support::lock_test_env();
         let home = tmpdir.path().join("home");
@@ -552,6 +649,76 @@ mod tests {
             expected_work.graph.is_some(),
             "fork fixture must use a graph"
         );
+        let raw = "CW_FORK_RETAINED_EXACT_EVIDENCE\n";
+        let sha = crate::hashing::sha256_hex(raw.as_bytes());
+        let artifact_id = format!("art_output_{sha}_0123456789ab");
+        let (parent_artifact_path, relative_path) =
+            crate::artifacts::write_session_artifact("parent-session", &artifact_id, raw)
+                .expect("write parent evidence");
+        app.session_artifacts
+            .push(crate::artifacts::ArtifactRecord {
+                id: artifact_id,
+                kind: crate::artifacts::ArtifactKind::ToolOutput,
+                session_id: "parent-session".to_string(),
+                tool_call_id: "call-fork-evidence".to_string(),
+                tool_name: "run_tests".to_string(),
+                success: Some(false),
+                created_at: chrono::Utc::now(),
+                byte_size: raw.len() as u64,
+                preview: "failed output".to_string(),
+                storage_path: relative_path,
+            });
+        let nested_raw = "CW_FORK_RETAINED_NESTED_EVIDENCE\n";
+        let nested_sha = crate::hashing::sha256_hex(nested_raw.as_bytes());
+        let nested_artifact_id = format!("art_output_{nested_sha}_fedcba987654");
+        let (parent_nested_path, nested_relative_path) = crate::artifacts::write_session_artifact(
+            "parent-session",
+            &nested_artifact_id,
+            nested_raw,
+        )
+        .expect("write nested parent evidence");
+        app.session_artifacts
+            .push(crate::artifacts::ArtifactRecord {
+                id: nested_artifact_id,
+                kind: crate::artifacts::ArtifactKind::ToolOutput,
+                session_id: "parent-session".to_string(),
+                tool_call_id: "call-fork-evidence.0".to_string(),
+                tool_name: "read_file".to_string(),
+                success: Some(true),
+                created_at: chrono::Utc::now(),
+                byte_size: nested_raw.len() as u64,
+                preview: "nested output".to_string(),
+                storage_path: nested_relative_path,
+            });
+        app.history = vec![HistoryCell::Tool(ToolCell::Generic(GenericToolCell {
+            name: "run_tests".to_string(),
+            status: ToolStatus::Failed,
+            input_summary: Some("cargo test".to_string()),
+            output: Some("{\"status\":\"failed\"}".to_string()),
+            prompts: None,
+            spillover_path: None,
+            output_summary: Some("1 failure · output kept".to_string()),
+            is_diff: false,
+        }))];
+        app.tool_details_by_cell.insert(
+            0,
+            vec![ToolDetailRecord {
+                tool_id: "call-fork-evidence".to_string(),
+                tool_name: "run_tests".to_string(),
+                input: serde_json::json!({"command": "cargo test"}),
+                output: Some("{\"status\":\"failed\"}".to_string()),
+                artifact: Some(ToolDetailArtifact {
+                    session_id: "parent-session".to_string(),
+                    relative_path: Some(app.session_artifacts[0].storage_path.clone()),
+                    absolute_path: Some(parent_artifact_path.clone()),
+                    sha256: Some(sha.clone()),
+                    byte_size: raw.len() as u64,
+                    duration_ms: Some(17),
+                    available: true,
+                }),
+            }],
+        );
+        app.resync_history_revisions();
 
         let result = fork(&mut app);
 
@@ -586,6 +753,58 @@ mod tests {
         );
         assert_eq!(parent.work_state.as_ref(), Some(&expected_work));
         assert_eq!(child.work_state.as_ref(), Some(&expected_work));
+        assert_eq!(child.artifacts.len(), 2);
+        assert!(
+            child
+                .artifacts
+                .iter()
+                .all(|artifact| artifact.session_id == new_id)
+        );
+        assert_eq!(app.session_artifacts, child.artifacts);
+        let rebound = app.tool_details_by_cell[&0]
+            .first()
+            .unwrap()
+            .artifact
+            .as_ref()
+            .unwrap();
+        assert_eq!(rebound.session_id, new_id);
+        assert_eq!(
+            rebound.relative_path.as_ref(),
+            Some(&child.artifacts[0].storage_path)
+        );
+        assert!(rebound.absolute_path.is_none());
+        let mut child_evidence = crate::artifacts::open_session_artifact_for_read(
+            &new_id,
+            &child.artifacts[0].storage_path,
+        )
+        .expect("forked evidence remains session-local");
+        let mut copied = String::new();
+        child_evidence.read_to_string(&mut copied).unwrap();
+        assert_eq!(copied, raw);
+        let nested_child = child
+            .artifacts
+            .iter()
+            .find(|artifact| artifact.tool_call_id == "call-fork-evidence.0")
+            .expect("nested child artifact");
+        let mut nested_evidence =
+            crate::artifacts::open_session_artifact_for_read(&new_id, &nested_child.storage_path)
+                .expect("forked nested evidence remains session-local");
+        let mut nested_copied = String::new();
+        nested_evidence.read_to_string(&mut nested_copied).unwrap();
+        assert_eq!(nested_copied, nested_raw);
+        std::fs::remove_file(parent_artifact_path).expect("simulate parent evidence pruning");
+        std::fs::remove_file(parent_nested_path).expect("simulate nested parent evidence pruning");
+        assert!(crate::tui::ui::open_details_pager_for_cell(&mut app, 0));
+        let mut view = app.view_stack.pop().expect("forked exact detail pager");
+        let pager = view
+            .as_any_mut()
+            .downcast_mut::<PagerView>()
+            .expect("pager");
+        assert!(
+            pager
+                .body_text()
+                .contains("CW_FORK_RETAINED_EXACT_EVIDENCE")
+        );
         let cached_child = app
             .current_session_metadata
             .as_ref()
@@ -1016,6 +1235,7 @@ mod tests {
                 session_id: "artifact-session".to_string(),
                 tool_call_id: "call-big".to_string(),
                 tool_name: "exec_shell".to_string(),
+                success: Some(true),
                 created_at: chrono::Utc::now(),
                 byte_size: 128,
                 preview: "checking crate".to_string(),
@@ -1032,6 +1252,7 @@ mod tests {
                 session_id: "stale-session".to_string(),
                 tool_call_id: "stale".to_string(),
                 tool_name: "exec_shell".to_string(),
+                success: None,
                 created_at: chrono::Utc::now(),
                 byte_size: 1,
                 preview: "stale".to_string(),

@@ -55,6 +55,7 @@ pub(super) const DEFAULT_ACTIVE_NATIVE_TOOLS: &[&str] = &[
     "git_show",
     "git_status",
     "grep_files",
+    "handle_read",
     "list_dir",
     "read_file",
     "remember",

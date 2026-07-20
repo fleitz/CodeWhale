@@ -39,7 +39,9 @@ use portable_pty::{CommandBuilder, PtySize, native_pty_system};
 
 mod output;
 
-use super::shell_output::{summarize_output, truncate_with_meta};
+#[cfg(test)]
+use super::shell_output::truncate_with_meta;
+use super::shell_output::{preserve_with_meta, summarize_output};
 use crate::child_env;
 use crate::sandbox::{
     CommandSpec,
@@ -895,8 +897,8 @@ impl BackgroundShell {
     pub fn snapshot(&self) -> ShellResult {
         let sandboxed = !matches!(self.sandbox_type, SandboxType::None);
         let (stdout_full, stderr_full, _, _) = self.full_output();
-        let (stdout, stdout_meta) = truncate_with_meta(&stdout_full);
-        let (stderr, stderr_meta) = truncate_with_meta(&stderr_full);
+        let (stdout, stdout_meta) = preserve_with_meta(&stdout_full);
+        let (stderr, stderr_meta) = preserve_with_meta(&stderr_full);
         ShellResult {
             task_id: Some(self.id.clone()),
             status: self.status.clone(),
@@ -1446,8 +1448,8 @@ impl ShellManager {
 
             // Check if sandbox denied the operation
             let sandbox_denied = SandboxManager::was_denied(sandbox_type, exit_code, &stderr_str);
-            let (stdout, stdout_meta) = truncate_with_meta(&stdout_str);
-            let (stderr, stderr_meta) = truncate_with_meta(&stderr_str);
+            let (stdout, stdout_meta) = preserve_with_meta(&stdout_str);
+            let (stderr, stderr_meta) = preserve_with_meta(&stderr_str);
 
             Ok(ShellResult {
                 task_id: None,
@@ -1487,8 +1489,8 @@ impl ShellManager {
             let stderr = recv_sync_reader_output(&stderr_rx);
             let stdout_str = String::from_utf8_lossy(&stdout).to_string();
             let stderr_str = String::from_utf8_lossy(&stderr).to_string();
-            let (stdout, stdout_meta) = truncate_with_meta(&stdout_str);
-            let (stderr, stderr_meta) = truncate_with_meta(&stderr_str);
+            let (stdout, stdout_meta) = preserve_with_meta(&stdout_str);
+            let (stderr, stderr_meta) = preserve_with_meta(&stderr_str);
 
             Ok(ShellResult {
                 task_id: None,
@@ -1939,8 +1941,8 @@ impl ShellManager {
             stdout_total,
             stderr_total,
         ) = shell.take_delta();
-        let (stdout, stdout_meta) = truncate_with_meta(&stdout_delta);
-        let (stderr, stderr_meta) = truncate_with_meta(&stderr_delta);
+        let (stdout, stdout_meta) = preserve_with_meta(&stdout_delta);
+        let (stderr, stderr_meta) = preserve_with_meta(&stderr_delta);
         let sandboxed = !matches!(shell.sandbox_type, SandboxType::None);
 
         let command = shell.command.clone();
@@ -2776,8 +2778,8 @@ impl ToolSpec for ExecShellTool {
 
             let result = match backend_result {
                 Ok(output) => {
-                    let (stdout, stdout_meta) = truncate_with_meta(&output.stdout);
-                    let (stderr, stderr_meta) = truncate_with_meta(&output.stderr);
+                    let (stdout, stdout_meta) = preserve_with_meta(&output.stdout);
+                    let (stderr, stderr_meta) = preserve_with_meta(&output.stderr);
                     ShellResult {
                         task_id: None,
                         status: if output.exit_code == 0 {
@@ -3299,8 +3301,8 @@ fn shell_delta_with_accumulated_output(
     stdout_total_len: usize,
     stderr_total_len: usize,
 ) -> ShellDeltaResult {
-    let (stdout, stdout_meta) = truncate_with_meta(stdout_accum);
-    let (stderr, stderr_meta) = truncate_with_meta(stderr_accum);
+    let (stdout, stdout_meta) = preserve_with_meta(stdout_accum);
+    let (stderr, stderr_meta) = preserve_with_meta(stderr_accum);
     result.stdout = stdout;
     result.stderr = stderr;
     result.stdout_len = stdout_meta.original_len;

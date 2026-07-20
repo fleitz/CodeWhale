@@ -148,10 +148,24 @@ impl ReadRepeatGuard {
             return;
         }
         if !result.content.contains("[codewhale read-repeat guard]") {
-            if !result.content.is_empty() {
-                result.content.push_str("\n\n");
+            if crate::core::engine::is_adaptive_evidence_envelope(&result.content) {
+                if let Ok(mut envelope) = serde_json::from_str::<Value>(&result.content)
+                    && let Some(object) = envelope.as_object_mut()
+                {
+                    object.insert(
+                        "guidance".to_string(),
+                        Value::String(CORRECTIVE_NUDGE.to_string()),
+                    );
+                    if let Ok(rendered) = serde_json::to_string(&envelope) {
+                        result.content = rendered;
+                    }
+                }
+            } else {
+                if !result.content.is_empty() {
+                    result.content.push_str("\n\n");
+                }
+                result.content.push_str(CORRECTIVE_NUDGE);
             }
-            result.content.push_str(CORRECTIVE_NUDGE);
         }
         if let Some(repeat) = result
             .metadata
@@ -327,5 +341,44 @@ mod tests {
 
         assert_eq!(result.content.matches(CORRECTIVE_NUDGE).count(), 1);
         assert_eq!(result.metadata.as_ref().unwrap()["read_repeat"]["count"], 3);
+    }
+
+    #[test]
+    fn nudge_keeps_adaptive_evidence_as_valid_json() {
+        let mut guard = ReadRepeatGuard::default();
+        let arguments = json!({"path": "large.rs"});
+        let _first = guard.register("read_file", &arguments);
+        let _second = guard.register("read_file", &arguments);
+        let third = guard.register("read_file", &arguments);
+        let sha = "a".repeat(64);
+        let mut result = ToolResult::success(
+            json!({
+                "schema": crate::tools::large_output_router::EVIDENCE_SCHEMA,
+                "status": "succeeded",
+                "tool": "read_file",
+                "payload_kind": "text",
+                "bytes": 2000000,
+                "estimated_tokens": 500000,
+                "handle": format!("output_{sha}_0123456789ab"),
+                "sha256": sha,
+                "facts": [],
+                "preview": {"head": "head", "tail": "tail"},
+                "inspect": {
+                    "tool": "handle_read",
+                    "operations": ["count", "slice", "range", "search", "introspect"]
+                },
+                "evidence_available": true
+            })
+            .to_string(),
+        );
+
+        guard.decorate_model_result(&third, &mut result);
+
+        assert!(crate::core::engine::is_adaptive_evidence_envelope(
+            &result.content
+        ));
+        let envelope: Value = serde_json::from_str(&result.content).expect("valid envelope");
+        assert_eq!(envelope["guidance"], CORRECTIVE_NUDGE);
+        assert_eq!(result.content.matches(CORRECTIVE_NUDGE).count(), 1);
     }
 }

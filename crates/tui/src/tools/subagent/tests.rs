@@ -8829,23 +8829,6 @@ fn cleanup_due_gates_write_locked_cleanup_to_a_bounded_cadence() {
 
 // ── #3882: bounded sub-agent output under Fleet fanout ─────────────────────
 
-/// Serialize-and-restore guard for the shared spillover test root, mirroring
-/// the pattern in `tools::truncate::tests`.
-fn with_spillover_root<F: FnOnce()>(root: &std::path::Path, f: F) {
-    let _guard = crate::tools::truncate::TEST_SPILLOVER_GUARD
-        .lock()
-        .unwrap_or_else(|err| err.into_inner());
-    let prior = crate::tools::truncate::set_test_spillover_root(Some(root.to_path_buf()));
-    struct Restore(Option<std::path::PathBuf>);
-    impl Drop for Restore {
-        fn drop(&mut self) {
-            crate::tools::truncate::set_test_spillover_root(self.0.take());
-        }
-    }
-    let _restore = Restore(prior);
-    f();
-}
-
 #[test]
 fn bounded_tail_messages_keeps_recent_within_budget_and_counts_omitted() {
     let messages: Vec<Message> = (0..10)
@@ -9054,83 +9037,138 @@ fn checkpoint_without_omitted_field_still_deserializes() {
     assert_eq!(checkpoint.omitted_messages, 0);
 }
 
-#[test]
-fn subagent_tool_results_spill_to_disk_and_stay_bounded_inline() {
+#[tokio::test(flavor = "current_thread")]
+#[allow(clippy::await_holding_lock)] // Serializes the process-global artifact-root override.
+async fn subagent_tool_results_use_the_native_canonical_artifact() {
+    let _root_guard = crate::artifacts::TEST_ARTIFACT_SESSIONS_GUARD
+        .lock()
+        .unwrap_or_else(|error| error.into_inner());
     let tmp = tempdir().expect("tempdir");
-    with_spillover_root(tmp.path(), || {
-        let raw = "cargo build noise line\n".repeat(220_000); // ~5 MB
-        let raw_len = raw.len();
+    let prior =
+        crate::artifacts::set_test_artifact_sessions_root(Some(tmp.path().join("sessions")));
+    let _restore = ArtifactRootReset(prior);
+    let mut runtime = stub_runtime();
+    runtime.context.workspace = tmp.path().to_path_buf();
+    runtime.context.state_namespace = "subagent-session".to_string();
+    let (event_tx, mut event_rx) = mpsc::channel(4);
+    runtime.event_tx = Some(event_tx);
+    let raw = "cargo build noise line\n".repeat(220_000);
 
-        let (inline, spilled) =
-            bound_subagent_tool_result("fleet-worker-1", "call-42", raw.clone());
+    let (inline, stored) = bound_subagent_tool_result(
+        &runtime,
+        "fleet-worker-1",
+        "call-42",
+        "exec_shell",
+        &json!({}),
+        ToolResult::error(raw.clone()).with_metadata(json!({
+            "exit_code": 101,
+            "duration_ms": 321,
+            "cargo_failure_summary": {"error_codes": ["E0382"]}
+        })),
+    )
+    .await;
+    let path = stored.expect("multi-MB output must be stored");
+    assert!(inline.content.len() < raw.len() / 100);
+    assert!(
+        inline
+            .content
+            .contains(crate::tools::large_output_router::EVIDENCE_SCHEMA)
+    );
+    assert!(inline.content.contains("exit code: 101"));
+    assert!(inline.content.contains("E0382"));
+    assert!(!inline.content.contains(&path.display().to_string()));
+    assert!(!inline.success);
+    assert_eq!(std::fs::read_to_string(path).expect("exact artifact"), raw);
+    let event = event_rx.recv().await.expect("sub-agent artifact receipt");
+    match event {
+        Event::ToolArtifactStored {
+            id,
+            name,
+            result,
+            parent_tool_id,
+            owner_agent_id,
+            ..
+        } => {
+            assert_eq!(id, "subagent-fleet-worker-1-call-42");
+            assert_eq!(name, "exec_shell");
+            assert!(!result.success);
+            assert!(parent_tool_id.is_none());
+            assert_eq!(owner_agent_id.as_deref(), Some("fleet-worker-1"));
+        }
+        other => panic!("unexpected sub-agent evidence event: {other:?}"),
+    }
 
-        let path = spilled.expect("multi-MB output must spill");
-        // Model-visible content is bounded to head + footer.
-        assert!(inline.len() <= crate::tools::truncate::SPILLOVER_HEAD_BYTES + 1024);
-        assert!(inline.contains("Sub-agent tool output truncated"));
-        assert!(inline.contains(&path.display().to_string()));
-        assert!(inline.contains("read_file"));
-        // Full output remains recoverable from disk.
-        let on_disk = std::fs::read_to_string(&path).expect("spill file readable");
-        assert_eq!(on_disk.len(), raw_len);
-
-        // Small outputs pass through untouched, no spill file.
-        let (small, spilled) =
-            bound_subagent_tool_result("fleet-worker-1", "call-43", "ok".to_string());
-        assert_eq!(small, "ok");
-        assert!(spilled.is_none());
-
-        // Oversized error output is bounded too: sub-agent errors are
-        // routinely full build logs, unlike the root loop's short errors.
-        let (bounded_err, spilled) =
-            bound_subagent_tool_result("fleet-worker-1", "call-44", format!("Error: {raw}"));
-        assert!(spilled.is_some());
-        assert!(bounded_err.len() <= crate::tools::truncate::SPILLOVER_HEAD_BYTES + 1024);
-        assert!(bounded_err.starts_with("Error:"));
-    });
+    let (small, stored) = bound_subagent_tool_result(
+        &runtime,
+        "fleet-worker-1",
+        "call-43",
+        "read_file",
+        &json!({}),
+        ToolResult::success("ok"),
+    )
+    .await;
+    assert_eq!(small.content, "ok");
+    assert!(small.success);
+    assert!(stored.is_none());
+    assert!(
+        event_rx.try_recv().is_err(),
+        "small inline results must not emit artifact receipts"
+    );
 }
 
-#[test]
-fn fanout_of_workers_with_huge_outputs_keeps_resident_state_bounded() {
+struct ArtifactRootReset(Option<PathBuf>);
+impl Drop for ArtifactRootReset {
+    fn drop(&mut self) {
+        crate::artifacts::set_test_artifact_sessions_root(self.0.take());
+    }
+}
+
+#[tokio::test(flavor = "current_thread")]
+#[allow(clippy::await_holding_lock)] // Serializes the process-global artifact-root override.
+async fn fanout_of_workers_with_huge_outputs_keeps_resident_state_bounded() {
     // Acceptance shape for #3882: multiple workers, each emitting multi-MB
     // tool output. Model-visible content and per-worker checkpoints stay
     // bounded while every full output is recoverable from disk.
+    let _root_guard = crate::artifacts::TEST_ARTIFACT_SESSIONS_GUARD
+        .lock()
+        .unwrap_or_else(|error| error.into_inner());
     let tmp = tempdir().expect("tempdir");
-    with_spillover_root(tmp.path(), || {
-        let huge = "warning: unused import `std::mem`\n".repeat(70_000); // ~2.4 MB
-        let mut resident_bytes = 0usize;
+    let prior =
+        crate::artifacts::set_test_artifact_sessions_root(Some(tmp.path().join("sessions")));
+    let _restore = ArtifactRootReset(prior);
+    let mut runtime = stub_runtime();
+    runtime.context.workspace = tmp.path().to_path_buf();
+    runtime.context.state_namespace = "fanout-session".to_string();
+    let huge = "warning: unused import `std::mem`\n".repeat(70_000);
+    let mut resident_bytes = 0usize;
 
-        for worker in 0..4 {
-            let agent_id = format!("fleet-worker-{worker}");
-            let mut messages = Vec::new();
-            for call in 0..3 {
-                let (inline, spilled) =
-                    bound_subagent_tool_result(&agent_id, &format!("call-{call}"), huge.clone());
-                let path = spilled.expect("should spill");
-                assert_eq!(
-                    std::fs::read_to_string(&path).expect("readable").len(),
-                    huge.len()
-                );
-                resident_bytes += inline.len();
-                messages.push(text_message("user", &inline));
-            }
-            let checkpoint = make_checkpoint(&agent_id, 3, messages);
-            let serialized = serde_json::to_string(&checkpoint).expect("serialize");
-            assert!(
-                serialized.len() <= SUBAGENT_CHECKPOINT_MESSAGE_BUDGET_BYTES + 128 * 1024,
-                "worker {worker} checkpoint too large: {} bytes",
-                serialized.len()
+    for worker in 0..4 {
+        let agent_id = format!("fleet-worker-{worker}");
+        let mut messages = Vec::new();
+        for call in 0..3 {
+            let (inline, stored) = bound_subagent_tool_result(
+                &runtime,
+                &agent_id,
+                &format!("call-{call}"),
+                "exec_shell",
+                &json!({}),
+                ToolResult::success(huge.clone()),
+            )
+            .await;
+            let path = stored.expect("should store");
+            assert_eq!(
+                std::fs::read_to_string(path).expect("readable").len(),
+                huge.len()
             );
-            resident_bytes += serialized.len();
+            resident_bytes += inline.content.len();
+            messages.push(text_message("user", &inline.content));
         }
-
-        // 4 workers × 3 calls × ~2.4 MB ≈ 29 MB raw. Bounded resident state
-        // must stay under 2 MB total.
-        assert!(
-            resident_bytes < 2 * 1024 * 1024,
-            "resident bytes not bounded: {resident_bytes}"
-        );
-    });
+        let checkpoint = make_checkpoint(&agent_id, 3, messages);
+        let serialized = serde_json::to_string(&checkpoint).expect("serialize");
+        assert!(serialized.len() <= SUBAGENT_CHECKPOINT_MESSAGE_BUDGET_BYTES + 128 * 1024);
+        resident_bytes += serialized.len();
+    }
+    assert!(resident_bytes < 2 * 1024 * 1024);
 }
 
 #[test]

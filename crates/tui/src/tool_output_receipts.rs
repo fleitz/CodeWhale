@@ -388,6 +388,7 @@ mod tests {
             session_id: "session-123".to_string(),
             tool_call_id: tool_call_id.to_string(),
             tool_name: "exec_shell".to_string(),
+            success: Some(true),
             created_at: Utc::now(),
             byte_size: raw.len() as u64,
             preview: "checking crate ... error[E0425]".to_string(),

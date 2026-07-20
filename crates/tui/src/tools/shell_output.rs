@@ -1,10 +1,13 @@
 //! Output truncation and summarization helpers for shell tools.
 
 /// Maximum output size before truncation (30KB like Claude Code).
+#[cfg(test)]
 const MAX_OUTPUT_SIZE: usize = 30_000;
 /// Head bytes preserved for large shell/test output. The matching tail budget
 /// keeps final errors and test summaries visible without a second command.
+#[cfg(test)]
 const TRUNCATED_HEAD_BYTES: usize = 22_000;
+#[cfg(test)]
 const TRUNCATED_TAIL_BYTES: usize = MAX_OUTPUT_SIZE - TRUNCATED_HEAD_BYTES;
 /// Limits for summary strings in tool metadata.
 const SUMMARY_MAX_LINES: usize = 3;
@@ -12,6 +15,7 @@ const SUMMARY_MAX_CHARS: usize = 240;
 /// Maximum number of preserved high-signal lines extracted from the tail
 /// when output is truncated (#242). Bounded so the preserved summary
 /// itself can never blow up the context window.
+#[cfg(test)]
 const MAX_PRESERVED_SUMMARY_LINES: usize = 80;
 
 #[derive(Debug, Clone, Copy, Default)]
@@ -21,6 +25,20 @@ pub(crate) struct TruncationMeta {
     pub(crate) truncated: bool,
 }
 
+/// Preserve the exact process stream until the engine-native evidence broker
+/// has written its canonical artifact and selected the model projection.
+pub(crate) fn preserve_with_meta(output: &str) -> (String, TruncationMeta) {
+    (
+        output.to_string(),
+        TruncationMeta {
+            original_len: output.len(),
+            omitted: 0,
+            truncated: false,
+        },
+    )
+}
+
+#[cfg(test)]
 pub(crate) fn truncate_with_meta(output: &str) -> (String, TruncationMeta) {
     let original_len = output.len();
     if original_len <= MAX_OUTPUT_SIZE {
@@ -76,6 +94,7 @@ pub(crate) fn truncate_with_meta(output: &str) -> (String, TruncationMeta) {
 /// and `Finished`/`running ...` markers. Returns at most
 /// `MAX_PRESERVED_SUMMARY_LINES` lines, oldest-first within each match
 /// class so the most actionable signal is at the end.
+#[cfg(test)]
 pub(crate) fn collect_summary_lines(text: &str) -> Vec<String> {
     let mut preserved: Vec<String> = Vec::new();
     for line in text.lines() {
@@ -93,6 +112,7 @@ pub(crate) fn collect_summary_lines(text: &str) -> Vec<String> {
 /// output is dropped." Tuned for Cargo/rustc and generic test runner
 /// vocabulary. Intentionally conservative: false positives only cost a
 /// handful of bytes; false negatives force the agent to re-run gates.
+#[cfg(test)]
 fn is_summary_line(line: &str) -> bool {
     let trimmed = line.trim_start();
     if trimmed.is_empty() {
@@ -143,6 +163,7 @@ fn is_summary_line(line: &str) -> bool {
     false
 }
 
+#[cfg(test)]
 fn char_boundary_at_or_before(text: &str, max_bytes: usize) -> usize {
     if max_bytes >= text.len() {
         return text.len();
@@ -160,6 +181,7 @@ fn char_boundary_at_or_before(text: &str, max_bytes: usize) -> usize {
     last_end.min(text.len())
 }
 
+#[cfg(test)]
 fn char_boundary_at_or_after(text: &str, min_bytes: usize) -> usize {
     if min_bytes >= text.len() {
         return text.len();
@@ -296,4 +318,13 @@ note: see help
         assert!(preserved.iter().any(|line| line.contains("error[E0277]")));
         assert!(preserved.iter().any(|line| line.contains("warning:")));
     }
+}
+#[test]
+fn engine_boundary_capture_preserves_multi_megabyte_stream_exactly() {
+    let raw = "cargo output sentinel\n".repeat(100_000);
+    let (captured, meta) = preserve_with_meta(&raw);
+    assert_eq!(captured.as_bytes(), raw.as_bytes());
+    assert_eq!(meta.original_len, raw.len());
+    assert_eq!(meta.omitted, 0);
+    assert!(!meta.truncated);
 }

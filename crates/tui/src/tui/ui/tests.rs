@@ -10587,21 +10587,23 @@ fn detail_target_prefers_visible_tool_card() {
     ];
     app.tool_details_by_cell.insert(
         1,
-        ToolDetailRecord {
+        vec![ToolDetailRecord {
             tool_id: "search-1".to_string(),
             tool_name: "file_search".to_string(),
             input: serde_json::json!({"query": "foo"}),
             output: Some("done".to_string()),
-        },
+            artifact: None,
+        }],
     );
     app.tool_details_by_cell.insert(
         3,
-        ToolDetailRecord {
+        vec![ToolDetailRecord {
             tool_id: "exec-1".to_string(),
             tool_name: "exec_shell".to_string(),
             input: serde_json::json!({"command": "ls"}),
             output: Some("...".to_string()),
-        },
+            artifact: None,
+        }],
     );
     app.resync_history_revisions();
     let revisions = app.history_revisions.clone();
@@ -10742,12 +10744,13 @@ fn tool_details_pager_frames_leaf_scope_and_preserves_raw_content() {
     }))];
     app.tool_details_by_cell.insert(
         0,
-        ToolDetailRecord {
+        vec![ToolDetailRecord {
             tool_id: "exec-1".to_string(),
             tool_name: "exec_shell".to_string(),
             input: serde_json::json!({"command": "ls"}),
             output: Some("total 0".to_string()),
-        },
+            artifact: None,
+        }],
     );
     app.resync_history_revisions();
 
@@ -10780,6 +10783,319 @@ fn tool_details_pager_frames_leaf_scope_and_preserves_raw_content() {
     assert!(body.contains("Output:"), "{body}");
     assert!(body.contains("total 0"), "{body}");
     assert!(body.contains("\"command\": \"ls\""), "{body}");
+}
+
+#[test]
+fn adaptive_exec_pager_loads_exact_failed_output_at_release_viewports() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let path = dir.path().join("exact-failure.txt");
+    let raw = "checking crate\nCW_EXACT_SENTINEL\nerror[E0382]: moved value\n";
+    std::fs::write(&path, raw).expect("write evidence");
+    let envelope = serde_json::json!({
+        "schema": crate::tools::large_output_router::EVIDENCE_SCHEMA,
+        "status": "failed",
+        "tool": "exec_shell",
+        "payload_kind": "command_output",
+        "bytes": raw.len(),
+        "estimated_tokens": 20,
+        "handle": format!("output_{}_0123456789ab", crate::hashing::sha256_hex(raw.as_bytes())),
+        "sha256": crate::hashing::sha256_hex(raw.as_bytes()),
+        "facts": ["error[E0382]: moved value"],
+        "preview": {"head": "checking crate", "tail": "error[E0382]: moved value"},
+        "inspect": {
+            "tool": "handle_read",
+            "operations": ["count", "slice", "range", "search", "introspect"]
+        },
+        "evidence_available": true
+    })
+    .to_string();
+
+    for (width, height) in [(80, 24), (100, 32), (140, 40)] {
+        let mut app = create_test_app();
+        app.viewport.last_transcript_area = Some(ratatui::layout::Rect::new(0, 0, width, height));
+        app.history = vec![HistoryCell::Tool(ToolCell::Exec(ExecCell {
+            command: "cargo test".to_string(),
+            status: ToolStatus::Failed,
+            output: Some(envelope.clone()),
+            live_output: None,
+            shell_task_id: None,
+            owner_agent_id: None,
+            owner_agent_name: None,
+            started_at: None,
+            duration_ms: Some(321),
+            source: ExecSource::Assistant,
+            interaction: None,
+            output_summary: Some("1 failure · output kept".to_string()),
+        }))];
+        app.tool_details_by_cell.insert(
+            0,
+            vec![ToolDetailRecord {
+                tool_id: "exec-adaptive".to_string(),
+                tool_name: "exec_shell".to_string(),
+                input: serde_json::json!({"command": "cargo test"}),
+                output: Some(envelope.clone()),
+                artifact: Some(crate::tui::app::ToolDetailArtifact {
+                    session_id: String::new(),
+                    relative_path: None,
+                    absolute_path: Some(path.clone()),
+                    sha256: Some(crate::hashing::sha256_hex(raw.as_bytes())),
+                    byte_size: raw.len() as u64,
+                    duration_ms: Some(321),
+                    available: true,
+                }),
+            }],
+        );
+        app.resync_history_revisions();
+        let collapsed = render_underwater_test_app(&mut app, width, height);
+        assert!(
+            collapsed.contains("cargo test"),
+            "{width}x{height}: {collapsed}"
+        );
+        assert!(
+            collapsed.contains("output kept"),
+            "{width}x{height}: {collapsed}"
+        );
+        assert!(
+            !collapsed.contains("codewhale.tool_evidence"),
+            "{width}x{height}: {collapsed}"
+        );
+        let alt_v = KeyEvent::new(KeyCode::Char('v'), KeyModifiers::ALT);
+        assert!(crate::tui::shell_key_routing::is_tool_details_shortcut(
+            &alt_v
+        ));
+        assert!(open_tool_details_pager(&mut app));
+        let pager_render = render_underwater_test_app(&mut app, width, height);
+        assert!(
+            pager_render.contains("Raw detail"),
+            "{width}x{height}: {pager_render}"
+        );
+        assert!(
+            pager_render.contains("Status: failed"),
+            "{width}x{height}: {pager_render}"
+        );
+        let mut view = app.view_stack.pop().expect("pager view");
+        let pager = view
+            .as_any_mut()
+            .downcast_mut::<PagerView>()
+            .expect("pager");
+        let body = pager.body_text();
+        assert!(body.contains("Status: failed"), "{width}x{height}: {body}");
+        assert!(
+            body.contains("Runtime: Shell · 321 ms"),
+            "{width}x{height}: {body}"
+        );
+        assert!(
+            body.contains("Tool: exec_shell"),
+            "{width}x{height}: {body}"
+        );
+        assert!(
+            body.contains("\"command\": \"cargo test\""),
+            "{width}x{height}: {body}"
+        );
+        assert!(
+            body.contains("Model observation:"),
+            "{width}x{height}: {body}"
+        );
+        assert!(body.contains("Raw output:\n"), "{width}x{height}: {body}");
+        assert!(
+            body.contains("CW_EXACT_SENTINEL"),
+            "{width}x{height}: {body}"
+        );
+        assert!(body.contains("Provenance:"), "{width}x{height}: {body}");
+    }
+}
+
+#[test]
+fn adaptive_pager_reports_corrupt_exact_evidence_without_showing_it() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let path = dir.path().join("corrupt.txt");
+    std::fs::write(&path, "tampered").expect("write evidence");
+    let mut app = create_test_app();
+    app.history = vec![HistoryCell::Tool(ToolCell::Generic(GenericToolCell {
+        name: "read_file".to_string(),
+        status: ToolStatus::Success,
+        input_summary: None,
+        output: Some("{}".to_string()),
+        prompts: None,
+        spillover_path: None,
+        output_summary: None,
+        is_diff: false,
+    }))];
+    app.tool_details_by_cell.insert(
+        0,
+        vec![ToolDetailRecord {
+            tool_id: "read-adaptive".to_string(),
+            tool_name: "read_file".to_string(),
+            input: serde_json::json!({"path": "fixture"}),
+            output: Some(serde_json::json!({"status": "succeeded"}).to_string()),
+            artifact: Some(crate::tui::app::ToolDetailArtifact {
+                session_id: String::new(),
+                relative_path: None,
+                absolute_path: Some(path),
+                sha256: Some("0".repeat(64)),
+                byte_size: 8,
+                duration_ms: None,
+                available: true,
+            }),
+        }],
+    );
+    app.resync_history_revisions();
+    let section = spillover_pager_section(&app, 0).expect("honest section");
+    assert!(section.contains("failed its integrity check"));
+    assert!(!section.contains("Raw output:\ntampered"));
+}
+
+#[cfg(unix)]
+#[test]
+fn adaptive_pager_reads_the_descriptor_anchored_before_parent_swap() {
+    let _root_guard = crate::artifacts::TEST_ARTIFACT_SESSIONS_GUARD
+        .lock()
+        .unwrap_or_else(|error| error.into_inner());
+    let dir = tempfile::tempdir().expect("tempdir");
+    let sessions = dir.path().join("sessions");
+    let attacker_artifacts = sessions.join("attacker-session/artifacts");
+    let owner_artifacts = sessions.join("owner-session/artifacts");
+    std::fs::create_dir_all(&attacker_artifacts).unwrap();
+    std::fs::create_dir_all(&owner_artifacts).unwrap();
+    let relative = PathBuf::from("artifacts/evidence.txt");
+    let attacker_raw = "CW_ATTACKER_SESSION_EVIDENCE\n";
+    let owner_raw = "CW_OTHER_SESSION_SECRET\n";
+    std::fs::write(attacker_artifacts.join("evidence.txt"), attacker_raw).unwrap();
+    std::fs::write(owner_artifacts.join("evidence.txt"), owner_raw).unwrap();
+    let prior = crate::artifacts::set_test_artifact_sessions_root(Some(sessions));
+    struct ArtifactRootReset(Option<PathBuf>);
+    impl Drop for ArtifactRootReset {
+        fn drop(&mut self) {
+            crate::artifacts::set_test_artifact_sessions_root(self.0.take());
+        }
+    }
+    let _reset = ArtifactRootReset(prior);
+
+    let mut app = create_test_app();
+    app.history = vec![HistoryCell::Tool(ToolCell::Generic(GenericToolCell {
+        name: "read_file".to_string(),
+        status: ToolStatus::Success,
+        input_summary: None,
+        output: Some("{\"status\":\"succeeded\"}".to_string()),
+        prompts: None,
+        spillover_path: None,
+        output_summary: None,
+        is_diff: false,
+    }))];
+    app.tool_details_by_cell.insert(
+        0,
+        vec![ToolDetailRecord {
+            tool_id: "race-safe-detail".to_string(),
+            tool_name: "read_file".to_string(),
+            input: serde_json::json!({"path": "evidence.txt"}),
+            output: Some("{\"status\":\"succeeded\"}".to_string()),
+            artifact: Some(crate::tui::app::ToolDetailArtifact {
+                session_id: "attacker-session".to_string(),
+                relative_path: Some(relative),
+                absolute_path: None,
+                sha256: Some(crate::hashing::sha256_hex(attacker_raw.as_bytes())),
+                byte_size: attacker_raw.len() as u64,
+                duration_ms: None,
+                available: true,
+            }),
+        }],
+    );
+    let attacker_for_swap = attacker_artifacts.clone();
+    let owner_for_swap = owner_artifacts.clone();
+    crate::artifacts::set_before_session_artifact_leaf_open_hook(move || {
+        let original = attacker_for_swap.with_file_name("artifacts-original");
+        std::fs::rename(&attacker_for_swap, &original).unwrap();
+        std::os::unix::fs::symlink(&owner_for_swap, &attacker_for_swap).unwrap();
+    });
+
+    assert!(open_details_pager_for_cell(&mut app, 0));
+    let body = pop_pager_body(&mut app);
+    assert!(body.contains("CW_ATTACKER_SESSION_EVIDENCE"), "{body}");
+    assert!(!body.contains("CW_OTHER_SESSION_SECRET"), "{body}");
+    assert!(!body.contains("failed its integrity check"), "{body}");
+}
+
+#[test]
+fn adaptive_pager_localizes_terminal_status() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let path = dir.path().join("failed.txt");
+    let raw = "failure evidence";
+    std::fs::write(&path, raw).expect("write evidence");
+    let mut app = create_test_app();
+    app.ui_locale = crate::localization::Locale::Ja;
+    app.history = vec![HistoryCell::Tool(ToolCell::Generic(GenericToolCell {
+        name: "read_file".to_string(),
+        status: ToolStatus::Failed,
+        input_summary: None,
+        output: Some("{\"status\":\"failed\"}".to_string()),
+        prompts: None,
+        spillover_path: None,
+        output_summary: None,
+        is_diff: false,
+    }))];
+    app.tool_details_by_cell.insert(
+        0,
+        vec![ToolDetailRecord {
+            tool_id: "localized-status".to_string(),
+            tool_name: "read_file".to_string(),
+            input: serde_json::json!({}),
+            output: Some("{\"status\":\"failed\"}".to_string()),
+            artifact: Some(crate::tui::app::ToolDetailArtifact {
+                session_id: String::new(),
+                relative_path: None,
+                absolute_path: Some(path),
+                sha256: Some(crate::hashing::sha256_hex(raw.as_bytes())),
+                byte_size: raw.len() as u64,
+                duration_ms: None,
+                available: true,
+            }),
+        }],
+    );
+
+    assert!(open_details_pager_for_cell(&mut app, 0));
+    let body = pop_pager_body(&mut app);
+    assert!(body.contains("状態: 失敗"), "{body}");
+    assert!(!body.contains("状態: failed"), "{body}");
+}
+
+#[test]
+fn adaptive_pager_never_falls_back_from_unsafe_session_path_to_absolute_metadata() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let fallback = dir.path().join("must-not-be-read.txt");
+    std::fs::write(&fallback, "CW_UNSAFE_FALLBACK_SENTINEL").expect("write fallback");
+    let mut app = create_test_app();
+    app.history = vec![HistoryCell::Tool(ToolCell::Generic(GenericToolCell {
+        name: "read_file".to_string(),
+        status: ToolStatus::Success,
+        input_summary: None,
+        output: Some("{}".to_string()),
+        prompts: None,
+        spillover_path: None,
+        output_summary: None,
+        is_diff: false,
+    }))];
+    app.tool_details_by_cell.insert(
+        0,
+        vec![ToolDetailRecord {
+            tool_id: "read-scoped".to_string(),
+            tool_name: "read_file".to_string(),
+            input: serde_json::json!({"path": "fixture"}),
+            output: Some(serde_json::json!({"status": "succeeded"}).to_string()),
+            artifact: Some(crate::tui::app::ToolDetailArtifact {
+                session_id: "invalid/session".to_string(),
+                relative_path: Some(std::path::PathBuf::from("artifacts/evidence.txt")),
+                absolute_path: Some(fallback),
+                sha256: None,
+                byte_size: 27,
+                duration_ms: None,
+                available: true,
+            }),
+        }],
+    );
+    app.resync_history_revisions();
+    let section = spillover_pager_section(&app, 0).expect("honest section");
+    assert!(section.contains("missing or unsafe"));
+    assert!(!section.contains("CW_UNSAFE_FALLBACK_SENTINEL"));
 }
 
 #[test]
@@ -13033,6 +13349,7 @@ fn apply_loaded_session_restores_artifact_registry() {
         session_id: "session-123".to_string(),
         tool_call_id: "call-big".to_string(),
         tool_name: "exec_shell".to_string(),
+        success: None,
         created_at: chrono::Utc::now(),
         byte_size: 128,
         preview: "hello".to_string(),
@@ -13044,6 +13361,275 @@ fn apply_loaded_session_restores_artifact_registry() {
 
     assert!(!recovered);
     assert_eq!(app.session_artifacts, session.artifacts);
+}
+
+#[test]
+fn restored_absolute_artifact_cannot_read_an_arbitrary_local_file() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let private_file = dir.path().join("private-config");
+    std::fs::write(&private_file, "CW_ARBITRARY_LOCAL_SECRET").unwrap();
+    let record = crate::artifacts::ArtifactRecord {
+        id: "art_tampered_absolute".to_string(),
+        kind: crate::artifacts::ArtifactKind::ToolOutput,
+        session_id: "resume-session".to_string(),
+        tool_call_id: "call-tampered".to_string(),
+        tool_name: "read_file".to_string(),
+        success: Some(true),
+        created_at: chrono::Utc::now(),
+        byte_size: 25,
+        preview: "claimed evidence".to_string(),
+        storage_path: private_file.clone(),
+    };
+
+    let detail = restored_tool_detail_artifact("resume-session", &record);
+
+    assert!(!detail.available);
+    assert!(detail.relative_path.is_none());
+    assert!(detail.absolute_path.is_none());
+
+    #[cfg(unix)]
+    {
+        let linked = dir.path().join("linked-private-config");
+        std::os::unix::fs::symlink(&private_file, &linked).unwrap();
+        let mut linked_record = record;
+        linked_record.storage_path = linked;
+        let linked_detail = restored_tool_detail_artifact("resume-session", &linked_record);
+        assert!(!linked_detail.available);
+        assert!(linked_detail.absolute_path.is_none());
+    }
+}
+
+#[test]
+fn apply_loaded_session_rebuilds_exact_adaptive_tool_detail() {
+    let _root_guard = crate::artifacts::TEST_ARTIFACT_SESSIONS_GUARD
+        .lock()
+        .unwrap_or_else(|error| error.into_inner());
+    let dir = tempfile::tempdir().expect("tempdir");
+    let prior = crate::artifacts::set_test_artifact_sessions_root(Some(dir.path().to_path_buf()));
+    struct ArtifactRootReset(Option<PathBuf>);
+    impl Drop for ArtifactRootReset {
+        fn drop(&mut self) {
+            crate::artifacts::set_test_artifact_sessions_root(self.0.take());
+        }
+    }
+    let _reset = ArtifactRootReset(prior);
+
+    let session_id = "resume-evidence-session";
+    let tool_call_id = "call-resume-evidence";
+    let raw = "first\n    indented  output\n\twith-tab\nCW_RESUME_SENTINEL\n";
+    let sha = crate::hashing::sha256_hex(raw.as_bytes());
+    let artifact_id = format!("art_output_{sha}_0123456789ab");
+    let (_, relative_path) =
+        crate::artifacts::write_session_artifact(session_id, &artifact_id, raw)
+            .expect("write canonical artifact");
+    let envelope = serde_json::json!({
+        "schema": crate::tools::large_output_router::EVIDENCE_SCHEMA,
+        "status": "failed",
+        "tool": "read_file",
+        "payload_kind": "text",
+        "bytes": raw.len(),
+        "estimated_tokens": 20,
+        "handle": format!("output_{sha}_0123456789ab"),
+        "sha256": sha,
+        "facts": [],
+        "preview": {"head": "first", "tail": "CW_RESUME_SENTINEL"},
+        "inspect": {
+            "tool": "handle_read",
+            "operations": ["count", "slice", "range", "search", "introspect"]
+        },
+        "evidence_available": true
+    })
+    .to_string();
+    let mut session = saved_session_with_messages(vec![
+        Message {
+            role: "assistant".to_string(),
+            content: vec![ContentBlock::ToolUse {
+                id: tool_call_id.to_string(),
+                name: "read_file".to_string(),
+                input: serde_json::json!({"path": "src/lib.rs"}),
+                caller: None,
+            }],
+        },
+        Message {
+            role: "user".to_string(),
+            content: vec![ContentBlock::ToolResult {
+                tool_use_id: tool_call_id.to_string(),
+                content: envelope.clone(),
+                is_error: None,
+                content_blocks: None,
+            }],
+        },
+    ]);
+    session.metadata.id = session_id.to_string();
+    session.artifacts.push(crate::artifacts::ArtifactRecord {
+        id: artifact_id,
+        kind: crate::artifacts::ArtifactKind::ToolOutput,
+        session_id: session_id.to_string(),
+        tool_call_id: tool_call_id.to_string(),
+        tool_name: "read_file".to_string(),
+        success: Some(false),
+        created_at: chrono::Utc::now(),
+        byte_size: raw.len() as u64,
+        preview: "first ... CW_RESUME_SENTINEL".to_string(),
+        storage_path: relative_path,
+    });
+
+    let mut app = create_test_app();
+    apply_loaded_session(&mut app, &mut Config::default(), &session).expect("restore session");
+
+    let (&cell_index, details) = app
+        .tool_details_by_cell
+        .iter()
+        .next()
+        .expect("restored detail map");
+    assert_eq!(details.len(), 1);
+    assert_eq!(details[0].tool_id, tool_call_id);
+    assert_eq!(
+        details[0]
+            .artifact
+            .as_ref()
+            .and_then(|a| a.sha256.as_deref()),
+        Some(sha.as_str())
+    );
+    assert!(open_details_pager_for_cell(&mut app, cell_index));
+    assert!(matches!(
+        app.history.get(cell_index),
+        Some(HistoryCell::Tool(ToolCell::Generic(GenericToolCell {
+            status: ToolStatus::Failed,
+            ..
+        })))
+    ));
+    let mut view = app.view_stack.pop().expect("exact detail pager");
+    let pager = view
+        .as_any_mut()
+        .downcast_mut::<PagerView>()
+        .expect("pager");
+    let body = pager.body_text();
+    assert!(body.contains("    indented  output"), "{body}");
+    assert!(body.contains("\twith-tab"), "{body:?}");
+    assert!(body.contains("CW_RESUME_SENTINEL"), "{body}");
+    let copied = match pager.handle_key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::NONE)) {
+        ViewAction::Emit(ViewEvent::CopyToClipboard { text, .. }) => text,
+        other => panic!("expected exact pager copy, got {other:?}"),
+    };
+    assert!(copied.contains(&envelope), "{copied}");
+    assert!(copied.contains(raw), "{copied}");
+}
+
+#[test]
+fn apply_loaded_session_keeps_unmatched_failed_artifact_truthful() {
+    let _root_guard = crate::artifacts::TEST_ARTIFACT_SESSIONS_GUARD
+        .lock()
+        .unwrap_or_else(|error| error.into_inner());
+    let dir = tempfile::tempdir().expect("tempdir");
+    let prior = crate::artifacts::set_test_artifact_sessions_root(Some(dir.path().to_path_buf()));
+    struct ArtifactRootReset(Option<PathBuf>);
+    impl Drop for ArtifactRootReset {
+        fn drop(&mut self) {
+            crate::artifacts::set_test_artifact_sessions_root(self.0.take());
+        }
+    }
+    let _reset = ArtifactRootReset(prior);
+
+    let session_id = "repaired-failure-session";
+    let tool_call_id = "call-repaired-failure";
+    let raw = "test result: FAILED\nCW_REPAIRED_FAILURE_SENTINEL\n";
+    let sha = crate::hashing::sha256_hex(raw.as_bytes());
+    let artifact_id = format!("art_output_{sha}_0123456789ab");
+    let (_, relative_path) =
+        crate::artifacts::write_session_artifact(session_id, &artifact_id, raw)
+            .expect("write repaired artifact");
+    let mut session = saved_session_with_messages(vec![Message {
+        role: "assistant".to_string(),
+        content: vec![ContentBlock::ToolUse {
+            id: tool_call_id.to_string(),
+            name: "run_tests".to_string(),
+            input: serde_json::json!({}),
+            caller: None,
+        }],
+    }]);
+    session.metadata.id = session_id.to_string();
+    session.artifacts.push(crate::artifacts::ArtifactRecord {
+        id: artifact_id,
+        kind: crate::artifacts::ArtifactKind::ToolOutput,
+        session_id: session_id.to_string(),
+        tool_call_id: tool_call_id.to_string(),
+        tool_name: "run_tests".to_string(),
+        success: Some(false),
+        created_at: chrono::Utc::now(),
+        byte_size: raw.len() as u64,
+        preview: "test result: FAILED".to_string(),
+        storage_path: relative_path,
+    });
+    let mut app = create_test_app();
+
+    apply_loaded_session(&mut app, &mut Config::default(), &session).expect("restore session");
+
+    let (&cell_index, _) = app
+        .tool_details_by_cell
+        .iter()
+        .next()
+        .expect("repaired artifact detail");
+    assert!(matches!(
+        app.history.get(cell_index),
+        Some(HistoryCell::Tool(ToolCell::Generic(GenericToolCell {
+            status: ToolStatus::Failed,
+            ..
+        })))
+    ));
+    assert!(open_details_pager_for_cell(&mut app, cell_index));
+    assert!(pop_pager_body(&mut app).contains("CW_REPAIRED_FAILURE_SENTINEL"));
+}
+
+#[test]
+fn apply_loaded_session_refuses_cross_session_artifact_record() {
+    let _root_guard = crate::artifacts::TEST_ARTIFACT_SESSIONS_GUARD
+        .lock()
+        .unwrap_or_else(|error| error.into_inner());
+    let dir = tempfile::tempdir().expect("tempdir");
+    let prior = crate::artifacts::set_test_artifact_sessions_root(Some(dir.path().to_path_buf()));
+    struct ArtifactRootReset(Option<PathBuf>);
+    impl Drop for ArtifactRootReset {
+        fn drop(&mut self) {
+            crate::artifacts::set_test_artifact_sessions_root(self.0.take());
+        }
+    }
+    let _reset = ArtifactRootReset(prior);
+    let raw = "CW_OTHER_SESSION_SECRET";
+    let sha = crate::hashing::sha256_hex(raw.as_bytes());
+    let artifact_id = format!("art_output_{sha}_0123456789ab");
+    let (_, relative_path) =
+        crate::artifacts::write_session_artifact("other-session", &artifact_id, raw)
+            .expect("write other-session artifact");
+    let mut session = saved_session_with_messages(Vec::new());
+    session.metadata.id = "owner-session".to_string();
+    session.artifacts.push(crate::artifacts::ArtifactRecord {
+        id: artifact_id,
+        kind: crate::artifacts::ArtifactKind::ToolOutput,
+        session_id: "other-session".to_string(),
+        tool_call_id: "forged-call".to_string(),
+        tool_name: "read_file".to_string(),
+        success: Some(true),
+        created_at: chrono::Utc::now(),
+        byte_size: raw.len() as u64,
+        preview: "forged preview".to_string(),
+        storage_path: relative_path,
+    });
+    let mut app = create_test_app();
+
+    apply_loaded_session(&mut app, &mut Config::default(), &session).expect("restore session");
+
+    let details = app
+        .tool_details_by_cell
+        .get(&0)
+        .expect("restored unavailable detail");
+    let artifact = details[0].artifact.as_ref().expect("artifact metadata");
+    assert_eq!(artifact.session_id, "owner-session");
+    assert!(!artifact.available);
+    assert!(open_details_pager_for_cell(&mut app, 0));
+    let body = pop_pager_body(&mut app);
+    assert!(!body.contains(raw), "{body}");
+    assert!(body.contains("unavailable"), "{body}");
 }
 
 #[test]
@@ -13154,6 +13740,225 @@ fn out_of_order_completes_finalize_one_history_cell_per_turn() {
 }
 
 #[test]
+fn adaptive_exploring_results_keep_independent_exact_details() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let raw_a = "alpha\n    exact  spacing\nCW_EXPLORE_ALPHA\n";
+    let raw_b = "beta\n\texact-tab\nCW_EXPLORE_BETA\n";
+    let path_a = dir.path().join("alpha.txt");
+    let path_b = dir.path().join("beta.txt");
+    std::fs::write(&path_a, raw_a).expect("write alpha evidence");
+    std::fs::write(&path_b, raw_b).expect("write beta evidence");
+    let result = |tool: &str, raw: &str, path: &std::path::Path| {
+        let sha = crate::hashing::sha256_hex(raw.as_bytes());
+        let envelope = serde_json::json!({
+            "schema": crate::tools::large_output_router::EVIDENCE_SCHEMA,
+            "status": "success",
+            "tool": tool,
+            "payload_kind": "text",
+            "bytes": raw.len(),
+            "estimated_tokens": 20,
+            "handle": format!("output_{sha}_0123456789ab"),
+            "sha256": sha,
+            "facts": [],
+            "preview": {"head": "preview", "tail": "sentinel"},
+            "inspect": {
+                "tool": "handle_read",
+                "operations": ["count", "slice", "range", "search", "introspect"]
+            },
+            "evidence_available": true
+        })
+        .to_string();
+        Ok(
+            crate::tools::spec::ToolResult::success(envelope).with_metadata(serde_json::json!({
+                "spillover_path": path.display().to_string(),
+                "artifact_path": path.display().to_string(),
+                "artifact_sha256": sha,
+                "artifact_byte_size": raw.len(),
+                "adaptive_evidence": {
+                    "schema": crate::tools::large_output_router::EVIDENCE_SCHEMA,
+                    "route": "hybrid",
+                    "artifact_path": path.display().to_string(),
+                    "sha256": sha,
+                    "bytes": raw.len(),
+                    "status": "success",
+                    "details_available": true,
+                    "display_summary": "output kept"
+                }
+            })),
+        )
+    };
+    let mut app = create_test_app();
+    // Put a non-exploring cell first so the aggregate's final index is not
+    // the active-group base. This catches completion-time map removal that
+    // would otherwise attach every detail to cell zero during flush.
+    handle_tool_call_started(
+        &mut app,
+        "exec-before-exploring",
+        "exec_shell",
+        &serde_json::json!({"command": "pwd"}),
+    );
+    handle_tool_call_complete(
+        &mut app,
+        "exec-before-exploring",
+        "exec_shell",
+        &ok_result("ok"),
+    );
+    handle_tool_call_started(
+        &mut app,
+        "explore-alpha",
+        "read_file",
+        &serde_json::json!({"path": "alpha.rs"}),
+    );
+    handle_tool_call_started(
+        &mut app,
+        "explore-beta",
+        "grep_files",
+        &serde_json::json!({"pattern": "beta"}),
+    );
+    handle_tool_call_complete(
+        &mut app,
+        "explore-beta",
+        "grep_files",
+        &result("grep_files", raw_b, &path_b),
+    );
+    handle_tool_call_complete(
+        &mut app,
+        "explore-alpha",
+        "read_file",
+        &result("read_file", raw_a, &path_a),
+    );
+
+    let active = app.active_cell.as_ref().expect("active exploring cell");
+    let HistoryCell::Tool(ToolCell::Exploring(exploring)) = &active.entries()[1] else {
+        panic!("expected exploring cell")
+    };
+    assert!(exploring.entries.iter().all(|entry| {
+        entry
+            .output_summary
+            .as_deref()
+            .is_some_and(|summary| summary.contains("output kept"))
+    }));
+
+    app.flush_active_cell();
+    let details = app
+        .tool_details_by_cell
+        .get(&1)
+        .expect("two details on exploring aggregate");
+    assert_eq!(details.len(), 2);
+    assert_eq!(details[0].tool_id, "explore-alpha");
+    assert_eq!(details[1].tool_id, "explore-beta");
+    assert_eq!(
+        app.tool_details_by_cell
+            .get(&0)
+            .expect("exec detail stays on first cell")
+            .len(),
+        1
+    );
+    assert!(open_details_pager_for_cell(&mut app, 1));
+    let body = pop_pager_body(&mut app);
+    assert!(body.contains("Result 1 of 2"), "{body}");
+    assert!(body.contains("Result 2 of 2"), "{body}");
+    assert!(body.contains("    exact  spacing"), "{body}");
+    assert!(body.contains("\texact-tab"), "{body:?}");
+    assert!(body.contains("CW_EXPLORE_ALPHA"), "{body}");
+    assert!(body.contains("CW_EXPLORE_BETA"), "{body}");
+}
+
+#[test]
+fn specialized_cards_render_adaptive_receipt_instead_of_parsing_envelope() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let raw = "CW_SPECIALIZED_EXACT\n".repeat(1_000);
+    let path = dir.path().join("specialized.txt");
+    std::fs::write(&path, &raw).expect("write specialized evidence");
+    let sha = crate::hashing::sha256_hex(raw.as_bytes());
+    let adaptive_result = |tool: &str| {
+        let envelope = serde_json::json!({
+            "schema": crate::tools::large_output_router::EVIDENCE_SCHEMA,
+            "status": "succeeded",
+            "tool": tool,
+            "payload_kind": "json",
+            "bytes": raw.len(),
+            "estimated_tokens": 5000,
+            "handle": format!("output_{sha}_0123456789ab"),
+            "sha256": sha,
+            "facts": ["specialized result complete"],
+            "preview": {"head": "head", "tail": "tail"},
+            "inspect": {
+                "tool": "handle_read",
+                "operations": ["count", "slice", "range", "search", "introspect"]
+            },
+            "evidence_available": true
+        })
+        .to_string();
+        Ok(
+            crate::tools::spec::ToolResult::success(envelope).with_metadata(serde_json::json!({
+                "spillover_path": path.display().to_string(),
+                "artifact_path": path.display().to_string(),
+                "artifact_sha256": sha,
+                "artifact_byte_size": raw.len(),
+                "adaptive_evidence": {
+                    "schema": crate::tools::large_output_router::EVIDENCE_SCHEMA,
+                    "route": "hybrid",
+                    "artifact_path": path.display().to_string(),
+                    "sha256": sha,
+                    "bytes": raw.len(),
+                    "status": "success",
+                    "details_available": true,
+                    "display_summary": "output kept",
+                    "display_primary": "specialized result complete"
+                }
+            })),
+        )
+    };
+
+    for (id, name, input) in [
+        (
+            "review-adaptive",
+            "review",
+            serde_json::json!({"target": "HEAD"}),
+        ),
+        (
+            "mcp-adaptive",
+            "mcp_example_lookup",
+            serde_json::json!({"query": "whale"}),
+        ),
+        (
+            "web-adaptive",
+            "web.run",
+            serde_json::json!({"search_query": [{"q": "whale"}]}),
+        ),
+    ] {
+        let mut app = create_test_app();
+        handle_tool_call_started(&mut app, id, name, &input);
+        handle_tool_call_complete(&mut app, id, name, &adaptive_result(name));
+        app.flush_active_cell();
+
+        let rendered = app.history[0]
+            .lines(100)
+            .iter()
+            .map(crate::tui::ui_text::line_to_plain)
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(rendered.contains("output kept"), "{name}: {rendered}");
+        assert!(
+            rendered.contains("specialized result complete"),
+            "{name}: {rendered}"
+        );
+        assert!(
+            !rendered.contains("codewhale.tool_evidence"),
+            "{name}: {rendered}"
+        );
+        assert_eq!(
+            app.tool_details_by_cell
+                .get(&0)
+                .expect("specialized detail")
+                .len(),
+            1
+        );
+    }
+}
+
+#[test]
 fn mixed_parallel_tools_render_in_single_active_cell() {
     // Tools of different shapes — exploring + exec + generic — all in flight
     // at once. The active cell must hold them all without bouncing.
@@ -13234,6 +14039,73 @@ fn orphan_tool_complete_with_unknown_id_pushes_separate_cell() {
     };
     assert_eq!(generic.name, "mystery_tool");
     assert_eq!(generic.status, ToolStatus::Success);
+}
+
+#[test]
+fn orphan_adaptive_completion_keeps_compact_receipt_and_exact_detail() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let raw = "orphan exact\n    spacing  kept\nCW_ORPHAN_SENTINEL\n";
+    let path = dir.path().join("orphan.txt");
+    std::fs::write(&path, raw).expect("write orphan evidence");
+    let sha = crate::hashing::sha256_hex(raw.as_bytes());
+    let envelope = serde_json::json!({
+        "schema": crate::tools::large_output_router::EVIDENCE_SCHEMA,
+        "status": "succeeded",
+        "tool": "read_file",
+        "payload_kind": "text",
+        "bytes": raw.len(),
+        "estimated_tokens": 20,
+        "handle": format!("output_{sha}_0123456789ab"),
+        "sha256": sha,
+        "facts": [],
+        "preview": {"head": "orphan exact", "tail": "CW_ORPHAN_SENTINEL"},
+        "inspect": {
+            "tool": "handle_read",
+            "operations": ["count", "slice", "range", "search", "introspect"]
+        },
+        "evidence_available": true
+    })
+    .to_string();
+    let result = Ok(
+        crate::tools::spec::ToolResult::success(envelope.clone()).with_metadata(
+            serde_json::json!({
+                "spillover_path": path.display().to_string(),
+                "artifact_path": path.display().to_string(),
+                "artifact_sha256": sha,
+                "artifact_byte_size": raw.len(),
+                "adaptive_evidence": {
+                    "schema": crate::tools::large_output_router::EVIDENCE_SCHEMA,
+                    "route": "hybrid",
+                    "artifact_path": path.display().to_string(),
+                    "sha256": sha,
+                    "bytes": raw.len(),
+                    "status": "success",
+                    "details_available": true,
+                    "display_summary": "output kept"
+                }
+            }),
+        ),
+    );
+    let mut app = create_test_app();
+
+    handle_tool_call_complete(&mut app, "orphan-adaptive", "read_file", &result);
+
+    let HistoryCell::Tool(ToolCell::Generic(generic)) = &app.history[0] else {
+        panic!("orphan should be generic")
+    };
+    assert_eq!(generic.output.as_deref(), Some(envelope.as_str()));
+    let rendered = app.history[0]
+        .lines(100)
+        .iter()
+        .map(crate::tui::ui_text::line_to_plain)
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(rendered.contains("output kept"), "{rendered}");
+    assert!(!rendered.contains("codewhale.tool_evidence"), "{rendered}");
+    assert!(open_details_pager_for_cell(&mut app, 0));
+    let body = pop_pager_body(&mut app);
+    assert!(body.contains("    spacing  kept"), "{body}");
+    assert!(body.contains("CW_ORPHAN_SENTINEL"), "{body}");
 }
 
 #[test]
@@ -13332,6 +14204,7 @@ fn tool_details_survive_active_cell_flush() {
     let detail = app
         .tool_details_by_cell
         .get(&0)
+        .and_then(|details| details.first())
         .expect("detail record migrated to flushed cell index");
     assert_eq!(detail.tool_id, "tid");
     assert_eq!(detail.tool_name, "exec_shell");
@@ -13743,12 +14616,13 @@ fn activity_detail_includes_tool_handle_and_neighbor_context() {
     ];
     app.tool_details_by_cell.insert(
         1,
-        ToolDetailRecord {
+        vec![ToolDetailRecord {
             tool_id: "call-read".to_string(),
             tool_name: "read_file".to_string(),
             input: serde_json::json!({"path": "src/main.rs"}),
             output: Some("full output behind raw details".to_string()),
-        },
+            artifact: None,
+        }],
     );
     app.session_artifacts
         .push(crate::artifacts::ArtifactRecord {
@@ -13757,6 +14631,7 @@ fn activity_detail_includes_tool_handle_and_neighbor_context() {
             session_id: "session-activity".to_string(),
             tool_call_id: "call-read".to_string(),
             tool_name: "read_file".to_string(),
+            success: Some(true),
             created_at: chrono::Utc::now(),
             byte_size: 42,
             preview: "bounded preview".to_string(),

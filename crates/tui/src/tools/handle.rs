@@ -6,11 +6,17 @@
 //! parent transcript.
 
 use std::collections::HashMap;
+use std::fs::File;
+use std::io::{self, Read, Seek, SeekFrom};
+#[cfg(test)]
+use std::path::Path;
+use std::path::PathBuf;
 use std::sync::Arc;
 
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
+use sha2::{Digest, Sha256};
 use tokio::sync::Mutex;
 
 use crate::tools::spec::{
@@ -21,6 +27,9 @@ const DEFAULT_MAX_CHARS: usize = 12_000;
 const HARD_MAX_CHARS: usize = 50_000;
 #[allow(dead_code)] // Used by producers as they begin returning var_handle records.
 const REPR_PREVIEW_CHARS: usize = 160;
+const READ_CHUNK_BYTES: usize = 16 * 1024;
+const DEFAULT_MAX_MATCHES: usize = 20;
+const HARD_MAX_MATCHES: usize = 100;
 
 pub type SharedHandleStore = Arc<Mutex<HandleStore>>;
 
@@ -63,11 +72,23 @@ pub struct HandleRecord {
     pub value: HandleValue,
 }
 
+/// Exact text owned by the session artifact store. Only metadata and a safe
+/// preview remain in memory; projections stream from the canonical file.
+#[derive(Debug, Clone)]
+pub struct ArtifactTextBacking {
+    pub relative_path: PathBuf,
+    pub byte_length: u64,
+    pub char_length: usize,
+    pub line_count: Option<usize>,
+    pub sha256: String,
+}
+
 #[allow(dead_code)] // Producers land in later v0.8.33 slices; handle_read is first.
 #[derive(Debug, Clone)]
 pub enum HandleValue {
     Text(String),
     Json(Value),
+    ArtifactText(ArtifactTextBacking),
 }
 
 #[allow(dead_code)] // Foundation methods used by upcoming RLM/agent session producers.
@@ -78,6 +99,7 @@ impl HandleValue {
             Self::Json(Value::Array(items)) => items.len(),
             Self::Json(Value::Object(map)) => map.len(),
             Self::Json(value) => value.to_string().chars().count(),
+            Self::ArtifactText(backing) => backing.char_length,
         }
     }
 
@@ -90,6 +112,7 @@ impl HandleValue {
             Self::Json(Value::Bool(_)) => "bool".to_string(),
             Self::Json(Value::Number(_)) => "number".to_string(),
             Self::Json(Value::Null) => "null".to_string(),
+            Self::ArtifactText(_) => "str".to_string(),
         }
     }
 
@@ -97,6 +120,7 @@ impl HandleValue {
         match self {
             Self::Text(text) => text.as_bytes().to_vec(),
             Self::Json(value) => serde_json::to_vec(value).unwrap_or_default(),
+            Self::ArtifactText(backing) => backing.sha256.as_bytes().to_vec(),
         }
     }
 
@@ -104,6 +128,7 @@ impl HandleValue {
         match self {
             Self::Text(text) => truncate_chars(text, REPR_PREVIEW_CHARS),
             Self::Json(value) => truncate_chars(&value.to_string(), REPR_PREVIEW_CHARS),
+            Self::ArtifactText(_) => String::new(),
         }
     }
 }
@@ -138,6 +163,35 @@ impl HandleStore {
     #[must_use]
     pub fn get(&self, handle: &VarHandle) -> Option<&HandleRecord> {
         self.records.get(&handle.key())
+    }
+
+    #[must_use]
+    pub fn insert_artifact_text(
+        &mut self,
+        session_id: impl Into<String>,
+        name: impl Into<String>,
+        backing: ArtifactTextBacking,
+        safe_preview: impl Into<String>,
+    ) -> VarHandle {
+        let session_id = session_id.into();
+        let name = name.into();
+        let handle = VarHandle {
+            kind: "var_handle".to_string(),
+            session_id: session_id.clone(),
+            name: name.clone(),
+            type_name: "str".to_string(),
+            length: backing.char_length,
+            repr_preview: truncate_chars(&safe_preview.into(), REPR_PREVIEW_CHARS),
+            sha256: backing.sha256.clone(),
+        };
+        self.records.insert(
+            HandleKey { session_id, name },
+            HandleRecord {
+                handle: handle.clone(),
+                value: HandleValue::ArtifactText(backing),
+            },
+        );
+        handle
     }
 
     fn insert(
@@ -179,12 +233,13 @@ impl ToolSpec for HandleReadTool {
 
     fn description(&self) -> &'static str {
         "Read a bounded projection from a var_handle returned by tools such \
-         as RLM sessions or sub-agents. This does not read artifact ids \
+         as ordinary tool calls, RLM sessions, or sub-agents. Opaque \
+         `output_...` aliases resolve within the current session. This does not read artifact ids \
          (`art_...`), tool-call ids (`call_...`), SHA refs, or files; use \
          retrieve_tool_result for spilled tool results/artifacts and \
          read_file for workspace files. Provide \
          exactly one projection: `slice` for char/line slices, `range` for \
-         one-based line ranges, `count` for metadata counts, or `jsonpath` \
+         one-based line ranges, `search` for bounded text matches, `count` for metadata counts, or `jsonpath` \
          for a small JSON-path projection. This retrieves from the handle's \
          backing environment instead of asking the parent transcript to hold \
          the full payload."
@@ -232,6 +287,16 @@ impl ToolSpec for HandleReadTool {
                         "end": { "type": "integer", "minimum": 1 }
                     }
                 },
+                "search": {
+                    "type": "object",
+                    "description": "Bounded substring search over text handles.",
+                    "required": ["query"],
+                    "properties": {
+                        "query": { "type": "string", "maxLength": 512 },
+                        "case_sensitive": { "type": "boolean", "default": false },
+                        "max_matches": { "type": "integer", "minimum": 1, "maximum": 100, "default": 20 }
+                    }
+                },
                 "count": {
                     "type": "boolean",
                     "description": "Return counts for the handle payload."
@@ -269,6 +334,7 @@ impl ToolSpec for HandleReadTool {
             input
                 .get("handle")
                 .ok_or_else(|| ToolError::missing_field("handle"))?,
+            &context.state_namespace,
         )?;
         let projection = parse_projection(&input)?;
         let max_chars = input
@@ -277,30 +343,37 @@ impl ToolSpec for HandleReadTool {
             .map(|n| (n as usize).min(HARD_MAX_CHARS))
             .unwrap_or(DEFAULT_MAX_CHARS);
 
-        let store = context.runtime.handle_store.lock().await;
-        let record = store.get(&handle).ok_or_else(|| {
+        let record = {
+            let store = context.runtime.handle_store.lock().await;
+            store.get(&handle).cloned()
+        }
+        .or_else(|| artifact_record_after_restart(&handle, &context.state_namespace))
+        .ok_or_else(|| {
             ToolError::invalid_input(format!(
                 "handle_read: no payload found for handle {}/{}",
                 handle.session_id, handle.name
             ))
         })?;
+        if matches!(record.value, HandleValue::ArtifactText(_))
+            && record.handle.session_id != context.state_namespace
+        {
+            return Err(ToolError::invalid_input(
+                "handle_read: artifact-backed handles are scoped to the current session",
+            ));
+        }
         if !handle.sha256.is_empty() && handle.sha256 != record.handle.sha256 {
             return Err(ToolError::invalid_input(
                 "handle_read: handle sha256 does not match stored payload",
             ));
         }
 
-        let output = match projection {
-            Projection::Count => count_projection(record),
-            Projection::Slice { start, end, unit } => {
-                slice_projection(record, start, end, unit, max_chars)
-            }
-            Projection::Range { start, end } => {
-                line_range_projection(record, start, end, max_chars)
-            }
-            Projection::JsonPath(path) => jsonpath_projection(record, &path, max_chars)?,
-            Projection::Introspect => introspect_projection(record),
-        };
+        let output = tokio::task::spawn_blocking(move || {
+            projection_for_record(&record, &projection, max_chars)
+        })
+        .await
+        .map_err(|error| {
+            ToolError::execution_failed(format!("handle_read worker failed: {error}"))
+        })??;
 
         ToolResult::json(&output).map_err(|e| ToolError::execution_failed(e.to_string()))
     }
@@ -312,6 +385,7 @@ enum SliceUnit {
     Lines,
 }
 
+#[derive(Debug, Clone)]
 enum Projection {
     Count,
     Slice {
@@ -323,12 +397,28 @@ enum Projection {
         start: usize,
         end: usize,
     },
+    Search {
+        query: String,
+        case_sensitive: bool,
+        max_matches: usize,
+    },
     JsonPath(String),
     Introspect,
 }
 
-fn parse_handle(value: &Value) -> Result<VarHandle, ToolError> {
+fn parse_handle(value: &Value, current_namespace: &str) -> Result<VarHandle, ToolError> {
     if let Some(raw) = value.as_str() {
+        if is_opaque_output_alias(raw) {
+            return Ok(VarHandle {
+                kind: "var_handle".to_string(),
+                session_id: current_namespace.to_string(),
+                name: raw.to_string(),
+                type_name: String::new(),
+                length: 0,
+                repr_preview: String::new(),
+                sha256: String::new(),
+            });
+        }
         if looks_like_tool_result_ref(raw) {
             return Err(ToolError::invalid_input(
                 "handle_read only accepts var_handle objects or `session_id/name` strings. \
@@ -352,7 +442,7 @@ fn parse_handle(value: &Value) -> Result<VarHandle, ToolError> {
         });
     }
 
-    let handle: VarHandle = serde_json::from_value(value.clone()).map_err(|e| {
+    let mut handle: VarHandle = serde_json::from_value(value.clone()).map_err(|e| {
         ToolError::invalid_input(format!("handle_read: invalid var_handle object: {e}"))
     })?;
     if handle.kind != "var_handle" {
@@ -365,7 +455,29 @@ fn parse_handle(value: &Value) -> Result<VarHandle, ToolError> {
             "handle_read: handle.session_id and handle.name must be non-empty",
         ));
     }
+    if let Some(encoded_sha256) = opaque_output_sha256(&handle.name) {
+        if !handle.sha256.is_empty() && handle.sha256 != encoded_sha256 {
+            return Err(ToolError::invalid_input(
+                "handle_read: handle sha256 does not match its opaque output alias",
+            ));
+        }
+        handle.sha256 = encoded_sha256.to_string();
+    }
     Ok(handle)
+}
+
+fn is_opaque_output_alias(value: &str) -> bool {
+    opaque_output_sha256(value).is_some()
+}
+
+fn opaque_output_sha256(value: &str) -> Option<&str> {
+    let digests = value.strip_prefix("output_")?;
+    let (content, occurrence) = digests.split_once('_')?;
+    (content.len() == 64
+        && occurrence.len() == 12
+        && content.chars().all(|ch| ch.is_ascii_hexdigit())
+        && occurrence.chars().all(|ch| ch.is_ascii_hexdigit()))
+    .then_some(content)
 }
 
 fn looks_like_tool_result_ref(raw: &str) -> bool {
@@ -385,6 +497,7 @@ fn parse_projection(input: &Value) -> Result<Projection, ToolError> {
     let mut count = 0usize;
     count += usize::from(input.get("slice").is_some());
     count += usize::from(input.get("range").is_some());
+    count += usize::from(input.get("search").is_some());
     count += usize::from(input.get("count").and_then(Value::as_bool).unwrap_or(false));
     count += usize::from(input.get("jsonpath").is_some());
     count += usize::from(
@@ -418,6 +531,37 @@ fn parse_projection(input: &Value) -> Result<Projection, ToolError> {
             ));
         }
         return Ok(Projection::JsonPath(path.to_string()));
+    }
+    if let Some(search) = input.get("search") {
+        let query = search
+            .get("query")
+            .and_then(Value::as_str)
+            .ok_or_else(|| ToolError::missing_field("search.query"))?
+            .to_string();
+        if query.is_empty() {
+            return Err(ToolError::invalid_input(
+                "handle_read: search.query must not be empty",
+            ));
+        }
+        if query.chars().count() > 512 {
+            return Err(ToolError::invalid_input(
+                "handle_read: search.query must be at most 512 characters",
+            ));
+        }
+        let case_sensitive = search
+            .get("case_sensitive")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+        let max_matches = search
+            .get("max_matches")
+            .and_then(Value::as_u64)
+            .map_or(DEFAULT_MAX_MATCHES, |value| value as usize)
+            .clamp(1, HARD_MAX_MATCHES);
+        return Ok(Projection::Search {
+            query,
+            case_sensitive,
+            max_matches,
+        });
     }
     if let Some(slice) = input.get("slice") {
         let start = slice.get("start").and_then(Value::as_u64).unwrap_or(0) as usize;
@@ -460,11 +604,528 @@ fn parse_projection(input: &Value) -> Result<Projection, ToolError> {
 }
 
 fn projection_usage_hint() -> String {
-    "handle_read: provide exactly one projection: `slice`, `range`, `count: true`, `jsonpath`, or `introspect: true`. \
+    "handle_read: provide exactly one projection: `slice`, `range`, `search`, `count: true`, `jsonpath`, or `introspect: true`. \
      Examples: {\"handle\":{\"kind\":\"var_handle\",\"session_id\":\"rlm:abc\",\"name\":\"final_1\"},\"slice\":{\"start\":0,\"end\":500}}; \
      {\"handle\":\"rlm:abc/final_1\",\"count\":true}; \
      {\"handle\":\"rlm:abc/final_1\",\"introspect\":true}."
         .to_string()
+}
+
+fn artifact_record_after_restart(
+    handle: &VarHandle,
+    current_namespace: &str,
+) -> Option<HandleRecord> {
+    if handle.session_id != current_namespace || !is_opaque_output_alias(&handle.name) {
+        return None;
+    }
+    let relative_path =
+        crate::artifacts::session_artifact_relative_path(&format!("art_{}", handle.name));
+    let absolute =
+        crate::artifacts::resolve_session_artifact_for_read(current_namespace, &relative_path)
+            .ok()?;
+    let byte_length = std::fs::metadata(absolute).ok()?.len();
+    let sha256 = opaque_output_sha256(&handle.name)?.to_string();
+    let fallback_handle = VarHandle {
+        kind: "var_handle".to_string(),
+        session_id: current_namespace.to_string(),
+        name: handle.name.clone(),
+        type_name: "str".to_string(),
+        length: handle.length,
+        repr_preview: String::new(),
+        sha256: sha256.clone(),
+    };
+    Some(HandleRecord {
+        handle: fallback_handle,
+        value: HandleValue::ArtifactText(ArtifactTextBacking {
+            relative_path,
+            byte_length,
+            char_length: handle.length,
+            line_count: None,
+            sha256,
+        }),
+    })
+}
+
+fn projection_for_record(
+    record: &HandleRecord,
+    projection: &Projection,
+    max_chars: usize,
+) -> Result<Value, ToolError> {
+    let HandleValue::ArtifactText(backing) = &record.value else {
+        return match projection {
+            Projection::Count => Ok(count_projection(record)),
+            Projection::Slice { start, end, unit } => {
+                Ok(slice_projection(record, *start, *end, *unit, max_chars))
+            }
+            Projection::Range { start, end } => {
+                Ok(line_range_projection(record, *start, *end, max_chars))
+            }
+            Projection::Search {
+                query,
+                case_sensitive,
+                max_matches,
+            } => Ok(memory_search_projection(
+                record,
+                query,
+                *case_sensitive,
+                *max_matches,
+                max_chars,
+            )),
+            Projection::JsonPath(path) => jsonpath_projection(record, path, max_chars),
+            Projection::Introspect => Ok(introspect_projection(record)),
+        };
+    };
+
+    // Traverse and open the session tree once without following any path
+    // component, then verify and project from that same descriptor.
+    let mut file = crate::artifacts::open_session_artifact_for_read(
+        &record.handle.session_id,
+        &backing.relative_path,
+    )
+    .map_err(|error| artifact_read_error("unavailable", error))?;
+    let stats = verify_artifact(&mut file, backing)
+        .map_err(|error| artifact_read_error("could not be verified", error))?;
+
+    match projection {
+        Projection::Count => Ok(json!({
+            "handle": record.handle.name,
+            "projection": "count",
+            "chars": stats.chars,
+            "lines": stats.lines,
+            "bytes": stats.bytes,
+            "sha256": stats.sha256,
+        })),
+        Projection::Slice { start, end, unit } => match unit {
+            SliceUnit::Chars => {
+                let end = end.unwrap_or(stats.chars).min(stats.chars);
+                let start = (*start).min(stats.chars);
+                let content = stream_char_slice(&mut file, start, end, max_chars)
+                    .map_err(|error| artifact_read_error("could not be read", error))?;
+                let shown = content.chars().count();
+                Ok(json!({
+                    "handle": record.handle.name,
+                    "projection": "slice",
+                    "content": content,
+                    "truncated": shown < end.saturating_sub(start),
+                    "shown_chars": shown,
+                    "omitted_chars": end.saturating_sub(start).saturating_sub(shown),
+                    "meta": {"unit": "chars", "start": start, "end": end, "total_chars": stats.chars},
+                }))
+            }
+            SliceUnit::Lines => artifact_line_projection(
+                record,
+                &mut file,
+                "slice",
+                (*start).min(stats.lines),
+                end.unwrap_or(stats.lines).min(stats.lines),
+                max_chars,
+                json!({
+                    "unit": "lines",
+                    "start": (*start).min(stats.lines),
+                    "end": end.unwrap_or(stats.lines).min(stats.lines),
+                    "total_lines": stats.lines,
+                }),
+            ),
+        },
+        Projection::Range { start, end } => artifact_line_projection(
+            record,
+            &mut file,
+            "range",
+            start.saturating_sub(1).min(stats.lines),
+            (*end).min(stats.lines),
+            max_chars,
+            json!({
+                "start": start,
+                "end": end,
+                "shown_start": start.saturating_sub(1).min(stats.lines).saturating_add(1),
+                "shown_end": (*end).min(stats.lines),
+                "total_lines": stats.lines,
+            }),
+        ),
+        Projection::Search {
+            query,
+            case_sensitive,
+            max_matches,
+        } => artifact_search_projection(
+            record,
+            &mut file,
+            query,
+            *case_sensitive,
+            *max_matches,
+            max_chars,
+        ),
+        Projection::JsonPath(_) => Err(ToolError::invalid_input(
+            "handle_read: jsonpath projection requires a JSON handle",
+        )),
+        Projection::Introspect => Ok(artifact_introspect_projection(record, &stats)),
+    }
+}
+
+fn artifact_read_error(action: &str, error: io::Error) -> ToolError {
+    ToolError::execution_failed(format!("handle_read: exact evidence is {action}: {error}"))
+}
+
+struct ArtifactStats {
+    bytes: u64,
+    chars: usize,
+    lines: usize,
+    sha256: String,
+}
+
+#[cfg(test)]
+fn open_artifact_no_follow(path: &Path) -> io::Result<File> {
+    #[cfg(unix)]
+    let file = {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        std::fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+            .open(path)?
+    };
+    #[cfg(not(unix))]
+    let file = {
+        if std::fs::symlink_metadata(path)?.file_type().is_symlink() {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "artifact symlink refused",
+            ));
+        }
+        File::open(path)?
+    };
+    if !file.metadata()?.is_file() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "artifact is not a regular file",
+        ));
+    }
+    Ok(file)
+}
+
+fn verify_artifact(file: &mut File, backing: &ArtifactTextBacking) -> io::Result<ArtifactStats> {
+    file.seek(SeekFrom::Start(0))?;
+    let mut hasher = Sha256::new();
+    let mut bytes = 0u64;
+    let mut chars = 0usize;
+    let mut newlines = 0usize;
+    let mut saw_byte = false;
+    let mut ended_in_newline = false;
+    let mut pending = Vec::with_capacity(READ_CHUNK_BYTES + 4);
+    let mut chunk = [0u8; READ_CHUNK_BYTES];
+    loop {
+        let read = file.read(&mut chunk)?;
+        if read == 0 {
+            break;
+        }
+        saw_byte = true;
+        ended_in_newline = chunk[read - 1] == b'\n';
+        bytes = bytes.saturating_add(read as u64);
+        hasher.update(&chunk[..read]);
+        newlines = newlines.saturating_add(chunk[..read].iter().filter(|&&b| b == b'\n').count());
+        pending.extend_from_slice(&chunk[..read]);
+        let valid_up_to = match std::str::from_utf8(&pending) {
+            Ok(text) => {
+                chars = chars.saturating_add(text.chars().count());
+                pending.clear();
+                continue;
+            }
+            Err(error) if error.error_len().is_none() => error.valid_up_to(),
+            Err(error) => return Err(io::Error::new(io::ErrorKind::InvalidData, error)),
+        };
+        let text = std::str::from_utf8(&pending[..valid_up_to])
+            .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
+        chars = chars.saturating_add(text.chars().count());
+        pending.drain(..valid_up_to);
+    }
+    if !pending.is_empty() {
+        let text = std::str::from_utf8(&pending)
+            .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
+        chars = chars.saturating_add(text.chars().count());
+    }
+    let sha256 = crate::hashing::hex_bytes(hasher.finalize());
+    if bytes != backing.byte_length {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "byte length changed (expected {}, found {bytes})",
+                backing.byte_length
+            ),
+        ));
+    }
+    if !backing.sha256.is_empty() && sha256 != backing.sha256 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "sha256 mismatch",
+        ));
+    }
+    let lines = if saw_byte {
+        newlines + usize::from(!ended_in_newline)
+    } else {
+        0
+    };
+    if backing.line_count.is_some_and(|expected| expected != lines) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "line count changed",
+        ));
+    }
+    Ok(ArtifactStats {
+        bytes,
+        chars,
+        lines,
+        sha256,
+    })
+}
+
+fn stream_chars(file: &mut File, mut visit: impl FnMut(char) -> bool) -> io::Result<()> {
+    file.seek(SeekFrom::Start(0))?;
+    let mut pending = Vec::with_capacity(READ_CHUNK_BYTES + 4);
+    let mut chunk = [0u8; READ_CHUNK_BYTES];
+    loop {
+        let read = file.read(&mut chunk)?;
+        if read == 0 {
+            break;
+        }
+        pending.extend_from_slice(&chunk[..read]);
+        let valid_up_to = match std::str::from_utf8(&pending) {
+            Ok(text) => {
+                for ch in text.chars() {
+                    if !visit(ch) {
+                        return Ok(());
+                    }
+                }
+                pending.clear();
+                continue;
+            }
+            Err(error) if error.error_len().is_none() => error.valid_up_to(),
+            Err(error) => return Err(io::Error::new(io::ErrorKind::InvalidData, error)),
+        };
+        let text = std::str::from_utf8(&pending[..valid_up_to])
+            .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
+        for ch in text.chars() {
+            if !visit(ch) {
+                return Ok(());
+            }
+        }
+        pending.drain(..valid_up_to);
+    }
+    if !pending.is_empty() {
+        let text = std::str::from_utf8(&pending)
+            .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
+        for ch in text.chars() {
+            if !visit(ch) {
+                break;
+            }
+        }
+    }
+    Ok(())
+}
+
+fn stream_char_slice(
+    file: &mut File,
+    start: usize,
+    end: usize,
+    max_chars: usize,
+) -> io::Result<String> {
+    let mut index = 0usize;
+    let mut shown = 0usize;
+    let mut output = String::new();
+    stream_chars(file, |ch| {
+        if index >= start && index < end && shown < max_chars {
+            output.push(ch);
+            shown += 1;
+        }
+        index = index.saturating_add(1);
+        index < end && shown < max_chars
+    })?;
+    Ok(output)
+}
+
+fn artifact_line_projection(
+    record: &HandleRecord,
+    file: &mut File,
+    projection: &str,
+    start: usize,
+    end: usize,
+    max_chars: usize,
+    meta: Value,
+) -> Result<Value, ToolError> {
+    let mut line = 0usize;
+    let mut shown = 0usize;
+    let mut content = String::new();
+    stream_chars(file, |ch| {
+        if line >= end || shown >= max_chars {
+            return false;
+        }
+        if ch == '\n' {
+            if line >= start && line + 1 < end && shown < max_chars {
+                content.push('\n');
+                shown += 1;
+            }
+            line = line.saturating_add(1);
+        } else if line >= start && line < end {
+            content.push(ch);
+            shown += 1;
+        }
+        true
+    })
+    .map_err(|error| artifact_read_error("could not be read", error))?;
+    Ok(json!({
+        "handle": record.handle.name,
+        "projection": projection,
+        "content": content,
+        "truncated": shown >= max_chars && line < end,
+        "shown_chars": shown,
+        "meta": meta,
+    }))
+}
+
+fn artifact_search_projection(
+    record: &HandleRecord,
+    file: &mut File,
+    query: &str,
+    case_sensitive: bool,
+    max_matches: usize,
+    max_chars: usize,
+) -> Result<Value, ToolError> {
+    use std::collections::VecDeque;
+    let needle = if case_sensitive {
+        query.as_bytes().to_vec()
+    } else {
+        query
+            .bytes()
+            .map(|byte| byte.to_ascii_lowercase())
+            .collect()
+    };
+    file.seek(SeekFrom::Start(0))
+        .map_err(|error| artifact_read_error("could not be searched", error))?;
+    let mut chunk = [0u8; READ_CHUNK_BYTES];
+    let mut window = VecDeque::with_capacity(needle.len());
+    let mut match_offsets = Vec::new();
+    let mut offset = 0u64;
+    let mut line = 1usize;
+    'read: loop {
+        let read = file
+            .read(&mut chunk)
+            .map_err(|error| artifact_read_error("could not be searched", error))?;
+        if read == 0 {
+            break;
+        }
+        for byte in &chunk[..read] {
+            let comparable = if case_sensitive {
+                *byte
+            } else {
+                byte.to_ascii_lowercase()
+            };
+            window.push_back(comparable);
+            if window.len() > needle.len() {
+                window.pop_front();
+            }
+            if window.len() == needle.len() && window.iter().copied().eq(needle.iter().copied()) {
+                match_offsets.push((
+                    line,
+                    offset.saturating_add(1).saturating_sub(needle.len() as u64),
+                ));
+                if match_offsets.len() >= max_matches {
+                    break 'read;
+                }
+            }
+            if *byte == b'\n' {
+                line = line.saturating_add(1);
+                window.clear();
+            }
+            offset = offset.saturating_add(1);
+        }
+    }
+    let found_count = match_offsets.len();
+    let mut matches = Vec::new();
+    let mut used_chars = 0usize;
+    for (line, byte_offset) in match_offsets {
+        if used_chars >= max_chars {
+            break;
+        }
+        let remaining = max_chars.saturating_sub(used_chars);
+        let excerpt = bounded_file_excerpt(file, byte_offset, needle.len(), 200)
+            .map(|excerpt| truncate_chars(&excerpt, remaining))
+            .unwrap_or_else(|_| truncate_chars("(excerpt unavailable)", remaining));
+        used_chars = used_chars.saturating_add(excerpt.chars().count());
+        matches.push(json!({
+            "line": line,
+            "byte_offset": byte_offset,
+            "excerpt": excerpt,
+        }));
+    }
+    let match_count = matches.len();
+    Ok(json!({
+        "handle": record.handle.name,
+        "projection": "search",
+        "query": query,
+        "matches": matches,
+        "match_count": match_count,
+        "truncated": found_count >= max_matches || match_count < found_count || used_chars >= max_chars,
+    }))
+}
+
+fn bounded_file_excerpt(
+    file: &mut File,
+    byte_offset: u64,
+    match_bytes: usize,
+    max_bytes: usize,
+) -> io::Result<String> {
+    let before = max_bytes.saturating_sub(match_bytes).div_ceil(2);
+    let start = byte_offset.saturating_sub(before as u64);
+    file.seek(SeekFrom::Start(start))?;
+    let mut buffer = vec![0u8; max_bytes.max(match_bytes)];
+    let read = file.read(&mut buffer)?;
+    buffer.truncate(read);
+    Ok(String::from_utf8_lossy(&buffer).replace(['\n', '\r'], " "))
+}
+
+fn memory_search_projection(
+    record: &HandleRecord,
+    query: &str,
+    case_sensitive: bool,
+    max_matches: usize,
+    max_chars: usize,
+) -> Value {
+    let text = record_text(record);
+    let needle = if case_sensitive {
+        query.to_string()
+    } else {
+        query.to_ascii_lowercase()
+    };
+    let mut matches = Vec::new();
+    let mut used = 0usize;
+    for (index, line) in text.lines().enumerate() {
+        let haystack = if case_sensitive {
+            line.to_string()
+        } else {
+            line.to_ascii_lowercase()
+        };
+        if haystack.contains(&needle) && matches.len() < max_matches && used < max_chars {
+            let excerpt = truncate_chars(line, (max_chars - used).min(500));
+            used += excerpt.chars().count();
+            matches.push(json!({"line": index + 1, "excerpt": excerpt}));
+        }
+    }
+    json!({
+        "handle": record.handle,
+        "projection": "search",
+        "query": query,
+        "match_count": matches.len(),
+        "matches": matches,
+        "truncated": matches.len() >= max_matches || used >= max_chars,
+    })
+}
+
+fn artifact_introspect_projection(record: &HandleRecord, stats: &ArtifactStats) -> Value {
+    json!({
+        "handle": record.handle.name,
+        "projection": "introspect",
+        "value_type": "text",
+        "length": stats.chars,
+        "bytes": stats.bytes,
+        "projections": ["count", "slice_chars", "range_lines", "search"],
+    })
 }
 
 fn count_projection(record: &HandleRecord) -> Value {
@@ -490,6 +1151,7 @@ fn count_projection(record: &HandleRecord) -> Value {
                 "bytes": bytes,
             })
         }
+        HandleValue::ArtifactText(_) => unreachable!("artifact projections use the streaming path"),
     }
 }
 
@@ -513,6 +1175,7 @@ fn introspect_projection(record: &HandleRecord) -> Value {
         "value_type": match &record.value {
             HandleValue::Text(_) => "text",
             HandleValue::Json(value) => json_type(value),
+            HandleValue::ArtifactText(_) => "text",
         },
         "length": record.handle.length,
         "repr_preview": record.handle.repr_preview,
@@ -658,6 +1321,9 @@ fn record_text(record: &HandleRecord) -> std::borrow::Cow<'_, str> {
         HandleValue::Json(value) => {
             std::borrow::Cow::Owned(serde_json::to_string_pretty(value).unwrap_or_default())
         }
+        HandleValue::ArtifactText(_) => {
+            unreachable!("artifact projections use the streaming path")
+        }
     }
 }
 
@@ -792,6 +1458,45 @@ mod tests {
 
     fn ctx() -> ToolContext {
         ToolContext::new(".")
+    }
+
+    #[test]
+    fn verified_projection_uses_same_open_artifact_snapshot() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let path = temp.path().join("evidence.txt");
+        let moved = temp.path().join("original.txt");
+        let original = "verified original bytes";
+        let replacement = "unverified replacement";
+        std::fs::write(&path, original).expect("write original");
+        let backing = ArtifactTextBacking {
+            relative_path: PathBuf::from("artifacts/evidence.txt"),
+            byte_length: original.len() as u64,
+            char_length: original.chars().count(),
+            line_count: Some(1),
+            sha256: crate::hashing::sha256_hex(original.as_bytes()),
+        };
+        let mut file = open_artifact_no_follow(&path).expect("open exact artifact");
+        verify_artifact(&mut file, &backing).expect("verify original descriptor");
+
+        std::fs::rename(&path, &moved).expect("replace verified path");
+        std::fs::write(&path, replacement).expect("write path replacement");
+        let projected = stream_char_slice(&mut file, 0, original.len(), 1_000)
+            .expect("project verified descriptor");
+
+        assert_eq!(projected, original);
+        assert_ne!(projected, replacement);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn artifact_leaf_open_refuses_symlink() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let target = temp.path().join("target.txt");
+        let link = temp.path().join("evidence.txt");
+        std::fs::write(&target, "secret").expect("write target");
+        std::os::unix::fs::symlink(&target, &link).expect("create symlink");
+
+        assert!(open_artifact_no_follow(&link).is_err());
     }
 
     #[tokio::test]
@@ -929,5 +1634,147 @@ mod tests {
         let message = err.to_string();
         assert!(message.contains("retrieve_tool_result"));
         assert!(message.contains("artifact/tool-result ref"));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    #[allow(clippy::await_holding_lock)] // Serializes the process-global artifact-root override.
+    async fn artifact_handles_are_session_scoped_and_fail_closed_after_restart() {
+        let _root_guard = crate::artifacts::TEST_ARTIFACT_SESSIONS_GUARD
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let temp = tempfile::tempdir().expect("tempdir");
+        let prior =
+            crate::artifacts::set_test_artifact_sessions_root(Some(temp.path().join("sessions")));
+        struct RestoreRoot(Option<PathBuf>);
+        impl Drop for RestoreRoot {
+            fn drop(&mut self) {
+                crate::artifacts::set_test_artifact_sessions_root(self.0.take());
+            }
+        }
+        let _restore = RestoreRoot(prior);
+
+        let raw = "alpha\nneedle with bounded context\nomega\n";
+        let sha256 = crate::hashing::sha256_hex(raw.as_bytes());
+        let name = format!("output_{sha256}_0123456789ab");
+        let artifact_id = format!("art_{name}");
+        let (path, relative_path) =
+            crate::artifacts::write_session_artifact("owner-session", &artifact_id, raw)
+                .expect("artifact");
+        let store = new_shared_handle_store();
+        let handle = {
+            let mut guard = store.lock().await;
+            guard.insert_artifact_text(
+                "owner-session",
+                name.clone(),
+                ArtifactTextBacking {
+                    relative_path,
+                    byte_length: raw.len() as u64,
+                    char_length: raw.chars().count(),
+                    line_count: Some(raw.lines().count()),
+                    sha256: sha256.clone(),
+                },
+                "alpha",
+            )
+        };
+
+        let mut foreign = ToolContext::new(temp.path()).with_state_namespace("foreign-session");
+        foreign.runtime.handle_store = store.clone();
+        let error = HandleReadTool
+            .execute(json!({"handle": handle, "count": true}), &foreign)
+            .await
+            .expect_err("cross-session artifact handle must fail");
+        assert!(error.to_string().contains("current session"));
+
+        let mut owner = ToolContext::new(temp.path()).with_state_namespace("owner-session");
+        owner.runtime.handle_store = store.clone();
+        let search = HandleReadTool
+            .execute(
+                json!({"handle": name, "search": {"query": "needle"}}),
+                &owner,
+            )
+            .await
+            .expect("bounded search");
+        assert!(search.content.contains("bounded context"));
+        let tiny_search = HandleReadTool
+            .execute(
+                json!({
+                    "handle": name,
+                    "search": {"query": "needle", "max_matches": 100},
+                    "max_chars": 1
+                }),
+                &owner,
+            )
+            .await
+            .expect("tiny bounded search");
+        let tiny: Value = serde_json::from_str(&tiny_search.content).unwrap();
+        let excerpt_chars = tiny["matches"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|entry| entry["excerpt"].as_str())
+            .map(str::chars)
+            .map(Iterator::count)
+            .sum::<usize>();
+        assert!(excerpt_chars <= 1, "{}", tiny_search.content);
+        assert_eq!(tiny["truncated"], true);
+
+        *store.lock().await = HandleStore::default();
+        std::fs::write(&path, raw.replace("alpha", "ALPHA")).expect("same-size corruption");
+        let error = HandleReadTool
+            .execute(
+                json!({"handle": format!("output_{sha256}_0123456789ab"), "count": true}),
+                &owner,
+            )
+            .await
+            .expect_err("digest mismatch must fail");
+        assert!(error.to_string().contains("sha256 mismatch"));
+
+        let forged_sha256 = crate::hashing::sha256_hex(raw.replace("alpha", "ALPHA").as_bytes());
+        let error = HandleReadTool
+            .execute(
+                json!({
+                    "handle": {
+                        "kind": "var_handle",
+                        "session_id": "owner-session",
+                        "name": format!("output_{sha256}_0123456789ab"),
+                        "type": "str",
+                        "length": raw.chars().count(),
+                        "repr_preview": "",
+                        "sha256": forged_sha256
+                    },
+                    "count": true
+                }),
+                &owner,
+            )
+            .await
+            .expect_err("caller-supplied digest must not override the opaque alias");
+        assert!(error.to_string().contains("opaque output alias"));
+
+        std::fs::remove_file(path).expect("remove test artifact");
+        let error = HandleReadTool
+            .execute(
+                json!({"handle": format!("output_{sha256}_0123456789ab"), "count": true}),
+                &owner,
+            )
+            .await
+            .expect_err("missing exact evidence must fail");
+        assert!(error.to_string().contains("no payload found"));
+    }
+
+    #[tokio::test]
+    async fn handle_read_rejects_oversized_search_query() {
+        let ctx = ctx();
+        let handle = {
+            let mut store = ctx.runtime.handle_store.lock().await;
+            store.insert_text("rlm:test", "body", "abc")
+        };
+        let error = HandleReadTool
+            .execute(
+                json!({"handle": handle, "search": {"query": "x".repeat(513)}}),
+                &ctx,
+            )
+            .await
+            .expect_err("query cap");
+        assert!(error.to_string().contains("at most 512"));
     }
 }

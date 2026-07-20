@@ -347,6 +347,7 @@ mod tests {
             entries: vec![ExploringEntry {
                 label: label.to_string(),
                 status: ToolStatus::Running,
+                output_summary: None,
             }],
         }))
     }

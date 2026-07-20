@@ -805,7 +805,7 @@ fn open_agent_chat_pager(app: &mut App, agent_id: &str) -> bool {
         Ok(store) => match store.get(&lookup) {
             Some(record) => match &record.value {
                 HandleValue::Json(value) => Some(value.clone()),
-                HandleValue::Text(_) => None,
+                HandleValue::Text(_) | HandleValue::ArtifactText(_) => None,
             },
             None => None,
         },

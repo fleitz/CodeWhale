@@ -412,7 +412,8 @@ pub struct EngineConfig {
     /// When true, force `tool_choice: "required"` and opt compatible function
     /// schemas into DeepSeek beta strict mode.
     pub strict_tool_mode: bool,
-    /// Workshop / large-tool-output routing (#548). `None` disables routing.
+    /// Large-tool-output policy overrides. `None` uses the adaptive defaults;
+    /// `[workshop] mode = "classic"` is the explicit compatibility fallback.
     pub workshop: Option<crate::tools::large_output_router::WorkshopConfig>,
     /// Which search backend `web_search` should use. Default: DuckDuckGo.
     pub search_provider: crate::config::SearchProvider,
@@ -686,12 +687,6 @@ pub struct Engine {
     /// — when LSP is disabled in config, this is an inert manager that
     /// always returns `None` from `diagnostics_for`.
     lsp_manager: Arc<crate::lsp::LspManager>,
-    /// Session-scoped workshop variable store (#548). Shared across all tool
-    /// calls so `last_tool_result` persists within the session and can be
-    /// promoted to the parent context via `promote_to_context`.
-    workshop_vars: Option<
-        std::sync::Arc<tokio::sync::Mutex<crate::tools::large_output_router::WorkshopVariables>>,
-    >,
     /// External sandbox backend (#516). When `Some`, exec_shell routes commands
     /// through this instead of spawning a local process.
     sandbox_backend: Option<std::sync::Arc<dyn crate::sandbox::backend::SandboxBackend>>,
@@ -1202,21 +1197,6 @@ impl Engine {
             None => crate::lsp::LspManager::disabled(),
         });
 
-        // Workshop variable store (#548). Created unconditionally so the Arc
-        // can be handed to every ToolContext; routing is gated on the router
-        // field being Some rather than on the vars Arc being present.
-        let workshop_vars: Option<
-            std::sync::Arc<
-                tokio::sync::Mutex<crate::tools::large_output_router::WorkshopVariables>,
-            >,
-        > = if config.workshop.is_some() {
-            Some(std::sync::Arc::new(tokio::sync::Mutex::new(
-                crate::tools::large_output_router::WorkshopVariables::default(),
-            )))
-        } else {
-            None
-        };
-
         // External sandbox backend (#516). Logged but non-fatal: if the
         // backend fails to construct, the engine continues with local
         // execution as the fallback.
@@ -1268,7 +1248,6 @@ impl Engine {
             lsp_manager,
             pending_lsp_blocks: Vec::new(),
             slop_ledger_gate_cache: None,
-            workshop_vars,
             sandbox_backend,
             current_mode: AppMode::Agent,
             token_estimate_cache: TokenEstimateCache::new(),
@@ -1537,21 +1516,16 @@ impl Engine {
         };
 
         let mut result = result;
-        if let Ok(tool_result) = result.as_mut()
-            && let Some(path) = crate::tools::truncate::apply_spillover_with_artifact(
-                tool_result,
-                &tool_id,
-                &tool_name,
-                &self.session.id,
-            )
-        {
-            emit_tool_audit(json!({
-                "event": "tool.spillover",
-                "tool_id": tool_id.clone(),
-                "tool_name": tool_name.clone(),
-                "path": path.display().to_string(),
-                "source": "composer_bang",
-            }));
+        let broker = self.large_output_broker();
+        if let Ok(tool_result) = result.as_mut() {
+            let projection = broker
+                .project(&tool_id, &tool_name, &tool_input, tool_result)
+                .await;
+            if let Some(audit) =
+                projection.audit_payload(&tool_id, &tool_name, Some("composer_bang"))
+            {
+                emit_tool_audit(audit);
+            }
         }
 
         let status = user_shell_turn_outcome(&result, self.cancel_token.is_cancelled());
@@ -3876,6 +3850,35 @@ impl Engine {
         )
     }
 
+    /// Snapshot the adaptive evidence policy once for an ordinary tool batch.
+    /// No Workflow-JS/RLM feature state participates in this construction.
+    pub(super) fn large_output_broker(
+        &mut self,
+    ) -> crate::tools::large_output_router::LargeOutputBroker {
+        let estimated_input = self.estimated_input_tokens();
+        let budget = route_context_budget_for_route(
+            self.api_provider,
+            &self.session.model,
+            self.active_route_limits,
+            estimated_input,
+        );
+        let route_context_window = crate::route_budget::route_context_window_tokens(
+            self.api_provider,
+            &self.session.model,
+            self.active_route_limits,
+        );
+        crate::tools::large_output_router::LargeOutputBroker::new(
+            self.config.workshop.clone().unwrap_or_default(),
+            self.session.id.clone(),
+            self.session.workspace.clone(),
+            self.config.runtime_services.handle_store.clone(),
+            budget.map_or(crate::context_budget::PressureLevel::Low, |value| {
+                value.pressure
+            }),
+            Some(route_context_window),
+        )
+    }
+
     fn trim_oldest_messages_to_budget(&mut self, target_input_budget: usize) -> usize {
         let mut removed = 0usize;
         while self.session.messages.len() > MIN_RECENT_MESSAGES_TO_KEEP
@@ -4106,18 +4109,6 @@ impl Engine {
 
         if let Some(decider) = self.config.network_policy.as_ref() {
             ctx = ctx.with_network_policy(decider.clone());
-        }
-
-        // Wire the large-output router (#548). Only attaches when the
-        // [workshop] config table is present; sub-agents don't inherit the
-        // router (their ToolContext is built separately) to prevent recursive
-        // routing of the synthesis call itself.
-        if let Some(workshop_cfg) = self.config.workshop.as_ref()
-            && let Some(vars_arc) = self.workshop_vars.as_ref()
-        {
-            let router =
-                crate::tools::large_output_router::LargeOutputRouter::new(workshop_cfg.clone());
-            ctx = ctx.with_large_output_router(router, vars_arc.clone());
         }
 
         // Wire the external sandbox backend (#516). exec_shell checks this
@@ -5015,9 +5006,9 @@ pub(crate) fn mock_engine_handle() -> MockEngineHandle {
 mod approval;
 mod context;
 mod handle;
+pub(crate) use context::compact_subagent_tool_result_for_context;
 #[cfg(test)]
 pub(crate) use context::compact_tool_result_for_context;
-pub(crate) use context::compact_tool_result_for_route;
 /// Public so external hosts/wrappers can reuse the engine's input-budget math
 /// (see `context_input_budget_for_route`'s doc) instead of re-deriving it.
 pub use context::context_input_budget_for_route;
@@ -5029,6 +5020,7 @@ use context::{
     extract_compaction_summary_prompt, is_context_length_error_message,
     route_context_budget_for_route, summarize_text,
 };
+pub(crate) use context::{compact_tool_result_for_route, is_adaptive_evidence_envelope};
 #[cfg(test)]
 use context::{context_input_budget_for_provider, effective_max_output_tokens};
 mod dispatch;

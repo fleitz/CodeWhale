@@ -457,9 +457,9 @@ fn push_tools(out: &mut String, app: &App, locale: Locale) {
     let mut rows: Vec<(usize, &ToolDetailRecord)> = app
         .tool_details_by_cell
         .iter()
-        .map(|(idx, detail)| (*idx, detail))
+        .flat_map(|(idx, details)| details.iter().map(move |detail| (*idx, detail)))
         .collect();
-    rows.sort_by_key(|(idx, _)| std::cmp::Reverse(*idx));
+    rows.sort_by_key(|(idx, detail)| (std::cmp::Reverse(*idx), detail.tool_id.as_str()));
 
     let mut rendered = 0usize;
     for detail in app.active_tool_details.values() {

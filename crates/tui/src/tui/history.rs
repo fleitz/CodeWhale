@@ -725,6 +725,23 @@ impl ExecCell {
             return wrap_card_rail(lines);
         }
 
+        if self
+            .output
+            .as_deref()
+            .or(self.live_output.as_deref())
+            .is_some_and(crate::core::engine::is_adaptive_evidence_envelope)
+        {
+            if let Some(summary) = self.output_summary.as_deref() {
+                lines.extend(render_card_detail_line(
+                    None,
+                    summary,
+                    Style::default().fg(palette::TEXT_MUTED),
+                    width,
+                ));
+            }
+            return wrap_card_rail(lines);
+        }
+
         // A successful shell call is rarely worth its full body — collapse it
         // to the single header line in live mode. The bottom shell strip owns
         // live/background detail, failures stay fully verbose so errors remain
@@ -844,8 +861,14 @@ impl ExploringCell {
             .entries
             .iter()
             .any(|entry| entry.status == ToolStatus::Hydrated);
+        let any_failed = self
+            .entries
+            .iter()
+            .any(|entry| entry.status == ToolStatus::Failed);
         let status = if all_done {
-            if any_hydrated {
+            if any_failed {
+                ToolStatus::Failed
+            } else if any_hydrated {
                 ToolStatus::Hydrated
             } else {
                 ToolStatus::Success
@@ -932,6 +955,14 @@ impl ExploringCell {
                     width,
                 ));
             }
+            if let Some(summary) = entry.output_summary.as_deref() {
+                lines.extend(render_card_detail_line(
+                    None,
+                    summary,
+                    Style::default().fg(palette::TEXT_MUTED),
+                    width,
+                ));
+            }
         }
         lines
     }
@@ -949,6 +980,7 @@ impl ExploringCell {
 pub struct ExploringEntry {
     pub label: String,
     pub status: ToolStatus,
+    pub output_summary: Option<String>,
 }
 
 /// Cell for patch summaries emitted by the patch tool.
@@ -1007,6 +1039,10 @@ pub struct ReviewCell {
     pub status: ToolStatus,
     pub output: Option<ReviewOutput>,
     pub error: Option<String>,
+    /// Compact local receipt for an adaptive evidence envelope. The model
+    /// observation stays in tool detail; specialized review parsing must not
+    /// interpret the envelope as review findings.
+    pub adaptive_summary: Option<String>,
 }
 
 impl ReviewCell {
@@ -1035,6 +1071,16 @@ impl ReviewCell {
         }
 
         if self.status == ToolStatus::Running {
+            return lines;
+        }
+
+        if let Some(summary) = self.adaptive_summary.as_ref() {
+            lines.extend(render_compact_kv(
+                "result",
+                summary,
+                Style::default().fg(palette::TEXT_MUTED),
+                width,
+            ));
             return lines;
         }
 
@@ -1173,6 +1219,8 @@ pub struct McpToolCell {
     pub status: ToolStatus,
     pub content: Option<String>,
     pub is_image: bool,
+    /// Compact local receipt for an adaptive evidence envelope.
+    pub adaptive_summary: Option<String>,
 }
 
 impl McpToolCell {
@@ -1197,6 +1245,16 @@ impl McpToolCell {
             tool_value_style(),
             width,
         ));
+
+        if let Some(summary) = self.adaptive_summary.as_ref() {
+            lines.extend(render_compact_kv(
+                "result",
+                summary,
+                Style::default().fg(palette::TEXT_MUTED),
+                width,
+            ));
+            return lines;
+        }
 
         if self.is_image {
             lines.extend(render_compact_kv(
@@ -1251,6 +1309,8 @@ pub struct WebSearchCell {
     pub source: Option<String>,
     pub degraded: Option<String>,
     pub ref_count: usize,
+    /// Compact local receipt for an adaptive evidence envelope.
+    pub adaptive_summary: Option<String>,
 }
 
 impl WebSearchCell {
@@ -1271,6 +1331,15 @@ impl WebSearchCell {
             tool_value_style(),
             width,
         ));
+        if let Some(summary) = self.adaptive_summary.as_ref() {
+            lines.extend(render_compact_kv(
+                "result",
+                summary,
+                Style::default().fg(palette::TEXT_MUTED),
+                width,
+            ));
+            return lines;
+        }
         if let Some(source) = self.source.as_ref() {
             lines.extend(render_compact_kv(
                 "source",
@@ -1356,6 +1425,35 @@ impl GenericToolCell {
     ) -> Vec<Line<'static>> {
         if self.name == "activity_group" {
             return agent_activity::render_activity_group(self, width);
+        }
+
+        if self
+            .output
+            .as_deref()
+            .is_some_and(crate::core::engine::is_adaptive_evidence_envelope)
+        {
+            let family = crate::tui::widgets::tool_card::tool_family_for_name(&self.name);
+            let header_summary = crate::tui::widgets::tool_card::tool_header_summary_for_name(
+                &self.name,
+                self.input_summary.as_deref(),
+            );
+            let mut lines = vec![render_tool_header_with_family_and_summary(
+                family,
+                header_summary.as_deref(),
+                tool_status_label(self.status),
+                self.status,
+                None,
+                low_motion,
+            )];
+            if let Some(summary) = self.output_summary.as_deref() {
+                lines.extend(render_card_detail_line(
+                    None,
+                    summary,
+                    Style::default().fg(palette::TEXT_MUTED),
+                    width,
+                ));
+            }
+            return wrap_card_rail(lines);
         }
 
         // Issue #241: when the underlying tool is a checklist/todo update and

@@ -7039,6 +7039,12 @@ fn fork_session(
     );
     forked.metadata.copy_cost_from(&saved.metadata);
     forked.metadata.mark_forked_from(&saved.metadata);
+    forked.artifacts = crate::artifacts::clone_artifact_records_for_session(
+        &saved.artifacts,
+        &saved.metadata.id,
+        &forked.metadata.id,
+    )
+    .context("failed to retain exact evidence in forked session")?;
     manager.save_session(&forked)?;
 
     let source_title = saved.metadata.title.trim();
@@ -7054,6 +7060,74 @@ fn fork_session(
     );
 
     Ok(forked.metadata.id)
+}
+
+#[cfg(test)]
+mod fork_cli_tests {
+    use super::*;
+
+    #[test]
+    fn cli_fork_copies_exact_artifacts_into_the_child_namespace() {
+        let _artifact_lock = crate::artifacts::TEST_ARTIFACT_SESSIONS_GUARD
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let temp = tempfile::tempdir().expect("temporary home");
+        let _env_lock = crate::test_support::lock_test_env();
+        let _home = crate::test_support::EnvVarGuard::set("HOME", temp.path());
+        let _codewhale_home = crate::test_support::EnvVarGuard::remove("CODEWHALE_HOME");
+        let workspace = temp.path().join("workspace");
+        std::fs::create_dir_all(&workspace).unwrap();
+
+        let parent_id = "cli-fork-parent";
+        let raw = "CW_CLI_FORK_EXACT_SENTINEL\n";
+        let sha = crate::hashing::sha256_hex(raw.as_bytes());
+        let artifact_id = format!("art_output_{sha}_0123456789ab");
+        let (parent_path, relative_path) =
+            crate::artifacts::write_session_artifact(parent_id, &artifact_id, raw)
+                .expect("parent artifact");
+        let mut parent = create_saved_session(&[], "deepseek-v4-pro", &workspace, 0, None);
+        parent.metadata.id = parent_id.to_string();
+        parent.artifacts.push(crate::artifacts::ArtifactRecord {
+            id: artifact_id,
+            kind: crate::artifacts::ArtifactKind::ToolOutput,
+            session_id: parent_id.to_string(),
+            tool_call_id: "call-cli-fork".to_string(),
+            tool_name: "run_tests".to_string(),
+            success: Some(false),
+            created_at: chrono::Utc::now(),
+            byte_size: raw.len() as u64,
+            preview: "failed test output".to_string(),
+            storage_path: relative_path,
+        });
+        let manager = SessionManager::default_location().unwrap();
+        manager.save_session(&parent).unwrap();
+
+        let child_id = fork_session(
+            &Config::default(),
+            Some(parent_id.to_string()),
+            false,
+            &workspace,
+        )
+        .expect("CLI fork");
+        let child = manager.load_session(&child_id).expect("saved child");
+        assert_eq!(child.artifacts.len(), 1);
+        assert_eq!(child.artifacts[0].session_id, child_id);
+        assert_eq!(
+            crate::artifacts::adaptive_sha_from_artifact_id(&child.artifacts[0].id).as_deref(),
+            Some(sha.as_str())
+        );
+
+        std::fs::remove_file(parent_path).expect("simulate parent pruning");
+        let mut child_file = crate::artifacts::open_session_artifact_for_read(
+            &child_id,
+            &child.artifacts[0].storage_path,
+        )
+        .expect("child-owned exact artifact");
+        let mut copied = String::new();
+        child_file.read_to_string(&mut copied).unwrap();
+        assert_eq!(copied, raw);
+        assert_eq!(crate::hashing::sha256_hex(copied.as_bytes()), sha);
+    }
 }
 
 fn pick_session_id() -> Result<String> {

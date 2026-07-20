@@ -184,7 +184,10 @@ fn summarize_subagent_snapshot(snapshot: &serde_json::Value, index: usize) -> St
     lines.join("\n")
 }
 
-fn compact_subagent_tool_result_for_context(tool_name: &str, raw: &str) -> Option<String> {
+pub(crate) fn compact_subagent_tool_result_for_context(
+    tool_name: &str,
+    raw: &str,
+) -> Option<String> {
     if tool_name != "agent" {
         return None;
     }
@@ -427,6 +430,13 @@ pub(crate) fn compact_tool_result_for_route(
         return String::new();
     }
 
+    // The adaptive broker has already applied a route-aware hard bound and
+    // produced the stable evidence schema. Re-compacting this JSON would hide
+    // its handle and make downstream inspection impossible.
+    if is_adaptive_evidence_envelope(raw) {
+        return raw.to_string();
+    }
+
     if let Some(summary) = compact_subagent_tool_result_for_context(tool_name, raw) {
         return summary;
     }
@@ -458,6 +468,160 @@ pub(crate) fn compact_tool_result_for_route(
             "[{tool_name} output compacted to protect context]\nSnippet: {snippet}\n(Original: {raw_chars} chars, omitted: {omitted} chars.)"
         )
     }
+}
+
+pub(crate) fn is_adaptive_evidence_envelope(raw: &str) -> bool {
+    if raw.chars().count() > 12_000 {
+        return false;
+    }
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(raw) else {
+        return false;
+    };
+    let Some(object) = value.as_object() else {
+        return false;
+    };
+    const ENVELOPE_KEYS: [&str; 14] = [
+        "schema",
+        "status",
+        "tool",
+        "payload_kind",
+        "bytes",
+        "estimated_tokens",
+        "handle",
+        "sha256",
+        "facts",
+        "structured_summary",
+        "preview",
+        "inspect",
+        "evidence_available",
+        "guidance",
+    ];
+    if object
+        .keys()
+        .any(|key| !ENVELOPE_KEYS.contains(&key.as_str()))
+    {
+        return false;
+    }
+    let schema_ok = object.get("schema").and_then(serde_json::Value::as_str)
+        == Some(crate::tools::large_output_router::EVIDENCE_SCHEMA);
+    let status_ok = object
+        .get("status")
+        .and_then(serde_json::Value::as_str)
+        .is_some_and(|status| matches!(status, "succeeded" | "failed"));
+    let payload_kind_ok = object
+        .get("payload_kind")
+        .and_then(serde_json::Value::as_str)
+        .is_some_and(|kind| matches!(kind, "text" | "json" | "diff" | "command_output"));
+    let evidence_available = object
+        .get("evidence_available")
+        .and_then(serde_json::Value::as_bool);
+    let scalars_ok = object
+        .get("tool")
+        .and_then(serde_json::Value::as_str)
+        .is_some_and(|tool| !tool.is_empty() && tool.len() <= 256)
+        && object
+            .get("bytes")
+            .and_then(serde_json::Value::as_u64)
+            .is_some_and(|bytes| bytes > 0)
+        && object
+            .get("estimated_tokens")
+            .and_then(serde_json::Value::as_u64)
+            .is_some_and(|tokens| tokens > 0)
+        && evidence_available.is_some();
+    let facts_ok = object
+        .get("facts")
+        .and_then(serde_json::Value::as_array)
+        .is_some_and(|facts| {
+            facts.len() <= 10
+                && facts.iter().all(|fact| {
+                    fact.as_str()
+                        .is_some_and(|text| text.chars().count() <= 320)
+                })
+        });
+    let preview_ok = object
+        .get("preview")
+        .and_then(serde_json::Value::as_object)
+        .is_some_and(|preview| {
+            ["head", "tail"].into_iter().all(|key| {
+                preview.get(key).is_none_or(|value| {
+                    value
+                        .as_str()
+                        .is_some_and(|text| text.chars().count() <= 1_800)
+                })
+            })
+        });
+    let guidance_ok = object.get("guidance").is_none_or(|guidance| {
+        guidance
+            .as_str()
+            .is_some_and(|text| text.chars().count() <= 500)
+    });
+    let structured_summary_ok = object.get("structured_summary").is_none_or(|summary| {
+        summary
+            .as_str()
+            .is_some_and(|text| text.chars().count() <= 3_000)
+    });
+    let evidence_refs_ok = match evidence_available {
+        Some(true) => {
+            let handle = object.get("handle").and_then(serde_json::Value::as_str);
+            let sha256 = object.get("sha256").and_then(serde_json::Value::as_str);
+            let handle_ok = handle.is_some_and(|handle| {
+                let Some(digests) = handle.strip_prefix("output_") else {
+                    return false;
+                };
+                let Some((content_digest, call_digest)) = digests.split_once('_') else {
+                    return false;
+                };
+                content_digest.len() == 64
+                    && call_digest.len() == 12
+                    && content_digest.chars().all(|ch| ch.is_ascii_hexdigit())
+                    && call_digest.chars().all(|ch| ch.is_ascii_hexdigit())
+                    && sha256 == Some(content_digest)
+            });
+            let inspect_ok = object
+                .get("inspect")
+                .and_then(serde_json::Value::as_object)
+                .is_some_and(|inspect| {
+                    inspect.len() == 2
+                        && inspect.get("tool").and_then(serde_json::Value::as_str)
+                            == Some("handle_read")
+                        && inspect
+                            .get("operations")
+                            .and_then(serde_json::Value::as_array)
+                            .is_some_and(|operations| {
+                                !operations.is_empty()
+                                    && operations.len() <= 8
+                                    && operations.iter().all(|operation| {
+                                        operation.as_str().is_some_and(|operation| {
+                                            matches!(
+                                                operation,
+                                                "count"
+                                                    | "slice"
+                                                    | "range"
+                                                    | "search"
+                                                    | "introspect"
+                                            )
+                                        })
+                                    })
+                            })
+                });
+            handle_ok && inspect_ok
+        }
+        Some(false) => {
+            object.get("handle").is_none()
+                && object.get("sha256").is_none()
+                && object.get("inspect").is_none()
+        }
+        None => false,
+    };
+    schema_ok
+        && status_ok
+        && payload_kind_ok
+        && scalars_ok
+        && facts_ok
+        && preview_ok
+        && guidance_ok
+        && structured_summary_ok
+        && evidence_refs_ok
 }
 
 pub(super) fn extract_compaction_summary_prompt(
