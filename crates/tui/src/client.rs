@@ -20,6 +20,7 @@ use codewhale_config::catalog::{
     CatalogOffering, CatalogRefreshError, CatalogSnapshot, CatalogSource, CatalogStatus,
     ProviderCatalogCache, ProviderCatalogDelta, base_url_fingerprint, now_unix,
 };
+use codewhale_config::provider::WireFormat;
 use codewhale_config::route::ReadyRouteCandidate;
 
 use crate::config::{ApiProvider, Config, RetryPolicy, wire_model_for_provider};
@@ -166,6 +167,7 @@ pub struct DeepSeekClient {
     api_key: String,
     pub(super) base_url: String,
     pub(super) api_provider: ApiProvider,
+    wire_format: WireFormat,
     retry: RetryPolicy,
     default_model: String,
     connection_health: Arc<AsyncMutex<ConnectionHealth>>,
@@ -388,6 +390,7 @@ impl Clone for DeepSeekClient {
             api_key: self.api_key.clone(),
             base_url: self.base_url.clone(),
             api_provider: self.api_provider,
+            wire_format: self.wire_format,
             retry: self.retry.clone(),
             default_model: self.default_model.clone(),
             connection_health: self.connection_health.clone(),
@@ -715,11 +718,13 @@ impl DeepSeekClient {
     /// an auth-source *class*), so the API key and provider are still read from
     /// `config`.
     pub fn from_candidate(config: &Config, candidate: &ReadyRouteCandidate) -> Result<Self> {
-        Self::from_parts(
+        let mut client = Self::from_parts(
             candidate.endpoint.base_url.clone(),
             candidate.wire_model_id.as_str().to_string(),
             config,
-        )
+        )?;
+        client.wire_format = candidate.protocol;
+        Ok(client)
     }
 
     /// Shared constructor body for [`Self::new`] and [`Self::from_candidate`].
@@ -781,11 +786,20 @@ impl DeepSeekClient {
         let http_client =
             Self::build_http_client(&api_key, &http_headers, api_provider, &base_url)?;
 
+        let wire_format = if api_provider == ApiProvider::OpenaiCodex {
+            WireFormat::Responses
+        } else if api_provider_uses_anthropic_messages(api_provider) {
+            WireFormat::AnthropicMessages
+        } else {
+            WireFormat::ChatCompletions
+        };
+
         Ok(Self {
             http_client,
             api_key,
             base_url,
             api_provider,
+            wire_format,
             retry,
             default_model,
             connection_health: Arc::new(AsyncMutex::new(ConnectionHealth::default())),
@@ -1132,7 +1146,7 @@ impl DeepSeekClient {
         target_language: &str,
     ) -> Result<String> {
         let model = wire_model_for_provider(self.api_provider, model);
-        if api_provider_uses_anthropic_messages(self.api_provider) {
+        if self.wire_format == WireFormat::AnthropicMessages {
             let response = self
                 .handle_anthropic_message(translation_message_request(text, model, target_language))
                 .await?;
@@ -1646,13 +1660,11 @@ impl LlmClient for DeepSeekClient {
 
     async fn create_message(&self, request: MessageRequest) -> Result<MessageResponse> {
         let _permit = self.acquire_provider_request_permit().await;
-        if self.api_provider == ApiProvider::OpenaiCodex {
-            return self.handle_responses_message(request).await;
+        match self.wire_format {
+            WireFormat::Responses => self.handle_responses_message(request).await,
+            WireFormat::AnthropicMessages => self.handle_anthropic_message(request).await,
+            WireFormat::ChatCompletions => self.create_message_chat(&request).await,
         }
-        if api_provider_uses_anthropic_messages(self.api_provider) {
-            return self.handle_anthropic_message(request).await;
-        }
-        self.create_message_chat(&request).await
     }
 
     async fn create_message_stream(
@@ -1660,19 +1672,11 @@ impl LlmClient for DeepSeekClient {
         request: MessageRequest,
     ) -> Result<crate::llm_client::StreamEventBox> {
         let permit = self.acquire_provider_request_permit().await;
-        if self.api_provider == ApiProvider::OpenaiCodex {
-            let stream = self.handle_responses_stream(request).await?;
-            return Ok(Self::hold_provider_request_permit_for_stream(
-                stream, permit,
-            ));
-        }
-        if api_provider_uses_anthropic_messages(self.api_provider) {
-            let stream = self.handle_anthropic_stream(request).await?;
-            return Ok(Self::hold_provider_request_permit_for_stream(
-                stream, permit,
-            ));
-        }
-        let stream = self.handle_chat_completion_stream(request).await?;
+        let stream = match self.wire_format {
+            WireFormat::Responses => self.handle_responses_stream(request).await?,
+            WireFormat::AnthropicMessages => self.handle_anthropic_stream(request).await?,
+            WireFormat::ChatCompletions => self.handle_chat_completion_stream(request).await?,
+        };
         Ok(Self::hold_provider_request_permit_for_stream(
             stream, permit,
         ))
@@ -2253,7 +2257,7 @@ impl DeepSeekClient {
         suffix: &str,
         max_tokens: u32,
     ) -> anyhow::Result<String> {
-        if api_provider_uses_anthropic_messages(self.api_provider) {
+        if self.wire_format == WireFormat::AnthropicMessages {
             bail!(
                 "FIM completion is not supported for {} because it uses the Anthropic Messages protocol",
                 self.api_provider.display_name()
