@@ -6664,9 +6664,16 @@ async fn set_config_model_follows_persisted_provider_before_reload() -> Result<(
         config_body.contains("provider = \"volcengine\""),
         "provider should be persisted before reload"
     );
+    // The persisted value is the normalized wire id (lowercase), not the
+    // display spelling of DEFAULT_VOLCENGINE_FLASH_MODEL.
+    let expected_wire = crate::config::normalize_model_name_for_provider(
+        crate::config::ApiProvider::Volcengine,
+        target_model,
+    )
+    .expect("volcengine flash model should normalize");
     assert!(
-        config_body.contains(&format!("model = \"{target_model}\"")),
-        "volcengine model should be written to the provider table"
+        config_body.contains(&format!("model = \"{expected_wire}\"")),
+        "volcengine model should be written to the provider table as its wire id"
     );
     assert!(
         config_body.contains("default_text_model = \"deepseek-v4-pro\""),
@@ -6681,7 +6688,7 @@ async fn set_config_model_follows_persisted_provider_before_reload() -> Result<(
 
     let after_reload = get_config(&client, &addr).await;
     assert_eq!(after_reload["provider"].as_str(), Some("volcengine"));
-    assert_eq!(after_reload["model"].as_str(), Some(target_model));
+    assert_eq!(after_reload["model"].as_str(), Some(expected_wire.as_str()));
 
     handle.abort();
     Ok(())

@@ -3603,12 +3603,21 @@ async fn set_config(
                 // GUI gets a clear error instead of silently persisting an
                 // unknown value that `Config::api_provider()` would later
                 // ignore (falling back to DeepSeek).
-                if ApiProvider::parse(&value).is_none() {
-                    return Err(ApiError::bad_request(format!(
+                let parsed = ApiProvider::parse(&value).ok_or_else(|| {
+                    ApiError::bad_request(format!(
                         "Unknown provider '{value}'. Call GET /v1/providers for the list of supported ids."
-                    )));
+                    ))
+                })?;
+                let result =
+                    config_persistence::persist_root_string_key(config_path, "provider", &value);
+                if result.is_ok() {
+                    // Keep the in-memory provider in step with the persisted
+                    // value so a following set_config(model) resolves the new
+                    // provider's table instead of clobbering the previous
+                    // provider's root default_text_model (#4658 follow-up).
+                    state.config.write().provider = Some(parsed.as_str().to_string());
                 }
-                config_persistence::persist_root_string_key(config_path, "provider", &value)
+                result
             }
             "provider_url" | "provider_base_url" => {
                 let provider = state.config.read().api_provider();
