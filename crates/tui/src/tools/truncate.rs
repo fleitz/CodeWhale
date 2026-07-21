@@ -664,7 +664,7 @@ fn apply_adaptive_evidence_inner(
         object.insert("artifact_session_id".into(), context.session_id.into());
         object.insert(
             "artifact_relative_path".into(),
-            relative_path.display().to_string().into(),
+            crate::artifacts::format_artifact_relative_path(&relative_path).into(),
         );
         object.insert("artifact_byte_size".into(), artifact.size_bytes.into());
         object.insert("artifact_digest".into(), digest.into());

@@ -679,11 +679,19 @@ fn activity_target(
 
 fn privacy_safe_path(workspace: &Path, raw: &str) -> Option<String> {
     let path = Path::new(raw);
-    let relative = if path.is_absolute() {
-        path.strip_prefix(workspace).ok()?
+    let normalized_raw = raw.replace('\\', "/");
+    let normalized_workspace = workspace.to_string_lossy().replace('\\', "/");
+    let relative = if path.is_absolute() || normalized_raw.starts_with('/') {
+        let workspace_prefix = normalized_workspace.trim_end_matches('/');
+        if normalized_raw == workspace_prefix {
+            ""
+        } else {
+            normalized_raw.strip_prefix(&format!("{workspace_prefix}/"))?
+        }
     } else {
-        path
+        normalized_raw.as_str()
     };
+    let relative = Path::new(relative);
     if relative.components().any(|component| {
         matches!(
             component,
