@@ -857,6 +857,7 @@ async fn auto_route_inventory_recommendation(
         stream: Some(false),
         temperature: Some(0.0),
         top_p: None,
+        sensitive_user_input_provenance: Default::default(),
     };
 
     let response =

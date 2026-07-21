@@ -2707,10 +2707,25 @@ impl SubAgentManager {
     /// source after a later parent answer is registered. Live provider state
     /// remains in the child task; manager records and transcript artifacts are
     /// public coordination state and are safe to rewrite in place.
+    #[cfg(test)]
     pub(crate) fn refresh_sensitive_user_input_provenance(
         &mut self,
         provenance: &crate::runtime_threads::SensitiveUserInputProvenance,
     ) -> Result<()> {
+        let generation = provenance.begin_cleanup_generation();
+        self.refresh_sensitive_user_input_provenance_for_generation(provenance, generation)
+    }
+
+    pub(crate) fn refresh_sensitive_user_input_provenance_for_generation(
+        &mut self,
+        provenance: &crate::runtime_threads::SensitiveUserInputProvenance,
+        generation: u64,
+    ) -> Result<()> {
+        if !provenance.cleanup_generation_is_current(generation) {
+            return Err(anyhow!(
+                "sub-agent privacy cleanup generation was superseded"
+            ));
+        }
         // Invalidate every payload captured before this provenance snapshot.
         // Writers re-check the generation while holding `persist_io`, so an
         // older paused thread cannot publish after this cleanup completes.
@@ -2727,31 +2742,59 @@ impl SubAgentManager {
                     .then_some(agent_id.clone())
             })
             .collect::<Vec<_>>();
+        let mut projected_agents = Vec::new();
+        let mut projected_workers = Vec::new();
         for agent_id in &agent_ids {
-            if let Some(agent) = self.agents.get_mut(agent_id) {
+            if let Some(agent) = self.agents.get(agent_id) {
                 let projected = agent.snapshot();
-                agent.prompt = crate::runtime_threads::redacted_sensitive_user_input_text(
-                    &agent.prompt,
-                    &sensitive_values,
-                );
-                agent.assignment = projected.assignment;
-                agent.status = projected.status;
-                agent.result = projected.result;
-                agent.checkpoint = projected.checkpoint;
-                agent.needs_input = projected.needs_input;
+                projected_agents.push((
+                    agent_id.clone(),
+                    crate::runtime_threads::redacted_sensitive_user_input_text(
+                        &agent.prompt,
+                        &sensitive_values,
+                    ),
+                    projected,
+                ));
             }
-            if let Some(record) = self.worker_records.get_mut(agent_id) {
-                *record =
-                    crate::runtime_threads::redacted_serializable_clone(record, &sensitive_values)?;
+            if let Some(record) = self.worker_records.get(agent_id) {
+                projected_workers.push((
+                    agent_id.clone(),
+                    crate::runtime_threads::redacted_serializable_clone(record, &sensitive_values)?,
+                ));
             }
-            reproject_subagent_transcript_artifact(&self.workspace, agent_id, &sensitive_values)?;
+            reproject_subagent_transcript_artifact_for_generation(
+                &self.workspace,
+                agent_id,
+                &sensitive_values,
+                provenance,
+                generation,
+            )?;
         }
         if !agent_ids.is_empty() {
+            provenance
+                .publish_cleanup_if_current(generation, || {
+                    for (agent_id, prompt, projected) in projected_agents {
+                        if let Some(agent) = self.agents.get_mut(&agent_id) {
+                            agent.prompt = prompt;
+                            agent.assignment = projected.assignment;
+                            agent.status = projected.status;
+                            agent.result = projected.result;
+                            agent.checkpoint = projected.checkpoint;
+                            agent.needs_input = projected.needs_input;
+                        }
+                    }
+                    for (agent_id, projected) in projected_workers {
+                        self.worker_records.insert(agent_id, projected);
+                    }
+                })
+                .ok_or_else(|| {
+                    anyhow!(
+                        "sub-agent privacy cleanup generation was superseded before publication"
+                    )
+                })?;
             self.persist_pending = false;
             self.last_persist_at = Some(Instant::now());
-            self.persist_state()?
-                .join()
-                .map_err(|_| anyhow!("sub-agent privacy persist thread panicked"))??;
+            self.persist_state_for_cleanup(provenance, generation)?;
         }
         Ok(())
     }
@@ -2979,6 +3022,42 @@ impl SubAgentManager {
             result
         });
         Ok(handle)
+    }
+
+    /// Synchronous cleanup publication used only from the approval path's
+    /// `spawn_blocking` worker. Both the manager generation and the global
+    /// privacy generation are re-checked after acquiring the disk lock and at
+    /// the final rename boundary.
+    fn persist_state_for_cleanup(
+        &self,
+        provenance: &crate::runtime_threads::SensitiveUserInputProvenance,
+        cleanup_generation: u64,
+    ) -> Result<()> {
+        let Some((path, payload)) = self.build_persist_payload()? else {
+            return Ok(());
+        };
+        let generation = self
+            .persist_generation
+            .fetch_add(1, std::sync::atomic::Ordering::AcqRel)
+            .saturating_add(1);
+        let _io = self.persist_io.lock();
+        if self
+            .persist_generation
+            .load(std::sync::atomic::Ordering::Acquire)
+            != generation
+            || !provenance.cleanup_generation_is_current(cleanup_generation)
+        {
+            return Err(anyhow!(
+                "sub-agent privacy persist generation was superseded"
+            ));
+        }
+        write_json_atomic_for_generation(
+            &self.workspace,
+            &path,
+            &payload,
+            provenance,
+            cleanup_generation,
+        )
     }
 
     /// Fire-and-forget persist — logs errors, drops the join handle.
@@ -4928,10 +5007,35 @@ fn json_line(value: &Value) -> Result<Vec<u8>> {
     Ok(encoded)
 }
 
+#[cfg(test)]
 fn reproject_subagent_transcript_artifact(
     workspace: &Path,
     agent_id: &str,
     sensitive_values: &HashSet<String>,
+) -> Result<()> {
+    reproject_subagent_transcript_artifact_inner(workspace, agent_id, sensitive_values, None)
+}
+
+fn reproject_subagent_transcript_artifact_for_generation(
+    workspace: &Path,
+    agent_id: &str,
+    sensitive_values: &HashSet<String>,
+    provenance: &crate::runtime_threads::SensitiveUserInputProvenance,
+    generation: u64,
+) -> Result<()> {
+    reproject_subagent_transcript_artifact_inner(
+        workspace,
+        agent_id,
+        sensitive_values,
+        Some((provenance, generation)),
+    )
+}
+
+fn reproject_subagent_transcript_artifact_inner(
+    workspace: &Path,
+    agent_id: &str,
+    sensitive_values: &HashSet<String>,
+    publication: Option<(&crate::runtime_threads::SensitiveUserInputProvenance, u64)>,
 ) -> Result<()> {
     let io_guard = lock_subagent_transcript_io();
     let workspace = normalize_subagent_workspace(workspace);
@@ -4972,7 +5076,13 @@ fn reproject_subagent_transcript_artifact(
         // it to authenticate the derived artifact path against the header.
         encoded.extend(json_line(&value)?);
     }
-    rewrite_private_subagent_transcript_atomic(&io_guard, &workspace, &path, &encoded)
+    rewrite_private_subagent_transcript_atomic_inner(
+        &io_guard,
+        &workspace,
+        &path,
+        &encoded,
+        publication,
+    )
 }
 
 fn subagent_transcript_artifact_relative_path(agent_id: &str) -> PathBuf {
@@ -5210,6 +5320,7 @@ fn open_subagent_state_file(path: &Path) -> Result<fs::File> {
     fs::File::open(path).map_err(Into::into)
 }
 
+#[cfg(not(unix))]
 fn prepare_subagent_transcript_parent(workspace: &Path, path: &Path) -> Result<()> {
     reject_workspace_relative_symlinks(workspace, path)?;
     let parent = path
@@ -5219,12 +5330,78 @@ fn prepare_subagent_transcript_parent(workspace: &Path, path: &Path) -> Result<(
     // Re-check after creation so a pre-existing component cannot redirect the
     // private transcript outside the workspace.
     reject_workspace_relative_symlinks(workspace, path)?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        fs::set_permissions(parent, fs::Permissions::from_mode(0o700))?;
-    }
     Ok(())
+}
+
+/// Resolve and create a private target's parent one component at a time below
+/// a pinned workspace descriptor. No path lookup after the workspace open can
+/// follow a symlink or escape through a directory rename.
+#[cfg(unix)]
+fn open_subagent_parent_directory_unix(workspace: &Path, path: &Path) -> Result<fs::File> {
+    use std::ffi::CString;
+    use std::os::fd::{AsRawFd as _, FromRawFd as _};
+    use std::os::unix::ffi::OsStrExt as _;
+    use std::os::unix::fs::{OpenOptionsExt as _, PermissionsExt as _};
+
+    let workspace = normalize_subagent_workspace(workspace);
+    let parent = path
+        .parent()
+        .ok_or_else(|| anyhow!("private sub-agent target must have a parent directory"))?;
+    let relative = parent.strip_prefix(&workspace).map_err(|_| {
+        anyhow!(
+            "sub-agent state path must stay within workspace: {}",
+            path.display()
+        )
+    })?;
+    let mut options = fs::OpenOptions::new();
+    options
+        .read(true)
+        .custom_flags(libc::O_DIRECTORY | libc::O_CLOEXEC | libc::O_NOFOLLOW);
+    let mut current = options.open(&workspace)?;
+    for component in relative.components() {
+        let Component::Normal(component) = component else {
+            return Err(anyhow!(
+                "sub-agent state path has a non-normal component: {}",
+                path.display()
+            ));
+        };
+        let name = CString::new(component.as_bytes())
+            .map_err(|_| anyhow!("sub-agent state directory component contains NUL"))?;
+        // SAFETY: the current descriptor and component remain valid. The
+        // no-follow directory open cannot escape through a symbolic link.
+        let mut fd = unsafe {
+            libc::openat(
+                current.as_raw_fd(),
+                name.as_ptr(),
+                libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC | libc::O_NOFOLLOW,
+            )
+        };
+        if fd < 0 && std::io::Error::last_os_error().kind() == std::io::ErrorKind::NotFound {
+            // SAFETY: creation is relative to the pinned current directory and
+            // cannot follow the missing leaf.
+            if unsafe { libc::mkdirat(current.as_raw_fd(), name.as_ptr(), 0o700) } != 0 {
+                let error = std::io::Error::last_os_error();
+                if error.kind() != std::io::ErrorKind::AlreadyExists {
+                    return Err(error.into());
+                }
+            }
+            // SAFETY: same stable descriptor/component as the first open.
+            fd = unsafe {
+                libc::openat(
+                    current.as_raw_fd(),
+                    name.as_ptr(),
+                    libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC | libc::O_NOFOLLOW,
+                )
+            };
+        }
+        if fd < 0 {
+            return Err(std::io::Error::last_os_error().into());
+        }
+        // SAFETY: `fd` is newly owned on the success path above.
+        current = unsafe { fs::File::from_raw_fd(fd) };
+        current.set_permissions(fs::Permissions::from_mode(0o700))?;
+    }
+    Ok(current)
 }
 
 /// Replace a transcript with a fully-written, synced, owner-private temporary
@@ -5233,43 +5410,175 @@ fn prepare_subagent_transcript_parent(workspace: &Path, path: &Path) -> Result<(
 /// in-place rewrite.
 #[cfg(unix)]
 fn rewrite_private_subagent_transcript_atomic(
-    _io_guard: &parking_lot::MutexGuard<'_, ()>,
+    io_guard: &parking_lot::MutexGuard<'_, ()>,
     workspace: &Path,
     path: &Path,
     bytes: &[u8],
 ) -> Result<()> {
-    use std::os::unix::fs::PermissionsExt;
-
-    prepare_subagent_transcript_parent(workspace, path)?;
-    let parent = path
-        .parent()
-        .ok_or_else(|| anyhow!("sub-agent transcript artifact must have a parent directory"))?;
-    let mut temporary = tempfile::NamedTempFile::new_in(parent)?;
-    temporary
-        .as_file()
-        .set_permissions(fs::Permissions::from_mode(0o600))?;
-    temporary.write_all(bytes)?;
-    temporary.flush()?;
-    temporary.as_file().sync_all()?;
-    reject_workspace_relative_symlinks(workspace, path)?;
-    temporary.persist(path).map_err(|err| err.error)?;
-    if let Ok(directory) = fs::File::open(parent) {
-        let _ = directory.sync_all();
-    }
-    Ok(())
+    rewrite_private_subagent_transcript_atomic_inner(io_guard, workspace, path, bytes, None)
 }
+
+#[cfg(unix)]
+fn rewrite_private_subagent_transcript_atomic_inner(
+    _io_guard: &parking_lot::MutexGuard<'_, ()>,
+    workspace: &Path,
+    path: &Path,
+    bytes: &[u8],
+    publication: Option<(&crate::runtime_threads::SensitiveUserInputProvenance, u64)>,
+) -> Result<()> {
+    write_private_bytes_atomic_unix(workspace, path, bytes, publication)
+}
+
+/// Publish bytes relative to one pinned parent-directory descriptor. Every
+/// pathname used after the descriptor is opened is a validated basename, so a
+/// same-user rename-and-replace of the directory cannot redirect the target.
+#[cfg(unix)]
+fn write_private_bytes_atomic_unix(
+    workspace: &Path,
+    path: &Path,
+    bytes: &[u8],
+    publication: Option<(&crate::runtime_threads::SensitiveUserInputProvenance, u64)>,
+) -> Result<()> {
+    use std::ffi::CString;
+    use std::os::fd::{AsRawFd as _, FromRawFd as _};
+    use std::os::unix::ffi::OsStrExt as _;
+    use std::os::unix::fs::PermissionsExt as _;
+
+    let target_name = path
+        .file_name()
+        .ok_or_else(|| anyhow!("private atomic write target must have a basename"))?;
+    let target = CString::new(target_name.as_bytes())
+        .map_err(|_| anyhow!("private atomic write target contains an interior NUL"))?;
+    let directory = open_subagent_parent_directory_unix(workspace, path)?;
+    directory.set_permissions(fs::Permissions::from_mode(0o700))?;
+
+    #[cfg(test)]
+    {
+        let parent = path
+            .parent()
+            .ok_or_else(|| anyhow!("private atomic write target must have a parent directory"))?;
+        let hook = TEST_PRIVATE_ATOMIC_DIRECTORY_HOOK
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner())
+            .take();
+        if let Some((expected_parent, opened, resume)) = hook {
+            if expected_parent == parent {
+                let _ = opened.send(());
+                let _ = resume.recv();
+            } else {
+                *TEST_PRIVATE_ATOMIC_DIRECTORY_HOOK
+                    .lock()
+                    .unwrap_or_else(|poison| poison.into_inner()) =
+                    Some((expected_parent, opened, resume));
+            }
+        }
+    }
+
+    let temp_name = format!(".codewhale-private-{}.tmp", Uuid::new_v4());
+    let temporary = CString::new(temp_name.as_str())
+        .map_err(|_| anyhow!("private atomic temporary basename contains an interior NUL"))?;
+    // SAFETY: the descriptor is pinned and both names are validated single
+    // components. A successful descriptor is transferred to `File`.
+    let fd = unsafe {
+        libc::openat(
+            directory.as_raw_fd(),
+            temporary.as_ptr(),
+            libc::O_WRONLY | libc::O_CREAT | libc::O_EXCL | libc::O_CLOEXEC | libc::O_NOFOLLOW,
+            0o600,
+        )
+    };
+    if fd < 0 {
+        return Err(std::io::Error::last_os_error().into());
+    }
+    // SAFETY: `fd` is newly owned on the success path above.
+    let mut file = unsafe { fs::File::from_raw_fd(fd) };
+    let result = (|| -> Result<()> {
+        file.set_permissions(fs::Permissions::from_mode(0o600))?;
+        file.write_all(bytes)?;
+        file.flush()?;
+        file.sync_all()?;
+        let rename = || {
+            // SAFETY: both basenames and the pinned descriptor remain valid.
+            if unsafe {
+                libc::renameat(
+                    directory.as_raw_fd(),
+                    temporary.as_ptr(),
+                    directory.as_raw_fd(),
+                    target.as_ptr(),
+                )
+            } == 0
+            {
+                Ok(())
+            } else {
+                Err(std::io::Error::last_os_error())
+            }
+        };
+        if let Some((provenance, generation)) = publication {
+            provenance
+                .publish_cleanup_if_current(generation, rename)
+                .ok_or_else(|| {
+                    anyhow!("privacy cleanup generation was superseded before atomic publication")
+                })??;
+        } else {
+            rename()?;
+        }
+        directory.sync_all()?;
+        Ok(())
+    })();
+    drop(file);
+    if result.is_err() {
+        // SAFETY: cleanup is confined to the pinned directory and temporary
+        // basename created above.
+        unsafe {
+            libc::unlinkat(directory.as_raw_fd(), temporary.as_ptr(), 0);
+        }
+    }
+    result
+}
+
+#[cfg(all(unix, test))]
+type PrivateAtomicDirectoryHook = (
+    PathBuf,
+    std::sync::mpsc::Sender<()>,
+    std::sync::mpsc::Receiver<()>,
+);
+
+#[cfg(all(unix, test))]
+static TEST_PRIVATE_ATOMIC_DIRECTORY_HOOK: std::sync::Mutex<Option<PrivateAtomicDirectoryHook>> =
+    std::sync::Mutex::new(None);
 
 #[cfg(not(unix))]
 fn rewrite_private_subagent_transcript_atomic(
-    _io_guard: &parking_lot::MutexGuard<'_, ()>,
+    io_guard: &parking_lot::MutexGuard<'_, ()>,
     workspace: &Path,
     path: &Path,
     bytes: &[u8],
 ) -> Result<()> {
-    prepare_subagent_transcript_parent(workspace, path)?;
-    crate::utils::write_atomic(path, bytes).map_err(Into::into)
+    rewrite_private_subagent_transcript_atomic_inner(io_guard, workspace, path, bytes, None)
 }
 
+#[cfg(not(unix))]
+fn rewrite_private_subagent_transcript_atomic_inner(
+    _io_guard: &parking_lot::MutexGuard<'_, ()>,
+    workspace: &Path,
+    path: &Path,
+    bytes: &[u8],
+    publication: Option<(&crate::runtime_threads::SensitiveUserInputProvenance, u64)>,
+) -> Result<()> {
+    prepare_subagent_transcript_parent(workspace, path)?;
+    if let Some((provenance, generation)) = publication {
+        provenance
+            .publish_cleanup_if_current(generation, || crate::utils::write_atomic(path, bytes))
+            .ok_or_else(|| {
+                anyhow!("sub-agent transcript cleanup generation was superseded before publication")
+            })?
+            .map_err(Into::into)
+    } else {
+        crate::utils::write_atomic(path, bytes).map_err(Into::into)
+    }
+}
+
+#[cfg(unix)]
 fn append_private_subagent_transcript(
     _io_guard: &parking_lot::MutexGuard<'_, ()>,
     workspace: &Path,
@@ -5277,8 +5586,32 @@ fn append_private_subagent_transcript(
     bytes: &[u8],
     durable: bool,
 ) -> Result<()> {
-    reject_workspace_relative_symlinks(workspace, path)?;
-    let mut file = open_private_subagent_transcript(path, true)?;
+    use std::ffi::CString;
+    use std::os::fd::{AsRawFd as _, FromRawFd as _};
+    use std::os::unix::ffi::OsStrExt as _;
+    use std::os::unix::fs::PermissionsExt as _;
+
+    let directory = open_subagent_parent_directory_unix(workspace, path)?;
+    let file_name = path
+        .file_name()
+        .ok_or_else(|| anyhow!("sub-agent transcript must have a basename"))?;
+    let target = CString::new(file_name.as_bytes())
+        .map_err(|_| anyhow!("sub-agent transcript basename contains NUL"))?;
+    // SAFETY: the target is one validated component relative to the pinned
+    // parent directory, and a successful descriptor is transferred to File.
+    let fd = unsafe {
+        libc::openat(
+            directory.as_raw_fd(),
+            target.as_ptr(),
+            libc::O_WRONLY | libc::O_APPEND | libc::O_CLOEXEC | libc::O_NOFOLLOW,
+        )
+    };
+    if fd < 0 {
+        return Err(std::io::Error::last_os_error().into());
+    }
+    // SAFETY: `fd` is newly owned on the success path above.
+    let mut file = unsafe { fs::File::from_raw_fd(fd) };
+    file.set_permissions(fs::Permissions::from_mode(0o600))?;
     if !bytes.is_empty() {
         file.write_all(bytes)?;
     }
@@ -5288,32 +5621,27 @@ fn append_private_subagent_transcript(
     Ok(())
 }
 
-#[cfg(unix)]
-fn open_private_subagent_transcript(path: &Path, append: bool) -> Result<fs::File> {
-    use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
-
-    let mut options = fs::OpenOptions::new();
-    options
-        .write(true)
-        .append(append)
-        .create(!append)
-        .truncate(!append)
-        .custom_flags(libc::O_NOFOLLOW)
-        .mode(0o600);
-    let file = options.open(path)?;
-    file.set_permissions(fs::Permissions::from_mode(0o600))?;
-    Ok(file)
-}
-
 #[cfg(not(unix))]
-fn open_private_subagent_transcript(path: &Path, append: bool) -> Result<fs::File> {
-    fs::OpenOptions::new()
+fn append_private_subagent_transcript(
+    _io_guard: &parking_lot::MutexGuard<'_, ()>,
+    workspace: &Path,
+    path: &Path,
+    bytes: &[u8],
+    durable: bool,
+) -> Result<()> {
+    reject_workspace_relative_symlinks(workspace, path)?;
+    let mut file = fs::OpenOptions::new()
         .write(true)
-        .append(append)
-        .create(!append)
-        .truncate(!append)
+        .append(true)
         .open(path)
-        .map_err(Into::into)
+        .map_err(anyhow::Error::from)?;
+    if !bytes.is_empty() {
+        file.write_all(bytes)?;
+    }
+    if durable {
+        file.sync_all()?;
+    }
+    Ok(())
 }
 
 fn epoch_millis_now() -> u64 {
@@ -5346,25 +5674,65 @@ fn instant_from_duration(duration: Duration) -> Instant {
 /// name only on the pid (as before) made every thread write the *same*
 /// `state.<pid>.tmp` and a rename could publish a half-written file — corrupt
 /// state that fails to parse on reload.
+#[cfg(not(unix))]
 static WRITE_JSON_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 fn write_json_atomic<T: Serialize>(workspace: &Path, path: &Path, value: &T) -> Result<()> {
+    write_json_atomic_inner(workspace, path, value, None)
+}
+
+fn write_json_atomic_for_generation<T: Serialize>(
+    workspace: &Path,
+    path: &Path,
+    value: &T,
+    provenance: &crate::runtime_threads::SensitiveUserInputProvenance,
+    generation: u64,
+) -> Result<()> {
+    write_json_atomic_inner(workspace, path, value, Some((provenance, generation)))
+}
+
+fn write_json_atomic_inner<T: Serialize>(
+    workspace: &Path,
+    path: &Path,
+    value: &T,
+    publication: Option<(&crate::runtime_threads::SensitiveUserInputProvenance, u64)>,
+) -> Result<()> {
     let workspace = normalize_subagent_workspace(workspace);
     reject_workspace_relative_symlinks(&workspace, path)?;
+    #[cfg(not(unix))]
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)?;
     }
     let payload = serde_json::to_string_pretty(value)?;
-    let seq = WRITE_JSON_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    let tmp_path = path.with_extension(format!("{}.{seq}.tmp", std::process::id()));
-    reject_workspace_relative_symlinks(&workspace, &tmp_path)?;
-    fs::write(&tmp_path, payload)?;
-    if let Err(err) = fs::rename(&tmp_path, path) {
-        // Don't leave a stray temp behind if the publish failed.
-        let _ = fs::remove_file(&tmp_path);
-        return Err(err.into());
+
+    #[cfg(unix)]
+    {
+        write_private_bytes_atomic_unix(&workspace, path, payload.as_bytes(), publication)
     }
-    Ok(())
+
+    #[cfg(not(unix))]
+    {
+        let seq = WRITE_JSON_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let tmp_path = path.with_extension(format!("{}.{seq}.tmp", std::process::id()));
+        reject_workspace_relative_symlinks(&workspace, &tmp_path)?;
+        fs::write(&tmp_path, payload)?;
+        let publish = || fs::rename(&tmp_path, path);
+        let result = if let Some((provenance, generation)) = publication {
+            provenance
+                .publish_cleanup_if_current(generation, publish)
+                .ok_or_else(|| {
+                    anyhow!("sub-agent state cleanup generation was superseded before publication")
+                })?
+        } else {
+            publish()
+        };
+        if let Err(err) = result {
+            // Don't leave a stray temp behind if the publish failed.
+            let _ = fs::remove_file(&tmp_path);
+            return Err(err.into());
+        }
+        Ok(())
+    }
 }
 
 /// Create a shared sub-agent manager with a configurable limit.
@@ -6680,6 +7048,7 @@ pub(crate) fn prefix_invariant_fork_request_fixture() -> MessageRequest {
         stream: Some(true),
         temperature: None,
         top_p: None,
+        sensitive_user_input_provenance: Default::default(),
     }
 }
 
@@ -7695,7 +8064,7 @@ async fn run_subagent(
         SubAgentForkContext {
             messages: messages.clone(),
             structured_state_block: None,
-            sensitive_user_input_provenance: inherited_sensitive_user_input_provenance,
+            sensitive_user_input_provenance: inherited_sensitive_user_input_provenance.clone(),
         },
     );
     let tool_registry = SubAgentToolRegistry::new_with_owner(
@@ -7875,6 +8244,7 @@ async fn run_subagent(
             stream: Some(false),
             temperature: None,
             top_p: None,
+            sensitive_user_input_provenance: inherited_sensitive_user_input_provenance.clone(),
         };
         latest_checkpoint = Some(
             checkpoint_subagent_progress(

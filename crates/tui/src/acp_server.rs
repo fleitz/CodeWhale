@@ -566,6 +566,7 @@ impl AcpServer {
             stream: Some(true),
             temperature: Some(0.2),
             top_p: Some(0.9),
+            sensitive_user_input_provenance: Default::default(),
         };
 
         client.create_message_stream(request).await

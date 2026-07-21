@@ -13,6 +13,7 @@ use crate::tools::user_input::{UserInputRequest, UserInputResponse};
 
 const USER_INPUT_TIMEOUT: Duration = Duration::from_secs(300);
 const MAX_LATE_SENSITIVE_PROJECTION_ATTEMPTS: u32 = 5;
+const LATE_SENSITIVE_PROJECTION_ATTEMPT_TIMEOUT: Duration = Duration::from_secs(2);
 
 use super::Engine;
 
@@ -70,23 +71,73 @@ impl Engine {
             {
                 self.late_sensitive_projection_attempts = attempt;
             }
-            let workflow_result = crate::tools::workflow::refresh_sensitive_user_input_provenance(
-                &self.session.sensitive_user_input_provenance,
-            );
-            let child_result = self
-                .subagent_manager
-                .write()
-                .await
-                .refresh_sensitive_user_input_provenance(
-                    &self.session.sensitive_user_input_provenance,
-                );
+            let provenance = self.session.sensitive_user_input_provenance.clone();
+            let generation = provenance.begin_cleanup_generation();
+            let manager = self.subagent_manager.clone();
+            #[cfg(test)]
+            let attempt_timeout = self
+                .late_sensitive_projection_attempt_timeout
+                .unwrap_or(LATE_SENSITIVE_PROJECTION_ATTEMPT_TIMEOUT);
+            #[cfg(not(test))]
+            let attempt_timeout = LATE_SENSITIVE_PROJECTION_ATTEMPT_TIMEOUT;
+            let cleanup = tokio::task::spawn_blocking(move || {
+                if !provenance.synchronize_cleanup_generation(generation) {
+                    return (false, false, false);
+                }
+                let workflow_clean =
+                    crate::tools::workflow::refresh_sensitive_user_input_provenance_for_generation(
+                        &provenance,
+                        generation,
+                    )
+                    .is_ok();
+                let child_clean = manager
+                    .blocking_write()
+                    .refresh_sensitive_user_input_provenance_for_generation(&provenance, generation)
+                    .is_ok();
+                let spill_clean = crate::tools::truncate::cleanup_sensitive_spills_for_generation(
+                    &provenance,
+                    generation,
+                )
+                .is_ok();
+                (workflow_clean, child_clean, spill_clean)
+            });
+            let cleanup_result = tokio::select! {
+                _ = self.cancel_token.cancelled() => {
+                    self.session
+                        .sensitive_user_input_provenance
+                        .invalidate_cleanup_generation();
+                    let suffix = self.cancel_reason_suffix();
+                    return Err(ToolError::cancelled(format!(
+                        "Request cancelled during private-data cleanup{suffix}"
+                    )));
+                }
+                result = tokio::time::timeout(attempt_timeout, cleanup) => result,
+            };
+            let (workflow_clean, child_clean, spill_clean) = match cleanup_result {
+                Ok(Ok(result)) => result,
+                Ok(Err(err)) => {
+                    self.session
+                        .sensitive_user_input_provenance
+                        .invalidate_cleanup_generation();
+                    tracing::warn!(?err, attempt, "late privacy cleanup worker failed");
+                    (false, false, false)
+                }
+                Err(_) => {
+                    self.session
+                        .sensitive_user_input_provenance
+                        .invalidate_cleanup_generation();
+                    tracing::warn!(attempt, "late privacy cleanup attempt timed out");
+                    (false, false, false)
+                }
+            };
             #[cfg(test)]
             let forced_failure = self.force_late_sensitive_projection_failure;
             #[cfg(not(test))]
             let forced_failure = false;
-            let workflow_clean = workflow_result.is_ok() && !forced_failure;
-            let child_clean = child_result.is_ok() && !forced_failure;
-            if workflow_clean && child_clean {
+            let workflow_clean = workflow_clean && !forced_failure;
+            let child_clean = child_clean && !forced_failure;
+            let spill_clean = spill_clean && !forced_failure;
+            if workflow_clean && child_clean && spill_clean {
                 return Ok(());
             }
 
@@ -97,6 +148,7 @@ impl Engine {
                 attempt,
                 workflow_clean,
                 child_clean,
+                spill_clean,
                 "late privacy projection incomplete; retrying before provider resume"
             );
             if attempt >= MAX_LATE_SENSITIVE_PROJECTION_ATTEMPTS {

@@ -1,11 +1,11 @@
 use super::*;
 
-use super::context::{COMPACTION_SUMMARY_MARKER, TURN_MAX_OUTPUT_TOKENS};
+use super::context::TURN_MAX_OUTPUT_TOKENS;
 use super::turn_loop::{
     registered_tool_approval_required, registered_tool_blocked_in_full_access,
     registered_tool_forces_prompt, tool_error_degradation_runtime_hint,
 };
-use crate::compaction::compaction_summary_message;
+use crate::compaction::{COMPACTION_SUMMARY_MARKER, compaction_summary_message};
 use crate::config::ApiProvider;
 use crate::models::{SystemBlock, Usage};
 use crate::test_support::{EnvVarGuard, lock_test_env};
@@ -8843,6 +8843,41 @@ async fn permanent_late_projection_failure_is_bounded_and_fails_closed() {
 }
 
 #[tokio::test]
+async fn held_subagent_lock_cannot_stall_private_input_cleanup() {
+    const SECRET: &str = "held-lock-secret-482915";
+    let (mut engine, handle) = Engine::new(EngineConfig::default(), &Config::default());
+    engine.late_sensitive_projection_attempt_timeout = Some(Duration::from_millis(20));
+    let manager = engine.subagent_manager.clone();
+    let held = manager.write().await;
+    let (request, response) = private_input_fixture(SECRET);
+    handle
+        .submit_user_input("private-input", response)
+        .await
+        .expect("queue modal response");
+    let started = Instant::now();
+
+    let error = engine
+        .await_user_input("private-input", request)
+        .await
+        .expect_err("held cleanup lock must fail closed after bounded attempts");
+
+    assert_eq!(engine.late_sensitive_projection_attempts, 5);
+    assert!(started.elapsed() < Duration::from_secs(2));
+    assert!(
+        error
+            .to_string()
+            .contains("could not complete durable privacy cleanup"),
+        "{error}"
+    );
+    assert!(!error.to_string().contains(SECRET));
+
+    // Release the lock so timed-out blocking workers can retire. Their stale
+    // generations are checked after acquisition and cannot publish.
+    drop(held);
+    tokio::time::sleep(Duration::from_millis(50)).await;
+}
+
+#[tokio::test]
 async fn cancellation_interrupts_late_projection_retry_without_forwarding_response() {
     const SECRET: &str = "projection-cancel-482915";
     let (mut engine, handle) = Engine::new(EngineConfig::default(), &Config::default());
@@ -10708,6 +10743,7 @@ async fn slop_gate_survives_mid_turn_compaction_without_reinjection() {
         Some(&pins),
         None,
         None,
+        None,
     )
     .await
     .expect("mid-turn compaction");
@@ -10947,6 +10983,7 @@ fn live_child_fork_context_tracks_compaction_and_goal_request_history() {
         stream: Some(true),
         temperature: None,
         top_p: None,
+        sensitive_user_input_provenance: Default::default(),
     };
 
     super::turn_loop::update_live_fork_context_from_request(Some(&shared), &request);

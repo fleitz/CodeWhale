@@ -45,15 +45,26 @@ enum DetailHandle {
 /// by compact receipts. Full output is kept behind existing session artifacts
 /// when available; otherwise a SHA-addressed spillover copy is written for
 /// `retrieve_tool_result`.
+#[cfg(test)]
 pub fn compact_messages_for_persistence(
     messages: &[Message],
     artifacts: &[ArtifactRecord],
 ) -> (Vec<Message>, ToolOutputReceiptStats) {
-    let mut sensitive_user_input_values = std::collections::HashSet::new();
+    let provenance = crate::runtime_threads::SensitiveUserInputProvenance::default();
+    compact_messages_for_persistence_with_provenance(messages, artifacts, &provenance)
+}
+
+pub(crate) fn compact_messages_for_persistence_with_provenance(
+    messages: &[Message],
+    artifacts: &[ArtifactRecord],
+    provenance: &crate::runtime_threads::SensitiveUserInputProvenance,
+) -> (Vec<Message>, ToolOutputReceiptStats) {
+    let mut sensitive_user_input_values = provenance.snapshot();
     crate::runtime_threads::collect_sensitive_user_input_values(
         messages,
         &mut sensitive_user_input_values,
     );
+    provenance.extend(sensitive_user_input_values.iter().cloned());
     let projected_messages = crate::runtime_threads::redacted_durable_history_clone(
         messages,
         &sensitive_user_input_values,
@@ -117,7 +128,7 @@ pub fn compact_messages_for_persistence(
                         .map(|artifact| DetailHandle::Artifact((*artifact).clone()))
                         .unwrap_or_else(|| DetailHandle::Sha {
                             sha: sha256_hex(content.as_bytes()),
-                            persisted: persist_sha_tool_result(content),
+                            persisted: persist_sha_tool_result(content, provenance),
                         });
                     let source = match &handle {
                         DetailHandle::Artifact(_) => ReceiptSource::Artifact,
@@ -293,9 +304,12 @@ fn render_tool_output_receipt(
     )
 }
 
-fn persist_sha_tool_result(content: &str) -> bool {
+fn persist_sha_tool_result(
+    content: &str,
+    provenance: &crate::runtime_threads::SensitiveUserInputProvenance,
+) -> bool {
     let sha = sha256_hex(content.as_bytes());
-    match truncate::write_sha_spillover(&sha, content) {
+    match truncate::write_sha_spillover_tracked(&sha, content, provenance) {
         Ok(_) => true,
         Err(err) => {
             crate::logging::warn(format!(
@@ -545,6 +559,47 @@ mod tests {
             let path = entry.expect("spill entry").path();
             let durable = std::fs::read_to_string(path).expect("read durable spill");
             assert!(!durable.contains(SECRET));
+        }
+    }
+
+    #[test]
+    fn persistence_compaction_keeps_cumulative_taint_after_modal_pair_is_gone() {
+        const SECRET: &str = "post-compaction-ui-secret-482915";
+        let _guard = crate::tools::truncate::TEST_SPILLOVER_GUARD
+            .lock()
+            .unwrap_or_else(|err| err.into_inner());
+        let tmp = tempdir().expect("tempdir");
+        let spill_root = tmp.path().join(".codewhale").join("tool_outputs");
+        let prior = crate::tools::truncate::set_test_spillover_root(Some(spill_root.clone()));
+        struct Restore(Option<PathBuf>);
+        impl Drop for Restore {
+            fn drop(&mut self) {
+                crate::tools::truncate::set_test_spillover_root(self.0.take());
+            }
+        }
+        let _restore = Restore(prior);
+
+        let echoed = format!("{}-{SECRET}-{}", "H".repeat(7_000), "T".repeat(7_000));
+        let messages = vec![
+            tool_use_message(
+                "echo-private",
+                "exec_shell",
+                json!({"command": "show output"}),
+            ),
+            tool_result_message("echo-private", &echoed),
+        ];
+        let provenance = crate::runtime_threads::SensitiveUserInputProvenance::default();
+        provenance.extend([SECRET.to_string()]);
+
+        let (compacted, _) =
+            compact_messages_for_persistence_with_provenance(&messages, &[], &provenance);
+        let encoded = serde_json::to_string(&compacted).expect("serialize compacted messages");
+        assert!(!encoded.contains(SECRET));
+        for entry in std::fs::read_dir(&spill_root).expect("read spill root") {
+            let durable = std::fs::read_to_string(entry.expect("spill entry").path())
+                .expect("read projected spill");
+            assert!(!durable.contains(SECRET));
+            assert!(durable.contains("[redacted user input]"));
         }
     }
 

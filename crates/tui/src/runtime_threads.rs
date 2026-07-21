@@ -42,6 +42,7 @@ use crate::core::engine::{
 };
 use crate::core::events::{Event as EngineEvent, TurnOutcomeStatus};
 use crate::core::ops::Op;
+pub(crate) use crate::models::SensitiveUserInputProvenance;
 use crate::models::{ContentBlock, Message, SystemPrompt, Usage};
 use crate::route_budget::{
     auto_compact_default_for_route, compaction_threshold_for_route_at_percent, known_route_limits,
@@ -75,47 +76,6 @@ const HISTORY_SNAPSHOT_SCOPE_KEY: &str = "history_snapshot_scope";
 const HISTORY_SNAPSHOT_MESSAGES_KEY: &str = "compacted_messages";
 #[cfg(test)]
 const TEST_HISTORY_SNAPSHOT_SAVE_FAILURE_ITEM_ID: &str = "item_test_history_snapshot_save_failure";
-
-/// Process-local, session-lifetime provenance for free-text answers collected
-/// by `request_user_input`.
-///
-/// The provider-facing transcript intentionally remains private and exact.
-/// Every public or durable projection takes a snapshot of this shared set so
-/// components created before a later answer (children, workflows, spill/log
-/// writers) learn the new taint instead of freezing an incomplete copy.
-#[derive(Clone, Default)]
-pub(crate) struct SensitiveUserInputProvenance {
-    values: Arc<parking_lot::RwLock<HashSet<String>>>,
-}
-
-impl std::fmt::Debug for SensitiveUserInputProvenance {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        formatter
-            .debug_struct("SensitiveUserInputProvenance")
-            .field("registered_values", &self.values.read().len())
-            .finish()
-    }
-}
-
-impl SensitiveUserInputProvenance {
-    pub(crate) fn snapshot(&self) -> HashSet<String> {
-        self.values.read().clone()
-    }
-
-    pub(crate) fn extend<I>(&self, values: I) -> bool
-    where
-        I: IntoIterator<Item = String>,
-    {
-        let mut current = self.values.write();
-        let prior_len = current.len();
-        current.extend(values.into_iter().filter(|value| !value.is_empty()));
-        current.len() != prior_len
-    }
-
-    pub(crate) fn shares_source_with(&self, other: &Self) -> bool {
-        Arc::ptr_eq(&self.values, &other.values)
-    }
-}
 
 async fn load_linked_session_messages_with<F>(session_id: String, load: F) -> Result<Vec<Message>>
 where
@@ -190,9 +150,9 @@ pub(crate) fn redacted_durable_history_clone(
             _ => None,
         })
         .collect::<HashSet<_>>();
-    let mut sensitive_values = prior_sensitive_values.clone();
-    collect_sensitive_user_input_values(messages, &mut sensitive_values);
-    let mut sensitive_values = sensitive_values.into_iter().collect::<Vec<_>>();
+    let mut sensitive_value_set = prior_sensitive_values.clone();
+    collect_sensitive_user_input_values(messages, &mut sensitive_value_set);
+    let mut sensitive_values = sensitive_value_set.iter().cloned().collect::<Vec<_>>();
     sensitive_values.sort_by_key(|value| std::cmp::Reverse(value.len()));
 
     let mut projected = messages.to_vec();
@@ -230,23 +190,39 @@ pub(crate) fn redacted_durable_history_clone(
                     }
                 }
                 ContentBlock::ToolUse { input, .. } | ContentBlock::ServerToolUse { input, .. } => {
-                    let _ = redact_sensitive_json_string_leaves(input, &sensitive_values);
+                    *input = redacted_sensitive_user_input_json(input, &sensitive_value_set);
                 }
                 ContentBlock::ToolResult {
                     content,
                     content_blocks,
                     ..
                 } => {
-                    let _ = redact_sensitive_user_input_values(content, &sensitive_values);
+                    if let Ok(value) = serde_json::from_str::<Value>(content) {
+                        let projected =
+                            redacted_sensitive_user_input_json(&value, &sensitive_value_set);
+                        let projected_content =
+                            serde_json::to_string(&projected).unwrap_or_else(|_| {
+                                let mut projected = content.clone();
+                                let _ = redact_sensitive_user_input_values(
+                                    &mut projected,
+                                    &sensitive_values,
+                                );
+                                projected
+                            });
+                        *content = projected_content;
+                    } else {
+                        let _ = redact_sensitive_user_input_values(content, &sensitive_values);
+                    }
                     if let Some(content_blocks) = content_blocks {
                         for value in content_blocks {
-                            let _ = redact_sensitive_json_string_leaves(value, &sensitive_values);
+                            *value =
+                                redacted_sensitive_user_input_json(value, &sensitive_value_set);
                         }
                     }
                 }
                 ContentBlock::ToolSearchToolResult { content, .. }
                 | ContentBlock::CodeExecutionToolResult { content, .. } => {
-                    let _ = redact_sensitive_json_string_leaves(content, &sensitive_values);
+                    *content = redacted_sensitive_user_input_json(content, &sensitive_value_set);
                 }
                 _ => {}
             }
@@ -443,34 +419,49 @@ fn serialized_field_contains_public_text(container: Option<&str>, field: &str) -
                 "id" | "session_id" | "tool_call_id" | "tool_name" | "storage_path"
             )
         || matches!(container, Some("PersistedSubAgent"))
-            && matches!(field, "id" | "workspace" | "model" | "session_boot_id");
+            && matches!(
+                field,
+                "id" | "session_name" | "workspace" | "model" | "session_boot_id"
+            )
+        || matches!(container, Some("SubAgentResult"))
+            && matches!(
+                field,
+                "name"
+                    | "agent_id"
+                    | "context_mode"
+                    | "workspace"
+                    | "git_branch"
+                    | "model"
+                    | "parent_run_id"
+            )
+        || matches!(
+            container,
+            Some("AgentCoordSummary" | "SubAgentSessionProjection")
+        ) && field == "name"
+        || matches!(container, Some("AgentRunArtifactRef"))
+            && matches!(field, "kind" | "name" | "target");
     if structural_identity {
         return false;
     }
     matches!(
         field,
         "blocked_reason"
-            | "agent_id"
-            | "child_ids"
+            | "command"
             | "content"
             | "context_summary"
-            | "context_mode"
             | "constraints"
-            | "critical_files"
             | "description"
             | "detail"
+            | "diff"
             | "display"
-            | "effective_billing_surface"
-            | "effective_model"
-            | "effective_provider"
-            | "effective_provider_id"
             | "error"
             | "explanation"
             | "Failed"
             | "handoff_packet"
             | "header"
-            | "git_branch"
             | "input_summary"
+            | "instructions"
+            | "interaction"
             | "intent_summary"
             | "Interrupted"
             | "label"
@@ -478,38 +469,33 @@ fn serialized_field_contains_public_text(container: Option<&str>, field: &str) -
             | "last_progress"
             | "message"
             | "message_preview"
-            | "model"
-            | "model_provider"
-            | "model_provider_id"
-            | "name"
             | "needs_input"
             | "nickname"
+            | "note"
             | "objective"
-            | "parent_run_id"
+            | "output"
+            | "overall_assessment"
             | "preview"
             | "progress"
             | "prompt"
             | "question"
+            | "query"
             | "reason"
             | "recommended_approach"
+            | "recent_progress"
             | "result"
             | "result_summary"
             | "role"
             | "risks_and_unknowns"
+            | "schema_error"
             | "step"
-            | "storage_path"
             | "summary"
-            | "sources_used"
-            | "source_path"
-            | "session_id"
-            | "session_name"
+            | "suggestion"
             | "system_prompt"
-            | "target"
             | "text"
             | "title"
+            | "unsupported_reason"
             | "verification_plan"
-            | "workspace"
-            | "workflow_id"
             | "workflow_goal"
     )
 }
@@ -527,6 +513,7 @@ struct SensitiveProjectionSerializer<'a> {
     dynamic_json: bool,
     public_text: bool,
     preserve_option_label: bool,
+    preserve_exact_value: bool,
     container: Option<&'static str>,
 }
 
@@ -537,19 +524,34 @@ impl<'a> SensitiveProjectionSerializer<'a> {
             dynamic_json: false,
             public_text: false,
             preserve_option_label: false,
+            preserve_exact_value: false,
             container: None,
         }
     }
 
     fn dynamic(self) -> Self {
+        if self.preserve_exact_value {
+            return self;
+        }
         Self {
             dynamic_json: true,
             ..self
         }
     }
 
+    fn exact(self) -> Self {
+        Self {
+            dynamic_json: false,
+            public_text: false,
+            preserve_exact_value: true,
+            ..self
+        }
+    }
+
     fn for_value<T: ?Sized>(self) -> Self {
-        if serialized_type_is_json_value::<T>() {
+        if self.preserve_exact_value {
+            self
+        } else if serialized_type_is_json_value::<T>() {
             self.dynamic()
         } else {
             self
@@ -572,7 +574,7 @@ impl<'a> SensitiveProjectionSerializer<'a> {
 
     fn project_text(self, value: &str) -> String {
         let mut value = value.to_string();
-        if self.dynamic_json || self.public_text {
+        if !self.preserve_exact_value && (self.dynamic_json || self.public_text) {
             let _ = redact_sensitive_user_input_values(&mut value, self.sensitive_values);
         }
         value
@@ -593,6 +595,84 @@ fn serialized_type_is_text_container<T: ?Sized>() -> bool {
             | "std::path::PathBuf"
             | "core::option::Option<std::path::PathBuf>"
     )
+}
+
+/// Operational leaves inside otherwise dynamic metadata stay exact. Unknown
+/// keys remain conservatively redactable prose; this allowlist is limited to
+/// routing, ownership, enum, and artifact/path identity consumed by loaders or
+/// tool dispatch.
+fn serialized_dynamic_key_is_structural(key: &str) -> bool {
+    matches!(
+        key,
+        "id" | "name"
+            | "agent_id"
+            | "child_ids"
+            | "session_id"
+            | "session_name"
+            | "run_id"
+            | "parent_run_id"
+            | "workflow_id"
+            | "task_id"
+            | "tool_id"
+            | "tool"
+            | "tool_call_id"
+            | "tool_name"
+            | "artifact_id"
+            | "artifact_session_id"
+            | "artifact_relative_path"
+            | "artifact_path"
+            | "spillover_path"
+            | "legacy_spillover_path"
+            | "storage_path"
+            | "relative_path"
+            | "workspace"
+            | "source_path"
+            | "sources_used"
+            | "critical_files"
+            | "path"
+            | "target"
+            | "model"
+            | "provider"
+            | "provider_identity"
+            | "key"
+            | "exact_id"
+            | "model_provider"
+            | "model_provider_id"
+            | "context_mode"
+            | "mode"
+            | "git_branch"
+            | "branch"
+            | "base_ref"
+            | "kind"
+            | "status"
+            | "role"
+            | "profile"
+            | "caller"
+            | "field"
+            | "ref"
+            | "sha"
+            | "sha256"
+            | "content_digest"
+            | "uri"
+            | "url"
+            | "base_url"
+    ) || key.ends_with("_id")
+        || key.ends_with("_ids")
+        || key.ends_with("_path")
+        || key.ends_with("_paths")
+        || key.ends_with("_ref")
+        || key.ends_with("_refs")
+        || key.ends_with("_sha")
+}
+
+fn serialized_dynamic_structural_value_is_leaf(value: &Value) -> bool {
+    match value {
+        Value::Object(_) => false,
+        Value::Array(values) => values
+            .iter()
+            .all(serialized_dynamic_structural_value_is_leaf),
+        Value::Null | Value::Bool(_) | Value::Number(_) | Value::String(_) => true,
+    }
 }
 
 struct SensitiveProjectedValue<'a, T: ?Sized> {
@@ -697,6 +777,7 @@ where
 struct SensitiveMap<'a, S> {
     inner: S,
     serializer: SensitiveProjectionSerializer<'a>,
+    pending_key: Option<String>,
 }
 
 impl<S> SerializeMap for SensitiveMap<'_, S>
@@ -707,17 +788,39 @@ where
     type Error = serde_json::Error;
 
     fn serialize_key<T: Serialize + ?Sized>(&mut self, key: &T) -> Result<(), Self::Error> {
+        let raw_key = key.serialize(serde_json::value::Serializer)?;
+        self.pending_key = raw_key.as_str().map(str::to_string);
+        let serializer = if raw_key
+            .as_str()
+            .is_some_and(serialized_dynamic_key_is_structural)
+        {
+            self.serializer.exact()
+        } else {
+            self.serializer.dynamic()
+        };
         self.inner.serialize_key(&SensitiveProjectedValue {
             value: key,
-            serializer: self.serializer.dynamic(),
+            serializer,
         })
     }
 
     fn serialize_value<T: Serialize + ?Sized>(&mut self, value: &T) -> Result<(), Self::Error> {
-        self.inner.serialize_value(&SensitiveProjectedValue {
-            value,
-            serializer: self.serializer.dynamic(),
-        })
+        let structural = self
+            .pending_key
+            .take()
+            .as_deref()
+            .is_some_and(serialized_dynamic_key_is_structural);
+        let exact_leaf = structural
+            && serialized_dynamic_structural_value_is_leaf(
+                &value.serialize(serde_json::value::Serializer)?,
+            );
+        let serializer = if exact_leaf {
+            self.serializer.exact()
+        } else {
+            self.serializer.dynamic()
+        };
+        self.inner
+            .serialize_value(&SensitiveProjectedValue { value, serializer })
     }
 
     fn end(self) -> Result<Self::Ok, Self::Error> {
@@ -942,6 +1045,7 @@ impl<'a> Serializer for SensitiveProjectionSerializer<'a> {
         Ok(SensitiveMap {
             inner: serde_json::value::Serializer.serialize_map(len)?,
             serializer: self.dynamic(),
+            pending_key: None,
         })
     }
     fn serialize_struct(
@@ -1000,11 +1104,16 @@ pub(crate) fn redacted_sensitive_user_input_json(
     value: &Value,
     sensitive_values: &HashSet<String>,
 ) -> Value {
-    let mut projected = value.clone();
-    let mut sorted_values = sensitive_values.iter().cloned().collect::<Vec<_>>();
-    sorted_values.sort_by_key(|value| std::cmp::Reverse(value.len()));
-    let _ = redact_sensitive_json_string_leaves(&mut projected, &sorted_values);
-    projected
+    redacted_serializable_clone(value, sensitive_values).unwrap_or_else(|_| {
+        // `serde_json::Value` should always round-trip through the projection
+        // serializer. Keep a conservative fallback so an unexpected serde
+        // failure cannot expose free-form bytes on a public surface.
+        let mut projected = value.clone();
+        let mut sorted_values = sensitive_values.iter().cloned().collect::<Vec<_>>();
+        sorted_values.sort_by_key(|value| std::cmp::Reverse(value.len()));
+        let _ = redact_sensitive_json_string_leaves(&mut projected, &sorted_values);
+        projected
+    })
 }
 
 pub(crate) fn redacted_tool_result_for_public(
@@ -1038,16 +1147,11 @@ pub(crate) fn redacted_tool_result_for_public(
             }
             crate::tools::spec::ToolError::MissingField { field } => {
                 crate::tools::spec::ToolError::MissingField {
-                    field: redacted_sensitive_user_input_text(field, sensitive_values),
+                    field: field.clone(),
                 }
             }
             crate::tools::spec::ToolError::PathEscape { path } => {
-                crate::tools::spec::ToolError::PathEscape {
-                    path: PathBuf::from(redacted_sensitive_user_input_text(
-                        &path.to_string_lossy(),
-                        sensitive_values,
-                    )),
-                }
+                crate::tools::spec::ToolError::PathEscape { path: path.clone() }
             }
             crate::tools::spec::ToolError::ExecutionFailed { message } => {
                 crate::tools::spec::ToolError::ExecutionFailed {
@@ -4159,14 +4263,14 @@ impl RuntimeThreadManager {
         turn_id: Option<&str>,
         item_id: Option<&str>,
         event: impl Into<String>,
-        mut payload: Value,
+        payload: Value,
     ) -> Result<RuntimeEventRecord> {
         let sensitive_values = self.sensitive_user_input_values_for_thread(thread_id).await;
-        if !sensitive_values.is_empty() {
-            let mut sorted_values = sensitive_values.into_iter().collect::<Vec<_>>();
-            sorted_values.sort_by_key(|value| std::cmp::Reverse(value.len()));
-            let _ = redact_sensitive_json_string_leaves(&mut payload, &sorted_values);
-        }
+        // Runtime event payloads mix generated prose with control-plane
+        // identity. Project through the schema-aware dynamic-map path so
+        // unknown text leaves are redacted without corrupting exact route,
+        // workspace, run, session, tool, or artifact identifiers.
+        let payload = redacted_serializable_clone(&payload, &sensitive_values)?;
         let record = self
             .store
             .append_event(thread_id, turn_id, item_id, event, payload)
@@ -4925,25 +5029,12 @@ impl RuntimeThreadManager {
                 .cloned()
                 .unwrap_or_default()
         };
-        if let Some(model) = req.model.as_mut() {
-            *model = redacted_sensitive_user_input_text(model, &sensitive_values);
-        }
-        if let Some(mode) = req.mode.as_mut() {
-            *mode = redacted_sensitive_user_input_text(mode, &sensitive_values);
-        }
         if let Some(title) = req.title.as_mut() {
             *title = redacted_sensitive_user_input_text(title, &sensitive_values);
         }
         if let Some(system_prompt) = req.system_prompt.as_mut() {
             *system_prompt = redacted_sensitive_user_input_text(system_prompt, &sensitive_values);
         }
-        if let Some(workspace) = req.workspace.as_mut() {
-            *workspace = PathBuf::from(redacted_sensitive_user_input_text(
-                &workspace.to_string_lossy(),
-                &sensitive_values,
-            ));
-        }
-
         if let Some(model) = req.model.as_ref()
             && model.trim().is_empty()
         {

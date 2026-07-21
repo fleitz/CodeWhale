@@ -719,6 +719,8 @@ pub struct Engine {
     force_late_sensitive_projection_failure: bool,
     #[cfg(test)]
     late_sensitive_projection_attempts: u32,
+    #[cfg(test)]
+    late_sensitive_projection_attempt_timeout: Option<Duration>,
 }
 
 fn claim_subagent_completion(
@@ -1276,6 +1278,8 @@ impl Engine {
             force_late_sensitive_projection_failure: false,
             #[cfg(test)]
             late_sensitive_projection_attempts: 0,
+            #[cfg(test)]
+            late_sensitive_projection_attempt_timeout: None,
         };
         let handle = EngineHandle {
             tx_op,
@@ -3824,6 +3828,7 @@ impl Engine {
             Some(&compaction_pins),
             Some(&compaction_paths),
             None,
+            Some(&self.session.sensitive_user_input_provenance),
         )
         .await
         {
@@ -4147,6 +4152,7 @@ impl Engine {
             Some(&compaction_pins),
             Some(&compaction_paths),
             live_request,
+            Some(&self.session.sensitive_user_input_provenance),
         )
         .await
         {

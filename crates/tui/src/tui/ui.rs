@@ -6779,6 +6779,7 @@ async fn run_cache_warmup(app: &App, config: &Config) -> Result<(Usage, String, 
         stream: None,
         temperature: None,
         top_p: None,
+        sensitive_user_input_provenance: app.sensitive_user_input_provenance.clone(),
     };
     let warmup = build_cache_warmup_request(&request);
     let inspection = inspect_prompt_for_request(&warmup);
@@ -7958,9 +7959,10 @@ async fn tool_result_content_for_api_message(
     if raw.chars().count() > crate::tool_output_receipts::RAW_TOOL_OUTPUT_RECEIPT_THRESHOLD_CHARS {
         let messages = live_tool_receipt_messages(app, id, raw, output.success);
         let artifacts = app.session_artifacts.clone();
+        let sensitive_user_input_provenance = app.sensitive_user_input_provenance.clone();
         let raw = raw.to_string();
         match tokio::task::spawn_blocking(move || {
-            compact_live_tool_receipt(messages, artifacts, raw)
+            compact_live_tool_receipt(messages, artifacts, raw, &sensitive_user_input_provenance)
         })
         .await
         {
@@ -8006,9 +8008,12 @@ fn compact_live_tool_receipt(
     messages: Vec<Message>,
     artifacts: Vec<crate::artifacts::ArtifactRecord>,
     raw: String,
+    provenance: &crate::runtime_threads::SensitiveUserInputProvenance,
 ) -> Option<String> {
     let (compacted, _) =
-        crate::tool_output_receipts::compact_messages_for_persistence(&messages, &artifacts);
+        crate::tool_output_receipts::compact_messages_for_persistence_with_provenance(
+            &messages, &artifacts, provenance,
+        );
     let content = compacted
         .last()
         .and_then(|message| message.content.first())

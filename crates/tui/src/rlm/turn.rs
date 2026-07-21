@@ -548,6 +548,7 @@ fn build_root_request(model: &str, messages: &[Message], system: &SystemPrompt) 
         stream: Some(false),
         temperature: Some(ROOT_TEMPERATURE),
         top_p: Some(0.9_f32),
+        sensitive_user_input_provenance: Default::default(),
     }
 }
 

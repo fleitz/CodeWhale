@@ -130,6 +130,7 @@ fn make_request(messages: Vec<Message>) -> MessageRequest {
         stream: Some(true),
         temperature: None,
         top_p: None,
+        sensitive_user_input_provenance: Default::default(),
     }
 }
 

@@ -1133,6 +1133,7 @@ pub async fn compact_messages_safe(
     external_pins: Option<&[usize]>,
     external_working_set_paths: Option<&[String]>,
     live_request: Option<&MessageRequest>,
+    privacy_provenance: Option<&crate::runtime_threads::SensitiveUserInputProvenance>,
 ) -> Result<CompactionResult> {
     const MAX_RETRIES: u32 = 3;
     const BASE_DELAY_MS: u64 = 1000;
@@ -1213,6 +1214,7 @@ pub async fn compact_messages_safe(
             external_pins,
             external_working_set_paths,
             live_request,
+            privacy_provenance,
         )
         .await
         {
@@ -1289,6 +1291,7 @@ pub async fn compact_messages(
     external_pins: Option<&[usize]>,
     external_working_set_paths: Option<&[String]>,
     live_request: Option<&MessageRequest>,
+    privacy_provenance: Option<&crate::runtime_threads::SensitiveUserInputProvenance>,
 ) -> Result<(Vec<Message>, Vec<Message>)> {
     if messages.is_empty() {
         return Ok((Vec::new(), Vec::new()));
@@ -1326,6 +1329,7 @@ pub async fn compact_messages(
         &config.model,
         config.effective_context_window,
         live_request,
+        privacy_provenance,
     )
     .await?;
 
@@ -1372,6 +1376,7 @@ async fn create_summary(
     model: &str,
     effective_context_window: Option<u32>,
     live_request: Option<&MessageRequest>,
+    privacy_provenance: Option<&crate::runtime_threads::SensitiveUserInputProvenance>,
 ) -> Result<String> {
     let limits = summary_input_limits_for_model(model, effective_context_window);
     let used_cache_aligned = live_request.is_some_and(|request| {
@@ -1385,7 +1390,7 @@ async fn create_summary(
     let request = if let Some(live_request) = live_request.filter(|_| used_cache_aligned) {
         build_cache_aligned_summary_request(live_request, limits)
     } else {
-        build_formatted_summary_request(model, messages, limits)
+        build_formatted_summary_request(model, messages, limits, privacy_provenance)
     };
 
     let mut telemetry_cache_aligned = used_cache_aligned;
@@ -1401,7 +1406,8 @@ async fn create_summary(
                 "Cache-aligned compaction returned a non-final/tool response; retrying with bounded formatted summary input",
             );
             telemetry_cache_aligned = false;
-            let fallback_request = build_formatted_summary_request(model, messages, limits);
+            let fallback_request =
+                build_formatted_summary_request(model, messages, limits, privacy_provenance);
             client.create_message(fallback_request).await?
         }
         Ok(response) => response,
@@ -1415,7 +1421,8 @@ async fn create_summary(
                  bounded formatted summary input"
             ));
             telemetry_cache_aligned = false;
-            let fallback_request = build_formatted_summary_request(model, messages, limits);
+            let fallback_request =
+                build_formatted_summary_request(model, messages, limits, privacy_provenance);
             client.create_message(fallback_request).await?
         }
         Err(err) => return Err(err),
@@ -1639,6 +1646,7 @@ fn build_formatted_summary_request(
     model: &str,
     messages: &[Message],
     limits: SummaryInputLimits,
+    privacy_provenance: Option<&crate::runtime_threads::SensitiveUserInputProvenance>,
 ) -> MessageRequest {
     // Format messages for summarization
     let mut conversation_text = String::new();
@@ -1707,6 +1715,7 @@ fn build_formatted_summary_request(
         stream: Some(false),
         temperature: Some(0.3),
         top_p: None,
+        sensitive_user_input_provenance: privacy_provenance.cloned().unwrap_or_default(),
     }
 }
 
@@ -2145,7 +2154,7 @@ mod tests {
             .collect::<Vec<_>>();
         let limits = summary_input_limits_for_model("deepseek-v4-pro", None);
 
-        let request = build_formatted_summary_request("deepseek-v4-pro", &messages, limits);
+        let request = build_formatted_summary_request("deepseek-v4-pro", &messages, limits, None);
 
         assert_eq!(request.messages.len(), 1);
         let ContentBlock::Text { text, .. } = &request.messages[0].content[0] else {
@@ -2185,6 +2194,7 @@ mod tests {
             stream: Some(true),
             temperature: None,
             top_p: None,
+            sensitive_user_input_provenance: Default::default(),
         };
         let limits = summary_input_limits_for_model("deepseek-v4-pro", None);
         let request = build_cache_aligned_summary_request(&live_request, limits);
@@ -2229,6 +2239,7 @@ mod tests {
             stream: Some(true),
             temperature: None,
             top_p: None,
+            sensitive_user_input_provenance: Default::default(),
         };
         let config = CompactionConfig {
             model: "deepseek-v4-pro".to_string(),
@@ -2246,6 +2257,7 @@ mod tests {
             Some(&[1]),
             None,
             Some(&live_request),
+            None,
         )
         .await
         .expect("compaction");
@@ -2287,6 +2299,7 @@ mod tests {
             stream: Some(true),
             temperature: None,
             top_p: None,
+            sensitive_user_input_provenance: Default::default(),
         };
         let mock = MockLlmClient::new(Vec::new());
         mock.push_message_response(MessageResponse {
@@ -2332,6 +2345,7 @@ mod tests {
             &live_request.model,
             Some(1_000_000),
             Some(&live_request),
+            None,
         )
         .await
         .expect("tool-only cache-aligned response should fall back");

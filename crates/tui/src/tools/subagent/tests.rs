@@ -2738,22 +2738,54 @@ fn child_name_followup_interrupt_and_state_are_projected_from_runtime_taint() {
             format!("interrupt because PIN{SECRET}"),
         )
         .expect("coordination interrupt");
+    assert_eq!(interrupted.name, format!("PIN{SECRET}"));
+    assert!(!interrupted.assignment.objective.contains(SECRET));
     assert!(
-        !serde_json::to_string(&interrupted)
-            .unwrap()
+        !interrupted
+            .result
+            .as_deref()
+            .unwrap_or_default()
             .contains(SECRET)
     );
+    assert!(matches!(
+        interrupted.status,
+        SubAgentStatus::Interrupted(ref reason) if !reason.contains(SECRET)
+    ));
+    let stored_result = manager.get_result(&agent_id).unwrap();
+    assert_eq!(stored_result.name, format!("PIN{SECRET}"));
+    assert!(!stored_result.assignment.objective.contains(SECRET));
     assert!(
-        !serde_json::to_string(&manager.get_result(&agent_id).unwrap())
-            .unwrap()
+        !stored_result
+            .result
+            .as_deref()
+            .unwrap_or_default()
             .contains(SECRET)
     );
+    assert!(matches!(
+        stored_result.status,
+        SubAgentStatus::Interrupted(ref reason) if !reason.contains(SECRET)
+    ));
 
     let (_, payload) = manager
         .build_persist_payload()
         .expect("build persisted projection")
         .expect("manager has a state path");
-    assert!(!serde_json::to_string(&payload).unwrap().contains(SECRET));
+    let persisted = payload.agents.first().expect("persisted child");
+    assert_eq!(persisted.id, agent_id);
+    assert_eq!(persisted.session_name, Some(format!("PIN{SECRET}")));
+    assert!(!persisted.prompt.contains(SECRET));
+    assert!(!persisted.assignment.objective.contains(SECRET));
+    assert!(
+        !persisted
+            .result
+            .as_deref()
+            .unwrap_or_default()
+            .contains(SECRET)
+    );
+    assert!(matches!(
+        persisted.status,
+        SubAgentStatus::Interrupted(ref reason) if !reason.contains(SECRET)
+    ));
 
     let mut exhaustive = SubAgentResult {
         name: format!("name-{SECRET}"),
@@ -2783,7 +2815,119 @@ fn child_name_followup_interrupt_and_state_are_projected_from_runtime_taint() {
         from_prior_session: false,
     };
     redact_subagent_result_for_persistence(&mut exhaustive, &HashSet::from([SECRET.to_string()]));
-    assert!(!serde_json::to_string(&exhaustive).unwrap().contains(SECRET));
+    assert_eq!(exhaustive.name, format!("name-{SECRET}"));
+    assert_eq!(exhaustive.agent_id, format!("agent-{SECRET}"));
+    assert_eq!(exhaustive.context_mode, format!("context-{SECRET}"));
+    assert_eq!(
+        exhaustive.workspace,
+        Some(PathBuf::from(format!("/tmp/workspace-{SECRET}")))
+    );
+    assert_eq!(exhaustive.git_branch, Some(format!("privacy/{SECRET}")));
+    assert_eq!(exhaustive.model, format!("model-{SECRET}"));
+    assert_eq!(exhaustive.parent_run_id, Some(format!("parent-{SECRET}")));
+    for prose in [
+        exhaustive.assignment.objective.as_str(),
+        exhaustive.assignment.role.as_deref().unwrap_or_default(),
+        exhaustive.nickname.as_deref().unwrap_or_default(),
+        exhaustive.result.as_deref().unwrap_or_default(),
+        exhaustive
+            .needs_input
+            .as_ref()
+            .map(|input| input.question.as_str())
+            .unwrap_or_default(),
+    ] {
+        assert!(!prose.contains(SECRET), "unprojected prose: {prose}");
+    }
+    assert!(matches!(
+        exhaustive.status,
+        SubAgentStatus::Failed(ref message) if !message.contains(SECRET)
+    ));
+}
+
+#[test]
+fn subagent_snapshot_roundtrips_taint_colliding_operational_identity() {
+    const SECRET: &str = "7";
+    let tmp = tempdir().expect("tempdir");
+    let (input_tx, _input_rx) = mpsc::unbounded_channel();
+    let mut agent = SubAgent::new(
+        "agent_7abc".to_string(),
+        SubAgentType::General,
+        "prompt echoed 7".to_string(),
+        SubAgentAssignment {
+            objective: "objective echoed 7".to_string(),
+            role: Some("role echoed 7".to_string()),
+        },
+        "model-7".to_string(),
+        Some("nickname echoed 7".to_string()),
+        None,
+        input_tx,
+        tmp.path().join("workspace-7"),
+        "boot-7".to_string(),
+    );
+    agent.session_name = "lane-7".to_string();
+    agent
+        .sensitive_user_input_provenance
+        .extend([SECRET.to_string()]);
+
+    let snapshot = agent.snapshot();
+    assert_eq!(snapshot.name, "lane-7");
+    assert_eq!(snapshot.agent_id, "agent_7abc");
+    assert_eq!(snapshot.context_mode, "fresh");
+    assert_eq!(snapshot.workspace, Some(tmp.path().join("workspace-7")));
+    assert_eq!(snapshot.model, "model-7");
+    assert!(!snapshot.assignment.objective.contains(SECRET));
+    assert!(
+        !snapshot
+            .assignment
+            .role
+            .as_deref()
+            .unwrap_or_default()
+            .contains(SECRET)
+    );
+    assert!(
+        !snapshot
+            .nickname
+            .as_deref()
+            .unwrap_or_default()
+            .contains(SECRET)
+    );
+
+    let encoded = serde_json::to_vec(&snapshot).expect("serialize snapshot");
+    let decoded: SubAgentResult = serde_json::from_slice(&encoded).expect("roundtrip snapshot");
+    assert_eq!(decoded.agent_id, snapshot.agent_id);
+    assert_eq!(decoded.name, snapshot.name);
+    assert_eq!(decoded.workspace, snapshot.workspace);
+    assert_eq!(decoded.model, snapshot.model);
+}
+
+#[test]
+fn coordination_projection_preserves_taint_colliding_subagent_identity() {
+    const SECRET: &str = "7";
+    let summary = AgentCoordSummary {
+        agent_id: "agent_7abc".to_string(),
+        name: "lane-7".to_string(),
+        parent_run_id: Some("parent-7".to_string()),
+        status: "running".to_string(),
+        steps_taken: 1,
+        token_budget: Some(7),
+        budget_spent_tokens: Some(1),
+        budget_remaining_tokens: Some(6),
+        recent_progress: vec!["progress echoed 7".to_string()],
+        queued_mail: 0,
+        checkpoint_id: Some("checkpoint-7".to_string()),
+        continuable: true,
+    };
+
+    let projected = crate::runtime_threads::redacted_serializable_clone(
+        &summary,
+        &HashSet::from([SECRET.to_string()]),
+    )
+    .expect("project coordination summary");
+    assert_eq!(projected.agent_id, summary.agent_id);
+    assert_eq!(projected.name, summary.name);
+    assert_eq!(projected.parent_run_id, summary.parent_run_id);
+    assert_eq!(projected.checkpoint_id, summary.checkpoint_id);
+    assert!(!projected.recent_progress[0].contains(SECRET));
 }
 
 #[tokio::test]
@@ -9465,6 +9609,43 @@ fn superseded_state_writer_cannot_publish_after_privacy_generation() {
 }
 
 #[test]
+fn timed_out_cleanup_generation_cannot_publish_delayed_state_writer() {
+    let tmp = tempdir().expect("tempdir");
+    let workspace = tmp.path().canonicalize().expect("canonical workspace");
+    let state_path = workspace
+        .join(".codewhale")
+        .join("subagents")
+        .join("state.json");
+    let provenance = crate::runtime_threads::SensitiveUserInputProvenance::default();
+    let generation = provenance.begin_cleanup_generation();
+    let delayed_provenance = provenance.clone();
+    let delayed_workspace = workspace.clone();
+    let delayed_path = state_path.clone();
+    let gate = Arc::new(std::sync::Barrier::new(2));
+    let delayed_gate = Arc::clone(&gate);
+    let writer = std::thread::spawn(move || {
+        delayed_gate.wait();
+        write_json_atomic_for_generation(
+            &delayed_workspace,
+            &delayed_path,
+            &serde_json::json!({"stale": true}),
+            &delayed_provenance,
+            generation,
+        )
+    });
+
+    provenance.invalidate_cleanup_generation();
+    gate.wait();
+    let error = writer
+        .join()
+        .expect("delayed writer thread")
+        .expect_err("superseded cleanup generation must not publish");
+
+    assert!(error.to_string().contains("superseded"), "{error:#}");
+    assert!(!state_path.exists(), "stale writer published after timeout");
+}
+
+#[test]
 fn child_local_taint_rewrites_earlier_append_only_transcript_records() {
     const SECRET: &str = "482915";
     let tmp = tempdir().expect("tempdir");
@@ -9952,6 +10133,53 @@ fn write_json_atomic_survives_concurrent_writers() {
         .filter(|e| e.file_name().to_string_lossy().contains(".tmp"))
         .collect();
     assert!(leftover.is_empty(), "temp files leaked: {leftover:?}");
+}
+
+#[cfg(unix)]
+#[test]
+fn write_json_atomic_cannot_be_redirected_by_same_user_directory_swap() {
+    let dir = tempdir().expect("tempdir");
+    let workspace = dir.path().canonicalize().expect("canonical workspace");
+    let parent = workspace.join(".codewhale").join("subagents");
+    std::fs::create_dir_all(&parent).expect("create original parent");
+    let path = parent.join("state.json");
+    let moved_parent = workspace.join("original-subagents");
+    let (opened_tx, opened_rx) = std::sync::mpsc::channel();
+    let (resume_tx, resume_rx) = std::sync::mpsc::channel();
+    *TEST_PRIVATE_ATOMIC_DIRECTORY_HOOK
+        .lock()
+        .unwrap_or_else(|poison| poison.into_inner()) =
+        Some((parent.clone(), opened_tx, resume_rx));
+
+    let writer_workspace = workspace.clone();
+    let writer_path = path.clone();
+    let writer = std::thread::spawn(move || {
+        write_json_atomic(
+            &writer_workspace,
+            &writer_path,
+            &serde_json::json!({"owner": "tracked"}),
+        )
+    });
+    opened_rx.recv().expect("writer pinned original parent");
+    std::fs::rename(&parent, &moved_parent).expect("move original directory");
+    std::fs::create_dir_all(&parent).expect("install replacement directory");
+    std::fs::write(&path, r#"{"owner":"replacement"}"#).expect("replacement target");
+    resume_tx.send(()).expect("resume pinned writer");
+    writer
+        .join()
+        .expect("writer thread")
+        .expect("descriptor-relative publish");
+
+    assert_eq!(
+        std::fs::read_to_string(&path).expect("replacement path"),
+        r#"{"owner":"replacement"}"#,
+        "replacement directory must remain untouched"
+    );
+    let published: serde_json::Value = serde_json::from_str(
+        &std::fs::read_to_string(moved_parent.join("state.json")).expect("original target"),
+    )
+    .expect("published JSON");
+    assert_eq!(published["owner"], "tracked");
 }
 
 // === agent(action="wait") + peek throttling (#4097) ===

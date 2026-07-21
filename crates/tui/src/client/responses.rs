@@ -826,6 +826,7 @@ mod tests {
             stream: None,
             temperature: None,
             top_p: None,
+            sensitive_user_input_provenance: Default::default(),
         }
     }
 
@@ -1151,6 +1152,7 @@ mod tests {
             stream: None,
             temperature: None,
             top_p: None,
+            sensitive_user_input_provenance: Default::default(),
         };
 
         let body = build_responses_body(&request);
@@ -1267,6 +1269,7 @@ mod tests {
             stream: None,
             temperature: None,
             top_p: None,
+            sensitive_user_input_provenance: Default::default(),
         };
 
         let input = convert_messages_to_responses_input(&request);
@@ -1302,6 +1305,7 @@ mod tests {
             stream: None,
             temperature: None,
             top_p: None,
+            sensitive_user_input_provenance: Default::default(),
         };
 
         let input = convert_messages_to_responses_input(&request);

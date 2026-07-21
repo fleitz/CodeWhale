@@ -34,9 +34,18 @@
 //! presses the tool-details shortcut on a spilled tool cell.
 
 use std::fs;
-use std::io;
+use std::io::{self, Read as _, Write as _};
 use std::path::PathBuf;
 use std::time::{Duration, SystemTime};
+
+#[cfg(unix)]
+use std::ffi::CString;
+#[cfg(unix)]
+use std::os::fd::{AsRawFd as _, FromRawFd as _};
+#[cfg(unix)]
+use std::os::unix::ffi::OsStrExt as _;
+#[cfg(unix)]
+use std::os::unix::fs::MetadataExt as _;
 
 use crate::tools::spec::ToolResult;
 
@@ -133,11 +142,37 @@ pub fn is_valid_sha256(s: &str) -> bool {
             .all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase())
 }
 
+#[cfg(unix)]
+fn validate_existing_sha_spill(file: &fs::File, expected_sha: &str) -> io::Result<()> {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    let metadata = file.metadata()?;
+    if !metadata.is_file() || metadata.uid() != unsafe { libc::geteuid() } || metadata.nlink() != 1
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "existing SHA spill is not a current-user regular file with one link",
+        ));
+    }
+    file.set_permissions(fs::Permissions::from_mode(0o600))?;
+    let mut bytes = Vec::new();
+    let mut reader = file;
+    reader.read_to_end(&mut bytes)?;
+    if crate::hashing::sha256_hex(&bytes) != expected_sha {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "existing SHA spill content does not match its digest",
+        ));
+    }
+    Ok(())
+}
+
 /// Write content to the SHA-addressed spillover file. Idempotent —
 /// the same hash always maps to the same path, and the file's bytes
 /// are a function of the hash. Skips the write if the file already
 /// exists (which is the common case for the wire dedup, since the
 /// second sighting writes the same content that the first did).
+#[cfg(any(test, not(unix)))]
 pub fn write_sha_spillover(sha: &str, content: &str) -> io::Result<PathBuf> {
     let path = sha_spillover_path(sha).ok_or_else(|| {
         io::Error::new(
@@ -153,6 +188,191 @@ pub fn write_sha_spillover(sha: &str, content: &str) -> io::Result<PathBuf> {
     }
     crate::utils::write_atomic(&path, content.as_bytes())?;
     Ok(path)
+}
+
+/// Write and register a SHA spill against one pinned directory identity.
+/// Chat/UI privacy sinks use this variant so no rename-and-replace between the
+/// write and handle registration can strand bytes outside later cleanup.
+pub(crate) fn write_sha_spillover_tracked(
+    sha: &str,
+    content: &str,
+    provenance: &crate::runtime_threads::SensitiveUserInputProvenance,
+) -> io::Result<PathBuf> {
+    let expected_sha = sha.trim().to_ascii_lowercase();
+    let path = sha_spillover_path(&expected_sha).ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "sha must be a 64-char lowercase hex digest",
+        )
+    })?;
+    if crate::hashing::sha256_hex(content.as_bytes()) != expected_sha {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "SHA spill content does not match the requested digest",
+        ));
+    }
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::{OpenOptionsExt as _, PermissionsExt as _};
+
+        let root = path.parent().ok_or_else(|| {
+            io::Error::new(io::ErrorKind::InvalidInput, "SHA spill path has no parent")
+        })?;
+        fs::create_dir_all(root)?;
+        let mut options = fs::OpenOptions::new();
+        options
+            .read(true)
+            .custom_flags(libc::O_DIRECTORY | libc::O_CLOEXEC | libc::O_NOFOLLOW);
+        let directory = options.open(root)?;
+        directory.set_permissions(fs::Permissions::from_mode(0o700))?;
+        let file_name = path.file_name().ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "SHA spill path has no basename",
+            )
+        })?;
+        let target = CString::new(file_name.as_bytes()).map_err(|_| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "SHA spill basename contains NUL",
+            )
+        })?;
+
+        // Existing content-addressed files need only be registered against the
+        // same pinned directory. O_NOFOLLOW rejects a hostile leaf symlink.
+        let existing = unsafe {
+            libc::openat(
+                directory.as_raw_fd(),
+                target.as_ptr(),
+                libc::O_RDONLY | libc::O_CLOEXEC | libc::O_NOFOLLOW,
+            )
+        };
+        if existing >= 0 {
+            // SAFETY: `existing` is newly owned on this success path.
+            let existing = unsafe { fs::File::from_raw_fd(existing) };
+            validate_existing_sha_spill(&existing, &expected_sha)?;
+            provenance.track_spill_path_with_directory(path.clone(), directory, &existing)?;
+            return Ok(path);
+        }
+        let existing_error = io::Error::last_os_error();
+        if existing_error.kind() != io::ErrorKind::NotFound {
+            return Err(existing_error);
+        }
+
+        let temp_name = format!(".sha-spill-{}.tmp", uuid::Uuid::new_v4());
+        let temporary = CString::new(temp_name).map_err(|_| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "SHA spill temporary basename contains NUL",
+            )
+        })?;
+        let fd = unsafe {
+            libc::openat(
+                directory.as_raw_fd(),
+                temporary.as_ptr(),
+                libc::O_RDWR | libc::O_CREAT | libc::O_EXCL | libc::O_CLOEXEC | libc::O_NOFOLLOW,
+                0o600,
+            )
+        };
+        if fd < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        // SAFETY: `fd` is newly owned on the success path above.
+        let mut file = unsafe { fs::File::from_raw_fd(fd) };
+        let mut installed_target = false;
+        let result = (|| {
+            file.set_permissions(fs::Permissions::from_mode(0o600))?;
+            file.write_all(content.as_bytes())?;
+            file.sync_all()?;
+            // Install without replacing a file created by another writer. The
+            // SHA namespace is immutable: an existing target wins, and this
+            // temporary link is retired.
+            if unsafe {
+                libc::linkat(
+                    directory.as_raw_fd(),
+                    temporary.as_ptr(),
+                    directory.as_raw_fd(),
+                    target.as_ptr(),
+                    0,
+                )
+            } != 0
+            {
+                let error = io::Error::last_os_error();
+                if error.kind() != io::ErrorKind::AlreadyExists {
+                    return Err(error);
+                }
+                // A racing writer won the immutable digest name. Validate the
+                // winning inode before registering it for later privacy
+                // cleanup; a mismatched or linked file fails closed.
+                let existing = unsafe {
+                    libc::openat(
+                        directory.as_raw_fd(),
+                        target.as_ptr(),
+                        libc::O_RDONLY | libc::O_CLOEXEC | libc::O_NOFOLLOW,
+                    )
+                };
+                if existing < 0 {
+                    return Err(io::Error::last_os_error());
+                }
+                // SAFETY: `existing` is newly owned on this success path.
+                let existing = unsafe { fs::File::from_raw_fd(existing) };
+                validate_existing_sha_spill(&existing, &expected_sha)?;
+                provenance.track_spill_path_with_directory(
+                    path.clone(),
+                    directory.try_clone()?,
+                    &existing,
+                )?;
+            } else {
+                installed_target = true;
+            }
+            // SAFETY: the staging name is confined to the pinned directory.
+            if unsafe { libc::unlinkat(directory.as_raw_fd(), temporary.as_ptr(), 0) } != 0 {
+                let error = io::Error::last_os_error();
+                if installed_target {
+                    // SAFETY: roll back the target installed by this attempt.
+                    unsafe {
+                        libc::unlinkat(directory.as_raw_fd(), target.as_ptr(), 0);
+                    }
+                    installed_target = false;
+                }
+                return Err(error);
+            }
+            directory.sync_all()?;
+            if installed_target {
+                provenance.track_spill_path_with_directory(
+                    path.clone(),
+                    directory.try_clone()?,
+                    &file,
+                )?;
+            }
+            Ok(())
+        })();
+        drop(file);
+        if result.is_err() {
+            // SAFETY: both names are confined to the pinned spill directory;
+            // never remove a pre-existing target that this attempt did not
+            // install.
+            unsafe {
+                libc::unlinkat(directory.as_raw_fd(), temporary.as_ptr(), 0);
+                if installed_target {
+                    libc::unlinkat(directory.as_raw_fd(), target.as_ptr(), 0);
+                }
+            }
+        }
+        result?;
+        Ok(path)
+    }
+
+    #[cfg(not(unix))]
+    {
+        let path = write_sha_spillover(sha, content)?;
+        if let Err(error) = provenance.track_spill_path(path.clone()) {
+            let _ = fs::remove_file(&path);
+            return Err(error);
+        }
+        Ok(path)
+    }
 }
 
 /// Write `content` to the spillover file for `id`. Creates the
@@ -174,6 +394,148 @@ pub fn write_spillover(id: &str, content: &str) -> io::Result<PathBuf> {
     }
     crate::utils::write_atomic(&path, content.as_bytes())?;
     Ok(path)
+}
+
+/// Remove tracked SHA spill files whose bytes now contain a late-classified
+/// private answer. The generation gate makes a cleanup attempt revocable: a
+/// task that outlives its timeout cannot delete through a newer attempt.
+///
+/// Unix cleanup is descriptor-relative to the directory pinned when the spill
+/// was registered. Renaming that directory and installing a same-user
+/// replacement at the old pathname therefore cannot redirect the deletion.
+pub(crate) fn cleanup_sensitive_spills_for_generation(
+    provenance: &crate::runtime_threads::SensitiveUserInputProvenance,
+    generation: u64,
+) -> io::Result<usize> {
+    let sensitive_values = provenance.snapshot();
+    if sensitive_values.is_empty() {
+        return Ok(0);
+    }
+    let mut removed = 0usize;
+    for tracked in provenance.tracked_spill_paths() {
+        if !provenance.cleanup_generation_is_current(generation) {
+            return Err(io::Error::new(
+                io::ErrorKind::Interrupted,
+                "spill cleanup generation was superseded",
+            ));
+        }
+        let file_name = tracked.file_name.to_string_lossy();
+        let Some(digest) = file_name
+            .strip_prefix("sha_")
+            .and_then(|name| name.strip_suffix(".txt"))
+        else {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "tracked spill path is outside the SHA spill namespace",
+            ));
+        };
+        if !is_valid_sha256(digest) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "tracked spill path has an invalid SHA basename",
+            ));
+        }
+
+        #[cfg(unix)]
+        {
+            let name = CString::new(tracked.file_name.as_bytes()).map_err(|_| {
+                io::Error::new(io::ErrorKind::InvalidInput, "spill basename contains NUL")
+            })?;
+            // SAFETY: the directory descriptor is pinned in the provenance
+            // record and `name` is a validated single component.
+            let fd = unsafe {
+                libc::openat(
+                    tracked.directory.as_raw_fd(),
+                    name.as_ptr(),
+                    libc::O_RDONLY | libc::O_CLOEXEC | libc::O_NOFOLLOW,
+                )
+            };
+            if fd < 0 {
+                let error = io::Error::last_os_error();
+                if error.kind() == io::ErrorKind::NotFound {
+                    continue;
+                }
+                return Err(error);
+            }
+            // SAFETY: `fd` is newly owned on the success path above.
+            let mut file = unsafe { fs::File::from_raw_fd(fd) };
+            let metadata = file.metadata()?;
+            if !metadata.is_file()
+                || metadata.uid() != unsafe { libc::geteuid() }
+                || metadata.nlink() != 1
+                || metadata.dev() != tracked.file_device
+                || metadata.ino() != tracked.file_inode
+            {
+                return Err(io::Error::new(
+                    io::ErrorKind::PermissionDenied,
+                    "tracked spill no longer has its registered private file identity",
+                ));
+            }
+            let mut content = String::new();
+            file.read_to_string(&mut content)?;
+            if !sensitive_values
+                .iter()
+                .any(|value| !value.is_empty() && content.contains(value))
+            {
+                continue;
+            }
+            let result = provenance.publish_cleanup_if_current(generation, || {
+                // SAFETY: both descriptor and component remain valid, and the
+                // operation cannot escape the pinned directory.
+                if unsafe { libc::unlinkat(tracked.directory.as_raw_fd(), name.as_ptr(), 0) } == 0 {
+                    Ok(())
+                } else {
+                    let error = io::Error::last_os_error();
+                    (error.kind() == io::ErrorKind::NotFound)
+                        .then_some(())
+                        .ok_or(error)
+                }
+            });
+            result.ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::Interrupted,
+                    "spill cleanup generation was superseded before deletion",
+                )
+            })??;
+            removed = removed.saturating_add(1);
+        }
+
+        #[cfg(not(unix))]
+        {
+            let Some(root) = spillover_root() else {
+                return Err(io::Error::new(
+                    io::ErrorKind::NotFound,
+                    "spillover root is unavailable",
+                ));
+            };
+            if tracked.path.parent() != Some(root.as_path()) {
+                return Err(io::Error::new(
+                    io::ErrorKind::PermissionDenied,
+                    "tracked spill path escaped the configured root",
+                ));
+            }
+            let content = match fs::read_to_string(&tracked.path) {
+                Ok(content) => content,
+                Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
+                Err(error) => return Err(error),
+            };
+            if sensitive_values
+                .iter()
+                .any(|value| !value.is_empty() && content.contains(value))
+            {
+                provenance
+                    .publish_cleanup_if_current(generation, || fs::remove_file(&tracked.path))
+                    .ok_or_else(|| {
+                        io::Error::new(
+                            io::ErrorKind::Interrupted,
+                            "spill cleanup generation was superseded before deletion",
+                        )
+                    })??;
+                removed = removed.saturating_add(1);
+            }
+        }
+    }
+    Ok(removed)
 }
 
 /// Drop spillover files older than `max_age`. Returns the number of
@@ -330,26 +692,14 @@ pub(crate) fn apply_spillover_with_artifact_projection(
     tool_name: &str,
     session_id: &str,
     durable_content: &str,
-    sensitive_user_input_values: &std::collections::HashSet<String>,
+    _sensitive_user_input_values: &std::collections::HashSet<String>,
 ) -> Option<PathBuf> {
-    let durable_tool_id = crate::runtime_threads::redacted_sensitive_user_input_text(
-        tool_id,
-        sensitive_user_input_values,
-    );
-    let durable_tool_name = crate::runtime_threads::redacted_sensitive_user_input_text(
-        tool_name,
-        sensitive_user_input_values,
-    );
-    let durable_session_id = crate::runtime_threads::redacted_sensitive_user_input_text(
-        session_id,
-        sensitive_user_input_values,
-    );
     apply_spillover_inner(
         result,
-        &durable_tool_id,
+        tool_id,
         Some(ArtifactSpilloverContext {
-            tool_name: &durable_tool_name,
-            session_id: &durable_session_id,
+            tool_name,
+            session_id,
         }),
         Some(durable_content),
     )
@@ -712,6 +1062,146 @@ mod tests {
         });
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn late_cleanup_uses_pinned_directory_after_same_user_swap() {
+        let _g = setup();
+        let tmp = tempdir().unwrap();
+        with_test_home(tmp.path(), || {
+            const SECRET: &str = "late-private-value-482915";
+            let content = format!("tool output echoed {SECRET}");
+            let sha = crate::hashing::sha256_hex(content.as_bytes());
+            let path = write_sha_spillover(&sha, &content).expect("write spill");
+            let provenance = crate::runtime_threads::SensitiveUserInputProvenance::default();
+            provenance
+                .track_spill_path(path.clone())
+                .expect("pin spill directory");
+
+            let root = path.parent().expect("spill root").to_path_buf();
+            let original_root = tmp.path().join("original-tool-outputs");
+            fs::rename(&root, &original_root).expect("move original root");
+            fs::create_dir_all(&root).expect("install replacement root");
+            fs::write(&path, "replacement user's unrelated bytes").expect("write replacement file");
+
+            provenance.extend([SECRET.to_string()]);
+            let generation = provenance.begin_cleanup_generation();
+            let removed = cleanup_sensitive_spills_for_generation(&provenance, generation)
+                .expect("descriptor-relative cleanup");
+
+            assert_eq!(removed, 1);
+            assert!(path.exists(), "replacement path must remain untouched");
+            assert_eq!(
+                fs::read_to_string(&path).expect("read replacement"),
+                "replacement user's unrelated bytes"
+            );
+            assert!(
+                !original_root.join(path.file_name().unwrap()).exists(),
+                "the originally tracked private spill must be deleted"
+            );
+        });
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn tracked_sha_writer_registers_preclassification_bytes_for_late_cleanup() {
+        let _g = setup();
+        let tmp = tempdir().unwrap();
+        with_test_home(tmp.path(), || {
+            const SECRET: &str = "preclassification-private-value-482915";
+            let content = format!("tool output echoed {SECRET}");
+            let sha = crate::hashing::sha256_hex(content.as_bytes());
+            let provenance = crate::runtime_threads::SensitiveUserInputProvenance::default();
+            let path = write_sha_spillover_tracked(&sha, &content, &provenance)
+                .expect("write and track spill");
+            assert!(path.exists());
+
+            provenance.extend([SECRET.to_string()]);
+            let generation = provenance.begin_cleanup_generation();
+            assert_eq!(
+                cleanup_sensitive_spills_for_generation(&provenance, generation)
+                    .expect("late cleanup"),
+                1
+            );
+            assert!(!path.exists());
+        });
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn tracked_sha_writer_rejects_mismatched_existing_digest_file() {
+        let _g = setup();
+        let tmp = tempdir().unwrap();
+        with_test_home(tmp.path(), || {
+            let expected = "expected immutable content";
+            let sha = crate::hashing::sha256_hex(expected.as_bytes());
+            let path = sha_spillover_path(&sha).expect("SHA path");
+            fs::create_dir_all(path.parent().expect("spill root")).expect("create spill root");
+            fs::write(&path, "same-user replacement content").expect("write mismatch");
+            let provenance = crate::runtime_threads::SensitiveUserInputProvenance::default();
+
+            let error = write_sha_spillover_tracked(&sha, expected, &provenance)
+                .expect_err("mismatched immutable name must fail closed");
+            assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+            assert!(provenance.tracked_spill_paths().is_empty());
+            assert_eq!(
+                fs::read_to_string(path).expect("mismatched file remains untouched"),
+                "same-user replacement content"
+            );
+        });
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn tracked_sha_writer_rejects_content_that_does_not_match_digest() {
+        let _g = setup();
+        let tmp = tempdir().unwrap();
+        with_test_home(tmp.path(), || {
+            let sha = crate::hashing::sha256_hex(b"expected immutable content");
+            let provenance = crate::runtime_threads::SensitiveUserInputProvenance::default();
+
+            let error =
+                write_sha_spillover_tracked(&sha, "different caller-supplied content", &provenance)
+                    .expect_err("caller content must authenticate the requested SHA name");
+
+            assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+            assert!(provenance.tracked_spill_paths().is_empty());
+            assert!(!sha_spillover_path(&sha).expect("SHA path").exists());
+        });
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn late_cleanup_rejects_same_directory_leaf_replacement() {
+        let _g = setup();
+        let tmp = tempdir().unwrap();
+        with_test_home(tmp.path(), || {
+            const SECRET: &str = "leaf-replacement-private-value-482915";
+            let content = format!("tool output echoed {SECRET}");
+            let sha = crate::hashing::sha256_hex(content.as_bytes());
+            let provenance = crate::runtime_threads::SensitiveUserInputProvenance::default();
+            let path = write_sha_spillover_tracked(&sha, &content, &provenance)
+                .expect("write and track spill");
+            let moved = path.with_extension("original");
+            fs::rename(&path, &moved).expect("move tracked leaf");
+            fs::write(&path, &content).expect("install same-user replacement leaf");
+
+            provenance.extend([SECRET.to_string()]);
+            let generation = provenance.begin_cleanup_generation();
+            let error = cleanup_sensitive_spills_for_generation(&provenance, generation)
+                .expect_err("replacement inode must fail closed");
+
+            assert_eq!(error.kind(), io::ErrorKind::PermissionDenied);
+            assert_eq!(
+                fs::read_to_string(&path).expect("replacement remains"),
+                content
+            );
+            assert_eq!(
+                fs::read_to_string(&moved).expect("original remains"),
+                content
+            );
+        });
+    }
+
     #[test]
     fn maybe_spillover_returns_none_below_threshold() {
         let _g = setup();
@@ -972,7 +1462,7 @@ mod tests {
     }
 
     #[test]
-    fn projected_spillover_keeps_raw_inline_but_redacts_every_durable_copy() {
+    fn projected_spillover_keeps_operational_identity_and_redacts_durable_body() {
         let _g = setup();
         let tmp = tempdir().unwrap();
         with_test_home(tmp.path(), || {
@@ -994,17 +1484,30 @@ mod tests {
             .expect("projected root output should spill");
 
             assert!(result.content.contains(&format!("PIN{SECRET}")));
-            assert!(!path.display().to_string().contains(SECRET));
+            assert!(
+                path.display().to_string().contains(SECRET),
+                "artifact routing identity must remain byte-exact"
+            );
             assert!(!fs::read_to_string(&path).unwrap().contains(SECRET));
             for entry in fs::read_dir(tmp.path().join(".codewhale/tool_outputs")).unwrap() {
                 let entry = entry.unwrap();
-                assert!(!entry.path().display().to_string().contains(SECRET));
+                assert!(entry.path().display().to_string().contains(SECRET));
                 assert!(!fs::read_to_string(entry.path()).unwrap().contains(SECRET));
             }
+            let metadata = result.metadata.expect("artifact metadata");
+            assert_eq!(
+                metadata["artifact_session_id"],
+                format!("privacy-{SECRET}-session")
+            );
             assert!(
-                !serde_json::to_string(&result.metadata)
-                    .unwrap()
-                    .contains(SECRET)
+                metadata["artifact_id"]
+                    .as_str()
+                    .is_some_and(|id| id.contains(SECRET))
+            );
+            assert!(
+                metadata["artifact_relative_path"]
+                    .as_str()
+                    .is_some_and(|path| path.contains(SECRET))
             );
         });
     }

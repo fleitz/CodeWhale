@@ -512,6 +512,7 @@ impl ToolSpec for ReviewTool {
             stream: Some(false),
             temperature: Some(0.2),
             top_p: Some(0.9),
+            sensitive_user_input_provenance: Default::default(),
         };
 
         let response = client

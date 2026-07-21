@@ -235,6 +235,7 @@ pub(crate) fn profile_drafting_request(
         stream: Some(false),
         temperature: Some(0.2),
         top_p: None,
+        sensitive_user_input_provenance: Default::default(),
     }
 }
 

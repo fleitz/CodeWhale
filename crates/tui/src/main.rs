@@ -6756,6 +6756,7 @@ async fn test_api_connectivity(config: &Config) -> Result<()> {
         stream: Some(false),
         temperature: None,
         top_p: None,
+        sensitive_user_input_provenance: Default::default(),
     };
 
     // Use tokio timeout to catch hanging requests
@@ -7133,6 +7134,7 @@ Provide findings ordered by severity with file references, then open questions, 
         stream: Some(false),
         temperature: Some(0.2),
         top_p: Some(0.9),
+        sensitive_user_input_provenance: Default::default(),
     };
 
     let response = client.create_message(request).await?;
@@ -9174,6 +9176,7 @@ async fn run_one_shot(
         stream: Some(false),
         temperature: None,
         top_p: None,
+        sensitive_user_input_provenance: Default::default(),
     };
 
     let response = client.create_message(request).await?;
@@ -9225,6 +9228,7 @@ async fn run_one_shot_json(
         stream: Some(false),
         temperature: Some(0.2),
         top_p: Some(0.9),
+        sensitive_user_input_provenance: Default::default(),
     };
 
     let response = client.create_message(request).await?;

@@ -1,5 +1,13 @@
 //! API request/response models for `DeepSeek` and OpenAI-compatible endpoints.
 
+use std::collections::HashSet;
+use std::ffi::OsString;
+use std::fs::File;
+use std::io;
+use std::path::PathBuf;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
+
 use serde::{Deserialize, Serialize};
 
 /// Context window used only for legacy DeepSeek model IDs that do not name a
@@ -42,6 +50,230 @@ pub const DEFAULT_AUTO_COMPACT_MAX_CONTEXT_WINDOW_TOKENS: u32 = DEEPSEEK_V4_CONT
 
 // === Core Message Types ===
 
+/// Process-local, session-lifetime provenance for free-text answers collected
+/// by `request_user_input`.
+///
+/// The provider-facing transcript intentionally remains private and exact.
+/// Every public or durable projection takes a snapshot of this shared set so
+/// components created before a later answer (children, workflows, spill/log
+/// writers) learn the new taint instead of freezing an incomplete copy.
+#[derive(Clone, Default)]
+pub(crate) struct SensitiveUserInputProvenance {
+    values: Arc<parking_lot::RwLock<HashSet<String>>>,
+    tracked_spill_paths: Arc<parking_lot::RwLock<Vec<TrackedSpillPath>>>,
+    cleanup_generation: Arc<AtomicU64>,
+    cleanup_publication: Arc<parking_lot::RwLock<()>>,
+}
+
+/// A spill file plus the directory identity that owned it when the file was
+/// registered. On Unix, cleanup stays relative to this pinned handle so a
+/// same-user directory swap cannot redirect deletion into a replacement tree.
+#[derive(Debug, Clone)]
+pub(crate) struct TrackedSpillPath {
+    pub(crate) path: PathBuf,
+    pub(crate) file_name: OsString,
+    #[cfg(unix)]
+    pub(crate) directory: Arc<File>,
+    #[cfg(unix)]
+    directory_device: u64,
+    #[cfg(unix)]
+    directory_inode: u64,
+    #[cfg(unix)]
+    pub(crate) file_device: u64,
+    #[cfg(unix)]
+    pub(crate) file_inode: u64,
+}
+
+impl std::fmt::Debug for SensitiveUserInputProvenance {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("SensitiveUserInputProvenance")
+            .field("registered_values", &self.values.read().len())
+            .field(
+                "tracked_spill_paths",
+                &self.tracked_spill_paths.read().len(),
+            )
+            .finish()
+    }
+}
+
+impl SensitiveUserInputProvenance {
+    pub(crate) fn snapshot(&self) -> HashSet<String> {
+        self.values.read().clone()
+    }
+
+    pub(crate) fn extend<I>(&self, values: I) -> bool
+    where
+        I: IntoIterator<Item = String>,
+    {
+        let mut current = self.values.write();
+        let prior_len = current.len();
+        current.extend(values.into_iter().filter(|value| !value.is_empty()));
+        current.len() != prior_len
+    }
+
+    pub(crate) fn shares_source_with(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.values, &other.values)
+    }
+
+    #[cfg(any(test, not(unix)))]
+    pub(crate) fn track_spill_path(&self, path: PathBuf) -> io::Result<()> {
+        #[cfg(unix)]
+        let parent = path.parent().map(PathBuf::from).ok_or_else(|| {
+            io::Error::new(io::ErrorKind::InvalidInput, "spill path has no parent")
+        })?;
+        #[cfg(unix)]
+        {
+            use std::os::fd::{AsRawFd as _, FromRawFd as _};
+            use std::os::unix::ffi::OsStrExt as _;
+            use std::os::unix::fs::OpenOptionsExt as _;
+            let file_name = path.file_name().ok_or_else(|| {
+                io::Error::new(io::ErrorKind::InvalidInput, "spill path has no file name")
+            })?;
+            let mut options = std::fs::OpenOptions::new();
+            options
+                .read(true)
+                .custom_flags(libc::O_DIRECTORY | libc::O_CLOEXEC | libc::O_NOFOLLOW);
+            let directory = options.open(&parent)?;
+            let file_name = std::ffi::CString::new(file_name.as_bytes()).map_err(|_| {
+                io::Error::new(io::ErrorKind::InvalidInput, "spill basename contains NUL")
+            })?;
+            // SAFETY: `file_name` is one validated component below the pinned
+            // parent descriptor, and a successful descriptor is transferred
+            // to `File` immediately.
+            let fd = unsafe {
+                libc::openat(
+                    directory.as_raw_fd(),
+                    file_name.as_ptr(),
+                    libc::O_RDONLY | libc::O_CLOEXEC | libc::O_NOFOLLOW,
+                )
+            };
+            if fd < 0 {
+                return Err(io::Error::last_os_error());
+            }
+            // SAFETY: `fd` is newly owned on the success path above.
+            let file = unsafe { File::from_raw_fd(fd) };
+            self.track_spill_path_with_directory(path, directory, &file)
+        }
+        #[cfg(not(unix))]
+        {
+            let file_name = path.file_name().map(OsString::from).ok_or_else(|| {
+                io::Error::new(io::ErrorKind::InvalidInput, "spill path has no file name")
+            })?;
+            let mut tracked = self.tracked_spill_paths.write();
+            if tracked.iter().any(|entry| entry.path == path) {
+                return Ok(());
+            }
+            tracked.push(TrackedSpillPath { path, file_name });
+            Ok(())
+        }
+    }
+
+    #[cfg(unix)]
+    pub(crate) fn track_spill_path_with_directory(
+        &self,
+        path: PathBuf,
+        directory: File,
+        file: &File,
+    ) -> io::Result<()> {
+        use std::os::unix::fs::MetadataExt as _;
+
+        let file_name = path.file_name().map(OsString::from).ok_or_else(|| {
+            io::Error::new(io::ErrorKind::InvalidInput, "spill path has no file name")
+        })?;
+        let metadata = directory.metadata()?;
+        let directory_device = metadata.dev();
+        let directory_inode = metadata.ino();
+        let file_metadata = file.metadata()?;
+        if !file_metadata.is_file()
+            || file_metadata.uid() != unsafe { libc::geteuid() }
+            || file_metadata.nlink() != 1
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "tracked SHA spill is not a current-user regular file with one link",
+            ));
+        }
+        let file_device = file_metadata.dev();
+        let file_inode = file_metadata.ino();
+        let mut tracked = self.tracked_spill_paths.write();
+        if let Some(existing) = tracked.iter().find(|entry| {
+            entry.path == path
+                && entry.directory_device == directory_device
+                && entry.directory_inode == directory_inode
+        }) {
+            if existing.file_device == file_device && existing.file_inode == file_inode {
+                return Ok(());
+            }
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "tracked SHA spill identity changed before registration",
+            ));
+        }
+        // One session can produce many SHA receipts in the same directory.
+        // Reuse the already-pinned descriptor for that directory identity so
+        // tracking remains bounded by directory swaps, not result count.
+        let directory = tracked
+            .iter()
+            .find(|entry| {
+                entry.directory_device == directory_device
+                    && entry.directory_inode == directory_inode
+            })
+            .map(|entry| Arc::clone(&entry.directory))
+            .unwrap_or_else(|| Arc::new(directory));
+        tracked.push(TrackedSpillPath {
+            path,
+            file_name,
+            directory,
+            directory_device,
+            directory_inode,
+            file_device,
+            file_inode,
+        });
+        Ok(())
+    }
+
+    pub(crate) fn tracked_spill_paths(&self) -> Vec<TrackedSpillPath> {
+        self.tracked_spill_paths.read().clone()
+    }
+
+    pub(crate) fn begin_cleanup_generation(&self) -> u64 {
+        self.cleanup_generation
+            .fetch_add(1, Ordering::AcqRel)
+            .saturating_add(1)
+    }
+
+    pub(crate) fn invalidate_cleanup_generation(&self) {
+        self.cleanup_generation.fetch_add(1, Ordering::AcqRel);
+    }
+
+    /// Wait for any already-authorized publication to finish, then verify
+    /// that this attempt still owns the generation. Callers run this from a
+    /// blocking worker so a stalled filesystem operation cannot pin Tokio.
+    pub(crate) fn synchronize_cleanup_generation(&self, generation: u64) -> bool {
+        let _publication = self.cleanup_publication.write();
+        self.cleanup_generation_is_current(generation)
+    }
+
+    pub(crate) fn cleanup_generation_is_current(&self, generation: u64) -> bool {
+        self.cleanup_generation.load(Ordering::Acquire) == generation
+    }
+
+    /// Publish one already-prepared cleanup mutation only while `generation`
+    /// remains current. Invalidation is deliberately nonblocking; the next
+    /// cleanup generation takes the write side via
+    /// [`Self::synchronize_cleanup_generation`] and waits for any publication
+    /// already authorized by this read-side check to finish.
+    pub(crate) fn publish_cleanup_if_current<T>(
+        &self,
+        generation: u64,
+        publish: impl FnOnce() -> T,
+    ) -> Option<T> {
+        let _publication = self.cleanup_publication.read();
+        self.cleanup_generation_is_current(generation).then(publish)
+    }
+}
+
 /// Request payload for sending a message to the API.
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct MessageRequest {
@@ -68,6 +300,12 @@ pub struct MessageRequest {
     pub temperature: Option<f32>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub top_p: Option<f32>,
+    /// Process-local cumulative privacy provenance. This is deliberately not
+    /// provider-wire data: adapters use it only to prevent or retire durable
+    /// spill handles after the originating modal answer has compacted out of
+    /// `messages`.
+    #[serde(skip, default)]
+    pub(crate) sensitive_user_input_provenance: SensitiveUserInputProvenance,
 }
 
 /// System prompt representation (plain text or structured blocks).
@@ -724,6 +962,62 @@ pub struct MessageDelta {
 mod tests {
     use super::*;
     use std::collections::BTreeMap;
+
+    #[test]
+    fn cleanup_invalidation_is_nonblocking_and_next_attempt_joins_prior_publication() {
+        let provenance = SensitiveUserInputProvenance::default();
+        let first_generation = provenance.begin_cleanup_generation();
+        let publisher_provenance = provenance.clone();
+        let (publishing_tx, publishing_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let publisher = std::thread::spawn(move || {
+            publisher_provenance
+                .publish_cleanup_if_current(first_generation, || {
+                    publishing_tx.send(()).expect("signal publication");
+                    release_rx.recv().expect("release publication");
+                })
+                .expect("first publication was authorized");
+        });
+        publishing_rx.recv().expect("publication started");
+
+        let started = std::time::Instant::now();
+        provenance.invalidate_cleanup_generation();
+        assert!(
+            started.elapsed() < std::time::Duration::from_millis(50),
+            "timeout invalidation must not wait on a blocking publication"
+        );
+
+        let next_generation = provenance.begin_cleanup_generation();
+        let synchronizer_provenance = provenance.clone();
+        let (synchronizer_started_tx, synchronizer_started_rx) = std::sync::mpsc::channel();
+        let (synchronized_tx, synchronized_rx) = std::sync::mpsc::channel();
+        let synchronizer = std::thread::spawn(move || {
+            synchronizer_started_tx
+                .send(())
+                .expect("signal synchronization start");
+            synchronized_tx
+                .send(synchronizer_provenance.synchronize_cleanup_generation(next_generation))
+                .expect("send synchronization result");
+        });
+        synchronizer_started_rx
+            .recv()
+            .expect("synchronizer thread started");
+        assert!(
+            synchronized_rx
+                .recv_timeout(std::time::Duration::from_millis(20))
+                .is_err(),
+            "the next attempt must wait for an already-authorized publication"
+        );
+
+        release_tx.send(()).expect("release publication");
+        publisher.join().expect("publisher thread");
+        assert!(
+            synchronized_rx
+                .recv_timeout(std::time::Duration::from_secs(1))
+                .expect("next attempt synchronized")
+        );
+        synchronizer.join().expect("synchronizer thread");
+    }
 
     #[test]
     fn v4_snapshots_preserve_context_window() {

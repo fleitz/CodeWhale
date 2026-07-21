@@ -489,6 +489,10 @@ impl Engine {
                     stream: Some(true),
                     temperature: None,
                     top_p: None,
+                    sensitive_user_input_provenance: self
+                        .session
+                        .sensitive_user_input_provenance
+                        .clone(),
                 };
 
                 let compaction_pins =
@@ -525,6 +529,7 @@ impl Engine {
                         Some(&compaction_pins),
                         Some(&compaction_paths),
                         Some(&request),
+                        Some(&self.session.sensitive_user_input_provenance),
                     )
                     .await
                     {

@@ -70,6 +70,7 @@ fn format_cache_inspect(app: &mut App, verbose: bool, json_mode: bool) -> String
         stream: Some(true),
         temperature: None,
         top_p: None,
+        sensitive_user_input_provenance: app.sensitive_user_input_provenance.clone(),
     };
     let inspection = inspect_prompt_for_request(&request);
     let previous = app.session.last_cache_inspection.as_ref();

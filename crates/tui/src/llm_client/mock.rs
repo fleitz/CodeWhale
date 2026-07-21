@@ -494,6 +494,7 @@ mod tests {
             stream: Some(true),
             temperature: None,
             top_p: None,
+            sensitive_user_input_provenance: Default::default(),
         }
     }
 

@@ -404,6 +404,7 @@ impl McpServer {
             stream: None,
             temperature: None,
             top_p: None,
+            sensitive_user_input_provenance: Default::default(),
         };
 
         let response = runtime

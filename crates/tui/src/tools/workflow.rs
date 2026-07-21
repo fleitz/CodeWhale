@@ -3298,10 +3298,21 @@ mod journal {
     use serde::{Deserialize, Serialize};
     use std::collections::{HashMap, HashSet};
     use std::fs::OpenOptions;
-    use std::io::{BufRead, Write};
+    use std::io::{Read, Write};
     use std::path::{Path, PathBuf};
     use std::sync::{Arc, Mutex, OnceLock};
     use tracing::warn;
+
+    #[cfg(unix)]
+    use std::ffi::CString;
+    #[cfg(unix)]
+    use std::fs::File;
+    #[cfg(unix)]
+    use std::os::fd::{AsRawFd as _, FromRawFd as _};
+    #[cfg(unix)]
+    use std::os::unix::ffi::OsStrExt as _;
+    #[cfg(unix)]
+    use std::os::unix::fs::{MetadataExt as _, OpenOptionsExt as _, PermissionsExt as _};
 
     const CODEWHALE_DIR: &str = ".codewhale";
     const WORKFLOW_RUNS_FILE: &str = "workflow-runs.jsonl";
@@ -3356,10 +3367,23 @@ mod journal {
                 .unwrap_or_default()
         }
 
+        #[cfg(test)]
         fn refresh_sensitive_user_input_provenance(
             &self,
             provenance: &crate::runtime_threads::SensitiveUserInputProvenance,
         ) -> Result<(), String> {
+            let generation = provenance.begin_cleanup_generation();
+            self.refresh_sensitive_user_input_provenance_for_generation(provenance, generation)
+        }
+
+        fn refresh_sensitive_user_input_provenance_for_generation(
+            &self,
+            provenance: &crate::runtime_threads::SensitiveUserInputProvenance,
+            generation: u64,
+        ) -> Result<(), String> {
+            if !provenance.cleanup_generation_is_current(generation) {
+                return Err("workflow privacy cleanup generation was superseded".to_string());
+            }
             let run_ids = self
                 .sensitive_user_input_provenance
                 .lock()
@@ -3375,17 +3399,18 @@ mod journal {
                 return Ok(());
             }
             let sensitive_values = provenance.snapshot();
-            let mut runs = self
+            let runs = self
                 .runs
                 .lock()
                 .unwrap_or_else(|poison| poison.into_inner());
+            let mut projected_runs = Vec::new();
             for run_id in &run_ids {
-                if let Some(run) = runs.get_mut(run_id) {
+                if let Some(run) = runs.get(run_id) {
                     match crate::runtime_threads::redacted_serializable_clone(
                         run,
                         &sensitive_values,
                     ) {
-                        Ok(projected) => *run = projected,
+                        Ok(projected) => projected_runs.push((run_id.clone(), projected)),
                         Err(err) => {
                             return Err(format!(
                                 "workflow late privacy projection failed for {run_id}: {err}"
@@ -3396,8 +3421,23 @@ mod journal {
             }
             drop(runs);
             self.journal
-                .reproject_runs(&run_ids, &sensitive_values)
-                .map_err(|err| format!("workflow late journal privacy projection failed: {err}"))
+                .reproject_runs(&run_ids, &sensitive_values, provenance, generation)
+                .map_err(|err| format!("workflow late journal privacy projection failed: {err}"))?;
+            provenance
+                .publish_cleanup_if_current(generation, || {
+                    let mut runs = self
+                        .runs
+                        .lock()
+                        .unwrap_or_else(|poison| poison.into_inner());
+                    for (run_id, projected) in projected_runs {
+                        runs.insert(run_id, projected);
+                    }
+                })
+                .ok_or_else(|| {
+                    "workflow privacy cleanup generation was superseded before publication"
+                        .to_string()
+                })?;
+            Ok(())
         }
 
         pub fn attach_lifecycle(&self, run_id: &str, lifecycle: WorkflowWorkLifecycle) {
@@ -3523,8 +3563,9 @@ mod journal {
             .clone()
     }
 
-    pub(crate) fn refresh_sensitive_user_input_provenance(
+    pub(crate) fn refresh_sensitive_user_input_provenance_for_generation(
         provenance: &crate::runtime_threads::SensitiveUserInputProvenance,
+        generation: u64,
     ) -> Result<(), String> {
         let states = workspace_store()
             .lock()
@@ -3533,7 +3574,7 @@ mod journal {
             .cloned()
             .collect::<Vec<_>>();
         for state in states {
-            state.refresh_sensitive_user_input_provenance(provenance)?;
+            state.refresh_sensitive_user_input_provenance_for_generation(provenance, generation)?;
         }
         Ok(())
     }
@@ -3558,8 +3599,193 @@ mod journal {
 
     #[derive(Debug)]
     struct WorkflowRunJournal {
+        #[cfg(not(unix))]
         ledger_path: PathBuf,
+        #[cfg(unix)]
+        pinned: Option<PinnedWorkflowJournal>,
         io_lock: Mutex<()>,
+    }
+
+    #[cfg(unix)]
+    #[derive(Debug)]
+    struct PinnedWorkflowJournal {
+        directory: File,
+        target: CString,
+    }
+
+    #[cfg(unix)]
+    impl PinnedWorkflowJournal {
+        fn open(path: &Path) -> std::io::Result<Self> {
+            let parent = path.parent().ok_or_else(|| {
+                std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    "workflow journal path has no parent",
+                )
+            })?;
+            let target_name = path.file_name().ok_or_else(|| {
+                std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    "workflow journal path has no basename",
+                )
+            })?;
+            let target = CString::new(target_name.as_bytes()).map_err(|_| {
+                std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    "workflow journal basename contains NUL",
+                )
+            })?;
+            let mut options = OpenOptions::new();
+            options
+                .read(true)
+                .custom_flags(libc::O_DIRECTORY | libc::O_CLOEXEC | libc::O_NOFOLLOW);
+            let directory = options.open(parent)?;
+            directory.set_permissions(std::fs::Permissions::from_mode(0o700))?;
+            Ok(Self { directory, target })
+        }
+
+        fn read_to_string(&self) -> std::io::Result<String> {
+            // SAFETY: the pinned descriptor and validated basename remain
+            // valid. A successful descriptor is transferred to `File`.
+            let fd = unsafe {
+                libc::openat(
+                    self.directory.as_raw_fd(),
+                    self.target.as_ptr(),
+                    libc::O_RDONLY | libc::O_CLOEXEC | libc::O_NOFOLLOW,
+                )
+            };
+            if fd < 0 {
+                let error = std::io::Error::last_os_error();
+                if error.kind() == std::io::ErrorKind::NotFound {
+                    return Ok(String::new());
+                }
+                return Err(error);
+            }
+            // SAFETY: `fd` is newly owned on the success path above.
+            let mut file = unsafe { File::from_raw_fd(fd) };
+            let metadata = file.metadata()?;
+            if !metadata.is_file()
+                || metadata.uid() != unsafe { libc::geteuid() }
+                || metadata.nlink() != 1
+            {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::PermissionDenied,
+                    "workflow journal is not a current-user regular file with one link",
+                ));
+            }
+            file.set_permissions(std::fs::Permissions::from_mode(0o600))?;
+            let mut raw = String::new();
+            file.read_to_string(&mut raw)?;
+            Ok(raw)
+        }
+
+        fn append(&self, bytes: &[u8]) -> std::io::Result<()> {
+            // SAFETY: the pinned descriptor and validated basename remain
+            // valid. `O_NOFOLLOW` rejects a replaced symbolic-link leaf.
+            let fd = unsafe {
+                libc::openat(
+                    self.directory.as_raw_fd(),
+                    self.target.as_ptr(),
+                    libc::O_WRONLY
+                        | libc::O_APPEND
+                        | libc::O_CREAT
+                        | libc::O_CLOEXEC
+                        | libc::O_NOFOLLOW,
+                    0o600,
+                )
+            };
+            if fd < 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            // SAFETY: `fd` is newly owned on the success path above.
+            let mut file = unsafe { File::from_raw_fd(fd) };
+            let metadata = file.metadata()?;
+            if !metadata.is_file()
+                || metadata.uid() != unsafe { libc::geteuid() }
+                || metadata.nlink() != 1
+            {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::PermissionDenied,
+                    "workflow journal is not a current-user regular file with one link",
+                ));
+            }
+            file.set_permissions(std::fs::Permissions::from_mode(0o600))?;
+            file.write_all(bytes)?;
+            file.flush()
+        }
+
+        fn replace(
+            &self,
+            bytes: &[u8],
+            provenance: &crate::runtime_threads::SensitiveUserInputProvenance,
+            generation: u64,
+        ) -> std::io::Result<()> {
+            let temp_name = format!(".workflow-runs.{}.tmp", uuid::Uuid::new_v4());
+            let temporary = CString::new(temp_name).map_err(|_| {
+                std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    "workflow journal temporary basename contains NUL",
+                )
+            })?;
+            // SAFETY: all names are single components relative to the pinned
+            // directory. A successful descriptor is transferred to `File`.
+            let fd = unsafe {
+                libc::openat(
+                    self.directory.as_raw_fd(),
+                    temporary.as_ptr(),
+                    libc::O_WRONLY
+                        | libc::O_CREAT
+                        | libc::O_EXCL
+                        | libc::O_CLOEXEC
+                        | libc::O_NOFOLLOW,
+                    0o600,
+                )
+            };
+            if fd < 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            // SAFETY: `fd` is newly owned on the success path above.
+            let mut file = unsafe { File::from_raw_fd(fd) };
+            let result = (|| {
+                file.set_permissions(std::fs::Permissions::from_mode(0o600))?;
+                file.write_all(bytes)?;
+                file.sync_all()?;
+                provenance
+                    .publish_cleanup_if_current(generation, || {
+                        // SAFETY: both names and the pinned descriptor remain
+                        // valid for the atomic replacement.
+                        if unsafe {
+                            libc::renameat(
+                                self.directory.as_raw_fd(),
+                                temporary.as_ptr(),
+                                self.directory.as_raw_fd(),
+                                self.target.as_ptr(),
+                            )
+                        } == 0
+                        {
+                            Ok(())
+                        } else {
+                            Err(std::io::Error::last_os_error())
+                        }
+                    })
+                    .ok_or_else(|| {
+                        std::io::Error::new(
+                            std::io::ErrorKind::Interrupted,
+                            "workflow privacy cleanup generation was superseded before publication",
+                        )
+                    })??;
+                self.directory.sync_all()?;
+                Ok(())
+            })();
+            drop(file);
+            if result.is_err() {
+                // SAFETY: cleanup is confined to the pinned directory and
+                // temporary basename created above.
+                unsafe {
+                    libc::unlinkat(self.directory.as_raw_fd(), temporary.as_ptr(), 0);
+                }
+            }
+            result
+        }
     }
 
     impl WorkflowRunJournal {
@@ -3580,20 +3806,52 @@ mod journal {
                     ledger_path.display()
                 );
             }
+            #[cfg(unix)]
+            let pinned = match PinnedWorkflowJournal::open(&ledger_path) {
+                Ok(pinned) => Some(pinned),
+                Err(err) => {
+                    warn!(
+                        "workflow journal pin failed ({}): {err}",
+                        ledger_path.display()
+                    );
+                    None
+                }
+            };
             Self {
+                #[cfg(not(unix))]
                 ledger_path,
+                #[cfg(unix)]
+                pinned,
                 io_lock: Mutex::new(()),
             }
         }
 
         fn hydrate_runs(&self) -> HashMap<String, WorkflowRunRecord> {
-            let file = match std::fs::File::open(&self.ledger_path) {
-                Ok(file) => file,
+            #[cfg(unix)]
+            let raw = match self
+                .pinned
+                .as_ref()
+                .ok_or_else(|| {
+                    std::io::Error::new(
+                        std::io::ErrorKind::PermissionDenied,
+                        "workflow journal directory is not pinned",
+                    )
+                })
+                .and_then(PinnedWorkflowJournal::read_to_string)
+            {
+                Ok(raw) => raw,
+                Err(err) => {
+                    warn!("workflow journal hydrate failed: {err}");
+                    return HashMap::new();
+                }
+            };
+            #[cfg(not(unix))]
+            let raw = match std::fs::read_to_string(&self.ledger_path) {
+                Ok(raw) => raw,
                 Err(_) => return HashMap::new(),
             };
             let mut runs = HashMap::new();
-            for line in std::io::BufReader::new(file).lines() {
-                let Ok(line) = line else { continue };
+            for line in raw.lines() {
                 let trimmed = line.trim();
                 if trimmed.is_empty() {
                     continue;
@@ -3662,24 +3920,50 @@ mod journal {
             let mut line = serde_json::to_string(record)
                 .map_err(|err| std::io::Error::other(err.to_string()))?;
             line.push('\n');
-            let mut file = OpenOptions::new()
-                .create(true)
-                .append(true)
-                .open(&self.ledger_path)?;
-            file.write_all(line.as_bytes())?;
-            file.flush()?;
-            Ok(())
+            #[cfg(unix)]
+            {
+                self.pinned
+                    .as_ref()
+                    .ok_or_else(|| {
+                        std::io::Error::new(
+                            std::io::ErrorKind::PermissionDenied,
+                            "workflow journal directory is not pinned",
+                        )
+                    })?
+                    .append(line.as_bytes())
+            }
+            #[cfg(not(unix))]
+            {
+                let mut file = OpenOptions::new()
+                    .create(true)
+                    .append(true)
+                    .open(&self.ledger_path)?;
+                file.write_all(line.as_bytes())?;
+                file.flush()
+            }
         }
 
         fn reproject_runs(
             &self,
             run_ids: &HashSet<String>,
             sensitive_values: &HashSet<String>,
+            provenance: &crate::runtime_threads::SensitiveUserInputProvenance,
+            generation: u64,
         ) -> std::io::Result<()> {
             let _io_guard = self
                 .io_lock
                 .lock()
                 .unwrap_or_else(|poison| poison.into_inner());
+            #[cfg(unix)]
+            let pinned = self.pinned.as_ref().ok_or_else(|| {
+                std::io::Error::new(
+                    std::io::ErrorKind::PermissionDenied,
+                    "workflow journal directory is not pinned",
+                )
+            })?;
+            #[cfg(unix)]
+            let raw = pinned.read_to_string()?;
+            #[cfg(not(unix))]
             let raw = std::fs::read_to_string(&self.ledger_path).unwrap_or_default();
             let mut projected = String::with_capacity(raw.len());
             for line in raw.lines() {
@@ -3713,27 +3997,43 @@ mod journal {
                 projected.push_str(&line);
                 projected.push('\n');
             }
-            let file_name = self
-                .ledger_path
-                .file_name()
-                .and_then(|name| name.to_str())
-                .unwrap_or(WORKFLOW_RUNS_FILE);
-            let tmp_path = self
-                .ledger_path
-                .with_file_name(format!(".{file_name}.{}.tmp", uuid::Uuid::new_v4()));
-            let result = (|| {
-                let mut tmp = OpenOptions::new()
-                    .create_new(true)
-                    .write(true)
-                    .open(&tmp_path)?;
-                tmp.write_all(projected.as_bytes())?;
-                tmp.sync_all()?;
-                std::fs::rename(&tmp_path, &self.ledger_path)
-            })();
-            if result.is_err() {
-                let _ = std::fs::remove_file(&tmp_path);
+            #[cfg(unix)]
+            {
+                pinned.replace(projected.as_bytes(), provenance, generation)
             }
-            result
+            #[cfg(not(unix))]
+            {
+                let file_name = self
+                    .ledger_path
+                    .file_name()
+                    .and_then(|name| name.to_str())
+                    .unwrap_or(WORKFLOW_RUNS_FILE);
+                let tmp_path = self
+                    .ledger_path
+                    .with_file_name(format!(".{file_name}.{}.tmp", uuid::Uuid::new_v4()));
+                let result = (|| {
+                    let mut tmp = OpenOptions::new()
+                        .create_new(true)
+                        .write(true)
+                        .open(&tmp_path)?;
+                    tmp.write_all(projected.as_bytes())?;
+                    tmp.sync_all()?;
+                    provenance
+                        .publish_cleanup_if_current(generation, || {
+                            std::fs::rename(&tmp_path, &self.ledger_path)
+                        })
+                        .ok_or_else(|| {
+                            std::io::Error::new(
+                                std::io::ErrorKind::Interrupted,
+                                "workflow privacy cleanup generation was superseded before publication",
+                            )
+                        })?
+                })();
+                if result.is_err() {
+                    let _ = std::fs::remove_file(&tmp_path);
+                }
+                result
+            }
         }
 
         fn append_snapshot(&self, record: &WorkflowRunRecord) -> std::io::Result<()> {
@@ -3977,8 +4277,48 @@ mod journal {
 
             let path = tmp.path().join(".codewhale/workflow-runs.jsonl");
             let durable = std::fs::read_to_string(path).expect("read workflow journal");
-            assert!(!durable.contains(SECRET));
-            assert!(durable.contains("[redacted user input]"));
+            let records = durable
+                .lines()
+                .map(serde_json::from_str::<WorkflowJournalRecord>)
+                .collect::<Result<Vec<_>, _>>()
+                .expect("parse workflow journal");
+            let WorkflowJournalRecord::Snapshot { run } = &records[0] else {
+                panic!("first workflow record was not a snapshot");
+            };
+            assert_eq!(
+                run.source_path,
+                Some(PathBuf::from(format!("private/PIN{SECRET}")))
+            );
+            assert_eq!(run.workflow_id, Some(format!("id-{SECRET}")));
+            assert_eq!(run.child_ids, vec![format!("child-{SECRET}")]);
+            assert!(
+                !run.workflow_goal
+                    .as_deref()
+                    .unwrap_or_default()
+                    .contains(SECRET)
+            );
+            assert!(run.progress.iter().all(|message| !message.contains(SECRET)));
+            assert!(!run.error.as_deref().unwrap_or_default().contains(SECRET));
+            assert!(!serde_json::to_string(&run.result).unwrap().contains(SECRET));
+            assert!(run.events.iter().all(|event| {
+                matches!(
+                    &event.kind,
+                    WorkflowUiEventKind::Log { message } if !message.contains(SECRET)
+                )
+            }));
+            let WorkflowJournalRecord::Progress { run_id, message } = &records[1] else {
+                panic!("second workflow record was not progress");
+            };
+            assert_eq!(run_id, "workflow_private");
+            assert!(!message.contains(SECRET));
+            let WorkflowJournalRecord::Event { run_id, event } = &records[2] else {
+                panic!("third workflow record was not an event");
+            };
+            assert_eq!(run_id, "workflow_private");
+            assert!(matches!(
+                &event.kind,
+                WorkflowUiEventKind::Log { message } if !message.contains(SECRET)
+            ));
         }
 
         #[test]
@@ -4029,15 +4369,120 @@ mod journal {
                     .contains(SECRET)
             );
         }
+
+        #[test]
+        fn stalled_workflow_writer_cannot_publish_after_cleanup_timeout() {
+            const SECRET: &str = "stalled-workflow-482915";
+            let tmp = tempfile::tempdir().expect("tempdir");
+            let state = WorkflowWorkspaceState::open(tmp.path());
+            let run_id = "workflow_stalled_private";
+            let provenance = crate::runtime_threads::SensitiveUserInputProvenance::default();
+            state.attach_sensitive_user_input_provenance(run_id, provenance.clone());
+            let mut record = sample_record(run_id, WorkflowRunStatus::Running);
+            record.workflow_goal = Some(format!("guessed {SECRET}"));
+            state
+                .runs
+                .lock()
+                .expect("runs")
+                .insert(run_id.to_string(), record.clone());
+            state.record_snapshot(&record);
+            let path = tmp.path().join(".codewhale/workflow-runs.jsonl");
+            provenance.extend([SECRET.to_string()]);
+
+            let io_guard = state
+                .journal
+                .io_lock
+                .lock()
+                .unwrap_or_else(|poison| poison.into_inner());
+            let generation = provenance.begin_cleanup_generation();
+            let delayed_state = Arc::clone(&state);
+            let delayed_provenance = provenance.clone();
+            let delayed = std::thread::spawn(move || {
+                delayed_state.refresh_sensitive_user_input_provenance_for_generation(
+                    &delayed_provenance,
+                    generation,
+                )
+            });
+            std::thread::sleep(std::time::Duration::from_millis(20));
+            provenance.invalidate_cleanup_generation();
+            drop(io_guard);
+
+            let error = delayed
+                .join()
+                .expect("delayed workflow cleanup")
+                .expect_err("superseded workflow cleanup must not publish");
+            assert!(error.contains("superseded"), "{error}");
+            assert!(
+                std::fs::read_to_string(&path)
+                    .expect("still-raw journal")
+                    .contains(SECRET),
+                "the stale generation must not publish even a redacted rewrite"
+            );
+
+            let fresh_generation = provenance.begin_cleanup_generation();
+            state
+                .refresh_sensitive_user_input_provenance_for_generation(
+                    &provenance,
+                    fresh_generation,
+                )
+                .expect("fresh cleanup repairs the stale journal");
+            assert!(
+                !std::fs::read_to_string(path)
+                    .expect("repaired journal")
+                    .contains(SECRET)
+            );
+        }
+
+        #[cfg(unix)]
+        #[test]
+        fn late_workflow_cleanup_uses_directory_pinned_before_same_user_swap() {
+            const SECRET: &str = "swapped-workflow-private-482915";
+            let tmp = tempfile::tempdir().expect("tempdir");
+            let state = WorkflowWorkspaceState::open(tmp.path());
+            let run_id = "workflow_swapped_private";
+            let provenance = crate::runtime_threads::SensitiveUserInputProvenance::default();
+            state.attach_sensitive_user_input_provenance(run_id, provenance.clone());
+            let mut record = sample_record(run_id, WorkflowRunStatus::Running);
+            record.workflow_goal = Some(format!("guessed {SECRET}"));
+            state
+                .runs
+                .lock()
+                .expect("runs")
+                .insert(run_id.to_string(), record.clone());
+            state.record_snapshot(&record);
+
+            let current_dir = tmp.path().join(".codewhale");
+            let original_dir = tmp.path().join("original-codewhale");
+            std::fs::rename(&current_dir, &original_dir).expect("move original journal dir");
+            std::fs::create_dir_all(&current_dir).expect("install replacement journal dir");
+            let replacement = current_dir.join(WORKFLOW_RUNS_FILE);
+            std::fs::write(&replacement, "replacement journal must stay exact\n")
+                .expect("write replacement journal");
+
+            provenance.extend([SECRET.to_string()]);
+            state
+                .refresh_sensitive_user_input_provenance(&provenance)
+                .expect("descriptor-relative late privacy rewrite");
+
+            let original = std::fs::read_to_string(original_dir.join(WORKFLOW_RUNS_FILE))
+                .expect("read original journal");
+            assert!(!original.contains(SECRET));
+            assert!(original.contains("[redacted user input]"));
+            assert_eq!(
+                std::fs::read_to_string(replacement).expect("read replacement journal"),
+                "replacement journal must stay exact\n"
+            );
+        }
     }
 }
 
 use journal::{WorkflowWorkspaceState, shared_workflow_state};
 
-pub(crate) fn refresh_sensitive_user_input_provenance(
+pub(crate) fn refresh_sensitive_user_input_provenance_for_generation(
     provenance: &crate::runtime_threads::SensitiveUserInputProvenance,
+    generation: u64,
 ) -> Result<(), String> {
-    journal::refresh_sensitive_user_input_provenance(provenance)
+    journal::refresh_sensitive_user_input_provenance_for_generation(provenance, generation)
 }
 
 /// Reconcile workflow bindings after the journal has replayed restart

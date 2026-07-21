@@ -2642,19 +2642,6 @@ fn redact_optional_text(text: &mut Option<String>, sensitive_values: &HashSet<St
     }
 }
 
-fn redact_path(path: &mut PathBuf, sensitive_values: &HashSet<String>) {
-    *path = PathBuf::from(crate::runtime_threads::redacted_sensitive_user_input_text(
-        &path.to_string_lossy(),
-        sensitive_values,
-    ));
-}
-
-fn redact_optional_path(path: &mut Option<PathBuf>, sensitive_values: &HashSet<String>) {
-    if let Some(path) = path.as_mut() {
-        redact_path(path, sensitive_values);
-    }
-}
-
 fn redact_history_cell(cell: &mut HistoryCell, sensitive_values: &HashSet<String>) {
     match cell {
         HistoryCell::User { content }
@@ -2695,12 +2682,7 @@ fn redact_tool_cell(cell: &mut ToolCell, sensitive_values: &HashSet<String>) {
             redact_optional_text(&mut snapshot.verification_plan, sensitive_values);
             redact_optional_text(&mut snapshot.risks_and_unknowns, sensitive_values);
             redact_optional_text(&mut snapshot.handoff_packet, sensitive_values);
-            for value in snapshot
-                .sources_used
-                .iter_mut()
-                .chain(snapshot.critical_files.iter_mut())
-                .chain(snapshot.constraints.iter_mut())
-            {
+            for value in &mut snapshot.constraints {
                 redact_text(value, sensitive_values);
             }
             for item in &mut snapshot.items {
@@ -2708,12 +2690,10 @@ fn redact_tool_cell(cell: &mut ToolCell, sensitive_values: &HashSet<String>) {
             }
         }
         ToolCell::PatchSummary(cell) => {
-            redact_text(&mut cell.path, sensitive_values);
             redact_text(&mut cell.summary, sensitive_values);
             redact_optional_text(&mut cell.error, sensitive_values);
         }
         ToolCell::Review(cell) => {
-            redact_text(&mut cell.target, sensitive_values);
             redact_optional_text(&mut cell.error, sensitive_values);
             if let Some(output) = cell.output.as_mut() {
                 redact_text(&mut output.summary, sensitive_values);
@@ -2721,11 +2701,9 @@ fn redact_tool_cell(cell: &mut ToolCell, sensitive_values: &HashSet<String>) {
                 for issue in &mut output.issues {
                     redact_text(&mut issue.title, sensitive_values);
                     redact_text(&mut issue.description, sensitive_values);
-                    redact_optional_text(&mut issue.path, sensitive_values);
                 }
                 for suggestion in &mut output.suggestions {
                     redact_text(&mut suggestion.suggestion, sensitive_values);
-                    redact_optional_text(&mut suggestion.path, sensitive_values);
                 }
             }
         }
@@ -2734,7 +2712,7 @@ fn redact_tool_cell(cell: &mut ToolCell, sensitive_values: &HashSet<String>) {
             redact_text(&mut cell.diff, sensitive_values);
         }
         ToolCell::Mcp(cell) => redact_optional_text(&mut cell.content, sensitive_values),
-        ToolCell::ViewImage(cell) => redact_path(&mut cell.path, sensitive_values),
+        ToolCell::ViewImage(_) => {}
         ToolCell::WebSearch(cell) => {
             redact_text(&mut cell.query, sensitive_values);
             redact_optional_text(&mut cell.summary, sensitive_values);
@@ -2749,7 +2727,6 @@ fn redact_tool_cell(cell: &mut ToolCell, sensitive_values: &HashSet<String>) {
                     redact_text(prompt, sensitive_values);
                 }
             }
-            redact_optional_path(&mut cell.spillover_path, sensitive_values);
             redact_optional_text(&mut cell.output_summary, sensitive_values);
         }
     }
@@ -2950,13 +2927,10 @@ impl App {
             redact_text(&mut panel.label, &sensitive_values);
             redact_optional_text(&mut panel.error, &sensitive_values);
             redact_optional_text(&mut panel.result_summary, &sensitive_values);
-            redact_optional_path(&mut panel.source_path, &sensitive_values);
-            redact_optional_path(&mut panel.spillover_path, &sensitive_values);
             for phase in &mut panel.phases {
                 redact_text(&mut phase.title, &sensitive_values);
                 for row in &mut phase.rows {
                     redact_text(&mut row.label, &sensitive_values);
-                    redact_optional_path(&mut row.workspace, &sensitive_values);
                     redact_optional_text(&mut row.error, &sensitive_values);
                     redact_optional_text(&mut row.schema_error, &sensitive_values);
                 }

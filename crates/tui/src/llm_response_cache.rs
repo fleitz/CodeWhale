@@ -116,6 +116,7 @@ mod tests {
             stream: None,
             temperature: Some(0.0),
             top_p: None,
+            sensitive_user_input_provenance: Default::default(),
         }
     }
 

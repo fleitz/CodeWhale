@@ -2472,7 +2472,19 @@ mod tests {
             .save_session(&session)
             .expect("save projected session");
         let raw_session = fs::read_to_string(saved_path).expect("saved session bytes");
-        assert!(!raw_session.contains(SECRET), "{raw_session}");
+        let raw_session: SavedSession =
+            serde_json::from_str(&raw_session).expect("projected session stays loadable");
+        assert_eq!(raw_session.metadata.model, SHORT);
+        assert_eq!(
+            raw_session
+                .work_state
+                .as_ref()
+                .expect("Work state")
+                .plan
+                .sources_used,
+            vec![format!("source {SECRET} {SHORT}")],
+            "source identity is structural"
+        );
         let saved_artifact = fs::read_to_string(&artifact_path).expect("projected artifact");
         assert!(!saved_artifact.contains(SECRET), "{saved_artifact}");
         assert!(!saved_artifact.contains(SHORT), "{saved_artifact}");
@@ -2489,10 +2501,16 @@ mod tests {
                 .is_some_and(|prompt| !prompt.contains(SECRET) && !prompt.contains(SHORT))
         );
         let plan = &loaded.work_state.as_ref().expect("Work state").plan;
+        assert_eq!(plan.sources_used, vec![format!("source {SECRET} {SHORT}")]);
         assert!(
-            plan.sources_used
+            plan.objective
+                .as_deref()
+                .is_some_and(|objective| !objective.contains(SECRET) && !objective.contains(SHORT))
+        );
+        assert!(
+            plan.items
                 .iter()
-                .all(|source| !source.contains(SECRET) && !source.contains(SHORT))
+                .all(|item| !item.step.contains(SECRET) && !item.step.contains(SHORT))
         );
         assert!(loaded.artifacts[0].preview.find(SECRET).is_none());
         assert_eq!(

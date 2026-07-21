@@ -8046,7 +8046,7 @@ fn classified_values_redact_nested_json_object_keys_and_values() -> Result<()> {
 }
 
 #[test]
-fn typed_projection_preserves_fixed_schema_keys_and_redacts_dynamic_json_keys() -> Result<()> {
+fn typed_projection_preserves_fixed_and_dynamic_operational_identity() -> Result<()> {
     #[derive(Debug, Serialize, Deserialize)]
     struct FixedEnvelope {
         id: String,
@@ -8069,17 +8069,80 @@ fn typed_projection_preserves_fixed_schema_keys_and_redacts_dynamic_json_keys() 
     let serialized = serde_json::to_value(projected)?;
 
     assert_eq!(serialized["id"], "stable-id");
-    assert!(
-        serialized["session_id"]
-            .as_str()
-            .is_some_and(|value| { value.starts_with("linked-") && !value.contains('7') })
-    );
+    assert_eq!(serialized["session_id"], "linked-7");
     assert_eq!(serialized["messages"][0], "ordinary");
     assert!(serialized.get("input").is_some());
     assert!(serialized["input"].get("input").is_none());
     let dynamic = serde_json::to_string(&serialized["input"])?;
     assert!(!dynamic.contains("\"7\""));
     assert!(!dynamic.contains("echo input"));
+    Ok(())
+}
+
+#[test]
+fn dynamic_metadata_redacts_prose_without_rewriting_operational_leaves() -> Result<()> {
+    #[derive(Debug, Serialize, Deserialize)]
+    struct MetadataEnvelope {
+        metadata: Value,
+    }
+
+    const SECRET: &str = "7";
+    let envelope = MetadataEnvelope {
+        metadata: json!({
+            "agent_id": "agent_7abc",
+            "session_id": "session-7",
+            "tool_name": "tool-7",
+            "artifact_path": "/tmp/artifact-7.txt",
+            "provider_identity": {
+                "provider": "openai-7",
+                "key": "provider-key-7",
+                "exact_id": "provider-exact-7",
+                "message": "provider prose echoed 7"
+            },
+            "message": "public prose echoed 7",
+            "nested": {"workspace": "/tmp/workspace-7", "detail": "detail 7"}
+        }),
+    };
+    let projected = redacted_serializable_clone(&envelope, &HashSet::from([SECRET.to_string()]))?;
+
+    assert_eq!(projected.metadata["agent_id"], "agent_7abc");
+    assert_eq!(projected.metadata["session_id"], "session-7");
+    assert_eq!(projected.metadata["tool_name"], "tool-7");
+    assert_eq!(projected.metadata["artifact_path"], "/tmp/artifact-7.txt");
+    assert_eq!(
+        projected.metadata["provider_identity"]["provider"],
+        "openai-7"
+    );
+    assert_eq!(
+        projected.metadata["provider_identity"]["key"],
+        "provider-key-7"
+    );
+    assert_eq!(
+        projected.metadata["provider_identity"]["exact_id"],
+        "provider-exact-7"
+    );
+    assert!(
+        !projected.metadata["provider_identity"]["message"]
+            .as_str()
+            .unwrap_or_default()
+            .contains(SECRET)
+    );
+    assert_eq!(
+        projected.metadata["nested"]["workspace"],
+        "/tmp/workspace-7"
+    );
+    assert!(
+        !projected.metadata["message"]
+            .as_str()
+            .unwrap_or_default()
+            .contains(SECRET)
+    );
+    assert!(
+        !projected.metadata["nested"]["detail"]
+            .as_str()
+            .unwrap_or_default()
+            .contains(SECRET)
+    );
     Ok(())
 }
 
@@ -8195,13 +8258,64 @@ fn late_thread_projection_preserves_every_execution_identity_field_byte_exact() 
     Ok(())
 }
 
+#[tokio::test]
+async fn thread_update_preserves_taint_colliding_route_and_workspace_identity() -> Result<()> {
+    let manager = test_manager(test_runtime_dir())?;
+    let thread = manager
+        .create_thread(CreateThreadRequest::default())
+        .await?;
+    manager
+        .extend_sensitive_user_input_values(
+            &thread.id,
+            [
+                "openai".to_string(),
+                "agent".to_string(),
+                "tmp".to_string(),
+                "7".to_string(),
+            ],
+        )
+        .await?;
+
+    let updated = manager
+        .update_thread(
+            &thread.id,
+            UpdateThreadRequest {
+                model: Some("openai-7".to_string()),
+                mode: Some("agent-7".to_string()),
+                workspace: Some(PathBuf::from("/tmp/repo-7")),
+                title: Some("public title echoed openai agent tmp 7".to_string()),
+                ..UpdateThreadRequest::default()
+            },
+        )
+        .await?;
+
+    assert_eq!(updated.model, "openai-7");
+    assert_eq!(updated.mode, "agent-7");
+    assert_eq!(updated.workspace, PathBuf::from("/tmp/repo-7"));
+    assert!(
+        !updated
+            .title
+            .as_deref()
+            .unwrap_or_default()
+            .contains("openai")
+    );
+    let durable = manager.store.load_thread(&thread.id)?;
+    assert_eq!(durable.model, updated.model);
+    assert_eq!(durable.mode, updated.mode);
+    assert_eq!(durable.workspace, updated.workspace);
+    Ok(())
+}
+
 #[test]
 fn public_tool_result_projects_dynamic_metadata_without_changing_result_schema() -> Result<()> {
     let sensitive_values = HashSet::from(["input".to_string(), "7".to_string()]);
     let result = Ok(
         crate::tools::spec::ToolResult::success("echo 7").with_metadata(json!({
             "input": "7",
-            "safe": {"input": "echo input"}
+            "safe": {"input": "echo input"},
+            "agent_id": "agent-7",
+            "workspace": "/tmp/workspace-7",
+            "message": "public prose echoed input and 7"
         })),
     );
     let projected = redacted_tool_result_for_public(&result, &sensitive_values)?;
@@ -8215,6 +8329,76 @@ fn public_tool_result_projects_dynamic_metadata_without_changing_result_schema()
     }
     assert!(serialized["metadata"].get("input").is_none());
     assert!(!serde_json::to_string(&serialized["metadata"])?.contains("\"7\""));
+    assert_eq!(serialized["metadata"]["agent_id"], "agent-7");
+    assert_eq!(serialized["metadata"]["workspace"], "/tmp/workspace-7");
+    assert!(
+        !serialized["metadata"]["message"]
+            .as_str()
+            .unwrap_or_default()
+            .contains('7')
+    );
+    Ok(())
+}
+
+#[test]
+fn durable_history_keeps_operational_paths_and_error_identity_exact() -> Result<()> {
+    let sensitive_values =
+        HashSet::from(["7".to_string(), "path".to_string(), "read_file".to_string()]);
+    let messages = vec![Message {
+        role: "assistant".to_string(),
+        content: vec![ContentBlock::ToolUse {
+            id: "call-7".to_string(),
+            name: "read_file".to_string(),
+            input: json!({
+                "path": "/tmp/workspace-7/file.txt",
+                "message": "public prose echoed read_file path and 7"
+            }),
+            caller: Some(crate::models::ToolCaller {
+                caller_type: "agent-7".to_string(),
+                tool_id: Some("parent-tool-7".to_string()),
+            }),
+        }],
+    }];
+
+    let projected = redacted_durable_history_clone(&messages, &sensitive_values);
+    let ContentBlock::ToolUse {
+        id,
+        name,
+        input,
+        caller,
+    } = &projected[0].content[0]
+    else {
+        panic!("expected projected tool use");
+    };
+    assert_eq!(id, "call-7");
+    assert_eq!(name, "read_file");
+    let caller = caller.as_ref().expect("tool caller identity");
+    assert_eq!(caller.caller_type, "agent-7");
+    assert_eq!(caller.tool_id.as_deref(), Some("parent-tool-7"));
+    assert_eq!(input["path"], "/tmp/workspace-7/file.txt");
+    assert!(!input["message"].as_str().unwrap_or_default().contains('7'));
+
+    let missing = Err(crate::tools::spec::ToolError::MissingField {
+        field: "path-7".to_string(),
+    });
+    let crate::tools::spec::ToolError::MissingField { field } =
+        redacted_tool_result_for_public(&missing, &sensitive_values)
+            .expect_err("missing-field result stays an error")
+    else {
+        panic!("expected missing-field error");
+    };
+    assert_eq!(field, "path-7");
+
+    let escaped = Err(crate::tools::spec::ToolError::PathEscape {
+        path: PathBuf::from("/tmp/workspace-7/file.txt"),
+    });
+    let crate::tools::spec::ToolError::PathEscape { path } =
+        redacted_tool_result_for_public(&escaped, &sensitive_values)
+            .expect_err("path-escape result stays an error")
+    else {
+        panic!("expected path-escape error");
+    };
+    assert_eq!(path, PathBuf::from("/tmp/workspace-7/file.txt"));
     Ok(())
 }
 
@@ -8390,14 +8574,55 @@ async fn late_root_taint_rewrites_thread_metadata_and_event_replay() -> Result<(
             .unwrap_or_default()
             .contains(SECRET)
     );
-    assert!(!serde_json::to_string(&durable_events)?.contains(SECRET));
+    let durable_update = durable_events
+        .iter()
+        .find(|event| event.event == "thread.updated")
+        .expect("durable thread.updated event");
+    let expected_workspace = format!("/tmp/guessed-{SECRET}");
+    assert_eq!(
+        durable_update
+            .payload
+            .pointer("/thread/workspace")
+            .and_then(Value::as_str),
+        Some(expected_workspace.as_str())
+    );
+    assert_eq!(
+        durable_update
+            .payload
+            .pointer("/changes/workspace")
+            .and_then(Value::as_str),
+        Some(expected_workspace.as_str())
+    );
+    for pointer in [
+        "/thread/title",
+        "/thread/system_prompt",
+        "/changes/title",
+        "/changes/system_prompt",
+    ] {
+        assert!(
+            !durable_update
+                .payload
+                .pointer(pointer)
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .contains(SECRET),
+            "unprojected event prose at {pointer}: {}",
+            durable_update.payload
+        );
+    }
     let durable_thread_file: ThreadRecord = serde_json::from_str(&std::fs::read_to_string(
         data_dir.join("threads").join(format!("{}.json", thread.id)),
     )?)?;
     assert_eq!(durable_thread_file, durable_thread);
-    assert!(
-        !std::fs::read_to_string(data_dir.join("events").join(format!("{}.jsonl", thread.id)))?
-            .contains(SECRET)
+    let durable_event_file =
+        std::fs::read_to_string(data_dir.join("events").join(format!("{}.jsonl", thread.id)))?;
+    let durable_event_file = durable_event_file
+        .lines()
+        .map(serde_json::from_str::<RuntimeEventRecord>)
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+    assert_eq!(
+        serde_json::to_value(&durable_event_file)?,
+        serde_json::to_value(&durable_events)?
     );
     assert_eq!(manager.get_thread(&thread.id).await?, durable_thread);
     assert_eq!(
@@ -8420,18 +8645,69 @@ async fn late_root_taint_rewrites_thread_metadata_and_event_replay() -> Result<(
             },
         )
         .await?;
-    assert!(!serde_json::to_string(&projected_update)?.contains(SECRET));
-    assert!(!serde_json::to_string(&manager.store.load_thread(&thread.id)?)?.contains(SECRET));
+    let new_workspace = PathBuf::from(format!("/tmp/new-{SECRET}"));
+    assert_eq!(projected_update.workspace, new_workspace);
     assert!(
-        !serde_json::to_string(&manager.store.events_since(&thread.id, None)?)?.contains(SECRET)
+        !projected_update
+            .title
+            .as_deref()
+            .unwrap_or_default()
+            .contains(SECRET)
     );
+    assert!(
+        !projected_update
+            .system_prompt
+            .as_deref()
+            .unwrap_or_default()
+            .contains(SECRET)
+    );
+    assert_eq!(manager.store.load_thread(&thread.id)?, projected_update);
+
+    let updated_events = manager.store.events_since(&thread.id, None)?;
+    let latest_update = updated_events.last().expect("latest thread.updated event");
+    assert_eq!(latest_update.event, "thread.updated");
+    let new_workspace_text = new_workspace.to_string_lossy();
+    assert_eq!(
+        latest_update
+            .payload
+            .pointer("/thread/workspace")
+            .and_then(Value::as_str),
+        Some(new_workspace_text.as_ref())
+    );
+    assert_eq!(
+        latest_update
+            .payload
+            .pointer("/changes/workspace")
+            .and_then(Value::as_str),
+        Some(new_workspace_text.as_ref())
+    );
+    for pointer in [
+        "/thread/title",
+        "/thread/system_prompt",
+        "/changes/title",
+        "/changes/system_prompt",
+    ] {
+        assert!(
+            !latest_update
+                .payload
+                .pointer(pointer)
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .contains(SECRET),
+            "unprojected event prose at {pointer}: {}",
+            latest_update.payload
+        );
+    }
 
     let mut replay = manager.replay_events(&thread.id, None, None).await?;
     let mut replayed = Vec::new();
     while let Some(batch) = replay.batches.recv().await {
         replayed.extend(batch.map_err(anyhow::Error::msg)?);
     }
-    assert!(!serde_json::to_string(&replayed)?.contains(SECRET));
+    assert_eq!(
+        serde_json::to_value(&replayed)?,
+        serde_json::to_value(&updated_events)?
+    );
     Ok(())
 }
 
@@ -8671,7 +8947,28 @@ async fn pending_late_taint_manifest_projects_forks_and_usage_keys() -> Result<(
         .expect_err("injected rewrite failure must leave projected recovery work pending");
     let rewrite_path = manager.store.sensitive_rewrite_path(&thread.id)?;
     assert!(rewrite_path.exists());
-    assert!(!std::fs::read_to_string(&rewrite_path)?.contains(SECRET));
+    let pending: PendingSensitiveRewrite =
+        serde_json::from_str(&std::fs::read_to_string(&rewrite_path)?)?;
+    let projected_turn: TurnRecord = serde_json::from_str(
+        &pending
+            .replacements
+            .iter()
+            .find(|replacement| {
+                matches!(replacement.target, SensitiveRewriteTarget::Turn)
+                    && replacement.id == turn_ids[0]
+            })
+            .expect("pending projected usage turn")
+            .contents,
+    )?;
+    assert_eq!(
+        projected_turn.effective_model.as_deref(),
+        Some(format!("model-{SECRET}").as_str())
+    );
+    assert_eq!(
+        projected_turn.effective_provider.as_deref(),
+        Some(format!("provider-{SECRET}").as_str())
+    );
+    assert!(!projected_turn.input_summary.contains(SECRET));
     assert!(serde_json::to_string(&manager.store.load_turn(&turn_ids[0])?)?.contains(SECRET));
     assert!(
         serde_json::to_string(&manager.store.list_items_for_turn(&turn_ids[0])?)?.contains(SECRET)
@@ -8679,15 +8976,29 @@ async fn pending_late_taint_manifest_projects_forks_and_usage_keys() -> Result<(
 
     for group_by in [UsageGroupBy::Model, UsageGroupBy::Provider] {
         let usage = manager.aggregate_usage(None, None, group_by).await?;
-        let serialized = serde_json::to_string(&usage)?;
-        assert!(!serialized.contains(SECRET));
         assert_eq!(usage.buckets.len(), 1);
+        let expected = match group_by {
+            UsageGroupBy::Model => format!("model-{SECRET}"),
+            UsageGroupBy::Provider => format!("provider-{SECRET}"),
+            UsageGroupBy::Day | UsageGroupBy::Thread => unreachable!(),
+        };
+        assert_eq!(usage.buckets[0].key, expected);
     }
 
     let forked = manager.fork_thread(&thread.id).await?;
     assert!(!serde_json::to_string(&forked)?.contains(SECRET));
     for turn in manager.store.list_turns_for_thread(&forked.id)? {
-        assert!(!serde_json::to_string(&turn)?.contains(SECRET));
+        assert!(!turn.input_summary.contains(SECRET));
+        if turn.id == turn_ids[0] {
+            assert_eq!(
+                turn.effective_model.as_deref(),
+                Some(format!("model-{SECRET}").as_str())
+            );
+            assert_eq!(
+                turn.effective_provider.as_deref(),
+                Some(format!("provider-{SECRET}").as_str())
+            );
+        }
         assert!(
             !serde_json::to_string(&manager.store.list_items_for_turn(&turn.id)?)?.contains(SECRET)
         );
@@ -8706,7 +9017,17 @@ async fn pending_late_taint_manifest_projects_forks_and_usage_keys() -> Result<(
             .is_some_and(|text| text.contains("[redacted user input]"))
     );
     for turn in manager.store.list_turns_for_thread(&backtracked.id)? {
-        assert!(!serde_json::to_string(&turn)?.contains(SECRET));
+        assert!(!turn.input_summary.contains(SECRET));
+        if turn.id == turn_ids[0] {
+            assert_eq!(
+                turn.effective_model.as_deref(),
+                Some(format!("model-{SECRET}").as_str())
+            );
+            assert_eq!(
+                turn.effective_provider.as_deref(),
+                Some(format!("provider-{SECRET}").as_str())
+            );
+        }
         assert!(
             !serde_json::to_string(&manager.store.list_items_for_turn(&turn.id)?)?.contains(SECRET)
         );
@@ -8782,9 +9103,27 @@ async fn registered_taint_preserves_session_identity_and_projects_turn_api_retur
         Some(format!("session-{SECRET}").as_str()),
         "linked-session identity must remain byte-exact for history restore"
     );
-    assert!(
-        !serde_json::to_string(&manager.store.events_since(&thread.id, None)?)?.contains(SECRET)
-    );
+    let assert_projected_events = |events: &[RuntimeEventRecord]| -> Result<()> {
+        for event in events {
+            let mut projected = serde_json::to_value(event)?;
+            for pointer in ["/payload/thread/session_id", "/payload/changes/session_id"] {
+                if let Some(value) = projected.pointer_mut(pointer) {
+                    assert_eq!(
+                        value.as_str(),
+                        Some(format!("session-{SECRET}").as_str()),
+                        "session identity changed at {pointer}"
+                    );
+                    *value = json!("structural-session-id");
+                }
+            }
+            assert!(
+                !serde_json::to_string(&projected)?.contains(SECRET),
+                "event prose retained classified input: {projected}"
+            );
+        }
+        Ok(())
+    };
+    assert_projected_events(&manager.store.events_since(&thread.id, None)?)?;
 
     let mut harness = install_mock_engine(&manager, &thread.id).await;
     let accepted = manager
@@ -8833,7 +9172,7 @@ async fn registered_taint_preserves_session_identity_and_projects_turn_api_retur
     manager.store.save_turn(&stale_turn)?;
     let interrupted = manager.interrupt_turn(&thread.id, &accepted.id).await?;
     assert!(!serde_json::to_string(&interrupted)?.contains(SECRET));
-    assert!(!serde_json::to_string(&manager.events_since(&thread.id, None)?)?.contains(SECRET));
+    assert_projected_events(&manager.events_since(&thread.id, None)?)?;
     Ok(())
 }
 

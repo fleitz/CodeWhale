@@ -1337,6 +1337,7 @@ fn translation_message_request(text: &str, model: String, target_language: &str)
         stream: Some(false),
         temperature: Some(0.1),
         top_p: None,
+        sensitive_user_input_provenance: Default::default(),
     }
 }
 
@@ -2828,6 +2829,7 @@ mod tests {
             stream: Some(stream),
             temperature: Some(0.25),
             top_p: Some(0.75),
+            sensitive_user_input_provenance: Default::default(),
         }
     }
 
@@ -3471,6 +3473,7 @@ mod tests {
             stream: None,
             temperature: None,
             top_p: None,
+            sensitive_user_input_provenance: Default::default(),
         }
     }
 
@@ -4550,6 +4553,7 @@ mod tests {
                 stream: Some(false),
                 temperature: None,
                 top_p: None,
+                sensitive_user_input_provenance: Default::default(),
             })
             .await
             .expect("message succeeds");
@@ -4688,6 +4692,7 @@ mod tests {
             stream: None,
             temperature: None,
             top_p: None,
+            sensitive_user_input_provenance: Default::default(),
         };
 
         let openai = build_chat_messages_for_request_and_provider(&request, ApiProvider::Openai);
@@ -4970,6 +4975,7 @@ mod tests {
             stream: None,
             temperature: None,
             top_p: None,
+            sensitive_user_input_provenance: Default::default(),
         };
 
         let out = build_chat_messages_for_request(&request);
@@ -5026,6 +5032,7 @@ mod tests {
             stream: None,
             temperature: None,
             top_p: None,
+            sensitive_user_input_provenance: Default::default(),
         };
 
         let out = build_chat_messages_for_request(&request);
@@ -5078,6 +5085,7 @@ mod tests {
             stream: None,
             temperature: None,
             top_p: None,
+            sensitive_user_input_provenance: Default::default(),
         };
 
         let inspection = inspect_prompt_for_request(&request);
@@ -5140,6 +5148,7 @@ mod tests {
                 stream: None,
                 temperature: None,
                 top_p: None,
+                sensitive_user_input_provenance: Default::default(),
             }
         }
 
@@ -5202,6 +5211,7 @@ mod tests {
             stream: None,
             temperature: None,
             top_p: None,
+            sensitive_user_input_provenance: Default::default(),
         };
 
         let first = inspect_prompt_for_request(&request);
@@ -5257,6 +5267,7 @@ mod tests {
             stream: Some(true),
             temperature: Some(0.7),
             top_p: None,
+            sensitive_user_input_provenance: Default::default(),
         };
 
         let warmup = build_cache_warmup_request(&request);

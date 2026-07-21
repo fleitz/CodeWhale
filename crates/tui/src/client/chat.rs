@@ -887,12 +887,14 @@ pub(super) fn build_chat_messages(
     messages: &[Message],
     model: &str,
 ) -> Vec<Value> {
+    let provenance = crate::runtime_threads::SensitiveUserInputProvenance::default();
     build_chat_messages_with_reasoning(
         system,
         messages,
         model,
         should_replay_reasoning_content(model, None),
         false,
+        &provenance,
     )
 }
 
@@ -937,6 +939,7 @@ struct PromptBuilder<'a> {
     tools: Option<&'a [Tool]>,
     model: &'a str,
     reasoning_effort: Option<&'a str>,
+    sensitive_user_input_provenance: &'a crate::runtime_threads::SensitiveUserInputProvenance,
 }
 
 impl<'a> PromptBuilder<'a> {
@@ -947,6 +950,7 @@ impl<'a> PromptBuilder<'a> {
             tools: request.tools.as_deref(),
             model: &request.model,
             reasoning_effort: request.reasoning_effort.as_deref(),
+            sensitive_user_input_provenance: &request.sensitive_user_input_provenance,
         }
     }
 
@@ -958,6 +962,7 @@ impl<'a> PromptBuilder<'a> {
             self.model,
             should_replay_reasoning_content(self.model, self.reasoning_effort),
             false,
+            self.sensitive_user_input_provenance,
         )
     }
 
@@ -973,6 +978,7 @@ impl<'a> PromptBuilder<'a> {
                 self.reasoning_effort,
             ),
             false,
+            self.sensitive_user_input_provenance,
         );
         dump_system_prompt_if_requested(&messages);
         if provider == ApiProvider::Arcee {
@@ -991,6 +997,7 @@ impl<'a> PromptBuilder<'a> {
             self.model,
             should_replay_reasoning_content(self.model, self.reasoning_effort),
             true,
+            self.sensitive_user_input_provenance,
         );
         inspect_wire_request(self.tools, &messages)
     }
@@ -1024,6 +1031,7 @@ impl<'a> PromptBuilder<'a> {
             stream: None,
             temperature: Some(0.0),
             top_p: None,
+            sensitive_user_input_provenance: self.sensitive_user_input_provenance.clone(),
         }
     }
 }
@@ -1551,11 +1559,15 @@ fn sha256_hex(bytes: &[u8]) -> String {
 /// no-home-dir edge case (InvalidInput) is treated as a real
 /// failure: we can't promise retrieval works without a writable
 /// store.
-fn persist_tool_result_for_sha(sha: &str, content: &str) -> bool {
+fn persist_tool_result_for_sha(
+    sha: &str,
+    content: &str,
+    provenance: &crate::runtime_threads::SensitiveUserInputProvenance,
+) -> bool {
     if content.chars().count() < TOOL_RESULT_SHA_PERSIST_MIN_CHARS {
         return true;
     }
-    match crate::tools::truncate::write_sha_spillover(sha, content) {
+    match crate::tools::truncate::write_sha_spillover_tracked(sha, content, provenance) {
         Ok(_) => true,
         Err(err) => {
             logging::warn(format!(
@@ -1666,6 +1678,7 @@ fn compact_tool_result_for_wire(
     message_label: &str,
     seen_tool_results: &mut HashMap<String, SeenToolResult>,
     sensitive_user_input_values: &std::collections::HashSet<String>,
+    provenance: &crate::runtime_threads::SensitiveUserInputProvenance,
 ) -> WireToolResult {
     let original_chars = content.chars().count();
     let sha = sha256_hex(content.as_bytes());
@@ -1741,7 +1754,7 @@ fn compact_tool_result_for_wire(
         // Re-check persistence before emitting a ref. If the file is
         // already present this is a cheap no-op; if the write now fails,
         // inline the content rather than producing an orphan reference.
-        if !persist_tool_result_for_sha(&sha, content) {
+        if !persist_tool_result_for_sha(&sha, content, provenance) {
             return WireToolResult {
                 content: content.to_string(),
                 original_chars,
@@ -1775,7 +1788,7 @@ fn compact_tool_result_for_wire(
         // if the write fails, skip registration so later occurrences
         // stay inline instead of pointing at a file that was never
         // created.
-        let persisted = persist_tool_result_for_sha(&sha, content);
+        let persisted = persist_tool_result_for_sha(&sha, content, provenance);
         if persisted && dedup_eligible {
             seen_tool_results.insert(
                 sha.clone(),
@@ -1884,13 +1897,15 @@ fn build_chat_messages_with_reasoning(
     _model: &str,
     include_reasoning: bool,
     include_tool_budget_metadata: bool,
+    provenance: &crate::runtime_threads::SensitiveUserInputProvenance,
 ) -> Vec<Value> {
     let mut out = Vec::new();
-    let mut sensitive_user_input_values = std::collections::HashSet::new();
+    let mut sensitive_user_input_values = provenance.snapshot();
     crate::runtime_threads::collect_sensitive_user_input_values(
         messages,
         &mut sensitive_user_input_values,
     );
+    provenance.extend(sensitive_user_input_values.iter().cloned());
     let mut pending_tool_calls: HashMap<String, PendingToolCallInfo> = HashMap::new();
     let mut seen_tool_results: HashMap<String, SeenToolResult> = HashMap::new();
     let mut last_full_turn_meta: Option<LastFullTurnMeta> = None;
@@ -2091,6 +2106,7 @@ fn build_chat_messages_with_reasoning(
                             &message_label,
                             &mut seen_tool_results,
                             &sensitive_user_input_values,
+                            provenance,
                         );
                         let mut tool_msg = json!({
                             "role": "tool",
@@ -3503,6 +3519,7 @@ mod prefix_invariant_tests {
             stream: Some(true),
             temperature: None,
             top_p: None,
+            sensitive_user_input_provenance: Default::default(),
         }
     }
 
@@ -3601,6 +3618,7 @@ mod arcee_waf_message_encoding_tests {
             stream: None,
             temperature: None,
             top_p: None,
+            sensitive_user_input_provenance: Default::default(),
         }
     }
 
@@ -3695,6 +3713,7 @@ mod minimax_reasoning_replay_tests {
             stream: None,
             temperature: None,
             top_p: None,
+            sensitive_user_input_provenance: Default::default(),
         }
     }
 
@@ -4650,6 +4669,7 @@ mod stream_decoder_tests {
             stream: None,
             temperature: None,
             top_p: None,
+            sensitive_user_input_provenance: Default::default(),
         };
 
         let inspection = inspect_prompt_for_request(&request);
@@ -4810,6 +4830,63 @@ mod stream_decoder_tests {
                     .next()
                     .is_none(),
             "classified bytes must not create a durable SHA spill"
+        );
+    }
+
+    #[test]
+    fn request_builder_keeps_cumulative_taint_after_modal_pair_compacts_out() {
+        const SECRET: &str = "post-compaction-secret-482915";
+        let _guard = crate::tools::truncate::TEST_SPILLOVER_GUARD
+            .lock()
+            .unwrap_or_else(|err| err.into_inner());
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let spill_root = tmp.path().join(".codewhale").join("tool_outputs");
+        let prior = crate::tools::truncate::set_test_spillover_root(Some(spill_root.clone()));
+        struct Restore(Option<std::path::PathBuf>);
+        impl Drop for Restore {
+            fn drop(&mut self) {
+                crate::tools::truncate::set_test_spillover_root(self.0.take());
+            }
+        }
+        let _restore = Restore(prior);
+
+        // The request_user_input call/result is intentionally absent, as it
+        // would be after context compaction. Only process-local provenance can
+        // identify this later echoed tool output as private.
+        let echoed = format!("{}-{SECRET}-{}", "H".repeat(8_000), "T".repeat(8_000));
+        let request = MessageRequest {
+            model: "deepseek-v4-flash".to_string(),
+            messages: vec![
+                tool_use_message("echo-private", "read_file", json!({"path": "output.txt"})),
+                tool_result_message("echo-private", &echoed),
+            ],
+            max_tokens: 128,
+            system: None,
+            tools: None,
+            tool_choice: None,
+            metadata: None,
+            thinking: None,
+            reasoning_effort: None,
+            stream: None,
+            temperature: None,
+            top_p: None,
+            sensitive_user_input_provenance: Default::default(),
+        };
+        request
+            .sensitive_user_input_provenance
+            .extend([SECRET.to_string()]);
+
+        let built = build_chat_messages_for_request(&request);
+        let live_echo = tool_message_content(&built, 0);
+        assert!(live_echo.contains("[TOOL_RESULT_TRUNCATED]"));
+        assert!(live_echo.contains("retrieval: unavailable"));
+        assert!(
+            !spill_root.exists()
+                || std::fs::read_dir(&spill_root)
+                    .expect("read spill root")
+                    .next()
+                    .is_none(),
+            "post-compaction taint must not create a durable SHA spill"
         );
     }
 
@@ -5054,6 +5131,7 @@ mod stream_decoder_tests {
                 stream: None,
                 temperature: None,
                 top_p: None,
+                sensitive_user_input_provenance: Default::default(),
             };
 
             let inspection = inspect_prompt_for_request(&request);
