@@ -1,18 +1,21 @@
 #![allow(dead_code)]
 //! System prompts for different modes.
 //!
-//! Prompts are assembled from composable layers loaded at compile time:
-//!   constitution.md + personality overlay → message[0] (byte-stable).
+//! Prompts are assembled from composable layers loaded at compile time from
+//! the single [`text`] module:
+//!   constitution + personality overlay → message[0] (byte-stable).
 //!   mode delta + tool taxonomy + approval policy → request-time runtime metadata.
 //!
-//! This keeps each concern in its own file and makes prompt tuning
-//! a single-file operation.
+//! Keeping every layer's text in one module makes prompt tuning a
+//! single-file operation.
 
 use crate::models::{SystemBlock, SystemPrompt};
 use crate::project_context::{ProjectContext, load_project_context_with_parents};
 use crate::tui::app::AppMode;
 use std::path::{Path, PathBuf};
 use std::sync::{LazyLock, Mutex};
+
+pub(crate) mod text;
 
 #[derive(Debug, Clone)]
 pub struct PromptSessionContext<'a> {
@@ -380,24 +383,21 @@ fn user_constitution_disabled_by_setup_state() -> bool {
 }
 
 // ── Prompt layers loaded at compile time ──────────────────────────────
-
-/// Core: task execution, tool-use rules, output format, toolbox reference,
-/// "When NOT to use" guidance, sub-agent sentinel protocol.
-///
-/// This markdown is the single hand-maintained source of the constitutional
-/// system prompt. The earlier YAML + Python-renderer generation pipeline
-/// (`constitution.yaml` / `render_constitution.py`) was retired because it
-/// had drifted from this file since the v4 "zero ceremony" adoption and the
-/// renderer could no longer reproduce it byte-for-byte. The layered runtime
-/// assembly composes this core with mode / approval / skills /
-/// context-management / compaction / authority-recap layers at runtime (see
-/// `system_prompt_for_mode_with_context_skills_and_session`). Edit this file
-/// directly; `constitution_md_carries_required_structure` guards its skeleton.
-pub const BASE_PROMPT: &str = include_str!("prompts/constitution.md");
-/// Language mirroring law, split from the compact constitution in 0.9.0.
-pub const LANGUAGE_PROMPT: &str = include_str!("prompts/language.md");
-/// Terminal-facing output formatting law, split from the compact constitution.
-pub const OUTPUT_PROMPT: &str = include_str!("prompts/output.md");
+//
+// Every bundled prompt layer lives in `prompts/text.rs` as a compile-time
+// constant (consolidated from the retired per-layer `prompts/*.md` files;
+// each constant is byte-identical to the file it replaced, trailing newline
+// included). The constants are re-exported here so the existing
+// `crate::prompts::NAME` paths used across the crate are unchanged. Edit
+// prompt text in `text.rs` directly; the test suite below guards content
+// and ordering invariants (constitution structure and binding gates #4032,
+// byte-stable prefix ordering, prefix privacy #4632).
+pub use text::{
+    AGENT_MODE, AGENT_PROMPT, AUTO_APPROVAL, BASE_PROMPT, CALM_PERSONALITY, COMPACT_TEMPLATE,
+    CORE_EXECUTION_PROFILE_PROMPT, GOAL_CONTINUATION_PROMPT, LANGUAGE_PROMPT, MEMORY_GUIDANCE,
+    NEVER_APPROVAL, OPERATE_MODE, OUTPUT_PROMPT, PLAN_MODE, PLAYFUL_PERSONALITY, SUGGEST_APPROVAL,
+    YOLO_MODE,
+};
 
 // ── Embedder prompt overrides ──
 // Let an embedder replace these compile-time prompt constants at startup,
@@ -873,22 +873,6 @@ dự án có là tiếng Anh, quá trình suy nghĩ của bạn cũng không đ�
 tích lũy trong ngữ cảnh. Trừ khi người dùng yêu cầu rõ ràng việc chuyển đổi (ví dụ \"think in English\"), \
 hãy tiếp tục suy nghĩ và trả lời bằng tiếng Việt.";
 
-/// Personality overlays — voice and tone.
-pub const CALM_PERSONALITY: &str = include_str!("prompts/personalities/calm.md");
-pub const PLAYFUL_PERSONALITY: &str = include_str!("prompts/personalities/playful.md");
-
-/// Mode deltas — permissions, workflow expectations, mode-specific rules.
-pub const AGENT_MODE: &str = include_str!("prompts/modes/agent.md");
-pub const PLAN_MODE: &str = include_str!("prompts/modes/plan.md");
-pub const YOLO_MODE: &str = include_str!("prompts/modes/yolo.md");
-pub const OPERATE_MODE: &str = include_str!("prompts/modes/operate.md");
-
-/// Approval-policy overlays — whether tool calls are auto-approved,
-/// require confirmation, or are blocked.
-pub const AUTO_APPROVAL: &str = include_str!("prompts/approvals/auto.md");
-pub const SUGGEST_APPROVAL: &str = include_str!("prompts/approvals/suggest.md");
-pub const NEVER_APPROVAL: &str = include_str!("prompts/approvals/never.md");
-
 /// Shell policy guidance for `allow_shell=false`. Referenced from the
 /// Runtime Policy Reference so the model can adapt without mutating the
 /// static system-prompt prefix (preserves DeepSeek prefix cache across
@@ -896,32 +880,6 @@ pub const NEVER_APPROVAL: &str = include_str!("prompts/approvals/never.md");
 pub const SHELL_POLICY_DISABLED: &str = "Shell tools unavailable. For mandatory-use items referencing \
 `exec_shell`, use `code_execution` (Python sandbox). For GitHub triage, use \
 `github_issue_context` / `github_pr_context` as primary route.";
-
-/// Compaction relay template — written into the system prompt so the
-/// model knows the format to use when writing `.codewhale/handoff.md`.
-pub const COMPACT_TEMPLATE: &str = include_str!("prompts/compact.md");
-
-/// Goal continuation audit template — injected by the engine when a runtime
-/// goal is active and the assistant tries to end a turn without closing it.
-pub const GOAL_CONTINUATION_PROMPT: &str = include_str!("prompts/continuation.md");
-
-/// Memory hygiene guidance — appended to the system prompt only when the
-/// session has a non-empty user-memory block. Steers the model toward
-/// writing durable memories as declarative facts ("User prefers concise
-/// responses") rather than imperatives ("Always respond concisely"),
-/// because imperatives get re-read as directives in later sessions and
-/// can override the user's current request (#725).
-pub const MEMORY_GUIDANCE: &str = include_str!("prompts/memory_guidance.md");
-
-/// Lean execution layer shared by the default agent runtime. Product/UI
-/// tutorials remain outside the model-facing coding contract.
-pub const CORE_EXECUTION_PROFILE_PROMPT: &str = include_str!("prompts/core_execution.md");
-
-// ── Legacy prompt constants (kept for backwards compatibility) ────────
-
-/// Legacy base prompt (agent.txt — now decomposed into constitution.md + overlays).
-/// Still available for callers that haven't migrated to the layered API.
-pub const AGENT_PROMPT: &str = include_str!("prompts/agent.txt");
 
 // ── Personality selection ─────────────────────────────────────────────
 
@@ -3859,17 +3817,17 @@ mod tests {
         );
     }
 
-    /// #2953 — the Calm overlay (calm.md) stays out of the default
+    /// #2953 — the Calm overlay (`CALM_PERSONALITY`) stays out of the default
     /// model-prompt path to keep the static prefix slim. Voice and tone
     /// guidance travels via the constitution preamble instead.
     #[test]
     fn default_prompt_does_not_include_calm_personality_overlay() {
         let prompt = compose_prompt(Personality::Calm);
-        let calm_text = include_str!("prompts/personalities/calm.md");
+        let calm_text = CALM_PERSONALITY;
         let first_calm_line = calm_text.lines().find(|l| !l.is_empty()).unwrap_or("");
         assert!(
             !prompt.contains(first_calm_line),
-            "default agent prompt must not include calm.md overlay"
+            "default agent prompt must not include the calm personality overlay"
         );
     }
 

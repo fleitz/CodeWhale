@@ -1667,7 +1667,7 @@ fn clamp_child_max_spawn_depth(child_spawn_depth: u32, requested_max_depth: u32)
 /// agents that inbox is the engine turn loop; for nested agents it is a
 /// parent-local receiver inside `run_subagent`. Carries the already-rendered
 /// `<codewhale:subagent.done>` sentinel that the model expects in the
-/// transcript per `prompts/constitution.md`.
+/// transcript per the constitution (`prompts/text.rs`, `BASE_PROMPT`).
 #[derive(Debug, Clone)]
 pub struct SubAgentCompletion {
     /// The completing child's agent id. Held for routing/logging — the
@@ -10083,7 +10083,7 @@ fn subagent_status_name(status: &SubAgentStatus) -> &'static str {
     }
 }
 
-const SUBAGENT_OUTPUT_FORMAT: &str = include_str!("../../prompts/subagent_output_format.md");
+use crate::prompts::text::SUBAGENT_OUTPUT_FORMAT;
 
 const GENERAL_AGENT_INTRO: &str = concat!(
     "You are a trusted general-purpose sub-agent. Your job is to complete the one task you were given, end-to-end, and report back concisely.\n",

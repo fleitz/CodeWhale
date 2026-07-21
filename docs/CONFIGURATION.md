@@ -196,7 +196,8 @@ and shell-write gates, not by this mechanism.
 ### Expert full base-prompt override (#3638)
 
 The global Constitution (the base system prompt, normally compiled in from
-`prompts/constitution.md`) can be replaced per-user without rebuilding. This is
+`crates/tui/src/prompts/text.rs` as `BASE_PROMPT`) can be replaced per-user
+without rebuilding. This is
 an expert escape hatch, not the normal `/constitution` guided setup output.
 Because this is a prompt trust boundary, it takes **two deliberate steps** — a
 file alone is not enough:

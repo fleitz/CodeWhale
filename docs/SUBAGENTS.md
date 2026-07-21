@@ -27,8 +27,8 @@ launches detached background work: cancelling the parent turn stops the parent
 wait path, but it does not kill already-opened child runs.
 
 This doc covers the role taxonomy and current compatibility controls. The active
-orchestration surface is `agent`; see
-`crates/tui/src/prompts/constitution.md` "Sub-Agent Strategy" and the in-line
+orchestration surface is `agent`; see the sub-agent guidance in
+`crates/tui/src/prompts/text.rs` (`AGENT_MODE`) and the in-line
 tool description.
 
 ## Role taxonomy
@@ -473,7 +473,7 @@ RISKS:      what could go wrong / what the parent should double-check
 BLOCKERS:   what stopped you; "None." if you finished cleanly
 ```
 
-The exact format lives in `crates/tui/src/prompts/subagent_output_format.md`.
+The exact format lives in `crates/tui/src/prompts/text.rs` (`SUBAGENT_OUTPUT_FORMAT`).
 The parent reads `EVIDENCE` as a working set for the next turn, so
 explorers and reviewers should be precise here.
 

@@ -23,7 +23,7 @@ if grep -En \
   crates/tui/src/config.rs \
   crates/tui/src/commands/groups/config/config.rs \
   crates/tui/src/commands/groups/skills/restore.rs \
-  crates/tui/src/prompts/approvals/never.md; then
+  crates/tui/src/prompts/text.rs; then
   printf '%s\n' 'retired TUI vocabulary remains in current product messages' >&2
   exit 1
 fi

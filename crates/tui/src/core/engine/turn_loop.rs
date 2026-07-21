@@ -1408,8 +1408,9 @@ impl Engine {
                 // finished while we were inferring), surface their
                 // `<codewhale:subagent.done>` sentinels into the transcript and
                 // resume instead of ending the turn. This fulfils the contract
-                // already documented in `prompts/constitution.md`: the parent is
-                // promised it'll see the sentinel when a child finishes.
+                // already documented in the constitution (`prompts/text.rs`,
+                // `BASE_PROMPT`): the parent is promised it'll see the sentinel
+                // when a child finishes.
                 let subagent_completions = self.drain_subagent_completion_events("").await;
                 if subagent_completions == 0 {
                     // #3216: do NOT barrier the parent on running children.

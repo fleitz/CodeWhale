@@ -1,7 +1,7 @@
 # Tool surface
 
 Why these specific tools, in this groupings, and how each one is meant to be
-chosen over the available shell equivalent. Companion to `crates/tui/src/prompts/agent.txt`.
+chosen over the available shell equivalent. Companion to `crates/tui/src/prompts/text.rs` (`AGENT_PROMPT`).
 
 ## Design stance
 
